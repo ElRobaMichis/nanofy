@@ -25,6 +25,14 @@ nunca carga el driver. egui solo repinta cuando hay entrada, animación o un cam
 
 > Para reproducir hace falta **Spotify Premium** (limitación de librespot y de Spotify).
 
+## Descargar
+
+Los ejecutables listos para usar están en la pestaña **Releases** del repositorio:
+<https://github.com/ElRobaMichis/nanofy/releases>. Descarga el zip de tu sistema
+(`Nanofy-windows-x64.zip`, `Nanofy-linux-x64.zip`, `Nanofy-macos-arm64.zip` o
+`Nanofy-macos-x64.zip`), descomprímelo y abre Nanofy. El `LEEME.txt` incluido explica el
+primer arranque. Cada release la compila GitHub Actions a partir del código de este repositorio.
+
 ## Interfaz
 
 Inspirada en el rediseño de Spotify de la comunidad: fondo casi negro, contenido en tarjetas

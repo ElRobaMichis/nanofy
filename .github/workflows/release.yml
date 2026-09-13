@@ -10,6 +10,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Etiqueta de la release donde publicar (p. ej. v1.0.0). Vacío = solo compilar."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -32,7 +37,7 @@ jobs:
             target: aarch64-apple-darwin
             name: macos-arm64
             bin: nanofy
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             name: macos-x64
             bin: nanofy
@@ -111,7 +116,8 @@ jobs:
           path: dist/Nanofy-${{ matrix.name }}.zip
 
       - name: Publicar en la release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist/Nanofy-${{ matrix.name }}.zip

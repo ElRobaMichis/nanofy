@@ -88,15 +88,16 @@ jobs:
           mkdir -p "$APP/MacOS"
           cp target/${{ matrix.target }}/release/nanofy "$APP/MacOS/Nanofy"
           chmod +x "$APP/MacOS/Nanofy"
-          cat > "$APP/Info.plist" <<'EOF'
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"//p' Cargo.toml | head -1)
+          cat > "$APP/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
             <key>CFBundleName</key><string>Nanofy</string>
             <key>CFBundleDisplayName</key><string>Nanofy</string>
             <key>CFBundleIdentifier</key><string>app.nanofy</string>
-            <key>CFBundleVersion</key><string>1.0.0</string>
-            <key>CFBundleShortVersionString</key><string>1.0.0</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleExecutable</key><string>Nanofy</string>
             <key>NSHighResolutionCapable</key><true/>

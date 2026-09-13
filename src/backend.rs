@@ -69,6 +69,10 @@ pub enum Cmd {
     /// Reinicia el reproductor con nuevos ajustes de audio.
     Restart(Settings),
     PlayPause,
+    /// Play y pausa explícitos: la interfaz conoce el estado real y evita que el conmutador de
+    /// Spirc haga lo contrario cuando su estado interno se ha quedado desfasado.
+    Play,
+    Pause,
     Next,
     Prev,
     Seek(u32),
@@ -171,7 +175,9 @@ pub struct Backend {
 impl Backend {
     pub fn start(paths: Paths, settings: Settings, ui: UiTx) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            // Dos hilos: si una llamada de librespot bloquea uno (visto al reconectar tras un
+            // estancamiento), los temporizadores y el bucle de órdenes siguen vivos en el otro.
+            .worker_threads(2)
             // Pilas pequeñas y pocos hilos de bloqueo (DNS, archivos): menos RAM comprometida.
             .thread_stack_size(512 * 1024)
             .max_blocking_threads(2)
@@ -431,13 +437,15 @@ async fn run(
                     continue;
                 }
                 let result = match other {
-                    Cmd::PlayPause | Cmd::Next | Cmd::Prev => {
+                    Cmd::PlayPause | Cmd::Play | Cmd::Pause | Cmd::Next | Cmd::Prev => {
                         // Tras mucho tiempo en pausa Spotify deja de tenernos como dispositivo
                         // activo y Spirc ignora estas órdenes: se reactiva antes (si ya lo
                         // estaba, la activación se ignora sin efecto).
                         let _ = a.spirc.activate();
                         match other {
                             Cmd::PlayPause => a.spirc.play_pause(),
+                            Cmd::Play => a.spirc.play(),
+                            Cmd::Pause => a.spirc.pause(),
                             Cmd::Next => a.spirc.next(),
                             _ => a.spirc.prev(),
                         }
@@ -738,9 +746,18 @@ async fn start(
         }
         crate::tmark("sesión: token y puntos de acceso");
     }
-    let (spirc, task) = Spirc::new(connect, session.clone(), creds, player.clone(), mixer)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (spirc, task) = match tokio::time::timeout(
+        Duration::from_secs(25),
+        Spirc::new(connect, session.clone(), creds, player.clone(), mixer),
+    )
+    .await
+    {
+        Ok(r) => r.map_err(|e| e.to_string())?,
+        Err(_) => {
+            session.shutdown();
+            return Err("Spotify no respondió al conectar (25 s)".to_string());
+        }
+    };
     tokio::spawn(async move {
         task.await;
         let _ = dead_tx.send(generation);

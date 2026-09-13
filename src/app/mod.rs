@@ -5,6 +5,7 @@
 //! (y más a menudo si el panel de letras está abierto, para resaltar la línea actual).
 
 mod artist;
+pub mod control;
 mod icons;
 mod pages;
 mod panels;
@@ -1465,6 +1466,10 @@ impl App {
                 Msg::Image { key, image } => self.images.loaded(ctx, &key, image),
                 Msg::Media(ev) => self.on_media(ev),
                 Msg::Update { result, manual } => self.on_update(result, manual),
+                Msg::Control(req) => {
+                    let reply = self.control_exec(ctx, &req.cmd);
+                    let _ = req.reply.send(reply);
+                }
             }
         }
         if self.media_dirty {
@@ -1663,7 +1668,14 @@ impl App {
             }
             Event::Loading => self.player.state = PlayState::Loading,
             Event::Unavailable => {
-                self.status_err("Esta canción no está disponible (¿cuenta sin Premium?)")
+                self.status_err("Esta canción no está disponible (¿cuenta sin Premium?)");
+                // Si no hay nada más que reproducir, librespot no manda «parado»: el botón se
+                // quedaría en «cargando». Si sigue con otra pista, el evento Playing lo corrige.
+                if self.player.state == PlayState::Loading {
+                    self.player.state = PlayState::Stopped;
+                    self.player.position_at = None;
+                    self.media_dirty = true;
+                }
             }
             Event::Volume(v) => {
                 if self.volume_drag.is_none() && self.accept_volume_echo(v) {
@@ -2101,8 +2113,13 @@ impl App {
                 }
             }
             Resp::Search(s) => {
-                self.search_result = Some(s);
-                self.search_loading = false;
+                // Dos búsquedas seguidas pueden responder desordenadas: solo vale la de la
+                // consulta actual (si el usuario ya ha vuelto a escribir, se ignora la vieja).
+                let stale = matches!(&r.req, Req::Search(q) if q.trim() != self.search_query.trim() && !self.search_query.trim().is_empty());
+                if !stale {
+                    self.search_result = Some(s);
+                    self.search_loading = false;
+                }
             }
             Resp::Recent(t) => {
                 if !self.play_log.seeded {
@@ -3602,7 +3619,11 @@ impl App {
             }
             self.media_dirty = true;
         } else {
-            self.backend.send(Cmd::PlayPause);
+            match self.player.state {
+                PlayState::Playing => self.backend.send(Cmd::Pause),
+                PlayState::Paused => self.backend.send(Cmd::Play),
+                _ => self.backend.send(Cmd::PlayPause),
+            }
         }
     }
 
@@ -3890,53 +3911,58 @@ impl App {
             }
         });
         for a in acts {
-            match a {
-                Shortcut::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Shortcut::Search => self.focus_search = true,
-                Shortcut::Next => self.next(),
-                Shortcut::Prev => self.prev(),
-                Shortcut::VolUp => self.volume_by(5),
-                Shortcut::VolDown => self.volume_by(-5),
-                Shortcut::SeekFwd => self.seek_by(10_000),
-                Shortcut::SeekBack => self.seek_by(-10_000),
-                Shortcut::Back => self.back(),
-                Shortcut::Forward => self.forward(),
-                Shortcut::Home => self.go(Page::Home),
-                Shortcut::Liked => self.go(Page::Liked),
-                Shortcut::Sidebar => self.settings.sidebar_visible = !self.settings.sidebar_visible,
-                Shortcut::Settings => {
-                    self.draft = self.settings.clone();
-                    self.go(Page::Settings)
+            self.run_shortcut(a, ctx);
+        }
+    }
+
+    /// Ejecuta un atajo (teclado y modo de control comparten este camino).
+    pub(crate) fn run_shortcut(&mut self, a: Shortcut, ctx: &egui::Context) {
+        match a {
+            Shortcut::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Shortcut::Search => self.focus_search = true,
+            Shortcut::Next => self.next(),
+            Shortcut::Prev => self.prev(),
+            Shortcut::VolUp => self.volume_by(5),
+            Shortcut::VolDown => self.volume_by(-5),
+            Shortcut::SeekFwd => self.seek_by(10_000),
+            Shortcut::SeekBack => self.seek_by(-10_000),
+            Shortcut::Back => self.back(),
+            Shortcut::Forward => self.forward(),
+            Shortcut::Home => self.go(Page::Home),
+            Shortcut::Liked => self.go(Page::Liked),
+            Shortcut::Sidebar => self.settings.sidebar_visible = !self.settings.sidebar_visible,
+            Shortcut::Settings => {
+                self.draft = self.settings.clone();
+                self.go(Page::Settings)
+            }
+            Shortcut::Help => self.show_shortcuts = !self.show_shortcuts,
+            Shortcut::PlayPause => self.play_pause(),
+            Shortcut::Shuffle => self.toggle_shuffle(),
+            Shortcut::Repeat => self.cycle_repeat(),
+            Shortcut::Mute => self.toggle_mute(),
+            Shortcut::Queue => self.toggle_side(SideTab::Queue),
+            Shortcut::Lyrics => self.toggle_side(SideTab::Lyrics),
+            Shortcut::NewPlaylist => {
+                if self.logged_in() {
+                    self.actions.push(Action::OpenEditor(None));
                 }
-                Shortcut::Help => self.show_shortcuts = !self.show_shortcuts,
-                Shortcut::PlayPause => self.play_pause(),
-                Shortcut::Shuffle => self.toggle_shuffle(),
-                Shortcut::Repeat => self.cycle_repeat(),
-                Shortcut::Mute => self.toggle_mute(),
-                Shortcut::Queue => self.toggle_side(SideTab::Queue),
-                Shortcut::Lyrics => self.toggle_side(SideTab::Lyrics),
-                Shortcut::NewPlaylist => {
-                    if self.logged_in() {
-                        self.actions.push(Action::OpenEditor(None));
-                    }
+            }
+            Shortcut::Jam => self.jam_open = !self.jam_open,
+            Shortcut::CloseTab => {
+                if let ActiveTab::Tab(i) = self.active {
+                    self.close_tab(i);
                 }
-                Shortcut::Jam => self.jam_open = !self.jam_open,
-                Shortcut::CloseTab => {
-                    if let ActiveTab::Tab(i) = self.active {
-                        self.close_tab(i);
-                    }
-                }
-                Shortcut::Escape => {
-                    self.show_shortcuts = false;
-                    self.jam_open = false;
-                    self.editor = None;
-                }
+            }
+            Shortcut::Escape => {
+                self.show_shortcuts = false;
+                self.jam_open = false;
+                self.editor = None;
             }
         }
     }
 }
 
-enum Shortcut {
+pub(crate) enum Shortcut {
     Quit,
     Search,
     Next,

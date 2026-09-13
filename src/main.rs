@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
@@ -6,6 +7,7 @@ mod backend;
 mod bus;
 mod cache;
 mod config;
+mod control;
 mod fonts;
 mod images;
 mod media;
@@ -44,6 +46,8 @@ fn main() {
     let start_page = flag("--page");
     let start_side = flag("--side");
     let start_jam = args.iter().any(|a| a == "--jam");
+    // `--control <puerto>`: modo de control local para las pruebas automatizadas (carpeta qa/).
+    let control_port = flag("--control").and_then(|p| p.parse::<u16>().ok());
     // `--tab <página>` (repetible): abre pestañas adicionales en segundo plano.
     let extra_tabs: Vec<String> = args
         .iter()
@@ -68,6 +72,9 @@ fn main() {
         app.apply_start_flags(start_page.as_deref(), start_side.as_deref(), start_jam);
         for t in &extra_tabs {
             app.open_tab_from_flag(t);
+        }
+        if let Some(port) = control_port {
+            app.control_start(port);
         }
         app
     }) {

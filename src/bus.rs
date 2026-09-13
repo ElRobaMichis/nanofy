@@ -2,6 +2,7 @@
 
 use crate::api::ApiResult;
 use crate::backend::Event;
+use crate::control::ControlReq;
 use crate::update::UpdateResult;
 
 pub enum Msg {
@@ -14,6 +15,8 @@ pub enum Msg {
     Media(souvlaki::MediaControlEvent),
     /// Resultado de la comprobación de versiones (`manual` = pedida desde Ajustes).
     Update { result: UpdateResult, manual: bool },
+    /// Operación del modo de control (`--control`); se responde por su canal.
+    Control(ControlReq),
 }
 
 #[derive(Clone)]

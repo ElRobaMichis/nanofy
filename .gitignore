@@ -20,3 +20,10 @@ assets/windows-icon-check.png
 vendor/*/.cargo-ok
 vendor/*/.cargo_vcs_info.json
 vendor/*/Cargo.lock
+
+# Informes y capturas de las pruebas (qa/run.py)
+/qa/reports
+__pycache__/
+
+# Herramienta interna de pruebas (no se publica)
+/qa

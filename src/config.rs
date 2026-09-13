@@ -118,6 +118,10 @@ pub struct Settings {
     pub home_order: Vec<String>,
     pub home_custom: Vec<String>,
     pub home_recs: bool,
+    /// Consultar GitHub al arrancar (y cada pocas horas) y avisar si hay una versión nueva.
+    pub update_check: bool,
+    /// Versión que el usuario pidió omitir (no se vuelve a avisar de ella).
+    pub update_skipped: String,
 }
 
 impl Default for Settings {
@@ -147,6 +151,8 @@ impl Default for Settings {
             home_order: Vec::new(),
             home_custom: Vec::new(),
             home_recs: true,
+            update_check: true,
+            update_skipped: String::new(),
         }
     }
 }

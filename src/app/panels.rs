@@ -216,6 +216,76 @@ impl App {
         self.editor_window(ctx);
         self.folder_window(ctx);
         self.add_dialog_window(ctx);
+        self.update_window(ctx);
+    }
+
+    /// Aviso flotante «hay una versión nueva» (arriba a la derecha, sobre el contenido).
+    fn update_window(&mut self, ctx: &egui::Context) {
+        if !self.update_banner {
+            return;
+        }
+        let Some(info) = self.update.clone() else {
+            self.update_banner = false;
+            return;
+        };
+        let p = theme::palette(ctx);
+        let current = crate::update::current_version();
+        let mut action: Option<u8> = None; // 1 descargar · 2 novedades · 3 omitir · 4 cerrar
+        egui::Area::new(egui::Id::new("update_banner"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, vec2(-18.0, 58.0))
+            .show(ctx, |ui| {
+                Self::dialog_frame(ctx).show(ui, |ui| {
+                    ui.set_width(340.0);
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                        icons::paint(ui.painter(), r, GREEN, Icon::Download);
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("Nanofy {} disponible", info.version)).font(theme::bold(15.0)));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icons::button(ui, Icon::Close, 24.0, p.weak).on_hover_text("Recordar más tarde").clicked() {
+                                action = Some(4);
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("Tienes la {current}. Descarga el zip nuevo y sustituye el ejecutable.")).small().color(p.weak));
+                    let first_lines: Vec<&str> = info.notes.lines().filter(|l| !l.trim().is_empty()).take(3).collect();
+                    if !first_lines.is_empty() {
+                        ui.add_space(6.0);
+                        for l in first_lines {
+                            ui.add(Label::new(RichText::new(l.trim_start_matches(['-', '*', '#', ' '])).small().color(p.text)).wrap());
+                        }
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if Self::primary_button(ui, "Descargar", true).clicked() {
+                            action = Some(1);
+                        }
+                        if Self::secondary_button(ui, "Ver novedades", true).clicked() {
+                            action = Some(2);
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let b = Button::new(RichText::new("Omitir esta versión").small().color(p.weak)).frame(false);
+                            let r = ui.add(b).on_hover_text("No volver a avisar de esta versión");
+                            if r.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if r.clicked() {
+                                action = Some(3);
+                            }
+                        });
+                    });
+                });
+            });
+        match action {
+            Some(1) => self.open_update(ctx, true),
+            Some(2) => self.open_update(ctx, false),
+            Some(3) => self.skip_update(),
+            Some(4) => self.update_banner = false,
+            _ => {}
+        }
     }
 
     /// Diálogo «Nueva carpeta» / «Renombrar carpeta» (mismo estilo que los demás).

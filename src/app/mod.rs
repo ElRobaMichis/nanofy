@@ -29,6 +29,7 @@ use crate::images::Images;
 use crate::media::Media;
 use crate::model::*;
 use crate::shell::{NativeHandles, FPS_CAP_KEY, FRAME_MS_KEY};
+use crate::update::{UpdateInfo, UpdateResult};
 use crate::webauth::WebAuth;
 
 pub use theme::GREEN;
@@ -271,6 +272,14 @@ pub struct App {
     pub user: Option<User>,
     pub device_id: String,
     pub status: Option<(String, Instant, bool)>,
+    /// Versión nueva publicada en GitHub y si su aviso flotante está a la vista.
+    pub update: Option<UpdateInfo>,
+    pub update_banner: bool,
+    /// Comprobación en curso y último resultado en texto (para Ajustes; `true` = error).
+    pub update_busy: bool,
+    pub update_note: Option<(String, bool)>,
+    /// Próxima comprobación automática (al arrancar y cada 6 h).
+    update_check_at: Option<Instant>,
 
     pub playlists: Vec<Playlist>,
     pub playlists_loaded: bool,
@@ -554,6 +563,8 @@ impl App {
         let volume = vol_pct_to_raw(settings.volume as f32);
         let side = settings.lyrics_open.then_some(SideTab::Lyrics);
         let settings_library_grid = settings.library_grid;
+        // La consulta de versiones espera unos segundos para no competir con el arranque.
+        let update_check_at = settings.update_check.then(|| Instant::now() + Duration::from_secs(5));
         crate::tmark("antes de fuentes");
         crate::fonts::install_system_fonts(ctx);
         crate::tmark("fuentes");
@@ -573,6 +584,11 @@ impl App {
             user: None,
             device_id: device_id0,
             status: None,
+            update: None,
+            update_banner: false,
+            update_busy: false,
+            update_note: None,
+            update_check_at,
             playlists: Vec::new(),
             playlists_loaded: false,
             playlist_meta: HashMap::new(),
@@ -1308,6 +1324,80 @@ impl App {
         self.status = Some((text.into(), Instant::now(), false));
     }
 
+    // ------------------------------------------------------------ actualizaciones
+
+    /// Consulta la última release en GitHub (en un hilo). `manual` = pulsado en Ajustes.
+    pub fn check_updates(&mut self, manual: bool) {
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = true;
+        if manual {
+            self.update_note = None;
+        }
+        crate::update::check(self.ui_tx.clone(), manual);
+    }
+
+    fn on_update(&mut self, result: UpdateResult, manual: bool) {
+        self.update_busy = false;
+        match result {
+            UpdateResult::Available(info) => {
+                // La versión omitida no vuelve a saltar sola, pero sí si el usuario la pide.
+                let skipped = !manual && self.settings.update_skipped == info.version;
+                self.update_note = Some((format!("Hay una versión nueva: {}", info.version), false));
+                self.update_banner = !skipped;
+                self.update = Some(info);
+            }
+            UpdateResult::UpToDate => {
+                self.update = None;
+                self.update_banner = false;
+                self.update_note = Some((format!("Estás al día ({})", crate::update::current_version()), false));
+            }
+            UpdateResult::Failed(e) => {
+                // La comprobación automática falla en silencio (sin red, límite de GitHub…).
+                log::info!("[update] {e}");
+                if manual {
+                    self.update_note = Some((e, true));
+                }
+            }
+        }
+    }
+
+    /// Activa o desactiva el aviso automático; se guarda al instante.
+    pub fn set_update_check(&mut self, on: bool) {
+        self.settings.update_check = on;
+        self.draft.update_check = on;
+        self.update_check_at = on.then(|| Instant::now() + Duration::from_secs(6 * 3600));
+        if !self.ephemeral {
+            self.settings.save(&self.paths);
+        }
+    }
+
+    /// «Omitir esta versión»: no se vuelve a avisar de ella (sí de las siguientes).
+    pub fn skip_update(&mut self) {
+        if let Some(u) = &self.update {
+            self.settings.update_skipped = u.version.clone();
+            self.draft.update_skipped = u.version.clone();
+            if !self.ephemeral {
+                self.settings.save(&self.paths);
+            }
+        }
+        self.update_banner = false;
+    }
+
+    /// Abre en el navegador el zip de esta plataforma (`download`) o la página de la release.
+    pub fn open_update(&mut self, ctx: &egui::Context, download: bool) {
+        let Some(u) = &self.update else {
+            return;
+        };
+        let url = match (&u.asset_url, download) {
+            (Some(asset), true) => asset.clone(),
+            _ => u.page_url.clone(),
+        };
+        ctx.open_url(egui::OpenUrl::new_tab(url));
+        self.status(if download { "Se ha abierto el navegador para descargar la versión nueva" } else { "Se han abierto las novedades en el navegador" });
+    }
+
     pub fn status_err(&mut self, text: impl Into<String>) {
         let text = text.into();
         log::warn!("{text}");
@@ -1374,6 +1464,7 @@ impl App {
                 Msg::Api(r) => self.on_api(r),
                 Msg::Image { key, image } => self.images.loaded(ctx, &key, image),
                 Msg::Media(ev) => self.on_media(ev),
+                Msg::Update { result, manual } => self.on_update(result, manual),
             }
         }
         if self.media_dirty {
@@ -2534,6 +2625,17 @@ impl App {
 
     fn tick(&mut self, ctx: &egui::Context) {
         self.diag_tick(ctx);
+        // Comprobación de versiones programada (la interfaz solo repinta cuando hace falta, así
+        // que se pide un repintado para el instante previsto).
+        if let Some(at) = self.update_check_at {
+            let now = Instant::now();
+            if now >= at {
+                self.update_check_at = Some(now + Duration::from_secs(6 * 3600));
+                self.check_updates(false);
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
         self.flush_volume(ctx);
         self.poll_restore_queue(ctx);
         // Precarga suave de playlists (una cada 250 ms) para que abrirlas sea instantáneo.

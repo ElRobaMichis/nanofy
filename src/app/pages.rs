@@ -2496,9 +2496,28 @@ impl App {
         let cache_dir = self.paths.cache_dir.display().to_string();
         Self::settings_card(ui, "Acerca de Nanofy", |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Versión {}", env!("CARGO_PKG_VERSION"))).strong());
+                ui.label(RichText::new(format!("Versión {}", crate::update::current_version())).strong());
                 let _ = Self::pill(ui, "Rust · egui · librespot", false);
             });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if Self::secondary_button(ui, "Buscar actualizaciones", !self.update_busy).clicked() {
+                    self.check_updates(true);
+                }
+                if self.update_busy {
+                    Self::loading(ui, "Consultando GitHub");
+                } else if let Some((text, err)) = self.update_note.clone() {
+                    ui.label(RichText::new(text).small().color(if err { ERROR_RED } else { weak }));
+                    if self.update.is_some() && Self::primary_button(ui, "Descargar", true).clicked() {
+                        self.open_update(&ctx, true);
+                    }
+                }
+            });
+            let mut v = self.settings.update_check;
+            if Self::toggle_pad(ui, &mut v, "Avisar al arrancar cuando haya una versión nueva", 0.0) {
+                self.set_update_check(v);
+            }
             if let Some(m) = mem {
                 ui.label(RichText::new(format!("Memoria en uso {m:.0} MB · {n_img} portadas en memoria ({img_mb:.1} MB) · último fotograma {frame_ms:.1} ms")).small().color(weak));
             }

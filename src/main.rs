@@ -14,6 +14,7 @@ mod taskbar;
 mod model;
 mod raster;
 mod shell;
+mod update;
 mod webauth;
 
 fn main() {

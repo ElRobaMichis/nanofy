@@ -2,6 +2,7 @@
 
 use crate::api::ApiResult;
 use crate::backend::Event;
+use crate::update::UpdateResult;
 
 pub enum Msg {
     Backend(Event),
@@ -11,6 +12,8 @@ pub enum Msg {
         image: Option<egui::ColorImage>,
     },
     Media(souvlaki::MediaControlEvent),
+    /// Resultado de la comprobación de versiones (`manual` = pedida desde Ajustes).
+    Update { result: UpdateResult, manual: bool },
 }
 
 #[derive(Clone)]

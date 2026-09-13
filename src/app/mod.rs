@@ -29,7 +29,7 @@ use crate::config::{vol_pct_to_raw, vol_raw_to_pct, Paths, Settings};
 use crate::images::Images;
 use crate::media::Media;
 use crate::model::*;
-use crate::shell::{NativeHandles, FPS_CAP_KEY, FRAME_MS_KEY};
+use crate::shell::{NativeHandles, FPS_CAP_KEY, FRAME_MS_KEY, FRAME_PHASES_KEY};
 use crate::update::{UpdateInfo, UpdateResult};
 use crate::webauth::WebAuth;
 
@@ -415,6 +415,8 @@ pub struct App {
     taskbar_ready: bool,
     taskbar_playing: Option<bool>,
     ws_trimmed: bool,
+    /// Próximo recorte del working set (tras cambiar de pista).
+    ws_trim_at: Option<Instant>,
     /// Canciones ocultas (ids): atenuadas en las listas y saltadas al reproducir.
     pub hidden_tracks: HashSet<String>,
     hidden_path: PathBuf,
@@ -466,6 +468,9 @@ pub struct App {
     pub lyrics: Option<Lyrics>,
     pub lyrics_for: Option<String>,
     pub lyrics_loading: bool,
+    /// Última línea de letra a la que se desplazó el panel (pista, índice): el desplazamiento
+    /// animado se pide una vez por cambio de línea, no en cada fotograma.
+    pub lyrics_scrolled: Option<(String, usize)>,
 
     pub jam_open: bool,
     pub jam: Option<JamSession>,
@@ -492,6 +497,10 @@ pub struct App {
     pub mem_mb: Option<f64>,
     pub mem_at: Instant,
     pub frame_ms: f32,
+    /// Últimos fotogramas (ms) para medir coste medio y máximo.
+    pub frame_hist: std::collections::VecDeque<f32>,
+    /// Suma de fases [ui, teselado, raster, presentación] de los fotogramas de `frame_hist`.
+    pub frame_phases: [f32; 4],
     pub web_busy: bool,
     media_dirty: bool,
     /// Instantánea de la biblioteca en disco.
@@ -678,6 +687,7 @@ impl App {
             taskbar_ready: false,
             taskbar_playing: None,
             ws_trimmed: false,
+            ws_trim_at: None,
             hidden_tracks,
             hidden_path,
             last_skipped: None,
@@ -720,6 +730,7 @@ impl App {
             lyrics: None,
             lyrics_for: None,
             lyrics_loading: false,
+            lyrics_scrolled: None,
             jam_open: false,
             jam: None,
             jam_link: String::new(),
@@ -742,6 +753,8 @@ impl App {
             mem_mb: None,
             mem_at: Instant::now() - Duration::from_secs(10),
             frame_ms: 0.0,
+            frame_hist: std::collections::VecDeque::with_capacity(240),
+            frame_phases: [0.0; 4],
             web_busy: false,
             media_dirty: false,
             snapshot_path,
@@ -775,7 +788,7 @@ impl App {
                 app.now_placeholder = true;
             }
         }
-        if app.api.web_configured() {
+        if app.api.web_configured() && !crate::config::no_session() {
             // El token propio de la Web API ya está en disco: el estado del reproductor y la
             // COLA se piden por HTTP de inmediato, sin esperar a que librespot conecte ni a que
             // este equipo sea el dispositivo activo. Así lo que suena en el móvil (pista, cola
@@ -791,7 +804,7 @@ impl App {
             app.restore_deadline = Some(Instant::now() + Duration::from_secs(4));
         }
         // Con credenciales guardadas no se muestra la bienvenida: la sesión llegará sola.
-        if let Some(username) = saved_username(&app.paths) {
+        if let Some(username) = saved_username(&app.paths).filter(|_| !crate::config::no_session()) {
             log::info!("[t] credenciales guardadas ({username}): interfaz de sesión desde el primer fotograma");
             app.auth = Auth::Connecting { username };
         }
@@ -1611,6 +1624,7 @@ impl App {
                 self.status("Sesión cerrada");
             }
             Event::TrackChanged(np) => {
+                self.ws_trim_at = Some(Instant::now() + Duration::from_secs(6));
                 if self.now_placeholder || self.pause_after_restore || self.restore_mark {
                     self.restore_mark = false;
                     self.restore_fallback_at = None;
@@ -2756,6 +2770,16 @@ impl App {
                     let _ = windows::Win32::System::ProcessStatus::K32EmptyWorkingSet(windows::Win32::System::Threading::GetCurrentProcess());
                 }
             }
+            if let Some(t) = self.ws_trim_at {
+                if Instant::now() >= t {
+                    self.ws_trim_at = None;
+                    unsafe {
+                        let _ = windows::Win32::System::ProcessStatus::K32EmptyWorkingSet(windows::Win32::System::Threading::GetCurrentProcess());
+                    }
+                } else {
+                    ctx.request_repaint_after(t - Instant::now());
+                }
+            }
             if !self.taskbar_ready && self.taskbar_at.elapsed() > Duration::from_millis(1200) {
                 self.taskbar_ready = true;
                 if let Some(h) = self.hwnd {
@@ -2845,6 +2869,17 @@ impl App {
         self.frame_ms = ctx
             .data(|d| d.get_temp::<f32>(egui::Id::new(FRAME_MS_KEY)))
             .unwrap_or(0.0);
+        if self.frame_ms > 0.0 {
+            if self.frame_hist.len() == 240 {
+                self.frame_hist.pop_front();
+            }
+            self.frame_hist.push_back(self.frame_ms);
+            if let Some(ph) = ctx.data(|d| d.get_temp::<[f32; 4]>(egui::Id::new(FRAME_PHASES_KEY))) {
+                for k in 0..4 {
+                    self.frame_phases[k] += ph[k];
+                }
+            }
+        }
         self.save_snapshot_if_needed(false);
         self.save_play_log_if_needed(false);
     }
@@ -4101,27 +4136,29 @@ impl crate::shell::UiApp for App {
             self.settings.lyrics_open = self.side == Some(SideTab::Lyrics);
             self.settings.save(&self.paths);
         }
-        // Las escrituras van en hilos aparte (fichero temporal + renombrado, así nunca queda a
-        // medias); la espera de abajo les da tiempo de sobra y la ventana no se bloquea.
+        // El backend empieza a desconectar (avisa a Spotify de la pausa y del dispositivo
+        // inactivo) mientras aquí se escriben los ficheros: son pequeños y va en este hilo,
+        // así el process::exit no los corta a medias.
+        self.backend.send(Cmd::Shutdown);
         if self.snapshot_dirty && self.logged_in() {
             self.snapshot_dirty = false;
-            self.snapshot().save_async(self.snapshot_path.clone());
+            self.snapshot().save_now(&self.snapshot_path);
         }
         if self.play_log_dirty {
             self.play_log_dirty = false;
-            self.play_log.save_async(self.play_log_path.clone());
+            self.play_log.save_now(&self.play_log_path);
         }
-        self.backend.send(Cmd::Shutdown);
-        // Spirc deja la sesión pausada en Spotify (posición incluida) y marca el dispositivo
-        // inactivo; la ventana ya está oculta, así que esperar aquí no se nota.
+        // Un margen corto para que salga el aviso de desconexión; si Spotify tarda más, se
+        // cierra igual: la copia local de la reproducción ya está guardada y el servidor
+        // detecta la desconexión por sí mismo.
         let t = Instant::now();
-        while !self.shutdown_done && t.elapsed() < Duration::from_millis(700) {
+        while !self.shutdown_done && t.elapsed() < Duration::from_millis(30) {
             while let Ok(msg) = self.rx.try_recv() {
                 if let Msg::Backend(Event::ShutdownDone) = msg {
                     self.shutdown_done = true;
                 }
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 }

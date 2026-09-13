@@ -204,6 +204,11 @@ impl Settings {
     }
 }
 
+/// `NANOFY_NO_SESSION=1`: arranca sin conectar con Spotify (medidas de memoria «sin sesión»).
+pub fn no_session() -> bool {
+    std::env::var_os("NANOFY_NO_SESSION").is_some()
+}
+
 /// Rango del slider de volumen en decibelios: 0 % = silencio, 1 % ≈ -40 dB, 100 % = 0 dB.
 /// El slider es lineal en dB (20·log10 de la amplitud), que es como percibe el oído.
 pub const VOL_DB_RANGE: f32 = 40.0;

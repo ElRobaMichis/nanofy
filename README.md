@@ -6,14 +6,14 @@ sincronizadas, gestiona playlists y se une a Jams.
 
 | Medida en este PC (Windows 11, i7 16 hilos, RTX 3060) | Nanofy | Fastpotify | Spotify oficial |
 |---|---|---|---|
-| RAM sin sesión | **23 MB** | 100–250 MB (según su README) | 600 MB – 1 GB+ |
-| RAM con sesión y biblioteca cargada, en reposo | **36 MB** | | |
-| RAM reproduciendo | **60 MB** | | |
+| RAM sin sesión (privada / en el Administrador de tareas) | **12 / 17 MB** | 100–250 MB (según su README) | 600 MB – 1 GB+ |
+| RAM con sesión y biblioteca cargada, en reposo | **18 / 11 MB** | | |
+| RAM reproduciendo | **29 / 21 MB** | | |
 | CPU en reposo (30 s) | **0 %** | | |
-| CPU reproduciendo (un núcleo) | **~3 %** (decodificación + audio) | | |
-| Proceso creado → primer fotograma | **171 ms** | | |
-| Cierre (clic en la X → proceso terminado) | **~150 ms** | | |
-| Coste de un fotograma (1136×759) | 1,6–3 ms | | |
+| CPU reproduciendo (un núcleo) | **1–2 %** (decodificación + audio) | | |
+| Proceso creado → primer fotograma pintado | **25 ms** sin sesión, **32 ms** con sesión | | |
+| Cierre (clic en la X → proceso terminado) | **17 ms** sin sesión, **46 ms** reproduciendo | | |
+| Coste de un fotograma (1920×1040, scroll) | **1,7 ms** en listas, **2,3 ms** en Inicio (0,5 ms es la copia a pantalla) | | |
 | Peticiones de red al iniciar sesión | 6 (la biblioteca sale de una instantánea local) | | |
 | Driver gráfico cargado | No | Sí (wgpu/OpenGL) | Sí |
 | Binario | 14 MB, un solo ejecutable | un solo ejecutable | ~300 MB |
@@ -146,7 +146,26 @@ propios: editar, guardar, fijar…), la misma selección múltiple y la misma lu
 «Descargar» guarda el audio en la caché de librespot (Ajustes → Caché de audio), de modo que
 esas canciones se reproducen sin volver a bajarlas; el registro está en `downloads.json`.
 
-## Rendimiento (medido el 4 sep 2026, Windows 11, release)
+## Rendimiento (medido el 13 sep 2026, Windows 11, release, mediana de 3 ejecuciones)
+
+| | 1.2.0 | 1.3.0 |
+|---|---|---|
+| Cierre con sesión (clic en × → proceso terminado) | 375 ms | 46 ms |
+| Fotograma en Inicio, scroll a 1920×1040 (medio / máximo) | 6,6 / 10 ms | 2,3 / 5 ms |
+| Fotograma en Canciones que te gustan (medio / máximo) | 2,5 / 5 ms | 1,7 / 4 ms |
+| Panel de letras abierto mientras suena | 20 fps, 15 % CPU | 2 fps, 1,6 % CPU |
+| Memoria en el Administrador de tareas reproduciendo | 48 MB | 21 MB |
+| Proceso creado → primer fotograma | 35 ms | 32 ms |
+
+Cómo (1.3.0): el rasterizador reparte el fotograma en bandas horizontales entre hasta 8 hilos
+(bandas finas que cada hilo toma según termina, así las barras vacías no desequilibran) y las
+portadas opacas a escala 1:1 se copian fila a fila sin mezclar; al cerrar, los ficheros se
+escriben en el mismo hilo (son pequeños) y se espera al aviso de desconexión como mucho 30 ms;
+el panel de letras solo pide desplazarse cuando cambia la línea (antes lo pedía en cada
+fotograma y la animación de egui no paraba nunca); y a los 6 s de cada cambio de pista se
+devuelven al sistema las páginas de fichero que dejó la descarga.
+
+### Medidas anteriores (4 sep 2026)
 
 | | Antes | Ahora |
 |---|---|---|

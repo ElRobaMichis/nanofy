@@ -209,6 +209,8 @@ struct Active {
     _player: Arc<Player>,
     /// Identifica esta conexión: los avisos de «tarea terminada» de conexiones viejas se ignoran.
     generation: u64,
+    /// Cierre de la app: no esperar a Spotify más que unas decenas de ms.
+    fast_stop: bool,
 }
 
 impl Active {
@@ -220,7 +222,9 @@ impl Active {
         if keep_session {
             let _ = self.spirc.disconnect(true);
             // Tiempo para que Spirc envíe la posición y el estado «inactivo» (una petición).
-            tokio::time::sleep(Duration::from_millis(350)).await;
+            // Al cerrar la app el límite lo pone on_exit (unos 40 ms); al cerrar sesión o
+            // reconectar hay más margen.
+            tokio::time::sleep(Duration::from_millis(if self.fast_stop { 20 } else { 350 })).await;
         } else {
             let _ = self.spirc.shutdown();
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -404,7 +408,8 @@ async fn run(
                 }
             }
             Cmd::Shutdown => {
-                if let Some(a) = active.take() {
+                if let Some(mut a) = active.take() {
+                    a.fast_stop = true;
                     a.stop(true).await;
                 }
                 ui.send(Msg::Backend(Event::ShutdownDone));
@@ -572,6 +577,9 @@ async fn run(
 }
 
 fn cached_credentials(paths: &Paths) -> Option<Credentials> {
+    if crate::config::no_session() {
+        return None;
+    }
     let cache = Cache::new(Some(paths.credentials_dir()), None, None, None).ok()?;
     cache.credentials()
 }
@@ -776,6 +784,7 @@ async fn start(
         session,
         _player: player,
         generation,
+        fast_stop: false,
     })
 }
 

@@ -24,6 +24,8 @@ use crate::raster::Raster;
 pub const FPS_CAP_KEY: &str = "nanofy_fps_cap";
 /// Clave con el coste del último fotograma en milisegundos (ui + rasterizado + presentación).
 pub const FRAME_MS_KEY: &str = "nanofy_frame_ms";
+/// [ui, teselado, rasterizado, presentación] del último fotograma, en ms.
+pub const FRAME_PHASES_KEY: &str = "nanofy_frame_phases";
 /// Fotogramas por segundo para animaciones cuando el usuario no está interactuando.
 const IDLE_FPS: u32 = 24;
 /// Tiempo tras la última entrada durante el que se aplica el límite alto de fps.
@@ -170,7 +172,9 @@ impl<A: UiApp> Shell<A> {
         self.surface = Some(surface);
         self.paint(el);
         window.set_visible(true);
-        crate::tmark("ventana visible");
+        let since = crate::ms_since_process_creation().unwrap_or(0.0);
+        let _ = crate::VISIBLE_MS.set(since);
+        crate::tmark(&format!("ventana visible ({since:.0} ms desde la creación del proceso)"));
         window.request_redraw();
     }
 
@@ -237,6 +241,7 @@ impl<A: UiApp> Shell<A> {
         raw_input.viewports = std::iter::once((ViewportId::ROOT, self.info.clone())).collect();
 
         let mut full = self.ctx.run_ui(raw_input, |ui| app.ui(ui));
+        let t_ui = t0.elapsed().as_secs_f32() * 1000.0;
 
         state.handle_platform_output(&window, full.platform_output);
 
@@ -263,6 +268,8 @@ impl<A: UiApp> Shell<A> {
         self.raster.update_textures(&full.textures_delta);
         let ppp = full.pixels_per_point;
         let primitives = self.ctx.tessellate(full.shapes, ppp);
+        let t_tess = t0.elapsed().as_secs_f32() * 1000.0;
+        let mut t_raster = t_tess;
 
         let size = window.inner_size();
         if size.width > 0 && size.height > 0 {
@@ -285,6 +292,7 @@ impl<A: UiApp> Shell<A> {
                         &primitives,
                         clear,
                     );
+                    t_raster = t0.elapsed().as_secs_f32() * 1000.0;
                     let _ = buffer.present();
                 }
             }
@@ -295,7 +303,9 @@ impl<A: UiApp> Shell<A> {
         let frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let repaint_delay_dbg = repaint_delay;
         if self.frames == 0 {
-            log::info!("[t] primer fotograma pintado ({frame_ms:.1} ms de trabajo)");
+            let since = crate::ms_since_process_creation().unwrap_or(0.0);
+            let _ = crate::FIRST_FRAME_MS.set(since);
+            log::info!("[t] primer fotograma pintado ({frame_ms:.1} ms de trabajo; {since:.0} ms desde la creación del proceso)");
         }
         self.frames += 1;
         if self.frames % 25 == 0 {
@@ -307,8 +317,10 @@ impl<A: UiApp> Shell<A> {
                 .collect();
             log::debug!("[t] fotograma {} ({frame_ms:.1} ms, repaint_delay siguiente {:?}, causas {:?})", self.frames, repaint_delay_dbg, causes);
         }
-        self.ctx
-            .data_mut(|d| d.insert_temp(egui::Id::new(FRAME_MS_KEY), frame_ms));
+        self.ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(FRAME_MS_KEY), frame_ms);
+            d.insert_temp(egui::Id::new(FRAME_PHASES_KEY), [t_ui, t_tess - t_ui, t_raster - t_tess, frame_ms - t_raster]);
+        });
         self.last_paint = Instant::now();
 
         // Siguiente repintado, respetando el límite de FPS durante animaciones.

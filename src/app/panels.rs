@@ -157,6 +157,10 @@ impl App {
         let current = lyrics.current_line(pos);
         let playing = self.player.state == PlayState::Playing;
         let mut seek_to: Option<u32> = None;
+        // Desplazar a la línea actual solo cuando cambia: pedirlo en cada fotograma mantenía la
+        // animación de egui viva para siempre (20 fps y un 15 % de CPU con el panel abierto).
+        let mut scrolled = self.lyrics_scrolled.clone();
+        let track_id = lyrics.track_id.clone();
         egui::ScrollArea::vertical()
             .id_salt(("lyrics_scroll", &lyrics.track_id))
             .auto_shrink([false, false])
@@ -181,8 +185,9 @@ impl App {
                     } else {
                         Sense::hover()
                     }));
-                    if is_cur && playing {
+                    if is_cur && playing && scrolled.as_ref() != Some(&(track_id.clone(), i)) {
                         r.scroll_to_me(Some(Align::Center));
+                        scrolled = Some((track_id.clone(), i));
                     }
                     if lyrics.synced() && r.clicked() {
                         seek_to = Some(line.start_ms);
@@ -205,6 +210,7 @@ impl App {
                     );
                 }
             });
+        self.lyrics_scrolled = scrolled;
         if let Some(ms) = seek_to {
             self.seek(ms);
         }

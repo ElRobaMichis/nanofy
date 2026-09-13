@@ -22,6 +22,8 @@ struct Texture {
     w: usize,
     h: usize,
     px: Pixels,
+    /// Todos los texels con alfa 255 (portadas): se copian sin mezclar.
+    opaque: bool,
 }
 
 impl Texture {
@@ -98,17 +100,20 @@ impl Raster {
                         } else {
                             Pixels::Rgba(img.pixels.iter().map(|c| c.to_array()).collect())
                         };
+                        let opaque = matches!(&px, Pixels::Rgba(p) if p.iter().all(|c| c[3] == 255));
                         self.textures.insert(
                             *id,
                             Texture {
                                 w: iw,
                                 h: ih,
                                 px,
+                                opaque,
                             },
                         );
                     }
                     Some([x, y]) => {
                         if let Some(t) = self.textures.get_mut(id) {
+                            t.opaque = false;
                             for row in 0..ih {
                                 let ty = y + row;
                                 if ty >= t.h {
@@ -137,6 +142,10 @@ impl Raster {
     }
 
     /// Pinta todas las primitivas en `buf` (ancho `w`, alto `h`, formato 0RGB).
+    ///
+    /// Con ventanas grandes el trabajo se reparte en bandas horizontales entre varios hilos:
+    /// cada banda recibe todas las primitivas recortadas a sus filas, así ningún hilo escribe
+    /// fuera de su trozo del búfer y no hace falta sincronización.
     pub fn paint(
         &self,
         buf: &mut [u32],
@@ -146,16 +155,45 @@ impl Raster {
         primitives: &[ClippedPrimitive],
         clear: Color32,
     ) {
-        buf.fill(pack(clear.to_array()));
+        let clear_px = pack(clear.to_array());
+        let threads = if w * h >= 400_000 {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8)
+        } else {
+            1
+        };
+        if threads == 1 {
+            buf.fill(clear_px);
+            self.paint_rows(buf, w, 0, h, ppp, primitives);
+            return;
+        }
+        let rows = h.div_ceil(threads * 3).max(8);
+        let bands: std::sync::Mutex<Vec<(usize, &mut [u32])>> = std::sync::Mutex::new(
+            buf.chunks_mut(rows * w).enumerate().map(|(i, b)| (i * rows, b)).rev().collect(),
+        );
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let bands = &bands;
+                s.spawn(move || loop {
+                    let Some((y0, band)) = bands.lock().unwrap().pop() else { break };
+                    let y1 = y0 + band.len() / w;
+                    band.fill(clear_px);
+                    self.paint_rows(band, w, y0, y1, ppp, primitives);
+                });
+            }
+        });
+    }
+
+    /// Pinta las primitivas en las filas [y0, y1) de la ventana; `band` empieza en la fila y0.
+    fn paint_rows(&self, band: &mut [u32], w: usize, y0: usize, y1: usize, ppp: f32, primitives: &[ClippedPrimitive]) {
         for p in primitives {
             let Primitive::Mesh(mesh) = &p.primitive else {
                 continue;
             };
             let clip = Clip {
                 x0: ((p.clip_rect.min.x * ppp).floor().max(0.0)) as i32,
-                y0: ((p.clip_rect.min.y * ppp).floor().max(0.0)) as i32,
+                y0: ((p.clip_rect.min.y * ppp).floor().max(y0 as f32)) as i32,
                 x1: ((p.clip_rect.max.x * ppp).ceil()).min(w as f32) as i32,
-                y1: ((p.clip_rect.max.y * ppp).ceil()).min(h as f32) as i32,
+                y1: ((p.clip_rect.max.y * ppp).ceil()).min(y1 as f32) as i32,
             };
             if clip.x0 >= clip.x1 || clip.y0 >= clip.y1 {
                 continue;
@@ -170,7 +208,7 @@ impl Raster {
                 let v0 = &mesh.vertices[tri[0] as usize];
                 let v1 = &mesh.vertices[tri[1] as usize];
                 let v2 = &mesh.vertices[tri[2] as usize];
-                triangle(buf, w, &clip, tex, is_font, v0, v1, v2, ppp);
+                triangle(band, w, y0 as i32, &clip, tex, is_font, v0, v1, v2, ppp);
             }
         }
     }
@@ -252,9 +290,11 @@ fn color_f(c: Color32) -> [f32; 4] {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn triangle(
     buf: &mut [u32],
     stride: usize,
+    y_off: i32,
     clip: &Clip,
     tex: &Texture,
     is_font: bool,
@@ -348,7 +388,7 @@ fn triangle(
         if xs >= xe {
             continue;
         }
-        let row = py as usize * stride;
+        let row = (py - y_off) as usize * stride;
         match flat_color {
             Some(c) if c[3] == 255 => {
                 buf[row + xs as usize..row + xe as usize].fill(pack(c));
@@ -408,6 +448,17 @@ fn triangle(
                         blend(dst, c);
                         for k in 0..4 {
                             col[k] += dcol[k];
+                        }
+                    }
+                } else if white && is_font && tex.opaque && dv.abs() < 1e-6 && (du * tex.w as f32 - 1.0).abs() < 1e-3 {
+                    // Portada opaca a escala 1:1 y sin rotar: la fila de texels se copia tal cual.
+                    if let Pixels::Rgba(p) = &tex.px {
+                        let ty = ((v * tex.h as f32) as isize).clamp(0, tex.h as isize - 1) as usize;
+                        let mut tx = ((u * tex.w as f32) as isize).clamp(0, tex.w as isize - 1) as usize;
+                        let row_px = &p[ty * tex.w..(ty + 1) * tex.w];
+                        for dst in span {
+                            *dst = pack(row_px[tx]);
+                            tx = (tx + 1).min(tex.w - 1);
                         }
                     }
                 } else if white {

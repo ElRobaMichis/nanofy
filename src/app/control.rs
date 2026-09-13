@@ -815,6 +815,11 @@ impl App {
                 self.update_banner = b(cmd, "on", true) && self.update.is_some();
                 ok()
             }
+            "frame_reset" => {
+                self.frame_hist.clear();
+                self.frame_phases = [0.0; 4];
+                ok()
+            }
             "status_clear" => {
                 self.status = None;
                 ok()
@@ -1043,6 +1048,8 @@ impl App {
             "secs_left": self.sleep_at.map(|t| t.saturating_duration_since(Instant::now()).as_secs()),
             "end_of_track": self.sleep_end_of_track,
         });
+        let phases_n = self.frame_hist.len().max(1) as f32;
+        let phases_avg = json!({"ui": self.frame_phases[0] / phases_n, "tessellate": self.frame_phases[1] / phases_n, "raster": self.frame_phases[2] / phases_n, "present": self.frame_phases[3] / phases_n});
         json!({
             "version": crate::update::current_version(),
             "auth": auth,
@@ -1114,6 +1121,17 @@ impl App {
             "ephemeral": self.ephemeral,
             "mem_mb": self.mem_mb,
             "frame_ms": self.frame_ms,
+            "frames": {
+                "count": self.frame_hist.len(),
+                "avg_ms": if self.frame_hist.is_empty() { 0.0 } else { self.frame_hist.iter().sum::<f32>() / self.frame_hist.len() as f32 },
+                "max_ms": self.frame_hist.iter().cloned().fold(0.0f32, f32::max),
+                "phases_avg_ms": phases_avg,
+            },
+            "startup": {
+                "first_frame_ms": crate::FIRST_FRAME_MS.get().copied(),
+                "visible_ms": crate::VISIBLE_MS.get().copied(),
+                "since_main_ms": crate::since_start_ms(),
+            },
         })
     }
 }

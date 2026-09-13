@@ -28,6 +28,17 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Escritura atómica: fichero temporal y renombrado, así nunca queda un JSON a medias.
+pub fn write_atomic(path: &Path, text: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 impl Snapshot {
     pub fn load(path: &Path) -> Option<Self> {
         let text = std::fs::read_to_string(path).ok()?;
@@ -36,6 +47,13 @@ impl Snapshot {
 
     pub fn age_secs(&self) -> u64 {
         now_secs().saturating_sub(self.saved_at)
+    }
+
+    /// Escribe ahora mismo (fichero temporal + renombrado). Para el cierre.
+    pub fn save_now(&self, path: &Path) {
+        if let Ok(text) = serde_json::to_string(self) {
+            write_atomic(path, &text);
+        }
     }
 
     /// Serializa en este hilo (rápido) y escribe en otro para no tocar el fotograma.
@@ -98,6 +116,12 @@ impl PlayLog {
         if self.entries.len() > 5000 {
             self.entries.sort_by(|a, b| b.last.cmp(&a.last));
             self.entries.truncate(4000);
+        }
+    }
+
+    pub fn save_now(&self, path: &Path) {
+        if let Ok(text) = serde_json::to_string(self) {
+            write_atomic(path, &text);
         }
     }
 

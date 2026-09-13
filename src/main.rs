@@ -101,6 +101,29 @@ fn icon_rgba() -> Vec<u8> {
     ICON.to_vec()
 }
 
+/// Milisegundos desde que Windows creó el proceso (incluye cargar el ejecutable y sus DLL).
+#[cfg(windows)]
+pub fn ms_since_process_creation() -> Option<f64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    unsafe {
+        GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u).ok()?;
+        let now = GetSystemTimeAsFileTime();
+        let to_u64 = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
+        Some((to_u64(now).saturating_sub(to_u64(c))) as f64 / 10_000.0)
+    }
+}
+#[cfg(not(windows))]
+pub fn ms_since_process_creation() -> Option<f64> {
+    None
+}
+
+/// Marcas de arranque medidas desde la creación del proceso (para `--control` y el bench).
+pub static FIRST_FRAME_MS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+pub static VISIBLE_MS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
 /// Instante de arranque para las marcas de tiempo `[t]`.
 pub static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 

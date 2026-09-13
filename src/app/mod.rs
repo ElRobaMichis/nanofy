@@ -2480,14 +2480,13 @@ impl App {
     pub fn reload_library(&mut self) {
         self.requested.clear();
         self.playlists_loaded = false;
-        self.lists.clear();
+        // Lo que ya se ve se conserva hasta que llegue lo nuevo: si la red falla (cuota, sin
+        // conexión) la biblioteca no se queda vacía ni la instantánea se guarda a ceros.
+        self.lists.retain(|k, _| k == LIKED);
         self.albums.clear();
         self.artists.clear();
         self.users.clear();
         self.user_playlists.clear();
-        self.saved_albums.clear();
-        self.followed_artists.clear();
-        self.recent.clear();
         self.snapshot_age = None;
         self.refresh_from_network();
     }
@@ -3874,6 +3873,8 @@ impl App {
     pub fn save_settings(&mut self, ctx: &egui::Context) {
         let restart = self.settings.playback_differs(&self.draft);
         let media_changed = self.settings.media_keys != self.draft.media_keys;
+        self.draft.zoom = self.draft.zoom.clamp(0.7, 2.0);
+        self.draft.fps_cap = self.draft.fps_cap.clamp(30, 480);
         self.settings = self.draft.clone();
         self.settings.save(&self.paths);
         self.apply_theme(ctx);

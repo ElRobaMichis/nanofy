@@ -349,6 +349,26 @@ impl App {
                 self.queue_clear();
                 ok()
             }
+            "queue_play" => {
+                // Doble clic en una fila de la cola (misma ruta que la interfaz).
+                let Some(i) = n(cmd, "index").map(|i| i as usize) else { return err("falta index") };
+                let rows: Vec<crate::model::Track> = self.queue.as_ref().map(|q| q.queue.clone()).unwrap_or_default();
+                let Some(t) = rows.get(i).cloned() else { return err("índice fuera de la cola") };
+                self.play_from_queue(&t.uri, &rows, i);
+                ok()
+            }
+            "volume_wheel" => match cmd.get("points").and_then(|v| v.as_f64()) {
+                // Rueda del ratón sobre el volumen: 50 puntos por muesca (25 = 1 %).
+                Some(p) => {
+                    self.volume_wheel(p as f32);
+                    ok()
+                }
+                None => err("falta points"),
+            },
+            "minimize" => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(b(cmd, "on", true)));
+                ok()
+            }
             "queue_refresh" => {
                 self.api.send(Req::Queue);
                 self.queue_at = Instant::now();
@@ -1064,6 +1084,7 @@ impl App {
             "player": player,
             "devices": self.devices.iter().map(|d| json!({"name": d.name, "id": d.id, "active": d.is_active, "kind": d.kind, "self": d.id.as_deref() == Some(self.device_id.as_str())})).collect::<Vec<_>>(),
             "queue": queue,
+            "queue_source": self.now_context().map(|(name, page)| json!({"name": name, "page": page.as_ref().map(page_spec)})),
             "queued_local": self.queued_local,
             "lyrics": lyrics,
             "lyrics_for": self.lyrics_for,
@@ -1111,6 +1132,7 @@ impl App {
             "home_feed": self.home_feed.iter().map(|s| json!({"id": s.id, "title": s.title, "items": s.items.len(), "first": s.items.first().map(|i| json!({"uri": i.uri, "title": i.title, "context": i.context}))})).collect::<Vec<_>>(),
             "recent": self.recent.len(),
             "play_log": self.play_log.entries.len(),
+            "play_log_last": self.play_log.entries.iter().max_by_key(|e| e.last).map(|e| json!({"uri": e.track.uri, "name": e.track.name, "count": e.count, "last": e.last})),
             "shows": self.shows.iter().map(|(k, (s, eps))| (k.clone(), json!({"name": s.name, "episodes": eps.len()}))).collect::<serde_json::Map<_, _>>(),
             "followed_shows": self.followed_shows,
             "saved_episodes": self.saved_episodes,

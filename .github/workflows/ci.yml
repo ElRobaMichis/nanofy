@@ -1,0 +1,17 @@
+# Comprueba que Nanofy compila en Windows en cada push o pull request.
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compilar (release)
+        run: cargo build --release

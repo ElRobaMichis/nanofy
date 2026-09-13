@@ -1,0 +1,117 @@
+# Compila Nanofy para Windows, Linux y macOS y publica los zips en una release de GitHub.
+# Se dispara al subir una etiqueta v* (por ejemplo: git tag v1.0.0 && git push --tags)
+# o a mano desde la pestaña Actions ("Run workflow").
+#
+# Si guardas tu Client ID de Spotify como secreto del repositorio (Settings → Secrets →
+# NANOFY_CLIENT_ID), queda incluido como valor por defecto en los binarios.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x64
+            bin: nanofy.exe
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            name: linux-x64
+            bin: nanofy
+          - os: macos-14
+            target: aarch64-apple-darwin
+            name: macos-arm64
+            bin: nanofy
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: macos-x64
+            bin: nanofy
+    runs-on: ${{ matrix.os }}
+    env:
+      NANOFY_CLIENT_ID: ${{ secrets.NANOFY_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Dependencias de Linux (ALSA, OpenSSL, teclado)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libssl-dev pkg-config libxkbcommon-dev libdbus-1-dev
+
+      - name: Compilar
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Empaquetar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/Nanofy | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/nanofy.exe dist/Nanofy/
+          Copy-Item LEEME.txt dist/Nanofy/
+          Compress-Archive -Path dist/Nanofy -DestinationPath dist/Nanofy-${{ matrix.name }}.zip
+
+      - name: Empaquetar (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/Nanofy
+          cp target/${{ matrix.target }}/release/nanofy dist/Nanofy/
+          cp LEEME.txt dist/Nanofy/
+          cat > dist/Nanofy/LEEME-linux.txt <<'EOF'
+          Linux: necesita ALSA (libasound2) y OpenSSL 3 instalados, presentes en casi
+          cualquier distribución. Ejecuta:  chmod +x nanofy && ./nanofy
+          EOF
+          (cd dist && zip -r Nanofy-${{ matrix.name }}.zip Nanofy)
+
+      - name: Empaquetar (macOS, .app)
+        if: runner.os == 'macOS'
+        run: |
+          APP=dist/Nanofy.app/Contents
+          mkdir -p "$APP/MacOS"
+          cp target/${{ matrix.target }}/release/nanofy "$APP/MacOS/Nanofy"
+          chmod +x "$APP/MacOS/Nanofy"
+          cat > "$APP/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>Nanofy</string>
+            <key>CFBundleDisplayName</key><string>Nanofy</string>
+            <key>CFBundleIdentifier</key><string>app.nanofy</string>
+            <key>CFBundleVersion</key><string>1.0.0</string>
+            <key>CFBundleShortVersionString</key><string>1.0.0</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleExecutable</key><string>Nanofy</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+          </dict></plist>
+          EOF
+          cp LEEME.txt dist/
+          cat > dist/LEEME-mac.txt <<'EOF'
+          macOS: la app no está firmada. La primera vez, clic derecho sobre Nanofy.app →
+          Abrir → Abrir. (O en Ajustes del Sistema → Privacidad y seguridad → "Abrir igualmente".)
+          EOF
+          (cd dist && zip -r Nanofy-${{ matrix.name }}.zip Nanofy.app LEEME.txt LEEME-mac.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nanofy-${{ matrix.name }}
+          path: dist/Nanofy-${{ matrix.name }}.zip
+
+      - name: Publicar en la release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Nanofy-${{ matrix.name }}.zip

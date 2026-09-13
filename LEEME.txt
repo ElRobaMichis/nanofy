@@ -1,0 +1,38 @@
+Nanofy — cliente ligero de Spotify
+==================================
+
+Qué necesitas
+-------------
+- Una cuenta de Spotify Premium (Spotify solo permite reproducir desde apps
+  externas con Premium).
+- Windows 10 u 11 (64 bits). No hace falta instalar nada más: Nanofy es un solo
+  archivo, sin Node, sin Java, sin runtimes.
+
+Cómo abrirlo
+------------
+1. Descomprime el zip en cualquier carpeta (por ejemplo, Documentos\Nanofy).
+2. Abre nanofy.exe.
+   Si Windows muestra "Windows protegió tu PC" (el archivo no está firmado):
+   pulsa "Más información" y luego "Ejecutar de todas formas". Solo la primera vez.
+3. Pulsa "Iniciar sesión": se abre el navegador con la página oficial de Spotify.
+   Acepta y vuelve a Nanofy. Ya puedes reproducir.
+
+Biblioteca, búsqueda y playlists (Web API)
+------------------------------------------
+Para ver tu biblioteca, buscar y editar playlists, Nanofy usa la Web API de
+Spotify con una "app de desarrollador". Quien te pasó Nanofy ya tiene una y
+puede añadir tu correo de Spotify a su lista de usuarios (hasta 25 personas):
+- Si te lo pasó con su Client ID ya incluido, solo tienes que ir a
+  Ajustes → Web API → "Conectar" y aceptar en el navegador.
+- Si no, pega el Client ID que te dé en ese mismo campo y pulsa "Conectar".
+
+Dónde guarda sus datos
+----------------------
+- Ajustes:   %APPDATA%\nanofy\config\settings.json
+- Sesión y caché: %LOCALAPPDATA%\nanofy\  (bórrala para "desinstalar" por completo;
+  el programa en sí es solo nanofy.exe)
+
+Atajos
+------
+Espacio: reproducir / pausar · Ctrl+←/→: anterior / siguiente · S: aleatorio ·
+R: repetir · M: silencio · L: letra · Q: cola · Ctrl+J: Jam · Ctrl+W: cerrar pestaña

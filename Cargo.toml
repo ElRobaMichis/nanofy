@@ -1,0 +1,68 @@
+[package]
+name = "nanofy"
+version = "1.0.0"
+edition = "2021"
+description = "Cliente nativo y ligero de Spotify (Rust + egui + librespot)"
+license = "MIT"
+
+[dependencies]
+librespot-core = "0.8"
+librespot-playback = { version = "0.8", default-features = false, features = ["rodio-backend"] }
+librespot-connect = "0.8"
+librespot-oauth = "0.8"
+librespot-metadata = "0.8"
+librespot-audio = "0.8"
+librespot-protocol = "0.8"
+protobuf = "3"
+egui = "0.36"
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links", "x11", "wayland"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+ureq = { version = "3", default-features = false, features = ["native-tls", "json", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+directories = "6"
+souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }
+http = "1"
+base64 = "0.22"
+memmap2 = "0.9"
+futures = "0.3"
+log = "0.4"
+env_logger = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_Graphics_Gdi", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[target.'cfg(not(windows))'.dependencies]
+sysinfo = "0.37"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[patch.crates-io]
+librespot-playback = { path = "vendor/librespot-playback" }
+# Parche propio: librespot 0.8 descarta el comando `transfer` entrante de una Jam porque su
+# `logging_params` llega como null y rompe la deserialización (cae en «endpoint desconocido»).
+# Aquí se tolera null/ausente para que el motor procese el transfer y la Jam se sincronice.
+librespot-core = { path = "vendor/librespot-core" }
+# Parche propio: en una Jam, Spotify envía un `set_options` de latido cada ~0.5 s; librespot
+# reportaba su estado en cada uno, saturaba el límite (429) y Spotify expulsaba el dispositivo de
+# la sesión (la sincronización se cortaba tras unas canciones). Aquí solo se reporta si algo cambia.
+librespot-connect = { path = "vendor/librespot-connect" }
+
+[build-dependencies]
+winresource = { version = "0.1.31", default-features = false }

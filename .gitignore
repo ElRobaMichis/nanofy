@@ -1,0 +1,22 @@
+# Compilación y paquetes generados
+/target
+/dist
+*.log
+
+# Archivos personales / de sesión de herramientas
+/.claude
+/claude-rc.cmd
+/nanofy-jam-debug.cmd
+/nanofy.cmd
+
+# Capturas y pruebas locales
+*.png
+!assets/nanofy.png
+!assets/resonancia-original.png
+assets/windows-icon-check.png
+
+# Restos del `cargo vendor` en las crates parcheadas (no hacen falta para compilar).
+# tests/connect.rs de librespot-core sí va: su Cargo.toml lo declara como [[test]].
+vendor/*/.cargo-ok
+vendor/*/.cargo_vcs_info.json
+vendor/*/Cargo.lock

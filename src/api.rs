@@ -308,6 +308,7 @@ impl Api {
             web: web.clone(),
             web_personal: web_personal.clone(),
             cooldown_until: Mutex::new(cooldown_until),
+            personal_cooldown_until: Mutex::new(None),
             cooldown_file,
             genres: Mutex::new(genres),
             genres_file,
@@ -409,6 +410,9 @@ struct Client {
     /// Hasta cuándo Spotify ha bloqueado la cuota de la app (429 con Retry-After largo).
     /// Se persiste en disco para no gastar más cuota al reiniciar.
     cooldown_until: Mutex<Option<u64>>,
+    /// La app PROPIA del usuario agotó su cuota (QUOTA_EXCEEDED): hasta cuándo no se usa; el
+    /// resto de tokens sigue funcionando.
+    personal_cooldown_until: Mutex<Option<u64>>,
     cooldown_file: PathBuf,
     /// Géneros por "artist:<id>" / "album:<id>" (fuentes externas; se guardan en disco).
     genres: Mutex<std::collections::HashMap<String, Vec<String>>>,
@@ -438,8 +442,16 @@ impl Client {
     /// primera parte (la app propia del usuario no puede escribir en modo desarrollo). Las
     /// lecturas prefieren la app propia (cuota propia, rápida) y si no, la de primera parte.
     /// Devuelve también si el token es de una app propia/primera parte (`true`) o de librespot.
+    fn personal_cooled(&self) -> bool {
+        self.personal_cooldown_until
+            .lock()
+            .unwrap()
+            .map(|until| until > crate::cache::now_secs())
+            .unwrap_or(false)
+    }
+
     fn token(&self, write: bool) -> Result<(String, bool), String> {
-        if !write {
+        if !write && !self.personal_cooled() {
             if let Some(t) = self.web_personal.access_token()? {
                 return Ok((t, true));
             }
@@ -503,13 +515,16 @@ impl Client {
         // instantánea, y sí puede escribir en /me/library aunque esté en modo desarrollo); si un
         // endpoint concreto la bloquea (403 de modo desarrollo, p. ej. /me/tracks o /me/following),
         // se cae a la identidad de PRIMERA PARTE. En LECTURAS, token() ya elige (propia -> 1a parte).
-        let tokens: Vec<(String, bool)> = if write {
+        // (token, es app con cuota propia, es la app PROPIA del usuario)
+        let tokens: Vec<(String, bool, bool)> = {
             let mut v = Vec::new();
-            if let Some(t) = self.web_personal.access_token()? {
-                v.push((t, true));
+            if !self.personal_cooled() {
+                if let Some(t) = self.web_personal.access_token()? {
+                    v.push((t, true, true));
+                }
             }
             if let Some(t) = self.web.access_token()? {
-                v.push((t, true));
+                v.push((t, true, false));
             }
             if v.is_empty() {
                 let session = self.session()?;
@@ -517,18 +532,16 @@ impl Client {
                     .handle
                     .block_on(session.login5().auth_token())
                     .map_err(|e| format!("token: {e}"))?;
-                v.push((token.access_token, false));
+                v.push((token.access_token, false, false));
             }
             v
-        } else {
-            let (t, o) = self.token(false)?;
-            vec![(t, o)]
         };
         let last_i = tokens.len() - 1;
         // Guarda el resultado de un token que falló con 403/429 por si ningún otro token funciona.
         let mut fallback: Option<(u16, String)> = None;
-        for (ti, (token, own_app)) in tokens.iter().enumerate() {
+        for (ti, (token, own_app, personal)) in tokens.iter().enumerate() {
             let own_app = *own_app;
+            let personal = *personal;
             let is_last = ti == last_i;
             let bearer = format!("Bearer {token}");
             // Presupuesto total de espera para ESCRITURAS ante 429 (el id compartido de primera
@@ -577,15 +590,23 @@ impl Client {
                     // Cuota mensual real agotada (reason QUOTA_EXCEEDED): si hay otro token que
                     // probar, se prueba; si es el último, enfriamiento largo.
                     if text.contains("QUOTA_EXCEEDED") {
-                        if write && !is_last {
+                        // La cuota de ESTE token se ha agotado: se respeta el Retry-After real
+                        // (no una hora fija). Si es la app propia y hay otro token, se sigue
+                        // con la identidad de primera parte tanto en lecturas como en escrituras.
+                        let wait = retry_after.clamp(60, 6 * 3600);
+                        if personal {
+                            *self.personal_cooldown_until.lock().unwrap() = Some(crate::cache::now_secs() + wait);
+                            log::warn!("la app propia agotó su cuota (Retry-After {wait} s); se usa la identidad de primera parte");
+                        }
+                        if !is_last {
                             fallback = Some((status, text));
                             advance = true;
                             break;
                         }
-                        let until = crate::cache::now_secs() + 3600;
+                        let until = crate::cache::now_secs() + wait;
                         *self.cooldown_until.lock().unwrap() = Some(until);
                         let _ = std::fs::write(&self.cooldown_file, until.to_string());
-                        return Err(cooldown_message(3600));
+                        return Err(cooldown_message(wait));
                     }
                     // Las LECTURAS no bloquean la interfaz: fallan rápido (el llamador usa librespot
                     // o la caché). Un token que no es de app propia (login5) sin cuota -> avisar.

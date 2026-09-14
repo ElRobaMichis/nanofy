@@ -824,9 +824,12 @@ impl JamSession {
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string();
+        // Spotify devuelve `join_session_url` como URI interna (hm://social-connect/...), que no
+        // sirve para compartir: el enlace público es siempre open.spotify.com/socialsession/<token>.
         let join_url = v
             .get("join_session_url")
             .and_then(|s| s.as_str())
+            .filter(|s| s.starts_with("https://"))
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("https://open.spotify.com/socialsession/{join_token}"));
         Some(Self {

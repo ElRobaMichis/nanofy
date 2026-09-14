@@ -664,8 +664,14 @@ async fn start(
 
     let mut events = player.get_player_event_channel();
     let ui_events = ui.clone();
+    let session_events = session.clone();
     tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
+            if let PlayerEvent::Unavailable { track_id, .. } = &ev {
+                // Un fichero de caché a medias (cierre forzado, disco lleno) hace que la canción
+                // falle al decodificar para siempre: se borra para que la próxima vez se descargue.
+                tokio::spawn(purge_cached_audio(session_events.clone(), track_id.clone()));
+            }
             if let Some(e) = map_event(ev) {
                 ui_events.send(Msg::Backend(e));
             }
@@ -816,6 +822,22 @@ impl Sink for LazySink {
     }
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
         self.get().write(packet, converter)
+    }
+}
+
+/// Borra de la caché de audio los ficheros de una canción que no se pudo reproducir.
+async fn purge_cached_audio(session: Session, uri: librespot_core::SpotifyUri) {
+    use librespot_metadata::{Metadata, Track};
+    let Some(cache) = session.cache().cloned() else { return };
+    let Ok(track) = Track::get(&session, &uri).await else { return };
+    let mut n = 0;
+    for file in track.files.values() {
+        if cache.file_path(*file).map(|p| p.exists()).unwrap_or(false) && cache.remove_file(*file).is_ok() {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        log::warn!("caché de audio: {n} fichero(s) de {uri} borrados por no poderse reproducir");
     }
 }
 

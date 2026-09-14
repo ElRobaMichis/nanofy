@@ -550,6 +550,10 @@ impl Client {
             // revierta. La app propia casi nunca llega aquí (tiene su propia cuota).
             let mut write_budget = 35u64;
             let mut advance = false;
+            // Lecturas con el último token disponible: un 429 corto (la identidad de primera
+            // parte «en frío» pide 10-20 s) se espera una vez en vez de fallar; si no, la
+            // búsqueda o la biblioteca no cargarían mientras la app propia esté sin cuota.
+            let mut read_waited = false;
             for _ in 0..8 {
                 let resp = match method {
                     "GET" => self.agent.get(url).header("Authorization", &bearer).call(),
@@ -613,6 +617,17 @@ impl Client {
                     if !write {
                         if !own_app {
                             return Err(NO_APP_HINT.to_string());
+                        }
+                        if is_last && !read_waited && retry_after <= 25 {
+                            read_waited = true;
+                            log::info!("Spotify limita las lecturas (Retry-After {retry_after} s); se espera una vez");
+                            std::thread::sleep(Duration::from_secs(retry_after));
+                            continue;
+                        }
+                        if !is_last {
+                            fallback = Some((status, text));
+                            advance = true;
+                            break;
                         }
                         return Err("Spotify está limitando las peticiones; inténtalo de nuevo en unos segundos.".to_string());
                     }

@@ -138,6 +138,7 @@ enum PlayerCommand {
         context: String,
         next: Vec<String>,
     },
+    EmitClusterSnapshotEvent(Vec<u8>),
     EmitRepeatChangedEvent {
         context: bool,
         track: bool,
@@ -249,6 +250,11 @@ pub enum PlayerEvent {
         current: String,
         context: String,
         next: Vec<String>,
+    },
+    /// Clúster de Connect (protobuf `Cluster` sin parsear) tal como lo devuelve Spotify al
+    /// registrar el dispositivo: lo último que quedó sonando o en pausa en la cuenta, con posición.
+    ClusterSnapshot {
+        cluster: Vec<u8>,
     },
     RepeatChanged {
         context: bool,
@@ -650,6 +656,10 @@ impl Player {
 
     pub fn emit_shuffle_changed_event(&self, shuffle: bool) {
         self.command(PlayerCommand::EmitShuffleChangedEvent(shuffle));
+    }
+
+    pub fn emit_cluster_snapshot_event(&self, cluster: Vec<u8>) {
+        self.command(PlayerCommand::EmitClusterSnapshotEvent(cluster));
     }
 
     pub fn emit_jam_queue_event(&self, current: String, context: String, next: Vec<String>) {
@@ -2344,6 +2354,10 @@ impl PlayerInternal {
                 next,
             }),
 
+            PlayerCommand::EmitClusterSnapshotEvent(cluster) => {
+                self.send_event(PlayerEvent::ClusterSnapshot { cluster })
+            }
+
             PlayerCommand::EmitAutoPlayChangedEvent(auto_play) => {
                 self.send_event(PlayerEvent::AutoPlayChanged { auto_play })
             }
@@ -2575,6 +2589,10 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::EmitJamQueueEvent { next, .. } => f
                 .debug_tuple("EmitJamQueueEvent")
                 .field(&next.len())
+                .finish(),
+            PlayerCommand::EmitClusterSnapshotEvent(c) => f
+                .debug_tuple("EmitClusterSnapshotEvent")
+                .field(&c.len())
                 .finish(),
             PlayerCommand::EmitRepeatChangedEvent { context, track } => f
                 .debug_tuple("EmitRepeatChangedEvent")

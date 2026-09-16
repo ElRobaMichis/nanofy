@@ -115,6 +115,10 @@ impl Shortcut {
 }
 
 impl App {
+    fn auth_signed_in_for_control(&self) -> bool {
+        matches!(self.auth, Auth::LoggedIn { .. } | Auth::Connecting { .. })
+    }
+
     pub fn control_start(&self, port: u16) {
         crate::control::start(port, self.ui_tx.clone());
     }
@@ -1086,6 +1090,7 @@ impl App {
             "queue": queue,
             "queue_source": self.now_context().map(|(name, page)| json!({"name": name, "page": page.as_ref().map(page_spec)})),
             "queued_local": self.queued_local,
+            "restoring": self.restore_pending.is_some() || self.restore_wanted || self.restore_awaiting || self.restore_mark || (!self.restore_decided && !self.cluster_restored && self.auth_signed_in_for_control()),
             "lyrics": lyrics,
             "lyrics_for": self.lyrics_for,
             "lyrics_loading": self.lyrics_loading,

@@ -904,18 +904,27 @@ impl SpircTask {
         trace!("Received connection ID update: {connection_id:?}");
         self.session.set_connection_id(&connection_id);
 
+        let mut cluster_raw: Option<Vec<u8>> = None;
         let cluster = match self
             .connect_state
             .notify_new_device_appeared(&self.session)
             .await
         {
-            Ok(res) => Cluster::parse_from_bytes(&res).ok(),
+            Ok(res) => {
+                cluster_raw = Some(res.to_vec());
+                Cluster::parse_from_bytes(&res).ok()
+            }
             Err(why) => {
                 error!("{why:?}");
                 None
             }
         }
         .ok_or(SpircError::FailedDealerSetup)?;
+        // Nanofy: el clúster inicial trae lo último que quedó en la cuenta (p. ej. en pausa en
+        // el móvil) con su posición; se reenvía a la interfaz para restaurarlo.
+        if let Some(raw) = cluster_raw.take() {
+            self.player.emit_cluster_snapshot_event(raw);
+        }
 
         debug!(
             "successfully put connect state for {} with connection-id {connection_id}",

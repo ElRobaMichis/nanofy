@@ -145,6 +145,9 @@ pub enum Event {
 #[derive(Debug, Clone, Default)]
 pub struct ClusterInfo {
     pub active_device_id: String,
+    /// Última actualización del estado (ms desde 1970): permite saber si es más reciente que
+    /// la copia local aunque el dispositivo que lo dejó ya esté apagado.
+    pub timestamp_ms: i64,
     pub context_uri: String,
     pub track_uri: String,
     pub position_ms: u32,
@@ -667,6 +670,14 @@ async fn start(
     let session_events = session.clone();
     tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
+            if let PlayerEvent::ClusterSnapshot { cluster } = &ev {
+                use protobuf::Message as _;
+                match librespot_protocol::connect::Cluster::parse_from_bytes(cluster) {
+                    Ok(c) => ui_events.send(Msg::Backend(Event::Cluster(cluster_info(&c, "inicial")))),
+                    Err(e) => log::warn!("clúster inicial no legible: {e}"),
+                }
+                continue;
+            }
             if let PlayerEvent::Unavailable { track_id, .. } = &ev {
                 // Un fichero de caché a medias (cierre forzado, disco lleno) hace que la canción
                 // falle al decodificar para siempre: se borra para que la próxima vez se descargue.
@@ -706,39 +717,7 @@ async fn start(
                         continue;
                     }
                 };
-                let c = &cu.cluster;
-                let ps = &c.player_state;
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let mut pos = ps.position_as_of_timestamp;
-                if ps.is_playing && !ps.is_paused && ps.timestamp > 0 {
-                    pos += now_ms - ps.timestamp;
-                }
-                let info = ClusterInfo {
-                    active_device_id: c.active_device_id.clone(),
-                    context_uri: ps.context_uri.clone(),
-                    track_uri: ps.track.uri.clone(),
-                    position_ms: pos.clamp(0, u32::MAX as i64) as u32,
-                    is_playing: ps.is_playing,
-                    is_paused: ps.is_paused,
-                    shuffle: ps.options.shuffling_context,
-                    repeat_context: ps.options.repeating_context,
-                    repeat_track: ps.options.repeating_track,
-                    queue: ps.next_tracks.iter().filter(|t| t.provider == "queue").map(|t| t.uri.clone()).collect(),
-                    next: ps.next_tracks.iter().map(|t| t.uri.clone()).take(60).collect(),
-                };
-                log::debug!(
-                    "[clúster] activo=<{}> ctx={} pista={} pos={} ms playing={} paused={} sig={}",
-                    info.active_device_id,
-                    info.context_uri,
-                    info.track_uri,
-                    info.position_ms,
-                    info.is_playing,
-                    info.is_paused,
-                    info.next.len()
-                );
+                let info = cluster_info(&cu.cluster, "actualización");
                 ui_c.send(Msg::Backend(Event::Cluster(info)));
             }
         });
@@ -823,6 +802,45 @@ impl Sink for LazySink {
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
         self.get().write(packet, converter)
     }
+}
+
+/// Resume el clúster de Connect (estado de la cuenta) en lo que la interfaz necesita.
+fn cluster_info(c: &librespot_protocol::connect::Cluster, origen: &str) -> ClusterInfo {
+    let ps = &c.player_state;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let mut pos = ps.position_as_of_timestamp;
+    if ps.is_playing && !ps.is_paused && ps.timestamp > 0 {
+        pos += now_ms - ps.timestamp;
+    }
+    let info = ClusterInfo {
+        active_device_id: c.active_device_id.clone(),
+        timestamp_ms: ps.timestamp,
+        context_uri: ps.context_uri.clone(),
+        track_uri: ps.track.uri.clone(),
+        position_ms: pos.clamp(0, u32::MAX as i64) as u32,
+        is_playing: ps.is_playing,
+        is_paused: ps.is_paused,
+        shuffle: ps.options.shuffling_context,
+        repeat_context: ps.options.repeating_context,
+        repeat_track: ps.options.repeating_track,
+        queue: ps.next_tracks.iter().filter(|t| t.provider == "queue").map(|t| t.uri.clone()).collect(),
+        next: ps.next_tracks.iter().map(|t| t.uri.clone()).take(60).collect(),
+    };
+    log::info!(
+        "[clúster {origen}] activo=<{}> ctx={} pista={} pos={} ms ts={} playing={} paused={} sig={}",
+        info.active_device_id,
+        info.context_uri,
+        info.track_uri,
+        info.position_ms,
+        info.timestamp_ms,
+        info.is_playing,
+        info.is_paused,
+        info.next.len()
+    );
+    info
 }
 
 /// Borra de la caché de audio los ficheros de una canción que no se pudo reproducir.

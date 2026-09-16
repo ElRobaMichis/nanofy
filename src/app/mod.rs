@@ -310,6 +310,9 @@ pub struct App {
     /// La sesión restaurada llegó «reproduciendo»: se pausa en cuanto empiece (nunca se
     /// reproduce solo al abrir).
     pause_after_restore: bool,
+    /// El usuario pulsó play mientras aún se decidía qué restaurar: se reanuda en cuanto cargue
+    /// lo restaurado (desde su posición), en vez de empezar la pista desde cero.
+    play_after_restore: bool,
     /// La barra muestra la última canción escuchada (de la instantánea) mientras llega la
     /// sesión real; si se pulsa play antes, se reproduce esa canción.
     now_placeholder: bool,
@@ -337,6 +340,8 @@ pub struct App {
     /// Estado actual del reproductor en la cuenta (/me/player): fuente de verdad entre
     /// dispositivos. `Some(None)` = ya respondió sin nada; `None` = aún no ha respondido.
     server_now: Option<Option<crate::model::PlaybackState>>,
+    /// Estado del clúster de Connect al conectar (lo último que quedó en cualquier dispositivo).
+    server_cluster: Option<Option<crate::backend::ClusterInfo>>,
     /// Ya se decidió qué restaurar (local o servidor) en este arranque.
     restore_decided: bool,
     /// Se ha recibido al menos un estado del reproductor (o su 204) en este arranque.
@@ -619,6 +624,7 @@ impl App {
             restore_wanted: true,
             restore_awaiting: false,
             pause_after_restore: false,
+            play_after_restore: false,
             now_placeholder: false,
             queue_retry: None,
             restore_mark: false,
@@ -631,6 +637,7 @@ impl App {
             cluster_restored: false,
             server_last: None,
             server_now: None,
+            server_cluster: None,
             restore_decided: false,
             player_state_seen: false,
             restore_deadline: None,
@@ -1556,19 +1563,13 @@ impl App {
                 self.auth = Auth::LoggedIn { username };
                 self.device_id = device_id;
                 crate::tmark("sesión: conectado");
-                if self.restore_pending.is_some() {
-                    // Copia local (lo último que sonó en Nanofy): instantánea y fiable.
-                    self.cluster_restored = true;
-                    self.restore_wanted = false;
-                    self.restore_local();
-                } else if self.restore_wanted {
-                    // Sin copia local (primer uso o sonó en otro sitio): se pide la sesión de la
-                    // cuenta a Spotify por transferencia de Connect.
-                    self.restore_wanted = false;
-                    self.restore_awaiting = true;
-                    crate::tmark("sesión: pedida a Spotify");
-                    self.backend.send(Cmd::ResumeSession);
-                    self.restore_deadline = Some(Instant::now() + Duration::from_secs(5));
+                if self.restore_pending.is_some() || self.restore_wanted {
+                    // La decisión (copia local, clúster de Connect, recently-played) se toma en
+                    // try_decide_restore; el clúster inicial llega justo después de conectar.
+                    if self.restore_deadline.is_none() {
+                        self.restore_deadline = Some(Instant::now() + Duration::from_millis(2500));
+                    }
+                    self.try_decide_restore(false);
                 }
                 self.refresh_from_network();
                 if let Some(id) = self.pending_radio.take() {
@@ -1668,6 +1669,11 @@ impl App {
                 self.player.position_ms = position_ms;
                 self.player.position_at = None;
                 self.media_dirty = true;
+                if self.play_after_restore && !self.now_placeholder {
+                    // Lo restaurado ya está cargado en pausa: se cumple el play pendiente.
+                    self.play_after_restore = false;
+                    self.backend.send(Cmd::Play);
+                }
             }
             Event::Position(ms) => {
                 self.player.position_ms = ms;
@@ -1698,22 +1704,12 @@ impl App {
             }
             Event::ShutdownDone => self.shutdown_done = true,
             Event::Cluster(info) => {
-                if !self.cluster_restored && (self.restore_wanted || self.restore_pending.is_some()) {
+                if self.server_cluster.is_none() {
                     crate::tmark("sesión: estado del clúster recibido");
-                    let elsewhere = !info.active_device_id.is_empty() && info.active_device_id != self.device_id;
-                    if elsewhere && info.is_playing && !info.is_paused {
-                        // Suena en otro dispositivo: se controla desde allí, aquí no se carga nada.
-                        self.cluster_restored = true;
-                        self.restore_wanted = false;
-                        self.restore_pending = None;
-                        self.restore_deadline = None;
-                    } else if !info.track_uri.is_empty() {
-                        self.cluster_restored = true;
-                        self.restore_wanted = false;
-                        self.restore_pending = None;
-                        self.restore_deadline = None;
-                        self.restore_from_cluster(info);
-                    }
+                }
+                self.server_cluster = Some(if info.track_uri.is_empty() { None } else { Some(info) });
+                if !self.cluster_restored && (self.restore_wanted || self.restore_pending.is_some()) {
+                    self.try_decide_restore(false);
                 }
             }
             Event::SessionResumed(ok) => {
@@ -3204,7 +3200,10 @@ impl App {
         // Se espera a /me/player (sesión activa exacta) y a recently-played (última sesión de
         // la cuenta, que sobrevive aunque el dispositivo se apague). El plazo de respaldo llama
         // con force=true si alguna no llega.
-        if !force && (self.server_now.is_none() || self.server_last.is_none()) {
+        // También al estado del clúster de Connect: es lo único que conserva la posición exacta
+        // de lo que quedó en pausa en otro dispositivo (el teléfono) aunque ya esté cerrado.
+        let web_pending = self.api.web_configured() && (self.server_now.is_none() || self.server_last.is_none());
+        if !force && (web_pending || self.server_cluster.is_none()) {
             return;
         }
         self.restore_decided = true;
@@ -3227,7 +3226,29 @@ impl App {
                 return;
             }
         }
-        // 2) Sin sesión activa: la última que registró la cuenta (recently-played) si es más
+        // 2) Estado del clúster de Connect: lo último que quedó en pausa en cualquier
+        //    dispositivo, con su posición exacta. Manda si es más reciente que la copia local.
+        if let Some(Some(c)) = self.server_cluster.clone() {
+            let elsewhere = !c.active_device_id.is_empty() && c.active_device_id != self.device_id;
+            if elsewhere && c.is_playing && !c.is_paused {
+                log::info!("[restore] suena en otro dispositivo; aquí no se carga nada");
+                self.restore_wanted = false;
+                self.restore_pending = None;
+                self.cluster_restored = true;
+                return;
+            }
+            let c_at = (c.timestamp_ms.max(0) / 1000) as u64;
+            let newer = c_at > local_at.saturating_add(20);
+            if self.restore_pending.is_none() || newer {
+                log::info!("[restore] el clúster tiene la sesión más reciente ({c_at} > {local_at}): {} en {} ms", c.track_uri, c.position_ms);
+                self.restore_wanted = false;
+                self.restore_pending = None;
+                self.cluster_restored = true;
+                self.restore_from_cluster(c);
+                return;
+            }
+        }
+        // 3) Sin sesión activa: la última que registró la cuenta (recently-played) si es más
         //    reciente que la copia local y de otro contexto/pista (algo se oyó en otro sitio).
         let last = self.server_last.clone().flatten();
         if let Some(l) = last {
@@ -3239,6 +3260,18 @@ impl App {
                 self.restore_from_recent(l);
                 return;
             }
+        }
+        if self.restore_pending.is_none() {
+            // Sin copia local ni estado en el servidor: se pide la sesión por transferencia de
+            // Connect (como antes), por si Spotify aún la conserva.
+            if self.logged_in() && !self.restore_awaiting {
+                self.restore_wanted = false;
+                self.restore_awaiting = true;
+                crate::tmark("sesión: pedida a Spotify");
+                self.backend.send(Cmd::ResumeSession);
+                self.restore_deadline = Some(Instant::now() + Duration::from_secs(5));
+            }
+            return;
         }
         log::info!("[restore] la copia local es la más reciente o la única; se restaura localmente");
         self.restore_wanted = false;
@@ -3372,6 +3405,7 @@ impl App {
         };
         if let Some(uri) = &ctx {
             self.last_play = Some(PlayTarget::Context { uri: uri.clone(), track_uri: Some(item.uri.clone()), index: None, shuffle });
+            self.ensure_context_meta(&uri.clone());
         } else {
             self.last_play = Some(PlayTarget::Tracks { uris: vec![item.uri.clone()], index: Some(0), shuffle: false });
         }
@@ -3423,6 +3457,7 @@ impl App {
         };
         if let Cmd::LoadContext { uri, track_uri, index, shuffle, .. } = &cmd {
             self.last_play = Some(PlayTarget::Context { uri: uri.clone(), track_uri: track_uri.clone(), index: *index, shuffle: *shuffle });
+            self.ensure_context_meta(&uri.clone());
         }
         self.restore_mark = true;
         self.now_placeholder = false;
@@ -3443,6 +3478,23 @@ impl App {
             self.pending_queue = Some((Instant::now() + Duration::from_millis(2500), pos, info.queue));
         }
         log::info!("[restore] sesión del clúster: {} en {} ms ({})", info.track_uri, pos, info.context_uri);
+    }
+
+    /// Pide el nombre del contexto (álbum, playlist, artista) para que «Siguientes de: …» lo
+    /// muestre aunque nunca se haya abierto su página en esta sesión.
+    fn ensure_context_meta(&mut self, uri: &str) {
+        let mut parts = uri.splitn(3, ':');
+        let (Some(_), Some(kind), Some(id)) = (parts.next(), parts.next(), parts.next()) else { return };
+        let id = id.to_string();
+        let (key, req) = match kind {
+            "album" if !self.albums.contains_key(&id) => (format!("album:{id}"), Req::Album(id)),
+            "playlist" if !self.playlist_meta.contains_key(&id) && !self.playlists.iter().any(|p| p.id == id) => (format!("plmeta:{id}"), Req::PlaylistMeta(id)),
+            "artist" if !self.artists.contains_key(&id) => (format!("artistmeta:{id}"), Req::Artist(id)),
+            _ => return,
+        };
+        if self.requested.insert(key) {
+            self.api.send(req);
+        }
     }
 
     /// Carga en el reproductor (en pausa) lo guardado, con aleatorio, repetición y cola manual.
@@ -3517,6 +3569,7 @@ impl App {
     }
 
     pub fn play(&mut self, t: PlayTarget) {
+        self.play_after_restore = false;
         if !self.signed_in() {
             self.status_err("Inicia sesión para reproducir música");
             return;
@@ -3633,6 +3686,13 @@ impl App {
     pub fn play_pause(&mut self) {
         self.pause_after_restore = false;
         if self.now_placeholder && self.player.remote.is_none() {
+            // Todavía se está decidiendo qué restaurar (copia local, clúster, servidor): el play
+            // se aplica en cuanto cargue lo restaurado, desde su posición, no desde cero.
+            if self.restore_pending.is_some() || self.restore_wanted || !self.restore_decided {
+                self.play_after_restore = true;
+                self.player.state = PlayState::Loading;
+                return;
+            }
             // Aún no hay nada cargado en el reproductor: se reproduce la canción mostrada.
             if let Some(uri) = self.player.now.as_ref().map(|n| n.uri.clone()) {
                 self.now_placeholder = false;

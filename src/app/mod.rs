@@ -3239,7 +3239,11 @@ impl App {
             }
             let c_at = (c.timestamp_ms.max(0) / 1000) as u64;
             let newer = c_at > local_at.saturating_add(20);
-            if self.restore_pending.is_none() || newer {
+            // Si es la misma pista casi en el mismo punto, el clúster es el eco de la propia
+            // sesión de Nanofy: la copia local (con su cola y origen) es la buena.
+            let local_pos = self.restore_pending.as_ref().map(|s| s.position_ms).unwrap_or(0);
+            let same = Some(&c.track_uri) == local_track.as_ref() && (c.position_ms as i64 - local_pos as i64).abs() < 5000;
+            if self.restore_pending.is_none() || (newer && !same) {
                 log::info!("[restore] el clúster tiene la sesión más reciente ({c_at} > {local_at}): {} en {} ms", c.track_uri, c.position_ms);
                 self.restore_wanted = false;
                 self.restore_pending = None;
@@ -3442,7 +3446,11 @@ impl App {
     /// contexto, pista, posición, aleatorio, repetición y cola manual.
     fn restore_from_cluster(&mut self, info: crate::backend::ClusterInfo) {
         let pos = info.position_ms;
-        let cmd = if !info.context_uri.is_empty() && info.context_uri != "-" {
+        // Solo contextos que librespot puede resolver; «spotify:web-api» (pistas sueltas puestas
+        // desde la Web API o el móvil) y similares se restauran como lista de pistas.
+        let ctx_kind = info.context_uri.split(':').nth(1).unwrap_or("");
+        let ctx_ok = matches!(ctx_kind, "playlist" | "album" | "artist" | "show" | "station" | "collection" | "user");
+        let cmd = if ctx_ok && !info.context_uri.is_empty() && info.context_uri != "-" {
             Cmd::LoadContext {
                 uri: info.context_uri.clone(),
                 track_uri: Some(info.track_uri.clone()),

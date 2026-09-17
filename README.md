@@ -33,12 +33,13 @@ Los ejecutables listos para usar están en la pestaña **Releases** del reposito
 `Nanofy-macos-x64.zip`), descomprímelo y abre Nanofy. El `LEEME.txt` incluido explica el
 primer arranque. Cada release la compila GitHub Actions a partir del código de este repositorio.
 
-**Aviso de versiones nuevas.** Al arrancar (y cada seis horas) Nanofy consulta la última release
+**Actualización con un clic.** Al arrancar (y cada seis horas) Nanofy consulta la última release
 de este repositorio con una sola petición anónima a la API de GitHub. Si hay una versión más
-reciente aparece un aviso arriba a la derecha con «Descargar» (el zip de tu sistema), «Ver
-novedades» y «Omitir esta versión». En Ajustes → Acerca de Nanofy está el botón «Buscar
-actualizaciones» y el interruptor para desactivar el aviso automático. No se descarga ni se
-instala nada solo: sustituyes el ejecutable cuando quieras.
+reciente aparece un aviso arriba a la derecha con «Instalar», «Ver novedades» y «Omitir esta
+versión». «Instalar» descarga el zip de tu sistema, sustituye el ejecutable y Nanofy se reabre
+ya actualizado (Windows y Linux; en macOS el botón es «Descargar»). En Ajustes → Acerca de
+Nanofy está el botón «Buscar actualizaciones» y el interruptor para desactivar el aviso. Nada se
+descarga sin pulsar el botón.
 
 ## Interfaz
 

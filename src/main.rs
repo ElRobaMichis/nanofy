@@ -33,6 +33,7 @@ fn main() {
     // asocia el botón con el acceso directo anclado y este se queda sin icono.
     #[cfg(windows)]
     set_app_user_model_id();
+    update::cleanup_old_exe();
     let paths = config::Paths::new();
     let settings = config::Settings::load(&paths);
     tmark("ajustes cargados");

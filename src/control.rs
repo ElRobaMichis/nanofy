@@ -21,12 +21,19 @@ pub fn start(port: u16, ui: UiTx) {
     let spawn = std::thread::Builder::new()
         .name("nanofy-control".to_string())
         .spawn(move || {
-            let listener = match TcpListener::bind(("127.0.0.1", port)) {
-                Ok(l) => l,
-                Err(e) => {
-                    log::error!("[control] no se pudo escuchar en 127.0.0.1:{port}: {e}");
-                    return;
+            let mut listener = None;
+            for _ in 0..50 {
+                match TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(l) => {
+                        listener = Some(l);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
                 }
+            }
+            let Some(listener) = listener else {
+                log::error!("[control] no se pudo escuchar en 127.0.0.1:{port}");
+                return;
             };
             log::info!("[control] escuchando en 127.0.0.1:{port}");
             for stream in listener.incoming() {

@@ -236,7 +236,10 @@ impl App {
         };
         let p = theme::palette(ctx);
         let current = crate::update::current_version();
-        let mut action: Option<u8> = None; // 1 descargar · 2 novedades · 3 omitir · 4 cerrar
+        let mut action: Option<u8> = None; // 1 descargar · 2 novedades · 3 omitir · 4 cerrar · 5 instalar
+        let progress = self.update_progress.clone();
+        let can_install = crate::update::can_self_install() && info.asset_url.is_some();
+        let busy = matches!(progress, Some(crate::update::InstallProgress::Downloading { .. } | crate::update::InstallProgress::Extracting | crate::update::InstallProgress::Ready(_)));
         egui::Area::new(egui::Id::new("update_banner"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_TOP, vec2(-18.0, 58.0))
@@ -255,7 +258,7 @@ impl App {
                         });
                     });
                     ui.add_space(4.0);
-                    ui.label(RichText::new(format!("Tienes la {current}. Descarga el zip nuevo y sustituye el ejecutable.")).small().color(p.weak));
+                    ui.label(RichText::new(if can_install { format!("Tienes la {current}. Se instala sola y Nanofy se reabre actualizado.") } else { format!("Tienes la {current}. Descarga el zip nuevo y sustituye el ejecutable.") }).small().color(p.weak));
                     let first_lines: Vec<&str> = info.notes.lines().filter(|l| !l.trim().is_empty()).take(3).collect();
                     if !first_lines.is_empty() {
                         ui.add_space(6.0);
@@ -264,13 +267,33 @@ impl App {
                         }
                     }
                     ui.add_space(12.0);
+                    if let Some(pr) = progress.as_ref().filter(|_| busy) {
+                        ui.horizontal(|ui| {
+                            Self::loading(ui, "");
+                            ui.label(RichText::new(pr.label()).color(p.text));
+                        });
+                        return;
+                    }
+                    if let Some(crate::update::InstallProgress::Failed(e)) = progress.as_ref() {
+                        ui.label(RichText::new(e).small().color(theme::RED));
+                        ui.add_space(6.0);
+                    }
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        if Self::primary_button(ui, "Descargar", true).clicked() {
-                            action = Some(1);
-                        }
-                        if Self::secondary_button(ui, "Ver novedades", true).clicked() {
-                            action = Some(2);
+                        if can_install && !matches!(progress, Some(crate::update::InstallProgress::Failed(_))) {
+                            if Self::primary_button(ui, "Instalar", true).clicked() {
+                                action = Some(5);
+                            }
+                            if Self::secondary_button(ui, "Ver novedades", true).clicked() {
+                                action = Some(2);
+                            }
+                        } else {
+                            if Self::primary_button(ui, "Descargar", true).clicked() {
+                                action = Some(1);
+                            }
+                            if Self::secondary_button(ui, "Ver novedades", true).clicked() {
+                                action = Some(2);
+                            }
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let b = Button::new(RichText::new("Omitir esta versión").small().color(p.weak)).frame(false);
@@ -290,6 +313,7 @@ impl App {
             Some(2) => self.open_update(ctx, false),
             Some(3) => self.skip_update(),
             Some(4) => self.update_banner = false,
+            Some(5) => self.install_update(),
             _ => {}
         }
     }

@@ -3,7 +3,7 @@
 use crate::api::ApiResult;
 use crate::backend::Event;
 use crate::control::ControlReq;
-use crate::update::UpdateResult;
+use crate::update::{InstallProgress, UpdateResult};
 
 pub enum Msg {
     Backend(Event),
@@ -15,6 +15,8 @@ pub enum Msg {
     Media(souvlaki::MediaControlEvent),
     /// Resultado de la comprobación de versiones (`manual` = pedida desde Ajustes).
     Update { result: UpdateResult, manual: bool },
+    /// Progreso de la instalación automática de una versión nueva.
+    UpdateProgress(InstallProgress),
     /// Operación del modo de control (`--control`); se responde por su canal.
     Control(ControlReq),
 }

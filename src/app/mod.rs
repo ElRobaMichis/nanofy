@@ -30,7 +30,7 @@ use crate::images::Images;
 use crate::media::Media;
 use crate::model::*;
 use crate::shell::{NativeHandles, FPS_CAP_KEY, FRAME_MS_KEY, FRAME_PHASES_KEY};
-use crate::update::{UpdateInfo, UpdateResult};
+use crate::update::{InstallProgress, UpdateInfo, UpdateResult};
 use crate::webauth::WebAuth;
 
 pub use theme::GREEN;
@@ -279,6 +279,10 @@ pub struct App {
     /// Comprobación en curso y último resultado en texto (para Ajustes; `true` = error).
     pub update_busy: bool,
     pub update_note: Option<(String, bool)>,
+    /// Instalación automática en curso (o su error).
+    pub update_progress: Option<InstallProgress>,
+    /// Al cerrar, volver a abrir el ejecutable (ya sustituido por la versión nueva).
+    pub restart_after_exit: bool,
     /// Próxima comprobación automática (al arrancar y cada 6 h).
     update_check_at: Option<Instant>,
 
@@ -603,6 +607,8 @@ impl App {
             update_banner: false,
             update_busy: false,
             update_note: None,
+            update_progress: None,
+            restart_after_exit: false,
             update_check_at,
             playlists: Vec::new(),
             playlists_loaded: false,
@@ -1406,6 +1412,55 @@ impl App {
         self.update_banner = false;
     }
 
+    /// Instalación automática: descarga, sustituye el ejecutable y reinicia.
+    pub fn install_update(&mut self) {
+        let Some(u) = self.update.clone() else {
+            return;
+        };
+        if matches!(self.update_progress, Some(InstallProgress::Downloading { .. } | InstallProgress::Extracting | InstallProgress::Ready(_))) {
+            return;
+        }
+        if !crate::update::can_self_install() || u.asset_url.is_none() {
+            self.update_progress = Some(InstallProgress::Failed("En este sistema la actualización se instala a mano: descarga el zip".to_string()));
+            return;
+        }
+        self.update_banner = true;
+        self.update_progress = Some(InstallProgress::Downloading { done: 0, total: None });
+        crate::update::install(self.ui_tx.clone(), u);
+    }
+
+    fn on_update_progress(&mut self, ctx: &egui::Context, p: InstallProgress) {
+        if let InstallProgress::Ready(new_exe) = &p {
+            // Windows no deja sobrescribir un ejecutable en uso, pero sí renombrarlo: el actual
+            // pasa a .old.exe (se borra en el siguiente arranque) y el nuevo ocupa su sitio.
+            let swap = (|| -> Result<(), String> {
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                let old = crate::update::old_exe_path().ok_or("sin ruta")?;
+                let _ = std::fs::remove_file(&old);
+                std::fs::rename(&exe, &old).map_err(|e| format!("No se pudo apartar el ejecutable actual: {e}"))?;
+                if let Err(e) = std::fs::rename(new_exe, &exe) {
+                    let _ = std::fs::rename(&old, &exe);
+                    return Err(format!("No se pudo colocar el ejecutable nuevo: {e}"));
+                }
+                Ok(())
+            })();
+            match swap {
+                Ok(()) => {
+                    log::info!("[update] ejecutable sustituido; reiniciando");
+                    self.update_progress = Some(p);
+                    self.restart_after_exit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(new_exe);
+                    self.update_progress = Some(InstallProgress::Failed(format!("{e}. Descarga el zip y sustituye el ejecutable a mano.")));
+                }
+            }
+            return;
+        }
+        self.update_progress = Some(p);
+    }
+
     /// Abre en el navegador el zip de esta plataforma (`download`) o la página de la release.
     pub fn open_update(&mut self, ctx: &egui::Context, download: bool) {
         let Some(u) = &self.update else {
@@ -1486,6 +1541,7 @@ impl App {
                 Msg::Image { key, image } => self.images.loaded(ctx, &key, image),
                 Msg::Media(ev) => self.on_media(ev),
                 Msg::Update { result, manual } => self.on_update(result, manual),
+                Msg::UpdateProgress(p) => self.on_update_progress(ctx, p),
                 Msg::Control(req) => {
                     let reply = self.control_exec(ctx, &req.cmd);
                     let _ = req.reply.send(reply);
@@ -2749,6 +2805,7 @@ impl App {
             // arrancar (inicialización de DLLs, descompresión de fuentes…).
             if !self.ws_trimmed && self.taskbar_at.elapsed() > Duration::from_secs(4) {
                 self.ws_trimmed = true;
+                crate::update::cleanup_old_exe();
                 let atlas = ctx.fonts(|f| f.font_image_size());
                 log::info!(
                     "[mem] atlas de fuentes {}x{} ({:.1} MB en f32), portadas {:.1} MB en {} texturas, me gusta {} pistas, feed {} secciones, historial local {} entradas",
@@ -4220,6 +4277,16 @@ impl crate::shell::UiApp for App {
         // Un margen corto para que salga el aviso de desconexión; si Spotify tarda más, se
         // cierra igual: la copia local de la reproducción ya está guardada y el servidor
         // detecta la desconexión por sí mismo.
+        if self.restart_after_exit {
+            // Mismos argumentos (p. ej. --control) para que la versión nueva arranque igual.
+            if let Ok(exe) = std::env::current_exe() {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                match std::process::Command::new(&exe).args(&args).spawn() {
+                    Ok(_) => log::info!("[update] versión nueva lanzada: {}", exe.display()),
+                    Err(e) => log::error!("[update] no se pudo relanzar {}: {e}", exe.display()),
+                }
+            }
+        }
         let t = Instant::now();
         while !self.shutdown_done && t.elapsed() < Duration::from_millis(30) {
             while let Ok(msg) = self.rx.try_recv() {

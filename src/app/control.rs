@@ -12,6 +12,7 @@ use super::{Action, ActiveTab, App, Auth, Page, PlayState, PlayTarget, PlaylistE
 use crate::api::Req;
 use crate::backend::Cmd;
 use crate::config::vol_pct_to_raw;
+use crate::update::InstallProgress;
 
 fn s<'a>(cmd: &'a Value, key: &str) -> Option<&'a str> {
     cmd.get(key).and_then(|v| v.as_str())
@@ -831,6 +832,10 @@ impl App {
                 self.check_updates(true);
                 ok()
             }
+            "update_install" => {
+                self.install_update();
+                ok()
+            }
             "update_skip" => {
                 self.skip_update();
                 ok()
@@ -1131,7 +1136,7 @@ impl App {
             "downloaded": self.downloaded,
             "downloading": self.downloading,
             "sleep": sleep,
-            "update": {"available": self.update.as_ref().map(|u| u.version.clone()), "banner": self.update_banner, "busy": self.update_busy, "note": self.update_note},
+            "update": {"available": self.update.as_ref().map(|u| u.version.clone()), "banner": self.update_banner, "busy": self.update_busy, "note": self.update_note, "progress": self.update_progress.as_ref().map(|p| p.label()), "failed": matches!(self.update_progress, Some(InstallProgress::Failed(_)))},
             "invite_links": self.invite_links,
             "members": self.members.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>(),
             "home_feed": self.home_feed.iter().map(|s| json!({"id": s.id, "title": s.title, "items": s.items.len(), "first": s.items.first().map(|i| json!({"uri": i.uri, "title": i.title, "context": i.context}))})).collect::<Vec<_>>(),

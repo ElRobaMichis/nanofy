@@ -2509,8 +2509,17 @@ impl App {
                     Self::loading(ui, "Consultando GitHub");
                 } else if let Some((text, err)) = self.update_note.clone() {
                     ui.label(RichText::new(text).small().color(if err { ERROR_RED } else { weak }));
-                    if self.update.is_some() && Self::primary_button(ui, "Descargar", true).clicked() {
-                        self.open_update(&ctx, true);
+                    if let Some(pr) = self.update_progress.clone() {
+                        ui.label(RichText::new(pr.label()).small().color(weak));
+                    } else if self.update.is_some() {
+                        let install = crate::update::can_self_install() && self.update.as_ref().and_then(|u| u.asset_url.as_ref()).is_some();
+                        if Self::primary_button(ui, if install { "Instalar" } else { "Descargar" }, true).clicked() {
+                            if install {
+                                self.install_update();
+                            } else {
+                                self.open_update(&ctx, true);
+                            }
+                        }
                     }
                 }
             });

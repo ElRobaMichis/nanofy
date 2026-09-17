@@ -1,7 +1,8 @@
 use std::process::exit;
 use std::thread;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Volumen lineal (0.0..=1.0) aplicado directamente en el sink de rodio, de modo que el
 /// cambio se oye al instante en vez de tras vaciar la cola de paquetes ya decodificados.
@@ -87,6 +88,12 @@ impl From<cpal::SupportedStreamConfigsError> for RodioError {
 pub struct RodioSink {
     rodio_sink: rodio::Sink,
     _stream: rodio::OutputStream,
+    /// Para reabrir la salida si el dispositivo desaparece (auriculares Bluetooth, USB…).
+    device: Option<String>,
+    format: AudioFormat,
+    /// cpal avisa por aquí de que el flujo murió (dispositivo desconectado).
+    dead: Arc<AtomicBool>,
+    playing: bool,
 }
 
 fn list_formats(device: &cpal::Device) {
@@ -159,6 +166,7 @@ fn create_sink(
     host: &cpal::Host,
     device: Option<String>,
     format: AudioFormat,
+    dead: Arc<AtomicBool>,
 ) -> Result<(rodio::Sink, rodio::OutputStream), RodioError> {
     let cpal_device = match device.as_deref() {
         Some("?") => match list_outputs(host) {
@@ -206,16 +214,28 @@ fn create_sink(
         AudioFormat::S16 => cpal::SampleFormat::I16,
     };
 
+    // Si el dispositivo se desconecta (Bluetooth apagado, USB fuera), cpal lo comunica por este
+    // callback y `write` reabre la salida con el dispositivo predeterminado que haya entonces.
+    let on_error = {
+        let dead = dead.clone();
+        move |e: cpal::StreamError| {
+            warn!("salida de audio: {e}; se reabrirá");
+            dead.store(true, Ordering::Relaxed);
+        }
+    };
     let mut stream = match rodio::OutputStreamBuilder::default()
         .with_device(cpal_device.clone())
         .with_config(&config.config())
         .with_sample_format(sample_format)
+        .with_error_callback(on_error.clone())
         .open_stream()
     {
         Ok(exact_stream) => exact_stream,
         Err(e) => {
             warn!("unable to create Rodio output, falling back to default: {e}");
-            rodio::OutputStreamBuilder::from_device(cpal_device)?.open_stream_or_fallback()?
+            rodio::OutputStreamBuilder::from_device(cpal_device)?
+                .with_error_callback(on_error)
+                .open_stream_or_fallback()?
         }
     };
 
@@ -232,24 +252,71 @@ pub fn open(host: cpal::Host, device: Option<String>, format: AudioFormat) -> Ro
         host.id().name()
     );
 
-    let (sink, stream) = create_sink(&host, device, format).unwrap();
+    let dead = Arc::new(AtomicBool::new(false));
+    let (sink, stream) = create_sink(&host, device.clone(), format, dead.clone()).unwrap();
 
     debug!("Rodio sink was created");
     RodioSink {
         rodio_sink: sink,
         _stream: stream,
+        device,
+        format,
+        dead,
+        playing: false,
+    }
+}
+
+impl RodioSink {
+    /// Vuelve a abrir la salida de audio (dispositivo predeterminado actual). Reintenta mientras
+    /// no haya ninguno; lo que había en cola se pierde (unas décimas de segundo).
+    fn reopen(&mut self) {
+        for intento in 1..=120 {
+            self.dead.store(false, Ordering::Relaxed);
+            match create_sink(&cpal::default_host(), self.device.clone(), self.format, self.dead.clone()) {
+                Ok((sink, stream)) => {
+                    self.rodio_sink = sink;
+                    self._stream = stream;
+                    self.rodio_sink.set_volume(output_volume());
+                    if self.playing {
+                        self.rodio_sink.play();
+                    } else {
+                        self.rodio_sink.pause();
+                    }
+                    info!("salida de audio reabierta (intento {intento})");
+                    return;
+                }
+                Err(e) => {
+                    if intento == 1 {
+                        warn!("no hay salida de audio disponible ({e}); esperando a que vuelva");
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+        warn!("sin salida de audio tras 60 s; se seguirá intentando con el siguiente paquete");
     }
 }
 
 impl Sink for RodioSink {
     fn start(&mut self) -> SinkResult<()> {
+        self.playing = true;
+        if self.dead.load(Ordering::Relaxed) {
+            self.reopen();
+        }
         self.rodio_sink.set_volume(output_volume());
         self.rodio_sink.play();
         Ok(())
     }
 
     fn stop(&mut self) -> SinkResult<()> {
-        self.rodio_sink.sleep_until_end();
+        self.playing = false;
+        if !self.dead.load(Ordering::Relaxed) {
+            // Con el dispositivo muerto la cola nunca se vacía: no esperar.
+            let t0 = Instant::now();
+            while !self.rodio_sink.empty() && t0.elapsed() < Duration::from_secs(2) && !self.dead.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
         self.rodio_sink.pause();
         Ok(())
     }
@@ -264,6 +331,9 @@ impl Sink for RodioSink {
             SAMPLE_RATE,
             samples_f32,
         );
+        if self.dead.load(Ordering::Relaxed) {
+            self.reopen();
+        }
         self.rodio_sink.append(source);
 
         // Chunk sizes seem to be about 256 to 3000 ish items long.
@@ -274,9 +344,21 @@ impl Sink for RodioSink {
             self.rodio_sink.set_volume(v);
             debug!("rodio: volumen de salida aplicado {v:.3}");
         }
+        // Espera a que la cola baje; si no baja en 2 s (el dispositivo dejó de consumir sin avisar)
+        // o cpal ha avisado del fallo, se reabre la salida.
+        let mut last_len = self.rodio_sink.len();
+        let mut since = Instant::now();
         while self.rodio_sink.len() > 12 {
-            // sleep and wait for rodio to drain a bit
             thread::sleep(Duration::from_millis(10));
+            let l = self.rodio_sink.len();
+            if l < last_len {
+                last_len = l;
+                since = Instant::now();
+            } else if self.dead.load(Ordering::Relaxed) || since.elapsed() > Duration::from_secs(2) {
+                warn!("la salida de audio no consume datos; se reabre");
+                self.reopen();
+                break;
+            }
         }
         Ok(())
     }

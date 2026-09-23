@@ -43,6 +43,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::SAMPLES_PER_SECOND;
 
 const PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS: u32 = 30000;
+/// Precarga temprana: tras este tiempo sonando, sin esperar al final (ver `poll`).
+const PRELOAD_NEXT_TRACK_AFTER_LISTENING_MS: u32 = 5000;
 pub const DB_VOLTAGE_RATIO: f64 = 20.0;
 pub const PCM_AT_0DBFS: f64 = 1.0;
 
@@ -1101,9 +1103,14 @@ impl PlayerTrackLoader {
         // This is only a loop to be able to reload the file if an error occurred
         // while opening a cached file.
         loop {
-            let encrypted_file = AudioFile::open(&self.session, file_id, bytes_per_second);
+            // La clave no depende del fichero: se pide a la vez que se abre (resolver la CDN y
+            // bajar el primer trozo), en vez de después. Ahorra una ida y vuelta en cada canción.
+            let (encrypted_file, key) = futures_util::join!(
+                AudioFile::open(&self.session, file_id, bytes_per_second),
+                self.session.audio_key().request(track_id.clone(), file_id)
+            );
 
-            let encrypted_file = match encrypted_file.await {
+            let encrypted_file = match encrypted_file {
                 Ok(encrypted_file) => encrypted_file,
                 Err(e) => {
                     error!("Unable to load encrypted file: {e:?}");
@@ -1115,11 +1122,25 @@ impl PlayerTrackLoader {
 
             let stream_loader_controller = encrypted_file.get_stream_loader_controller().ok()?;
 
+            // Si la clave no llegó a tiempo (red lenta), se pide otra vez. Si Spotify la niega
+            // («unavailable», p. ej. por exceso de peticiones), reintentar solo añade carga.
+            let mut key = key;
+            if matches!(&key, Err(e) if e.kind == librespot_core::error::ErrorKind::Aborted) {
+                warn!("Audio key request timed out, retrying");
+                key = self.session.audio_key().request(track_id.clone(), file_id).await;
+            }
+
             // Not all audio files are encrypted. If we can't get a key, try loading the track
             // without decryption. If the file was encrypted after all, the decoder will fail
             // parsing and bail out, so we should be safe from outputting ear-piercing noise.
-            let key = match self.session.audio_key().request(track_id, file_id).await {
+            let key = match key {
                 Ok(key) => Some(key),
+                // Las canciones de Spotify (Ogg Vorbis) siempre van cifradas: sin clave, el
+                // decodificador puede tomar el cifrado por otro formato y sacar basura o ruido.
+                Err(e) if AudioFiles::is_ogg_vorbis(format) => {
+                    error!("Unable to load key for <{}>: {e}", audio_item.name);
+                    return None;
+                }
                 Err(e) => {
                     warn!("Unable to load key, continuing without decryption: {e}");
                     None
@@ -1589,6 +1610,7 @@ impl Future for PlayerInternal {
                 };
             }
 
+            let is_playing = self.state.is_playing();
             if let PlayerState::Playing {
                 ref track_id,
                 play_request_id,
@@ -1610,9 +1632,14 @@ impl Future for PlayerInternal {
             {
                 let track_id = track_id.clone();
 
+                // Además de a 30 s del final, la siguiente se precarga tras unos segundos
+                // escuchando esta: así «siguiente» a mitad de canción suena al instante. No en
+                // pausa (al abrir la app no se baja nada) ni al saltar canciones seguidas.
+                let near_end = (duration_ms as i64 - stream_position_ms as i64)
+                    < PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS as i64;
+                let listening = is_playing && stream_position_ms >= PRELOAD_NEXT_TRACK_AFTER_LISTENING_MS;
                 if (!*suggested_to_preload_next_track)
-                    && ((duration_ms as i64 - stream_position_ms as i64)
-                        < PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS as i64)
+                    && (near_end || listening)
                     && stream_loader_controller.range_to_end_available()
                 {
                     *suggested_to_preload_next_track = true;

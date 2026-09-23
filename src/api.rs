@@ -873,13 +873,26 @@ impl Client {
             .collect())
     }
 
-    /// Detalles de pistas por id: Web API por lotes de 50 y, si falla, metadatos de librespot.
+    /// Detalles de pistas por id: Web API por lotes de 50 y, si falla (las apps en modo
+    /// desarrollo no tienen /tracks), metadatos internos por lotes; una a una solo si eso falla.
     fn tracks_by_ids(&self, ids: &[String]) -> Result<Vec<Track>, String> {
         let mut out = Vec::with_capacity(ids.len());
         use std::sync::atomic::Ordering;
+        if self.tracks_blocked.load(Ordering::Relaxed) {
+            for chunk in ids.chunks(500) {
+                match self.tracks_via_batch(chunk) {
+                    Ok(t) => out.extend(t),
+                    Err(e) => {
+                        log::warn!("metadatos por lotes: {e}; se piden una a una");
+                        out.extend(self.tracks_via_librespot(chunk)?);
+                    }
+                }
+            }
+            return Ok(out);
+        }
         for chunk in ids.chunks(50) {
             if self.tracks_blocked.load(Ordering::Relaxed) {
-                out.extend(self.tracks_via_librespot(chunk)?);
+                out.extend(self.tracks_by_ids(chunk)?);
                 continue;
             }
             let url = format!("{BASE}/tracks?ids={}", chunk.join(","));
@@ -888,7 +901,7 @@ impl Client {
                 Err(e) => {
                     log::info!("/tracks no disponible ({e}); usando metadatos de librespot");
                     self.tracks_blocked.store(true, Ordering::Relaxed);
-                    out.extend(self.tracks_via_librespot(chunk)?);
+                    out.extend(self.tracks_by_ids(chunk)?);
                 }
             }
         }
@@ -912,7 +925,8 @@ impl Client {
             name: a.name.clone(),
             uri: format!("spotify:artist:{id}"),
             images,
-            genres: self.external_genres(&format!("artist:{id}"), &a.name, None),
+            // Los externos los completa quien llama, sin retrasar la página.
+            genres: self.cached_genres(&format!("artist:{id}")).unwrap_or_default(),
             followers: None,
         })
     }
@@ -938,6 +952,25 @@ impl Client {
         };
         let text = resp.body_mut().read_to_string().ok()?;
         serde_json::from_str(&text).ok()
+    }
+
+    /// Géneros ya conocidos, sin red. `None`: aún no se han buscado.
+    fn cached_genres(&self, key: &str) -> Option<Vec<String>> {
+        if let Some(g) = self.genres.lock().unwrap().get(key) {
+            return Some(g.clone());
+        }
+        self.genres_miss.lock().unwrap().contains(key).then(Vec::new)
+    }
+
+    /// Géneros sin retrasar la página: buscarlos cuesta varias consultas externas en serie, así
+    /// que si no están ya en memoria se envía `partial` en seguida y se buscan después (la misma
+    /// respuesta vuelve a llegar, ya con ellos).
+    fn genres_or_send(&self, key: &str, artist: &str, album: Option<&str>, partial: impl FnOnce() -> Resp, req: &Req, ui: &UiTx) -> Vec<String> {
+        if let Some(g) = self.cached_genres(key) {
+            return g;
+        }
+        ui.send(Msg::Api(ApiResult { req: req.clone(), result: Ok(partial()) }));
+        self.external_genres(key, artist, album)
     }
 
     /// Géneros cacheados o consultados a fuentes externas. `key` = "artist:<id>" o "album:<id>".
@@ -1053,10 +1086,11 @@ impl Client {
             .block_on(librespot_metadata::Album::get(&session, &uri))
             .map_err(|e| format!("álbum: {e}"))?;
         let ids: Vec<String> = a.discs.iter().flat_map(|d| d.tracks.iter()).filter_map(|u| u.to_id().ok()).collect();
-        let tracks = self.tracks_via_librespot(&ids)?;
+        let tracks = self.tracks_by_ids(&ids)?;
         let total = tracks.len() as u32;
         Ok(Album {
-            genres: self.external_genres(&format!("album:{id}"), &a.artists.first().map(|x| x.name.clone()).unwrap_or_default(), Some(&a.name)),
+            // Los externos los completa quien llama, sin retrasar la página.
+            genres: self.cached_genres(&format!("album:{id}")).unwrap_or_default(),
             id: id.to_string(),
             name: a.name.clone(),
             uri: format!("spotify:album:{id}"),
@@ -1129,40 +1163,50 @@ impl Client {
         })
     }
 
-    /// Álbumes a partir de uris internos (en paralelo), ordenados por fecha descendente.
-    fn albums_from_uris(&self, session: &librespot_core::Session, uris: &[SpotifyUri]) -> Vec<AlbumRef> {
-        let fetched = self.handle.block_on(async {
-            futures::future::join_all(uris.iter().map(|u| librespot_metadata::Album::get(session, u))).await
-        });
-        let mut out: Vec<AlbumRef> = fetched
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .map(|a| AlbumRef {
-                id: a.id.to_id().ok(),
-                name: a.name.clone(),
-                uri: a.id.to_uri().ok(),
-                images: a.covers.iter().map(image_from_meta).collect(),
-                artists: a
-                    .artists
-                    .iter()
-                    .map(|ar| ArtistRef { id: ar.id.to_id().ok(), name: ar.name.clone(), uri: ar.id.to_uri().ok() })
-                    .collect(),
-                release_date: Some(format!("{:04}-{:02}-{:02}", a.date.as_utc().year(), a.date.as_utc().month() as u8, a.date.as_utc().day())),
-                total_tracks: Some(a.discs.iter().map(|d| d.tracks.len() as u32).sum()),
-                album_type: Some(
-                    match a.album_type {
-                        librespot_metadata::album::AlbumType::SINGLE => "single",
-                        librespot_metadata::album::AlbumType::COMPILATION => "compilation",
-                        _ => "album",
-                    }
-                    .to_string(),
-                ),
+    /// Álbumes de varios grupos (discos, sencillos…) a partir de uris internos, en una sola
+    /// petición; cada grupo ordenado por fecha descendente.
+    fn albums_from_uri_groups(&self, groups: &[Vec<SpotifyUri>]) -> Vec<Vec<AlbumRef>> {
+        let all: Vec<SpotifyUri> = groups.iter().flatten().cloned().collect();
+        let mut fetched = self
+            .metadata_batch::<librespot_metadata::Album>(&all, librespot_protocol::extension_kind::ExtensionKind::ALBUM_V4)
+            .unwrap_or_default()
+            .into_iter();
+        groups
+            .iter()
+            .map(|g| {
+                let mut out: Vec<AlbumRef> = fetched.by_ref().take(g.len()).flatten().map(album_ref_from_meta).collect();
+                out.sort_by(|x, y| y.release_date.cmp(&x.release_date));
+                out
             })
-            .collect();
-        out.sort_by(|x, y| y.release_date.cmp(&x.release_date));
-        out
+            .collect()
     }
+}
 
+fn album_ref_from_meta(a: librespot_metadata::Album) -> AlbumRef {
+    AlbumRef {
+        id: a.id.to_id().ok(),
+        name: a.name.clone(),
+        uri: a.id.to_uri().ok(),
+        images: a.covers.iter().map(image_from_meta).collect(),
+        artists: a
+            .artists
+            .iter()
+            .map(|ar| ArtistRef { id: ar.id.to_id().ok(), name: ar.name.clone(), uri: ar.id.to_uri().ok() })
+            .collect(),
+        release_date: Some(format!("{:04}-{:02}-{:02}", a.date.as_utc().year(), a.date.as_utc().month() as u8, a.date.as_utc().day())),
+        total_tracks: Some(a.discs.iter().map(|d| d.tracks.len() as u32).sum()),
+        album_type: Some(
+            match a.album_type {
+                librespot_metadata::album::AlbumType::SINGLE => "single",
+                librespot_metadata::album::AlbumType::COMPILATION => "compilation",
+                _ => "album",
+            }
+            .to_string(),
+        ),
+    }
+}
+
+impl Client {
     /// Vista completa del artista: biografía, relacionados y discografía por grupos.
     fn artist_view_via_librespot(&self, id: &str) -> Result<ArtistView, String> {
         let session = self.session()?;
@@ -1174,10 +1218,11 @@ impl Client {
         let firsts = |groups: &librespot_metadata::artist::AlbumGroups, cap: usize| -> Vec<SpotifyUri> {
             groups.iter().filter_map(|g| g.first().cloned()).take(cap).collect()
         };
-        let albums = self.albums_from_uris(&session, &firsts(&a.albums, 40));
-        let singles = self.albums_from_uris(&session, &firsts(&a.singles, 40));
-        let compilations = self.albums_from_uris(&session, &firsts(&a.compilations, 20));
-        let appears_on = self.albums_from_uris(&session, &firsts(&a.appears_on_albums, 30));
+        let mut groups = self
+            .albums_from_uri_groups(&[firsts(&a.albums, 40), firsts(&a.singles, 40), firsts(&a.compilations, 20), firsts(&a.appears_on_albums, 30)])
+            .into_iter();
+        let mut next = || groups.next().unwrap_or_default();
+        let (albums, singles, compilations, appears_on) = (next(), next(), next(), next());
         let latest = albums.iter().chain(singles.iter()).max_by(|x, y| x.release_date.cmp(&y.release_date)).cloned();
         let mut header: Vec<Image> = a.portrait_group.iter().map(image_from_meta).collect();
         if header.is_empty() {
@@ -1216,12 +1261,12 @@ impl Client {
             .block_on(librespot_metadata::Show::get(&session, &uri))
             .map_err(|e| format!("podcast: {e}"))?;
         let ep_uris: Vec<SpotifyUri> = s.episodes.iter().take(50).cloned().collect();
-        let fetched = self.handle.block_on(async {
-            futures::future::join_all(ep_uris.iter().map(|u| librespot_metadata::Episode::get(&session, u))).await
-        });
+        let fetched = self
+            .metadata_batch::<librespot_metadata::Episode>(&ep_uris, librespot_protocol::extension_kind::ExtensionKind::EPISODE_V4)
+            .unwrap_or_default();
         let episodes: Vec<Episode> = fetched
             .into_iter()
-            .filter_map(|r| r.ok())
+            .flatten()
             .map(|e| Episode {
                 id: e.id.to_id().unwrap_or_default(),
                 name: e.name.clone(),
@@ -1265,16 +1310,12 @@ impl Client {
                 break;
             }
         }
-        let fetched = self.handle.block_on(async {
-            futures::future::join_all(
-                uris.iter()
-                    .map(|u| librespot_metadata::Album::get(&session, u)),
-            )
-            .await
-        });
+        let fetched = self
+            .metadata_batch::<librespot_metadata::Album>(&uris, librespot_protocol::extension_kind::ExtensionKind::ALBUM_V4)
+            .unwrap_or_default();
         let mut out: Vec<AlbumRef> = fetched
             .into_iter()
-            .filter_map(|r| r.ok())
+            .flatten()
             .map(|a| AlbumRef {
                 id: a.id.to_id().ok(),
                 name: a.name.clone(),
@@ -1303,6 +1344,74 @@ impl Client {
             .collect();
         out.sort_by(|x, y| y.release_date.cmp(&x.release_date));
         Ok(out)
+    }
+
+    /// Metadatos de muchas entidades en una sola petición (extended-metadata, lo que usa la app
+    /// oficial), en el orden pedido. Pedirlas una a una gasta una petición por elemento: además
+    /// de lento, agota el cupo de librespot (300 cada 30 s) y entonces tampoco se pueden cargar
+    /// canciones para sonar. Lo que el lote no traiga (pocas: ediciones regionales, retiradas)
+    /// se pide suelto.
+    fn metadata_batch<M: librespot_metadata::Metadata + Clone>(
+        &self,
+        uris: &[SpotifyUri],
+        kind: librespot_protocol::extension_kind::ExtensionKind,
+    ) -> Result<Vec<Option<M>>, String> {
+        use librespot_protocol::extended_metadata::{BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery};
+        use protobuf::{EnumOrUnknown, Message};
+        let session = self.session()?;
+        let keys: Vec<String> = uris.iter().map(|u| u.to_uri().unwrap_or_default()).collect();
+        let mut found: std::collections::HashMap<String, M> = std::collections::HashMap::with_capacity(uris.len());
+        for chunk in keys.chunks(500) {
+            let mut req = BatchedEntityRequest::new();
+            let header = req.header.mut_or_insert_default();
+            header.country = session.country();
+            header.catalogue = "premium".to_string();
+            for uri in chunk {
+                let mut q = ExtensionQuery::new();
+                q.extension_kind = EnumOrUnknown::new(kind);
+                let mut e = EntityRequest::new();
+                e.entity_uri = uri.clone();
+                e.query.push(q);
+                req.entity_request.push(e);
+            }
+            let body = req.write_to_bytes().map_err(|e| e.to_string())?;
+            let resp = self
+                .spclient_pb(http::Method::POST, "/extended-metadata/v0/extended-metadata", Some(&body))
+                .and_then(|b| BatchedExtensionResponse::parse_from_bytes(&b).map_err(|e| e.to_string()));
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("metadatos por lotes: {e}; se piden sueltos");
+                    continue;
+                }
+            };
+            for data in resp.extended_metadata.iter().flat_map(|a| a.extension_data.iter()) {
+                let Some(any) = data.extension_data.as_ref() else { continue };
+                let (Ok(msg), Ok(uri)) = (M::Message::parse_from_bytes(&any.value), SpotifyUri::from_uri(&data.entity_uri)) else { continue };
+                if let Ok(m) = M::parse(&msg, &uri) {
+                    found.insert(data.entity_uri.clone(), m);
+                }
+            }
+        }
+        let missing: Vec<usize> = (0..uris.len()).filter(|&i| !found.contains_key(&keys[i])).collect();
+        if !missing.is_empty() {
+            log::info!("metadatos por lotes: {} de {} sin datos; se piden sueltos", missing.len(), uris.len());
+            let fetched = self.handle.block_on(futures::future::join_all(missing.iter().map(|&i| M::get(&session, &uris[i]))));
+            // Puede volver con otro id (Spotify sustituye ediciones): cuenta como la pedida.
+            for (i, r) in missing.into_iter().zip(fetched) {
+                if let Ok(m) = r {
+                    found.insert(keys[i].clone(), m);
+                }
+            }
+        }
+        // `get`, no `remove`: una playlist puede tener la misma canción dos veces.
+        Ok(keys.iter().map(|k| found.get(k).cloned()).collect())
+    }
+
+    fn tracks_via_batch(&self, ids: &[String]) -> Result<Vec<Track>, String> {
+        let uris: Vec<SpotifyUri> = ids.iter().filter_map(|id| SpotifyUri::from_uri(&format!("spotify:track:{id}")).ok()).collect();
+        let tracks = self.metadata_batch::<librespot_metadata::Track>(&uris, librespot_protocol::extension_kind::ExtensionKind::TRACK_V4)?;
+        Ok(tracks.into_iter().flatten().map(track_from_meta).collect())
     }
 
     fn tracks_via_librespot(&self, ids: &[String]) -> Result<Vec<Track>, String> {
@@ -1603,13 +1712,9 @@ impl Client {
                     Ok(a) => a,
                     Err(e) => {
                         log::info!("/albums/{id} no disponible ({e}); usando metadatos de librespot");
-                        return Ok(Resp::Album(self.album_via_librespot(id)?));
+                        self.album_via_librespot(id)?
                     }
                 };
-                if album.genres.is_empty() {
-                    let by = album.artists.first().map(|a| a.name.clone()).unwrap_or_default();
-                    album.genres = self.external_genres(&format!("album:{id}"), &by, Some(&album.name));
-                }
                 if let Some(p) = album.tracks.as_mut() {
                     let mut next = p.next.take();
                     let mut n = 0;
@@ -1623,20 +1728,27 @@ impl Client {
                         n += 1;
                     }
                 }
+                if album.genres.is_empty() {
+                    let by = album.artists.first().map(|a| a.name.clone()).unwrap_or_default();
+                    let name = album.name.clone();
+                    album.genres = self.genres_or_send(&format!("album:{id}"), &by, Some(&name), || Resp::Album(album.clone()), req, ui);
+                }
                 Ok(Resp::Album(album))
             }
-            Req::Artist(id) => match self.get_json::<Artist>(&format!("{BASE}/artists/{id}")) {
-                Ok(mut a) => {
-                    if a.genres.is_empty() {
-                        a.genres = self.external_genres(&format!("artist:{id}"), &a.name, None);
+            Req::Artist(id) => {
+                let mut a = match self.get_json::<Artist>(&format!("{BASE}/artists/{id}")) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        log::info!("/artists/{id} no disponible ({e}); usando metadatos de librespot");
+                        self.artist_via_librespot(id)?
                     }
-                    Ok(Resp::Artist(a))
+                };
+                if a.genres.is_empty() {
+                    let name = a.name.clone();
+                    a.genres = self.genres_or_send(&format!("artist:{id}"), &name, None, || Resp::Artist(a.clone()), req, ui);
                 }
-                Err(e) => {
-                    log::info!("/artists/{id} no disponible ({e}); usando metadatos de librespot");
-                    Ok(Resp::Artist(self.artist_via_librespot(id)?))
-                }
-            },
+                Ok(Resp::Artist(a))
+            }
             Req::ArtistPlaylists { id, name } => {
                 let r: SearchResult = self.get_json(&format!("{BASE}/search?q={}&type=playlist&limit=50", urlencode(name)))?;
                 let want = name.trim().to_lowercase();
@@ -2436,8 +2548,15 @@ impl Client {
                 // Web API si está disponible; si no, metadatos internos.
                 let web: Result<(Show, Vec<Episode>), String> = (|| {
                     let show: Show = self.get_json(&format!("{BASE}/shows/{id}?market=from_token"))?;
-                    let eps = self.all_pages::<Option<Episode>>(&format!("{BASE}/shows/{id}/episodes?limit=50&market=from_token"), 4)?;
-                    Ok((show, eps.into_iter().flatten().collect()))
+                    let first: Paging<Option<Episode>> = self.get_json(&format!("{BASE}/shows/{id}/episodes?limit=50&market=from_token"))?;
+                    let mut episodes: Vec<Episode> = first.items.into_iter().flatten().collect();
+                    // La página se muestra ya con los primeros 50 episodios; el resto (hasta 150
+                    // más) y los temas llegan después en la misma respuesta completa.
+                    ui.send(Msg::Api(ApiResult { req: req.clone(), result: Ok(Resp::Show { show: show.clone(), episodes: episodes.clone() }) }));
+                    if let Some(next) = first.next {
+                        episodes.extend(self.all_pages::<Option<Episode>>(&next, 3)?.into_iter().flatten());
+                    }
+                    Ok((show, episodes))
                 })();
                 match web {
                     Ok((mut show, episodes)) => {

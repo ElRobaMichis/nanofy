@@ -823,6 +823,11 @@ impl App {
                 }
                 None => err("falta id"),
             },
+            "block_ui" => {
+                // Prueba del vigilante: bloquea el hilo de la interfaz a propósito.
+                std::thread::sleep(std::time::Duration::from_millis(n(cmd, "ms").unwrap_or(0).clamp(0, 30_000) as u64));
+                ok()
+            }
             "stall" => {
                 // Simula «lleva demasiado cargando»: fuerza la reconexión del backend.
                 self.backend.send(Cmd::Stalled);

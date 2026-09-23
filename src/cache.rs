@@ -39,6 +39,25 @@ pub fn write_atomic(path: &Path, text: &str) {
     }
 }
 
+/// Deja en `dir` como mucho `keep` copias `.json` (borra las escritas hace más tiempo, es decir,
+/// las que no se han abierto recientemente). `radios.json` no se toca.
+pub fn prune_dir(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(SystemTime, std::path::PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json") && p.file_name().is_some_and(|n| n != "radios.json"))
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    for (_, p) in &files[..files.len() - keep] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 impl Snapshot {
     pub fn load(path: &Path) -> Option<Self> {
         let text = std::fs::read_to_string(path).ok()?;

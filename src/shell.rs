@@ -7,6 +7,7 @@
 
 use std::ffi::c_void;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,56 @@ pub struct WindowConfig {
 #[derive(Debug)]
 pub enum UserEvent {
     Repaint { when: Instant },
+    /// Latido del vigilante: comprueba que el hilo de la interfaz sigue atendiendo eventos.
+    Ping,
+}
+
+/// Última vez (ms desde el arranque) que el bucle de la interfaz atendió algo.
+static UI_BEAT: AtomicU64 = AtomicU64::new(0);
+/// Qué estaba haciendo la interfaz, para saber dónde se quedó si deja de responder.
+static UI_PHASE: Mutex<(&'static str, String)> = Mutex::new(("arranque", String::new()));
+
+/// Anota la fase en curso de la interfaz (con un detalle opcional, p. ej. el evento).
+pub fn ui_phase(phase: &'static str, detail: impl FnOnce() -> String) {
+    if let Ok(mut p) = UI_PHASE.lock() {
+        *p = (phase, detail());
+    }
+}
+
+/// Vigilante: cada 2 s pide un latido a la interfaz; si no lo atiende en 10 s, deja en el registro
+/// en qué fase se quedó (y avisa de nuevo cuando se recupera). Sin esto, un bloqueo del hilo de la
+/// interfaz no deja rastro: la ventana simplemente deja de responder.
+fn spawn_ui_watchdog(proxy: EventLoopProxy<UserEvent>) {
+    let _ = std::thread::Builder::new()
+        .name("nanofy-vigilante".into())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let mut stalled_since: Option<u64> = None;
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                if proxy.send_event(UserEvent::Ping).is_err() {
+                    return;
+                }
+                let now = crate::since_start_ms();
+                let beat = UI_BEAT.load(Ordering::Relaxed);
+                if beat == 0 {
+                    continue;
+                }
+                let behind = now.saturating_sub(beat);
+                match (behind > 10_000, stalled_since) {
+                    (true, None) => {
+                        stalled_since = Some(beat);
+                        let (phase, detail) = UI_PHASE.lock().map(|p| (p.0, p.1.clone())).unwrap_or_default();
+                        log::error!("[vigilante] la interfaz no responde desde hace {} s; fase: {phase} {detail}", behind / 1000);
+                    }
+                    (false, Some(since)) => {
+                        stalled_since = None;
+                        log::warn!("[vigilante] la interfaz vuelve a responder tras {} s", now.saturating_sub(since) / 1000);
+                    }
+                    _ => {}
+                }
+            }
+        });
 }
 
 /// Recursos nativos que la app puede necesitar (p. ej. el HWND para las teclas multimedia).
@@ -88,6 +139,7 @@ pub fn run<A: UiApp + 'static>(
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     crate::tmark("bucle de eventos");
     let proxy: EventLoopProxy<UserEvent> = event_loop.create_proxy();
+    spawn_ui_watchdog(proxy.clone());
     let ctx = egui::Context::default();
     crate::tmark("contexto egui");
     {
@@ -183,6 +235,19 @@ impl<A: UiApp> Shell<A> {
             return;
         }
         self.exited = true;
+        // Seguro final: si algo bloquea la salida (visto de forma intermitente en las pruebas
+        // desde el 13 sep 2026: el proceso seguía vivo tras pedir el cierre), se termina igual a
+        // los 3 s. Lo persistente se escribe antes, y de forma atómica, así que no se pierde nada.
+        let _ = std::thread::Builder::new().name("nanofy-salida".into()).stack_size(64 * 1024).spawn(|| {
+            std::thread::sleep(Duration::from_secs(3));
+            // Nada de registro aquí: si lo bloqueado fuese el propio registro, esto no llegaría.
+            #[cfg(windows)]
+            unsafe {
+                use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+                let _ = TerminateProcess(GetCurrentProcess(), 0);
+            }
+            std::process::exit(0);
+        });
         let t = Instant::now();
         // La ventana desaparece al instante; la despedida a Spotify sigue en segundo plano.
         if let Some(w) = &self.window {
@@ -217,6 +282,7 @@ impl<A: UiApp> Shell<A> {
     }
 
     fn paint(&mut self, el: &ActiveEventLoop) {
+        ui_phase("pintar", String::new);
         let (Some(window), Some(state), Some(app), Some(surface)) = (
             self.window.clone(),
             self.egui_winit.as_mut(),
@@ -340,6 +406,7 @@ impl<A: UiApp> ApplicationHandler<UserEvent> for Shell<A> {
     }
 
     fn new_events(&mut self, _el: &ActiveEventLoop, cause: StartCause) {
+        UI_BEAT.store(crate::since_start_ms().max(1), Ordering::Relaxed);
         if let StartCause::ResumeTimeReached { .. } = cause {
             self.next_repaint = None;
             if let Some(w) = &self.window {
@@ -362,6 +429,7 @@ impl<A: UiApp> ApplicationHandler<UserEvent> for Shell<A> {
                     self.schedule(when);
                 }
             }
+            UserEvent::Ping => {}
         }
     }
 
@@ -403,6 +471,7 @@ impl<A: UiApp> ApplicationHandler<UserEvent> for Shell<A> {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        ui_phase("en espera", String::new);
         match self.next_repaint {
             Some(when) if when <= Instant::now() => {
                 self.next_repaint = None;

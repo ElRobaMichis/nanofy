@@ -1435,7 +1435,17 @@ impl SpircTask {
         let index = match cmd_options.playing_track {
             None => None,
             Some(ref playing_track) => Some(match playing_track {
-                PlayingTrack::Index(i) => Ok(*i as usize),
+                // Un índice fuera del contexto hacía fallar la carga entera sin avisar: la
+                // interfaz se quedaba «cargando». Se trata como una canción no encontrada.
+                PlayingTrack::Index(i) => {
+                    let i = *i as usize;
+                    match self.connect_state.get_context(ContextType::Default) {
+                        Ok(ctx) if i >= ctx.tracks.len() => {
+                            Err(crate::StateError::CanNotFindTrackInContext(Some(i), ctx.tracks.len()))
+                        }
+                        _ => Ok(i),
+                    }
+                }
                 PlayingTrack::Uri(uri) => {
                     let ctx = self.connect_state.get_context(ContextType::Default)?;
                     ConnectState::find_index_in_context(ctx, |t| &t.uri == uri)
@@ -1943,6 +1953,13 @@ impl SpircTask {
 
     async fn notify(&mut self) -> Result<(), Error> {
         self.emit_jam_queue_if_changed();
+        // Si ya se precargó la siguiente y cambió (cola, aleatorio…), se precarga la nueva. El
+        // reproductor ignora la petición si ya tiene esa misma.
+        if let SpircPlayStatus::Playing { preloading_of_next_track_triggered: true, .. }
+        | SpircPlayStatus::Paused { preloading_of_next_track_triggered: true, .. } = self.play_status
+        {
+            self.handle_preload_next_track();
+        }
         self.connect_state.set_status(&self.play_status);
 
         if self.connect_state.is_playing() {

@@ -210,6 +210,23 @@ pub enum PlayTarget {
     },
 }
 
+/// Copia en disco de una playlist (o radio): se muestra al instante al volver a abrirla, también
+/// tras reiniciar, mientras llega la versión fresca.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedList {
+    meta: Option<Playlist>,
+    tracks: Vec<Track>,
+}
+
+/// Copias en disco que se conservan por carpeta (playlists/radios y álbumes): unas pocas decenas
+/// de KB cada una; las abiertas hace más tiempo se borran.
+const CACHED_MAX: usize = 400;
+
+/// Solo las playlists (id base62 de 22 caracteres) se guardan; «Me gusta» va en la instantánea.
+fn is_playlist_key(key: &str) -> bool {
+    key.len() == 22 && key.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// Dónde se cortó la reproducción al perder la conexión con Spotify: se retoma ahí al volver.
 #[derive(Clone, Copy)]
 struct ResumePoint {
@@ -312,6 +329,14 @@ pub struct App {
     /// Página en la que se pulsó reproducir (para «Siguientes de: …» cuando no hay contexto).
     pub last_play_page: Option<Page>,
     playback_path: PathBuf,
+    /// Copias en disco de las playlists abiertas (`<id>.json`).
+    lists_dir: PathBuf,
+    /// Playlists que se ven desde la copia en disco: la versión fresca se junta aparte
+    /// (`list_fresh`) y la sustituye entera al terminar, sin parpadeos ni listas a medias.
+    list_cached: HashSet<String>,
+    list_fresh: HashMap<String, Vec<Track>>,
+    /// Radios ya resueltas (canción semilla → playlist); se carga del disco al primer uso.
+    radios: Option<HashMap<String, String>>,
     /// Reproducción guardada pendiente de cargar en el reproductor (tras conectar).
     restore_pending: Option<SavedPlayback>,
     /// Al abrir: pedir a Spotify la última sesión de la cuenta (una vez, si nada suena fuera).
@@ -330,6 +355,8 @@ pub struct App {
     /// Última orden de reproducción que aún no ha empezado a sonar: si la conexión cae antes,
     /// se repite al reconectar.
     pending_load: Option<Cmd>,
+    /// La barra muestra ya la canción elegida, antes de que el reproductor la confirme.
+    now_optimistic: bool,
     /// La barra muestra la última canción escuchada (de la instantánea) mientras llega la
     /// sesión real; si se pulsa play antes, se reproduce esa canción.
     now_placeholder: bool,
@@ -580,6 +607,7 @@ impl App {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
+        let lists_dir = paths.cache_dir.join("lists");
         let hidden_path = paths.state_dir.join("hidden.json");
         let hidden_tracks: HashSet<String> = std::fs::read_to_string(&hidden_path)
             .ok()
@@ -640,6 +668,10 @@ impl App {
             last_play: None,
             last_play_page: None,
             playback_path,
+            lists_dir,
+            list_cached: HashSet::new(),
+            list_fresh: HashMap::new(),
+            radios: None,
             restore_pending: None,
             restore_wanted: true,
             restore_awaiting: false,
@@ -647,6 +679,7 @@ impl App {
             play_after_restore: false,
             reconnect_resume: None,
             pending_load: None,
+            now_optimistic: false,
             now_placeholder: false,
             queue_retry: None,
             restore_mark: false,
@@ -1507,6 +1540,119 @@ impl App {
         self.requested.remove(key);
     }
 
+    /// Si una playlist aún no está en memoria, muestra al instante su última copia en disco.
+    /// La petición a Spotify sigue su curso y la sustituye al llegar.
+    pub fn warm_list(&mut self, id: &str) {
+        if self.lists.contains_key(id) || !is_playlist_key(id) || self.requested.contains(&format!("pl:{id}")) {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(self.lists_dir.join(format!("{id}.json"))) else { return };
+        let Ok(cached) = serde_json::from_str::<CachedList>(&text) else { return };
+        if let Some(meta) = cached.meta {
+            self.playlist_meta.entry(id.to_string()).or_insert(meta);
+        }
+        let total = cached.tracks.len() as u32;
+        self.lists.insert(id.to_string(), TrackList { tracks: cached.tracks, total, loading: false });
+        self.list_cached.insert(id.to_string());
+    }
+
+    /// Igual que `warm_list`, para un álbum: su última copia en disco mientras llega la fresca.
+    pub fn warm_album(&mut self, id: &str) {
+        if self.albums.contains_key(id) || !is_playlist_key(id) || self.requested.contains(&format!("album:{id}")) {
+            return;
+        }
+        let path = self.lists_dir.with_file_name("albums").join(format!("{id}.json"));
+        if let Some(album) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Album>(&t).ok()) {
+            self.albums.insert(id.to_string(), album);
+        }
+    }
+
+    fn save_album(&self, album: &Album) {
+        if !is_playlist_key(&album.id) {
+            return;
+        }
+        let dir = self.lists_dir.with_file_name("albums");
+        let path = dir.join(format!("{}.json", album.id));
+        if let Ok(text) = serde_json::to_string(album) {
+            std::thread::spawn(move || {
+                crate::cache::write_atomic(&path, &text);
+                crate::cache::prune_dir(&dir, CACHED_MAX);
+            });
+        }
+    }
+
+    /// Guarda en disco (en segundo plano) la versión completa de una playlist.
+    fn save_list(&self, id: &str) {
+        let Some(list) = self.lists.get(id) else { return };
+        let cached = CachedList { meta: self.playlist_meta.get(id).cloned(), tracks: list.tracks.clone() };
+        let (dir, path) = (self.lists_dir.clone(), self.lists_dir.join(format!("{id}.json")));
+        std::thread::spawn(move || {
+            if let Ok(text) = serde_json::to_string(&cached) {
+                crate::cache::write_atomic(&path, &text);
+                crate::cache::prune_dir(&dir, CACHED_MAX);
+            }
+        });
+    }
+
+    /// Pestaña nueva y activa con la playlist de una radio.
+    fn open_radio_tab(&mut self, playlist_id: String) {
+        let page = Page::Playlist(playlist_id);
+        let before = self.tabs.len();
+        self.open_tab(page.clone());
+        if self.tabs.len() > before {
+            self.active = ActiveTab::Tab(self.tabs.len() - 1);
+        } else if let Some(i) = self.tabs.iter().position(|t| t.page() == &page) {
+            self.active = ActiveTab::Tab(i);
+        }
+    }
+
+    /// Radios ya resueltas (canción semilla → playlist), leídas del disco la primera vez:
+    /// averiguar la playlist de una radio cuesta una ida y vuelta a Spotify.
+    fn radios(&mut self) -> &HashMap<String, String> {
+        if self.radios.is_none() {
+            let map = std::fs::read_to_string(self.lists_dir.join("radios.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+            self.radios = Some(map);
+        }
+        self.radios.as_ref().unwrap()
+    }
+
+    fn remember_radio(&mut self, seed: &str, playlist_id: &str) {
+        self.radios();
+        if let Some(map) = self.radios.as_mut() {
+            if map.get(seed).map(String::as_str) != Some(playlist_id) {
+                map.insert(seed.to_string(), playlist_id.to_string());
+                self.save_radios();
+            }
+        }
+    }
+
+    fn forget_radio(&mut self, playlist_id: &str) {
+        let Some(map) = self.radios.as_mut() else { return };
+        let before = map.len();
+        map.retain(|_, pid| pid != playlist_id);
+        if map.len() != before {
+            self.save_radios();
+        }
+    }
+
+    fn save_radios(&self) {
+        let Some(map) = self.radios.as_ref() else { return };
+        let path = self.lists_dir.join("radios.json");
+        if let Ok(text) = serde_json::to_string(map) {
+            std::thread::spawn(move || crate::cache::write_atomic(&path, &text));
+        }
+    }
+
+    /// Olvida la copia en disco (la playlist cambió: no debe verse la versión vieja).
+    fn forget_list(&mut self, id: &str) {
+        self.list_cached.remove(id);
+        self.list_fresh.remove(id);
+        let _ = std::fs::remove_file(self.lists_dir.join(format!("{id}.json")));
+    }
+
     pub fn login(&mut self) {
         self.auth = Auth::LoggingIn;
         self.backend.send(Cmd::Login);
@@ -1550,21 +1696,34 @@ impl App {
     // --------------------------------------------------------------- mensajes
 
     fn drain(&mut self, ctx: &egui::Context) {
+        use crate::shell::ui_phase;
+        let short = |s: String| s.chars().take(120).collect::<String>();
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Backend(e) => self.on_event(e),
-                Msg::Api(r) => self.on_api(r),
+                Msg::Backend(e) => {
+                    ui_phase("evento del reproductor", || short(format!("{e:?}")));
+                    self.on_event(e)
+                }
+                Msg::Api(r) => {
+                    ui_phase("respuesta de la API", || short(format!("{:?}", r.req)));
+                    self.on_api(r)
+                }
                 Msg::Image { key, image } => self.images.loaded(ctx, &key, image),
-                Msg::Media(ev) => self.on_media(ev),
+                Msg::Media(ev) => {
+                    ui_phase("tecla multimedia", || format!("{ev:?}"));
+                    self.on_media(ev)
+                }
                 Msg::Update { result, manual } => self.on_update(result, manual),
                 Msg::UpdateProgress(p) => self.on_update_progress(ctx, p),
                 Msg::Control(req) => {
+                    ui_phase("orden de control", || short(req.cmd.to_string()));
                     let reply = self.control_exec(ctx, &req.cmd);
                     let _ = req.reply.send(reply);
                 }
             }
         }
         if self.media_dirty {
+            ui_phase("controles multimedia de Windows", String::new);
             self.media_dirty = false;
             self.media.set_metadata(self.player.now.as_ref());
             self.media.set_playback(
@@ -1862,7 +2021,9 @@ impl App {
 
     /// Cambio de pista (local o remota): corazón, letras, cola y metadatos del sistema.
     fn set_now_playing(&mut self, np: NowPlaying) {
-        if self.player.now.as_ref() == Some(&np) {
+        // Si la barra ya la mostraba por adelantado (al hacer clic), la confirmación se procesa
+        // entera igualmente: historial, «me gusta», letras…
+        if !std::mem::take(&mut self.now_optimistic) && self.player.now.as_ref() == Some(&np) {
             return;
         }
         self.player.liked = np.id.as_ref().map(|id| self.liked_set.contains(id));
@@ -1934,9 +2095,24 @@ impl App {
                     Req::PlayerState | Req::Devices | Req::Queue => {
                         log::warn!("{e}")
                     }
+                    // Se ve la copia del disco y la fresca no llegó (sin red, límite de ritmo): se
+                    // mantiene la copia y se reintenta al volver a abrirla. Si la playlist ya no
+                    // existe (una radio caducada), se olvidan la copia y la radio.
+                    Req::PlaylistTracks(ref id) if self.list_cached.contains(id) => {
+                        self.list_fresh.remove(id);
+                        self.requested.remove(&format!("pl:{id}"));
+                        if e.contains("404") {
+                            self.forget_list(id);
+                            self.forget_radio(id);
+                        }
+                        log::info!("playlist {id}: {e}; se mantiene la copia guardada");
+                    }
                     // Precarga de playlist fallida (p. ej. límite de ritmo): se desmarca para que
                     // se recargue al abrirla, en vez de quedar bloqueada y salir vacía.
                     Req::PlaylistTracks(ref id) if !self.lists.contains_key(id) => {
+                        if e.contains("404") {
+                            self.forget_radio(id);
+                        }
                         self.requested.remove(&format!("pl:{id}"));
                         log::info!("precarga de playlist {id} falló ({e}); se reintentará al abrirla");
                     }
@@ -2142,6 +2318,20 @@ impl App {
                         self.snapshot_dirty = true;
                     }
                 }
+                if self.list_cached.contains(&key) {
+                    // Se está viendo la copia del disco: la fresca se junta aparte y la sustituye
+                    // entera al final (sin encoger a 100 filas mientras llega el resto).
+                    let fresh = self.list_fresh.entry(key.clone()).or_default();
+                    fresh.extend(tracks);
+                    if !done {
+                        return;
+                    }
+                    tracks = self.list_fresh.remove(&key).unwrap_or_default();
+                    self.list_cached.remove(&key);
+                    if let Some(l) = self.lists.get_mut(&key) {
+                        l.loading = false;
+                    }
+                }
                 let list_key = key.clone();
                 let list = self.lists.entry(key).or_default();
                 if !list.loading {
@@ -2154,6 +2344,9 @@ impl App {
                 list.loading = !done;
                 if self.diag {
                     log::info!("[diag] lista {} -> {} pistas", list_key, list.tracks.len());
+                }
+                if done && is_playlist_key(&list_key) {
+                    self.save_list(&list_key);
                 }
                 if let Some((ctx, cur)) = self.restore_ctx.clone() {
                     if ctx == list_key && self.build_context_queue(&ctx, &cur) {
@@ -2176,6 +2369,7 @@ impl App {
             }
             Resp::Album(a) => {
                 let id = a.id.clone();
+                self.save_album(&a);
                 self.albums.insert(a.id.clone(), a);
                 if let Some((ctx, cur)) = self.restore_ctx.clone() {
                     if ctx == id && self.build_context_queue(&ctx, &cur) {
@@ -2209,15 +2403,10 @@ impl App {
                 }
             }
             Resp::RadioPlaylist { playlist_id } => {
-                // Pestaña nueva y activa con la playlist de la radio (nombre y portada por librespot).
-                let page = Page::Playlist(playlist_id);
-                let before = self.tabs.len();
-                self.open_tab(page.clone());
-                if self.tabs.len() > before {
-                    self.active = ActiveTab::Tab(self.tabs.len() - 1);
-                } else if let Some(i) = self.tabs.iter().position(|t| t.page() == &page) {
-                    self.active = ActiveTab::Tab(i);
+                if let Req::RadioPlaylist(seed) = &r.req {
+                    self.remember_radio(seed, &playlist_id);
                 }
+                self.open_radio_tab(playlist_id);
             }
             Resp::ArtistPlaylists { id, playlists } => {
                 self.artist_playlists.insert(id, playlists);
@@ -2425,6 +2614,7 @@ impl App {
                 // Recarga metadatos y pistas de esa playlist y la lista de la biblioteca.
                 self.playlist_meta.remove(&id);
                 self.lists.remove(&id);
+                self.forget_list(&id);
                 self.invalidate(&format!("plmeta:{id}"));
                 self.invalidate(&format!("pl:{id}"));
                 self.api.send(Req::Playlists);
@@ -2893,6 +3083,7 @@ impl App {
                 let playing = self.player.state == PlayState::Playing;
                 if self.taskbar_playing != Some(playing) {
                     self.taskbar_playing = Some(playing);
+                    crate::shell::ui_phase("botones de la barra de tareas", String::new);
                     crate::taskbar::set_playing(playing);
                 }
             }
@@ -3040,8 +3231,14 @@ impl App {
                 }
                 Action::OpenRadio(id) => {
                     if self.logged_in() {
-                        self.status("Abriendo la radio…");
-                        self.api.send(Req::RadioPlaylist(id));
+                        match self.radios().get(&id).cloned() {
+                            // Radio ya conocida: se abre al instante (con su copia en disco).
+                            Some(pid) => self.open_radio_tab(pid),
+                            None => {
+                                self.status("Abriendo la radio…");
+                                self.api.send(Req::RadioPlaylist(id));
+                            }
+                        }
                     }
                 }
                 Action::Download(ids) => self.download_kind(ids, false),
@@ -3731,6 +3928,31 @@ impl App {
         }
     }
 
+    /// La canción con la que empezará `t`, si ya la tenemos en pantalla (lista, álbum, cola,
+    /// búsqueda o historial). Con aleatorio no se sabe cuál será.
+    fn target_track(&self, t: &PlayTarget) -> Option<Track> {
+        let uri = match t {
+            PlayTarget::Context { track_uri: Some(u), .. } => u.clone(),
+            PlayTarget::Context { shuffle: true, .. } | PlayTarget::Tracks { shuffle: true, .. } => return None,
+            PlayTarget::Context { uri, index, .. } => {
+                let i = index.unwrap_or(0) as usize;
+                let tracks = match uri.split(':').collect::<Vec<_>>()[..] {
+                    ["spotify", "playlist", id] => self.lists.get(id).map(|l| &l.tracks),
+                    ["spotify", "album", id] => self.albums.get(id).and_then(|a| a.tracks.as_ref()).map(|p| &p.items),
+                    ["spotify", "collection", ..] => self.lists.get(LIKED).map(|l| &l.tracks),
+                    _ => None,
+                };
+                return tracks.and_then(|v| v.get(i)).cloned();
+            }
+            PlayTarget::Tracks { uris, index, .. } => uris.get(index.unwrap_or(0) as usize)?.clone(),
+        };
+        let lists = self.lists.values().flat_map(|l| l.tracks.iter());
+        let albums = self.albums.values().filter_map(|a| a.tracks.as_ref()).flat_map(|p| p.items.iter());
+        let queue = self.queue.iter().flat_map(|q| q.queue.iter());
+        let search = self.search_result.iter().filter_map(|r| r.tracks.as_ref()).flat_map(|p| p.items.iter());
+        lists.chain(albums).chain(queue).chain(search).chain(self.recent.iter()).find(|x| x.uri == uri).cloned()
+    }
+
     pub fn play(&mut self, t: PlayTarget) {
         self.play_after_restore = false;
         if !self.signed_in() {
@@ -3784,6 +4006,16 @@ impl App {
             self.api.send(req);
             self.last_remote_poll = Instant::now() - Duration::from_millis(2000);
         } else {
+            if let Some(track) = self.target_track(&t) {
+                // La barra muestra ya la canción elegida; el reproductor la confirma al cargarla.
+                self.player.now = Some(NowPlaying::from_track(&track));
+                self.player.liked = track.id.as_ref().map(|id| self.liked_set.contains(id));
+                self.player.position_ms = 0;
+                self.player.position_at = None;
+                self.now_optimistic = true;
+                self.now_placeholder = false;
+                self.media_dirty = true;
+            }
             let cmd = match t {
                 PlayTarget::Context {
                     uri,

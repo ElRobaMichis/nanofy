@@ -476,6 +476,7 @@ impl App {
         for pid in self.settings.home_custom.clone() {
             let Some(pl) = self.playlists.iter().find(|p| p.id == pid).cloned() else { continue };
             // Misma clave que la página de la playlist: una sola carga por playlist.
+            self.warm_list(&pid);
             self.request_once(&format!("pl:{pid}"), Req::PlaylistTracks(pid.clone()));
             let items: Vec<HomeItem> = self
                 .lists
@@ -1778,6 +1779,7 @@ impl App {
             .find(|pl| pl.id == id)
             .cloned()
             .or_else(|| self.playlist_meta.get(&id).cloned());
+        self.warm_list(&id);
         self.request_once(&format!("plmeta:{id}"), Req::PlaylistMeta(id.clone()));
         self.request_once(&format!("pl:{id}"), Req::PlaylistTracks(id.clone()));
         let list = self.lists.remove(&id).unwrap_or_default();
@@ -1979,6 +1981,7 @@ impl App {
             self.welcome(ui);
             return;
         }
+        self.warm_album(&id);
         self.request_once(&format!("album:{id}"), Req::Album(id.clone()));
         let Some(album) = self.albums.remove(&id) else {
             Self::loading(ui, "Cargando");

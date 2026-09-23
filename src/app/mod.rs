@@ -1799,6 +1799,16 @@ impl App {
                 self.auth = Auth::LoggedIn { username };
                 self.device_id = device_id;
                 crate::tmark("sesión: conectado");
+                // Lo que casi seguro se va a restaurar se prepara ya en el reproductor, mientras
+                // llega el estado de la cuenta (necesario antes de activar Connect, para no
+                // quitarle la música a otro dispositivo): al decidir, suena al instante.
+                if let Some(saved) = &self.restore_pending {
+                    self.backend.send(Cmd::Preload(saved.now.uri.clone()));
+                }
+                // El aviso «Conectando…» duraba sus 8 s aunque la sesión llegase en 1 s.
+                if self.status.as_ref().is_some_and(|(t, _, err)| !err && t.starts_with("Conectando")) {
+                    self.status = None;
+                }
                 if self.restore_pending.is_some() || self.restore_wanted {
                     // La decisión (copia local, clúster de Connect, recently-played) se toma en
                     // try_decide_restore; el clúster inicial llega justo después de conectar.
@@ -3502,13 +3512,15 @@ impl App {
         if !(self.restore_wanted || self.restore_pending.is_some()) {
             return;
         }
-        // Se espera a /me/player (sesión activa exacta) y a recently-played (última sesión de
-        // la cuenta, que sobrevive aunque el dispositivo se apague). El plazo de respaldo llama
-        // con force=true si alguna no llega.
-        // También al estado del clúster de Connect: es lo único que conserva la posición exacta
-        // de lo que quedó en pausa en otro dispositivo (el teléfono) aunque ya esté cerrado.
+        // Se decide en cuanto llega el estado del clúster de Connect (~1,8 s tras abrir): dice si
+        // suena en otro dispositivo y conserva pista, posición exacta y cola de lo último que
+        // quedó en pausa en cualquiera (el teléfono) aunque ya esté cerrado. Esperar además a la
+        // Web API (/me/player, recently-played) retrasaba el «listo» hasta el plazo de 4 s, y casi
+        // nunca cambiaba la decisión: solo se espera por ella si el clúster llega vacío. El plazo
+        // de respaldo llama con force=true si nada llega.
         let web_pending = self.api.web_configured() && (self.server_now.is_none() || self.server_last.is_none());
-        if !force && (web_pending || self.server_cluster.is_none()) {
+        let cluster_has_session = matches!(self.server_cluster, Some(Some(_)));
+        if !force && !cluster_has_session && (web_pending || self.server_cluster.is_none()) {
             return;
         }
         self.restore_decided = true;

@@ -87,6 +87,9 @@ pub enum Cmd {
     },
     /// Trae a este equipo la reproducción que suena en otro dispositivo.
     TransferHere,
+    /// Prepara una canción en el reproductor (metadatos, clave y primer trozo de audio) sin
+    /// tocar Spotify Connect: al abrir, la que casi seguro se va a restaurar.
+    Preload(String),
     /// Al abrir: trae en pausa la última sesión de la cuenta guardada en Spotify (contexto,
     /// canción, posición, aleatorio, repetición y cola), como hace la app oficial.
     #[allow(dead_code)]
@@ -213,7 +216,7 @@ impl Backend {
 struct Active {
     spirc: Spirc,
     session: Session,
-    _player: Arc<Player>,
+    player: Arc<Player>,
     /// Identifica esta conexión: los avisos de «tarea terminada» de conexiones viejas se ignoran.
     generation: u64,
     /// Cierre de la app: no esperar a Spotify más que unas decenas de ms.
@@ -240,9 +243,17 @@ impl Active {
     }
 }
 
+/// Olvida los tokens guardados entre sesiones (librespot los reutiliza al abrir para conectar
+/// antes). Si una conexión falla o se cae, el siguiente intento los pide nuevos: así un token
+/// revocado antes de caducar no puede dejar la app sin conectar.
+fn forget_cached_tokens(paths: &Paths) {
+    let _ = std::fs::remove_file(paths.credentials_dir().join("tokens.json"));
+}
+
 /// Suelta la conexión actual para volver a conectar. Se avisa antes de cerrarla: es cuando el
 /// audio se corta, y la interfaz fija ahí el punto que retomará.
-async fn drop_for_reconnect(active: &mut Option<Active>, shared: &Shared, ui: &UiTx) {
+async fn drop_for_reconnect(active: &mut Option<Active>, shared: &Shared, ui: &UiTx, paths: &Paths) {
+    forget_cached_tokens(paths);
     if let Some(a) = active.take() {
         ui.send(Msg::Backend(Event::Reconnecting));
         a.stop(true).await;
@@ -273,7 +284,10 @@ async fn run(
         generation += 1;
         match start(&paths, &settings, creds, &ui, &shared, generation, dead_tx.clone()).await {
             Ok(a) => active = Some(a),
-            Err(e) => ui.error(format!("No se pudo conectar con Spotify: {e}")),
+            Err(e) => {
+                forget_cached_tokens(&paths);
+                ui.error(format!("No se pudo conectar con Spotify: {e}"))
+            }
         }
     }
 
@@ -309,7 +323,7 @@ async fn run(
                 if active.as_ref().map(|a| a.generation) == Some(g) {
                     log::warn!("la conexión con Spotify terminó sola; reconectando");
                     ui.status("Se perdió la conexión con Spotify; reconectando…");
-                    drop_for_reconnect(&mut active, &shared, &ui).await;
+                    drop_for_reconnect(&mut active, &shared, &ui, &paths).await;
                     retry_at = Some(tokio::time::Instant::now());
                 }
                 continue;
@@ -318,7 +332,7 @@ async fn run(
                 if active.as_ref().map(|a| a.session.is_invalid()).unwrap_or(false) {
                     log::warn!("la sesión de Spotify está invalidada; reconectando");
                     ui.status("Se perdió la conexión con Spotify; reconectando…");
-                    drop_for_reconnect(&mut active, &shared, &ui).await;
+                    drop_for_reconnect(&mut active, &shared, &ui, &paths).await;
                     retry_at = Some(tokio::time::Instant::now());
                 }
                 continue;
@@ -340,6 +354,7 @@ async fn run(
                         active = Some(a);
                     }
                     Err(e) => {
+                        forget_cached_tokens(&paths);
                         log::warn!("reconexión fallida: {e}; reintento en {retry_delay:?}");
                         ui.status(format!("Sin conexión con Spotify; reintentando en {} s…", retry_delay.as_secs()));
                         retry_at = Some(tokio::time::Instant::now() + retry_delay);
@@ -356,7 +371,7 @@ async fn run(
                 if let Some(a) = active.as_ref() {
                     log::warn!("reproducción estancada (sesión inválida: {}); reconectando", a.session.is_invalid());
                     ui.status("Spotify no responde; reconectando…");
-                    drop_for_reconnect(&mut active, &shared, &ui).await;
+                    drop_for_reconnect(&mut active, &shared, &ui, &paths).await;
                 }
                 retry_at = Some(tokio::time::Instant::now());
             }
@@ -380,7 +395,10 @@ async fn run(
                         start(&paths, &settings, c, &ui, &shared, generation, dead_tx.clone()).await
                     } {
                         Ok(a) => active = Some(a),
-                        Err(e) => ui.error(format!("No se pudo conectar con Spotify: {e}")),
+                        Err(e) => {
+                            forget_cached_tokens(&paths);
+                            ui.error(format!("No se pudo conectar con Spotify: {e}"))
+                        }
                     },
                     Err(e) => ui.error(format!("Inicio de sesión cancelado: {e}")),
                 }
@@ -392,6 +410,7 @@ async fn run(
                 }
                 *shared.session.lock().unwrap() = None;
                 let _ = std::fs::remove_file(paths.credentials_dir().join("credentials.json"));
+                forget_cached_tokens(&paths);
                 ui.send(Msg::Backend(Event::LoggedOut));
             }
             Cmd::Restart(new_settings) => {
@@ -433,7 +452,7 @@ async fn run(
                 if a.session.is_invalid() {
                     // La sesión murió sin que la tarea avisara todavía: reconectar ya.
                     ui.status("Se perdió la conexión con Spotify; reconectando…");
-                    drop_for_reconnect(&mut active, &shared, &ui).await;
+                    drop_for_reconnect(&mut active, &shared, &ui, &paths).await;
                     retry_at = Some(tokio::time::Instant::now());
                     continue;
                 }
@@ -468,6 +487,12 @@ async fn run(
                         .repeat(context)
                         .and_then(|_| a.spirc.repeat_track(track)),
                     Cmd::TransferHere => a.spirc.transfer(None),
+                    Cmd::Preload(uri) => {
+                        if let Ok(uri) = librespot_core::SpotifyUri::from_uri(&uri) {
+                            a.player.preload(uri);
+                        }
+                        Ok(())
+                    }
                     Cmd::ResumeSession => {
                         use librespot_core::dealer::protocol::TransferOptions;
                         use librespot_core::spclient::TransferRequest;
@@ -715,23 +740,8 @@ async fn start(
             }
         });
     }
-    // Spirc::new pide el token de cliente y luego resuelve los puntos de acceso, en serie
-    // (~300 ms cada uno). Aquí se piden a la vez; cuando llegue Spirc::new ya están en caché.
-    {
-        let s1 = session.clone();
-        let s2 = session.clone();
-        let (ct, ap) = tokio::join!(
-            async move { s1.spclient().client_token().await.map(|_| ()) },
-            async move { s2.apresolver().resolve("dealer").await.map(|_| ()) },
-        );
-        if let Err(e) = ct {
-            log::debug!("prefetch client token: {e}");
-        }
-        if let Err(e) = ap {
-            log::debug!("prefetch apresolve: {e}");
-        }
-        crate::tmark("sesión: token y puntos de acceso");
-    }
+    // Spirc::new (parche propio) pide el token de cliente y el de acceso mientras conecta al
+    // punto de acceso; esperar aquí antes a esos mismos datos solo retrasaba la conexión.
     let (spirc, task) = match tokio::time::timeout(
         Duration::from_secs(25),
         Spirc::new(connect, session.clone(), creds, player.clone(), mixer),
@@ -760,7 +770,7 @@ async fn start(
     Ok(Active {
         spirc,
         session,
-        _player: player,
+        player,
         generation,
         fast_stop: false,
     })

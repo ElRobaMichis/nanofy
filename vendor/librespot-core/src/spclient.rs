@@ -169,6 +169,21 @@ impl SpClient {
             return Ok(client_token.access_token);
         }
 
+        // El de la sesión anterior, si sigue vigente: ahorra una ida y vuelta al abrir.
+        if let Some((access_token, expires)) = self.session().cache().and_then(|c| c.token("client")) {
+            let now = SystemTime::now();
+            self.lock(|inner| {
+                inner.client_token = Some(Token {
+                    access_token: access_token.clone(),
+                    expires_in: expires.duration_since(now).unwrap_or_default(),
+                    token_type: "client-token".to_string(),
+                    scopes: vec![],
+                    timestamp: now,
+                })
+            });
+            return Ok(access_token);
+        }
+
         debug!("Client token unavailable or expired, requesting new token.");
 
         let mut request = ClientTokenRequest::new();
@@ -369,6 +384,10 @@ impl SpClient {
 
             inner.client_token = Some(client_token);
         });
+        if let Some(cache) = self.session().cache() {
+            let secs = granted_token.refresh_after_seconds.try_into().unwrap_or(7200);
+            cache.save_token("client", &access_token, SystemTime::now() + Duration::from_secs(secs));
+        }
 
         trace!("Got client token: {granted_token:?}");
 

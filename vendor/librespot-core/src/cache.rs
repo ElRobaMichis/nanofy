@@ -347,6 +347,59 @@ impl Cache {
         }
     }
 
+    fn apresolve_location(&self) -> Option<PathBuf> {
+        Some(self.credentials_location.as_ref()?.with_file_name("apresolve.json"))
+    }
+
+    /// Servidores de Spotify de la última sesión (respuesta de apresolve), si tienen menos de una
+    /// semana: permiten conectar sin esperar a resolverlos otra vez.
+    pub fn apresolve(&self) -> Option<String> {
+        let location = self.apresolve_location()?;
+        let age = fs::metadata(&location).ok()?.modified().ok()?.elapsed().ok()?;
+        if age > std::time::Duration::from_secs(7 * 24 * 3600) {
+            return None;
+        }
+        fs::read_to_string(location).ok()
+    }
+
+    pub fn save_apresolve(&self, data: &str) {
+        if let Some(location) = self.apresolve_location() {
+            if let Err(e) = fs::write(location, data) {
+                warn!("Cannot save access points to cache: {e}");
+            }
+        }
+    }
+
+    fn tokens_location(&self) -> Option<PathBuf> {
+        Some(self.credentials_location.as_ref()?.with_file_name("tokens.json"))
+    }
+
+    /// Token guardado (`"client"` o `"login5:<usuario>"`) y cuándo caduca, si aún le queda al
+    /// menos un minuto: pedirlos otra vez al abrir cuesta ~0,25 s cada uno, en serie.
+    pub fn token(&self, name: &str) -> Option<(String, SystemTime)> {
+        let text = fs::read_to_string(self.tokens_location()?).ok()?;
+        let all: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let entry = all.get(name)?;
+        let token = entry.get("token")?.as_str()?.to_string();
+        let expires = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(entry.get("expires")?.as_u64()?);
+        (expires > SystemTime::now() + std::time::Duration::from_secs(60)).then_some((token, expires))
+    }
+
+    pub fn save_token(&self, name: &str, token: &str, expires: SystemTime) {
+        let Some(location) = self.tokens_location() else { return };
+        let mut all: serde_json::Value = fs::read_to_string(&location)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .filter(|v: &serde_json::Value| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let expires = expires.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        all[name] = serde_json::json!({ "token": token, "expires": expires });
+        let tmp = location.with_extension("json.tmp");
+        if fs::write(&tmp, all.to_string()).and_then(|_| fs::rename(&tmp, &location)).is_err() {
+            warn!("Cannot save tokens to cache");
+        }
+    }
+
     pub fn volume(&self) -> Option<u16> {
         let location = self.volume_location.as_ref()?;
 

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use hyper::{Method, Request};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
@@ -15,7 +15,7 @@ pub struct AccessPoints {
     spclient: VecDeque<SocketAddress>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Serialize, Default)]
 pub struct ApResolveData {
     accesspoint: Vec<String>,
     dealer: Vec<String>,
@@ -44,6 +44,8 @@ impl AccessPoints {
 component! {
     ApResolver : ApResolverInner {
         data: AccessPoints = AccessPoints::default(),
+        // Ya se usaron los servidores guardados de la sesión anterior (solo la primera vez).
+        cache_tried: bool = false,
     }
 }
 
@@ -94,8 +96,43 @@ impl ApResolver {
         Ok(data)
     }
 
+    /// Servidores de la sesión anterior, si los hay: se conecta ya con ellos (~0,25 s menos al
+    /// abrir) y la lista se refresca en segundo plano para la próxima vez. Si fallan todos, la
+    /// cola se vacía y la siguiente resolución va a la red como siempre.
+    fn apresolve_from_cache(&self) -> bool {
+        if self.lock(|inner| std::mem::replace(&mut inner.cache_tried, true)) {
+            return false;
+        }
+        let Some(cache) = self.session().cache().cloned() else { return false };
+        let Some(data) = cache.apresolve().and_then(|t| serde_json::from_str::<ApResolveData>(&t).ok()) else {
+            return false;
+        };
+        let parsed = self.parse_resolve_to_access_points(data);
+        if parsed.is_any_empty() {
+            return false;
+        }
+        self.lock(|inner| inner.data = parsed);
+        let session = self.session();
+        self.session().spawn(async move {
+            if let Ok(fresh) = session.apresolver().try_apresolve().await {
+                if let Ok(text) = serde_json::to_string(&fresh) {
+                    cache.save_apresolve(&text);
+                }
+            }
+        });
+        true
+    }
+
     async fn apresolve(&self) {
+        if self.apresolve_from_cache() {
+            return;
+        }
         let result = self.try_apresolve().await;
+        if let (Ok(data), Some(cache)) = (&result, self.session().cache()) {
+            if let Ok(text) = serde_json::to_string(data) {
+                cache.save_apresolve(&text);
+            }
+        }
 
         self.lock(|inner| {
             let (data, error) = match result {

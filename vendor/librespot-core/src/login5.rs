@@ -182,6 +182,22 @@ impl Login5Manager {
             return Ok(auth_token);
         }
 
+        // El de la sesión anterior (vale una hora), si es de este usuario y sigue vigente:
+        // reabrir la app no tiene que esperar a login5 (~0,3 s).
+        let cache_name = format!("login5:{}", self.session().username());
+        if let Some((access_token, expires)) = self.session().cache().and_then(|c| c.token(&cache_name)) {
+            let now = std::time::SystemTime::now();
+            let token = Token {
+                access_token,
+                expires_in: expires.duration_since(now).unwrap_or_default(),
+                token_type: "Bearer".to_string(),
+                scopes: vec![],
+                timestamp: now,
+            };
+            self.lock(|inner| inner.auth_token = Some(token.clone()));
+            return Ok(token);
+        }
+
         let method = Login_method::StoredCredential(StoredCredential {
             username: self.session().username().to_string(),
             data: auth_data,
@@ -198,6 +214,9 @@ impl Login5Manager {
             inner.auth_token = Some(auth_token.clone());
             inner.auth_token.clone()
         });
+        if let Some(cache) = self.session().cache() {
+            cache.save_token(&cache_name, &auth_token.access_token, auth_token.timestamp + auth_token.expires_in);
+        }
 
         trace!("Got auth token: {auth_token:?}");
 

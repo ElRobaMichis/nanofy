@@ -125,7 +125,11 @@ pub enum Event {
     Shuffle(bool),
     Repeat { context: bool, track: bool },
     ShutdownDone,
-    /// La sesión con Spotify se perdió y se ha restablecido.
+    /// Se suelta la conexión con Spotify para reconectar: el audio se corta aquí, y la interfaz
+    /// guarda este punto para retomarlo tal cual.
+    Reconnecting,
+    /// La sesión con Spotify se perdió y se ha restablecido. El reproductor es nuevo y está
+    /// vacío: la interfaz vuelve a cargar lo que sonaba.
     Reconnected,
     /// Resultado de `Cmd::ResumeSession`: Spotify tenía (o no) una sesión que restaurar.
     SessionResumed(bool),
@@ -192,7 +196,7 @@ impl Backend {
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared::default());
         let handle = rt.handle().clone();
-        rt.spawn(run(rx, tx.clone(), ui, shared.clone(), paths, settings));
+        rt.spawn(run(rx, ui, shared.clone(), paths, settings));
         Self {
             tx,
             handle,
@@ -236,9 +240,18 @@ impl Active {
     }
 }
 
+/// Suelta la conexión actual para volver a conectar. Se avisa antes de cerrarla: es cuando el
+/// audio se corta, y la interfaz fija ahí el punto que retomará.
+async fn drop_for_reconnect(active: &mut Option<Active>, shared: &Shared, ui: &UiTx) {
+    if let Some(a) = active.take() {
+        ui.send(Msg::Backend(Event::Reconnecting));
+        a.stop(true).await;
+    }
+    *shared.session.lock().unwrap() = None;
+}
+
 async fn run(
     mut rx: mpsc::UnboundedReceiver<Cmd>,
-    self_tx: mpsc::UnboundedSender<Cmd>,
     ui: UiTx,
     shared: Arc<Shared>,
     paths: Paths,
@@ -252,8 +265,6 @@ async fn run(
     // caducó, se perdió la red, el equipo durmió…). Si no la paramos nosotros, se reconecta.
     let (dead_tx, mut dead_rx) = mpsc::unbounded_channel::<u64>();
     let mut generation: u64 = 0;
-    // Última orden de reproducción: se repite tras reconectar para que el «play» no se pierda.
-    let mut last_load: Option<Cmd> = None;
     let mut retry_at: Option<tokio::time::Instant> = None;
     let mut retry_delay = Duration::from_secs(2);
 
@@ -298,10 +309,7 @@ async fn run(
                 if active.as_ref().map(|a| a.generation) == Some(g) {
                     log::warn!("la conexión con Spotify terminó sola; reconectando");
                     ui.status("Se perdió la conexión con Spotify; reconectando…");
-                    if let Some(a) = active.take() {
-                        a.stop(true).await;
-                    }
-                    *shared.session.lock().unwrap() = None;
+                    drop_for_reconnect(&mut active, &shared, &ui).await;
                     retry_at = Some(tokio::time::Instant::now());
                 }
                 continue;
@@ -309,10 +317,8 @@ async fn run(
             Next::Health => {
                 if active.as_ref().map(|a| a.session.is_invalid()).unwrap_or(false) {
                     log::warn!("la sesión de Spotify está invalidada; reconectando");
-                    if let Some(a) = active.take() {
-                        a.stop(true).await;
-                    }
-                    *shared.session.lock().unwrap() = None;
+                    ui.status("Se perdió la conexión con Spotify; reconectando…");
+                    drop_for_reconnect(&mut active, &shared, &ui).await;
                     retry_at = Some(tokio::time::Instant::now());
                 }
                 continue;
@@ -332,10 +338,6 @@ async fn run(
                             let _ = a.spirc.set_volume(v);
                         }
                         active = Some(a);
-                        // Se repite lo último que se pidió reproducir.
-                        if let Some(c) = last_load.clone() {
-                            let _ = self_tx.send(c);
-                        }
                     }
                     Err(e) => {
                         log::warn!("reconexión fallida: {e}; reintento en {retry_delay:?}");
@@ -351,11 +353,10 @@ async fn run(
             Cmd::Stalled => {
                 // La interfaz lleva demasiado en «cargando»: si la sesión está caída (o
                 // parece viva pero no responde), se reconecta y se repite la última orden.
-                if let Some(a) = active.take() {
+                if let Some(a) = active.as_ref() {
                     log::warn!("reproducción estancada (sesión inválida: {}); reconectando", a.session.is_invalid());
                     ui.status("Spotify no responde; reconectando…");
-                    a.stop(true).await;
-                    *shared.session.lock().unwrap() = None;
+                    drop_for_reconnect(&mut active, &shared, &ui).await;
                 }
                 retry_at = Some(tokio::time::Instant::now());
             }
@@ -386,7 +387,6 @@ async fn run(
             }
             Cmd::Logout => {
                 retry_at = None;
-                last_load = None;
                 if let Some(a) = active.take() {
                     a.stop(false).await;
                 }
@@ -420,9 +420,8 @@ async fn run(
             }
             other => {
                 log::debug!("[cmd] {other:?}");
-                if matches!(other, Cmd::LoadContext { .. } | Cmd::LoadTracks { .. }) {
-                    last_load = Some(other.clone());
-                }
+                // Una orden que no llega a ejecutarse aquí no se guarda: al reconectar, la interfaz
+                // repite la carga que aún no sonaba o retoma lo que sonaba en su punto exacto.
                 let Some(a) = active.as_ref() else {
                     if retry_at.is_some() {
                         ui.status("Reconectando con Spotify…");
@@ -432,15 +431,9 @@ async fn run(
                     continue;
                 };
                 if a.session.is_invalid() {
-                    // La sesión murió sin que la tarea avisara todavía: reconectar ya y repetir la orden.
+                    // La sesión murió sin que la tarea avisara todavía: reconectar ya.
                     ui.status("Se perdió la conexión con Spotify; reconectando…");
-                    if let Some(a) = active.take() {
-                        a.stop(true).await;
-                    }
-                    *shared.session.lock().unwrap() = None;
-                    if !matches!(other, Cmd::LoadContext { .. } | Cmd::LoadTracks { .. }) {
-                        last_load = last_load.take().or(Some(other));
-                    }
+                    drop_for_reconnect(&mut active, &shared, &ui).await;
                     retry_at = Some(tokio::time::Instant::now());
                     continue;
                 }

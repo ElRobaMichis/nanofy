@@ -210,6 +210,13 @@ pub enum PlayTarget {
     },
 }
 
+/// Dónde se cortó la reproducción al perder la conexión con Spotify: se retoma ahí al volver.
+#[derive(Clone, Copy)]
+struct ResumePoint {
+    pos: u32,
+    playing: bool,
+}
+
 pub enum Action {
     SaveAlbum(String, bool),
     Download(Vec<String>),
@@ -317,6 +324,12 @@ pub struct App {
     /// El usuario pulsó play mientras aún se decidía qué restaurar: se reanuda en cuanto cargue
     /// lo restaurado (desde su posición), en vez de empezar la pista desde cero.
     play_after_restore: bool,
+    /// Se perdió la conexión con Spotify: al volver, se carga lo que sonaba en este punto. Sin
+    /// esto la sesión nueva empezaría vacía (o, antes, con la canción desde el principio).
+    reconnect_resume: Option<ResumePoint>,
+    /// Última orden de reproducción que aún no ha empezado a sonar: si la conexión cae antes,
+    /// se repite al reconectar.
+    pending_load: Option<Cmd>,
     /// La barra muestra la última canción escuchada (de la instantánea) mientras llega la
     /// sesión real; si se pulsa play antes, se reproduce esa canción.
     now_placeholder: bool,
@@ -365,8 +378,9 @@ pub struct App {
     /// Las filas muestran «Añadida por …» (playlists colaborativas).
     pub rows_added_by: bool,
     pub queued_local: Vec<String>,
-    /// Tras vaciar la cola: (cuándo, posición a restaurar, canciones a volver a añadir).
-    pending_queue: Option<(Instant, u32, Vec<String>)>,
+    /// Tras vaciar la cola: (cuándo, posición a restaurar si hace falta, canciones a volver a
+    /// añadir).
+    pending_queue: Option<(Instant, Option<u32>, Vec<String>)>,
     pub shows: HashMap<String, (Show, Vec<Episode>)>,
     pub play_log: PlayLog,
     play_log_path: PathBuf,
@@ -631,6 +645,8 @@ impl App {
             restore_awaiting: false,
             pause_after_restore: false,
             play_after_restore: false,
+            reconnect_resume: None,
+            pending_load: None,
             now_placeholder: false,
             queue_retry: None,
             restore_mark: false,
@@ -1600,6 +1616,11 @@ impl App {
         } else {
             log::debug!("[evento] {e:?}");
         }
+        if matches!(e, Event::Playing { .. } | Event::Paused { .. } | Event::Stopped | Event::Unavailable) {
+            // Lo pedido ya llegó al reproductor: a partir de aquí, si la conexión cae, se retoma
+            // desde donde suene, no desde donde se pidió.
+            self.pending_load = None;
+        }
         match e {
             Event::Status(s) => self.status(s),
             Event::Error(s) => {
@@ -1677,6 +1698,8 @@ impl App {
                     volume,
                     ..Default::default()
                 };
+                self.reconnect_resume = None;
+                self.pending_load = None;
                 self.media_dirty = true;
                 self.status("Sesión cerrada");
             }
@@ -1784,10 +1807,36 @@ impl App {
                     self.restore_local();
                 }
             }
+            Event::Reconnecting => {
+                // El audio se corta aquí: la barra se detiene en el punto que se retomará.
+                let pos = self.player.position();
+                self.reconnect_resume = match self.player.state {
+                    _ if self.player.remote.is_some() || self.jam.is_some() || self.now_placeholder => None,
+                    _ if self.player.now.is_none() => None,
+                    PlayState::Stopped => None,
+                    s => Some(ResumePoint { pos, playing: s != PlayState::Paused }),
+                };
+                if self.player.remote.is_none() {
+                    self.player.position_ms = pos;
+                    self.player.position_at = None;
+                    if self.player.state == PlayState::Playing {
+                        self.player.state = PlayState::Loading;
+                    }
+                }
+                self.media_dirty = true;
+            }
             Event::Reconnected => {
                 self.status("Conexión con Spotify restablecida");
                 self.loading_since = None;
-                if self.player.state == PlayState::Loading {
+                let resume = self.reconnect_resume.take();
+                if let Some(cmd) = self.pending_load.clone() {
+                    // Lo último que se pidió no llegó a sonar: se pide otra vez.
+                    log::info!("[reconexión] se repite la carga pendiente");
+                    self.backend.send(cmd);
+                    self.player.state = PlayState::Loading;
+                } else if let Some(point) = resume {
+                    self.resume_after_reconnect(point);
+                } else if self.player.state == PlayState::Loading {
                     self.player.state = PlayState::Stopped;
                 }
                 self.media_dirty = true;
@@ -2851,7 +2900,9 @@ impl App {
         if let Some((at, pos, adds)) = self.pending_queue.clone() {
             if Instant::now() >= at {
                 self.pending_queue = None;
-                self.seek(pos);
+                if let Some(pos) = pos {
+                    self.seek(pos);
+                }
                 for u in adds {
                     self.api.send(Req::AddToQueue(u));
                 }
@@ -3167,7 +3218,7 @@ impl App {
         let pos = self.player.position();
         self.play(target);
         self.queued_local = keep.clone();
-        self.pending_queue = Some((Instant::now() + Duration::from_millis(1500), pos, keep));
+        self.pending_queue = Some((Instant::now() + Duration::from_millis(1500), Some(pos), keep));
         self.queue = None;
     }
 
@@ -3540,7 +3591,7 @@ impl App {
         };
         if !info.queue.is_empty() {
             self.queued_local = info.queue.clone();
-            self.pending_queue = Some((Instant::now() + Duration::from_millis(2500), pos, info.queue));
+            self.pending_queue = Some((Instant::now() + Duration::from_millis(2500), Some(pos), info.queue));
         }
         log::info!("[restore] sesión del clúster: {} en {} ms ({})", info.track_uri, pos, info.context_uri);
     }
@@ -3595,9 +3646,56 @@ impl App {
         }
         if !saved.queued.is_empty() {
             // La cola manual se vuelve a añadir cuando el dispositivo ya está activo.
-            self.pending_queue = Some((Instant::now() + Duration::from_millis(2500), pos, saved.queued.clone()));
+            self.pending_queue = Some((Instant::now() + Duration::from_millis(2500), Some(pos), saved.queued.clone()));
         }
         log::info!("[restore] {} en {} ms", saved.now.name, pos);
+    }
+
+    /// Tras reconectar, el reproductor de la sesión nueva está vacío: se vuelve a cargar la pista
+    /// que sonaba, en el segundo en que se cortó, dentro de su contexto y con aleatorio,
+    /// repetición y cola manual. Repetir la orden original la devolvería al principio (o a la
+    /// canción con la que empezó el contexto).
+    fn resume_after_reconnect(&mut self, point: ResumePoint) {
+        let Some(now) = self.player.now.clone() else { return };
+        let shuffle = self.player.shuffle;
+        let cmd = match self.last_play.clone() {
+            Some(PlayTarget::Context { uri, .. }) => Cmd::LoadContext {
+                uri,
+                track_uri: Some(now.uri.clone()),
+                index: None,
+                shuffle,
+                resume: Some(point.pos),
+            },
+            Some(PlayTarget::Tracks { uris, .. }) if uris.contains(&now.uri) => {
+                let index = uris.iter().position(|u| u == &now.uri).map(|i| i as u32);
+                Cmd::LoadTracks { uris, index, shuffle, resume: Some(point.pos) }
+            }
+            _ => Cmd::LoadTracks { uris: vec![now.uri.clone()], index: Some(0), shuffle: false, resume: Some(point.pos) },
+        };
+        self.backend.send(cmd);
+        let (context, track) = match self.player.repeat {
+            Repeat::Off => (false, false),
+            Repeat::Context => (true, false),
+            Repeat::Track => (true, true),
+        };
+        if self.player.repeat != Repeat::Off {
+            self.backend.send(Cmd::Repeat { context, track });
+        }
+        if !self.queued_local.is_empty() {
+            // La cola manual se vuelve a añadir cuando el dispositivo ya está activo; sin
+            // buscar la posición, que ya es la buena y seguirá avanzando.
+            self.pending_queue = Some((Instant::now() + Duration::from_millis(2500), None, self.queued_local.clone()));
+        }
+        // Se carga en pausa en el segundo exacto; si sonaba, el evento de pausa la reanuda.
+        self.pause_after_restore = false;
+        self.play_after_restore = point.playing;
+        self.player.state = if point.playing { PlayState::Loading } else { PlayState::Paused };
+        log::info!(
+            "[reconexión] se retoma {} en {} ms ({})",
+            now.name,
+            point.pos,
+            if point.playing { "sonando" } else { "en pausa" }
+        );
     }
 
     /// Guarda lo que suena aquí (pista, segundo, contexto, aleatorio, repetición y cola manual).
@@ -3686,30 +3784,34 @@ impl App {
             self.api.send(req);
             self.last_remote_poll = Instant::now() - Duration::from_millis(2000);
         } else {
-            match t {
+            let cmd = match t {
                 PlayTarget::Context {
                     uri,
                     track_uri,
                     index,
                     shuffle,
-                } => self.backend.send(Cmd::LoadContext {
+                } => Cmd::LoadContext {
                     uri,
                     track_uri,
                     index,
                     shuffle,
                     resume: None,
-                }),
+                },
                 PlayTarget::Tracks {
                     uris,
                     index,
                     shuffle,
-                } => self.backend.send(Cmd::LoadTracks {
+                } => Cmd::LoadTracks {
                     uris,
                     index,
                     shuffle,
                     resume: None,
-                }),
-            }
+                },
+            };
+            // Lo recién pedido manda sobre lo que sonaba si la conexión se cae antes de empezar.
+            self.pending_load = Some(cmd.clone());
+            self.reconnect_resume = None;
+            self.backend.send(cmd);
             self.player.state = PlayState::Loading;
         }
     }
@@ -3750,6 +3852,14 @@ impl App {
 
     pub fn play_pause(&mut self) {
         self.pause_after_restore = false;
+        if let Some(point) = self.reconnect_resume.as_mut() {
+            // Reconectando: no hay reproductor al que mandar la orden; se decide cómo se
+            // retomará (sonando o en pausa) y la barra lo refleja ya.
+            point.playing = !point.playing;
+            self.player.state = if point.playing { PlayState::Loading } else { PlayState::Paused };
+            self.media_dirty = true;
+            return;
+        }
         if self.now_placeholder && self.player.remote.is_none() {
             // Todavía se está decidiendo qué restaurar (copia local, clúster, servidor): el play
             // se aplica en cuanto cargue lo restaurado, desde su posición, no desde cero.
@@ -3809,6 +3919,9 @@ impl App {
         self.player.position_at = (self.player.state == PlayState::Playing).then(Instant::now);
         if self.player.remote.is_some() {
             self.api.send(Req::RemoteSeek(ms));
+        } else if let Some(point) = self.reconnect_resume.as_mut() {
+            // Reconectando: se retomará desde aquí.
+            point.pos = ms;
         } else {
             self.backend.send(Cmd::Seek(ms));
         }

@@ -85,15 +85,25 @@ impl From<cpal::SupportedStreamConfigsError> for RodioError {
     }
 }
 
+/// Si la cola no baja en este tiempo damos la salida por perdida. Generoso a propósito: cada
+/// reapertura tira lo que hubiera en cola, así que un falso positivo se oye como un corte.
+const STALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Tiempo mínimo entre reaperturas, para no encadenarlas descartando audio sin parar.
+const REOPEN_COOLDOWN: Duration = Duration::from_secs(5);
+/// Cuánto insistir en abrir la salida antes de devolver el control al reproductor.
+const REOPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct RodioSink {
     rodio_sink: rodio::Sink,
     _stream: rodio::OutputStream,
     /// Para reabrir la salida si el dispositivo desaparece (auriculares Bluetooth, USB…).
     device: Option<String>,
     format: AudioFormat,
-    /// cpal avisa por aquí de que el flujo murió (dispositivo desconectado).
+    /// cpal avisa por aquí de que el flujo murió (dispositivo desconectado). Uno por flujo: el
+    /// del anterior sigue avisando mientras cpal lo cierra y daría por muerto al recién abierto.
     dead: Arc<AtomicBool>,
     playing: bool,
+    last_reopen: Instant,
 }
 
 fn list_formats(device: &cpal::Device) {
@@ -162,12 +172,13 @@ fn list_outputs(host: &cpal::Host) -> Result<(), cpal::DevicesError> {
     Ok(())
 }
 
+type OpenOutput = (rodio::Sink, rodio::OutputStream, Arc<AtomicBool>);
+
 fn create_sink(
     host: &cpal::Host,
     device: Option<String>,
     format: AudioFormat,
-    dead: Arc<AtomicBool>,
-) -> Result<(rodio::Sink, rodio::OutputStream), RodioError> {
+) -> Result<OpenOutput, RodioError> {
     let cpal_device = match device.as_deref() {
         Some("?") => match list_outputs(host) {
             Ok(()) => exit(0),
@@ -216,6 +227,7 @@ fn create_sink(
 
     // Si el dispositivo se desconecta (Bluetooth apagado, USB fuera), cpal lo comunica por este
     // callback y `write` reabre la salida con el dispositivo predeterminado que haya entonces.
+    let dead = Arc::new(AtomicBool::new(false));
     let on_error = {
         let dead = dead.clone();
         move |e: cpal::StreamError| {
@@ -243,7 +255,7 @@ fn create_sink(
     stream.log_on_drop(false);
 
     let sink = rodio::Sink::connect_new(stream.mixer());
-    Ok((sink, stream))
+    Ok((sink, stream, dead))
 }
 
 pub fn open(host: cpal::Host, device: Option<String>, format: AudioFormat) -> RodioSink {
@@ -252,8 +264,7 @@ pub fn open(host: cpal::Host, device: Option<String>, format: AudioFormat) -> Ro
         host.id().name()
     );
 
-    let dead = Arc::new(AtomicBool::new(false));
-    let (sink, stream) = create_sink(&host, device.clone(), format, dead.clone()).unwrap();
+    let (sink, stream, dead) = create_sink(&host, device.clone(), format).unwrap();
 
     debug!("Rodio sink was created");
     RodioSink {
@@ -263,37 +274,58 @@ pub fn open(host: cpal::Host, device: Option<String>, format: AudioFormat) -> Ro
         format,
         dead,
         playing: false,
+        last_reopen: Instant::now(),
     }
 }
 
 impl RodioSink {
-    /// Vuelve a abrir la salida de audio (dispositivo predeterminado actual). Reintenta mientras
-    /// no haya ninguno; lo que había en cola se pierde (unas décimas de segundo).
-    fn reopen(&mut self) {
-        for intento in 1..=120 {
-            self.dead.store(false, Ordering::Relaxed);
-            match create_sink(&cpal::default_host(), self.device.clone(), self.format, self.dead.clone()) {
-                Ok((sink, stream)) => {
-                    self.rodio_sink = sink;
-                    self._stream = stream;
+    /// Vuelve a abrir la salida de audio (dispositivo predeterminado actual). Insiste hasta
+    /// `REOPEN_TIMEOUT` y devuelve si lo consiguió; lo que había en cola se pierde (unas décimas
+    /// de segundo). No espera más para no dejar colgado al reproductor: si el dispositivo sigue
+    /// sin volver, el siguiente paquete vuelve a intentarlo.
+    fn reopen(&mut self) -> bool {
+        let t0 = Instant::now();
+        let mut avisado = false;
+        loop {
+            match create_sink(&cpal::default_host(), self.device.clone(), self.format) {
+                Ok((sink, stream, dead)) => {
+                    // Cerrar lo anterior de inmediato: mientras el flujo muerto viva, cpal sigue
+                    // avisando de su error. Con un aviso por flujo eso ya no mancha al nuevo.
+                    drop(std::mem::replace(&mut self.rodio_sink, sink));
+                    drop(std::mem::replace(&mut self._stream, stream));
+                    self.dead = dead;
+                    self.last_reopen = Instant::now();
                     self.rodio_sink.set_volume(output_volume());
                     if self.playing {
                         self.rodio_sink.play();
                     } else {
                         self.rodio_sink.pause();
                     }
-                    info!("salida de audio reabierta (intento {intento})");
-                    return;
+                    info!("salida de audio reabierta tras {:?}", t0.elapsed());
+                    return true;
                 }
                 Err(e) => {
-                    if intento == 1 {
+                    if !avisado {
                         warn!("no hay salida de audio disponible ({e}); esperando a que vuelva");
+                        avisado = true;
                     }
-                    thread::sleep(Duration::from_millis(500));
+                    if t0.elapsed() >= REOPEN_TIMEOUT {
+                        warn!("sigue sin haber salida de audio; se reintentará más adelante");
+                        self.last_reopen = Instant::now();
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(250));
                 }
             }
         }
-        warn!("sin salida de audio tras 60 s; se seguirá intentando con el siguiente paquete");
+    }
+
+    fn append(&self, samples: &[f32]) {
+        self.rodio_sink.append(rodio::buffer::SamplesBuffer::new(
+            NUM_CHANNELS as cpal::ChannelCount,
+            SAMPLE_RATE,
+            samples,
+        ));
     }
 }
 
@@ -326,15 +358,16 @@ impl Sink for RodioSink {
             .samples()
             .map_err(|e| RodioError::Samples(e.to_string()))?;
         let samples_f32: &[f32] = &converter.f64_to_f32(samples);
-        let source = rodio::buffer::SamplesBuffer::new(
-            NUM_CHANNELS as cpal::ChannelCount,
-            SAMPLE_RATE,
-            samples_f32,
-        );
+        // Si llega audio es que el reproductor está sonando: que el sink nunca se quede en pausa.
+        // Una reapertura en el momento justo lo dejaba mudo hasta reiniciar la aplicación.
+        self.playing = true;
         if self.dead.load(Ordering::Relaxed) {
             self.reopen();
         }
-        self.rodio_sink.append(source);
+        if self.rodio_sink.is_paused() {
+            self.rodio_sink.play();
+        }
+        self.append(samples_f32);
 
         // Chunk sizes seem to be about 256 to 3000 ish items long.
         // Assuming they're on average 1628 then a half second buffer is:
@@ -344,7 +377,7 @@ impl Sink for RodioSink {
             self.rodio_sink.set_volume(v);
             debug!("rodio: volumen de salida aplicado {v:.3}");
         }
-        // Espera a que la cola baje; si no baja en 2 s (el dispositivo dejó de consumir sin avisar)
+        // Espera a que la cola baje; si deja de bajar (el dispositivo dejó de consumir sin avisar)
         // o cpal ha avisado del fallo, se reabre la salida.
         let mut last_len = self.rodio_sink.len();
         let mut since = Instant::now();
@@ -354,11 +387,22 @@ impl Sink for RodioSink {
             if l < last_len {
                 last_len = l;
                 since = Instant::now();
-            } else if self.dead.load(Ordering::Relaxed) || since.elapsed() > Duration::from_secs(2) {
-                warn!("la salida de audio no consume datos; se reabre");
-                self.reopen();
-                break;
+                continue;
             }
+            if !self.dead.load(Ordering::Relaxed) && since.elapsed() < STALL_TIMEOUT {
+                continue;
+            }
+            // Cada reapertura descarta la cola: encadenarlas deja la música muda aunque la salida
+            // esté sana. Si se acaba de reabrir, se espera antes de volver a hacerlo.
+            if self.last_reopen.elapsed() < REOPEN_COOLDOWN {
+                continue;
+            }
+            warn!("la salida de audio no consume datos ({l} en cola); se reabre");
+            if self.reopen() {
+                // La cola se fue con el flujo anterior: reponer al menos el paquete de ahora.
+                self.append(samples_f32);
+            }
+            break;
         }
         Ok(())
     }

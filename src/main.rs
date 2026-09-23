@@ -19,22 +19,67 @@ mod shell;
 mod update;
 mod webauth;
 
+/// Copia del registro en `<state_dir>/nanofy.log`, además de la salida de error habitual. La
+/// versión publicada corre sin consola: sin esto no queda rastro de los fallos que solo aparecen
+/// tras horas de uso. Al arrancar, el registro anterior pasa a `nanofy.log.1`, de modo que cerrar
+/// y abrir la aplicación —lo primero que uno hace cuando algo falla— no borre lo que hay que ver.
+struct LogSink {
+    file: Option<std::fs::File>,
+    escrito: u64,
+}
+
+impl LogSink {
+    /// Tope por sesión; a partir de ahí el registro sigue solo en la salida de error.
+    const MAX: u64 = 4 << 20;
+
+    fn new(paths: &config::Paths) -> Self {
+        let file = (|| {
+            std::fs::create_dir_all(&paths.state_dir).ok()?;
+            let ruta = paths.state_dir.join("nanofy.log");
+            let _ = std::fs::rename(&ruta, paths.state_dir.join("nanofy.log.1"));
+            std::fs::File::create(&ruta).ok()
+        })();
+        Self { file, escrito: 0 }
+    }
+}
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write_all(buf);
+        if let Some(f) = &mut self.file {
+            if self.escrito < Self::MAX {
+                self.escrito += buf.len() as u64;
+                let _ = f.write_all(buf);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(f) = &mut self.file {
+            let _ = f.flush();
+        }
+        std::io::stderr().flush()
+    }
+}
+
 fn main() {
+    let paths = config::Paths::new();
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,nanofy=info"),
     )
     .format_timestamp_millis()
+    .target(env_logger::Target::Pipe(Box::new(LogSink::new(&paths))))
     .init();
 
     let t0 = std::time::Instant::now();
     let _ = START.set(t0);
-    log::info!("[t] main");
+    log::info!("[t] main {}", env!("CARGO_PKG_VERSION"));
     // Identidad estable en la barra de tareas: sin ella, al anclar el .exe suelto Windows no
     // asocia el botón con el acceso directo anclado y este se queda sin icono.
     #[cfg(windows)]
     set_app_user_model_id();
     update::cleanup_old_exe();
-    let paths = config::Paths::new();
     let settings = config::Settings::load(&paths);
     tmark("ajustes cargados");
     // `--diag`: prueba automática de letras, dispositivos, cola y reproducción (10 s), y sale.

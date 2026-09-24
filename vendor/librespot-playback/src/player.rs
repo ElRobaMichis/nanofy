@@ -113,6 +113,8 @@ enum PlayerCommand {
     Play,
     Pause,
     Stop,
+    /// Suelta el dispositivo de salida si no está sonando (ver `Player::release_sink`).
+    ReleaseSink,
     Seek(u32),
     SetSession(Session),
     AddEventSender(mpsc::UnboundedSender<PlayerEvent>),
@@ -583,6 +585,13 @@ impl Player {
 
     pub fn stop(&self) {
         self.command(PlayerCommand::Stop)
+    }
+
+    /// Suelta el dispositivo de salida si no está sonando: tras un rato en pausa, para que
+    /// Windows no lo dé por ocupado (unos auriculares Bluetooth multipunto no cambiarían al
+    /// teléfono). Al volver a sonar se abre otra vez.
+    pub fn release_sink(&self) {
+        self.command(PlayerCommand::ReleaseSink)
     }
 
     pub fn seek(&self, position_ms: u32) {
@@ -2353,6 +2362,12 @@ impl PlayerInternal {
 
             PlayerCommand::Stop => self.handle_player_stop(),
 
+            PlayerCommand::ReleaseSink => {
+                if self.sink_status != SinkStatus::Running {
+                    self.sink.release();
+                }
+            }
+
             PlayerCommand::SetSession(session) => self.session = session,
 
             PlayerCommand::AddEventSender(sender) => self.event_senders.push(sender),
@@ -2563,6 +2578,7 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::Play => f.debug_tuple("Play").finish(),
             PlayerCommand::Pause => f.debug_tuple("Pause").finish(),
             PlayerCommand::Stop => f.debug_tuple("Stop").finish(),
+            PlayerCommand::ReleaseSink => f.debug_tuple("ReleaseSink").finish(),
             PlayerCommand::Seek(position) => f.debug_tuple("Seek").field(&position).finish(),
             PlayerCommand::SetSession(_) => f.debug_tuple("SetSession").finish(),
             PlayerCommand::AddEventSender(_) => f.debug_tuple("AddEventSender").finish(),

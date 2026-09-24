@@ -31,6 +31,9 @@ use crate::bus::{Msg, UiTx};
 use crate::config::{vol_pct_to_raw, Paths, Quality, Settings};
 use crate::model::NowPlaying;
 
+/// Tiempo en pausa tras el que se suelta el dispositivo de audio (ver `start`).
+const RELEASE_AUDIO_AFTER_PAUSE: Duration = Duration::from_secs(5);
+
 const REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
 
 const SCOPES: &[&str] = &[
@@ -686,8 +689,23 @@ async fn start(
     let mut events = player.get_player_event_channel();
     let ui_events = ui.clone();
     let session_events = session.clone();
+    // Débil: el reproductor no debe seguir vivo solo porque esta tarea lo recuerde.
+    let player_weak = Arc::downgrade(&player);
     tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
+            if matches!(ev, PlayerEvent::Paused { .. } | PlayerEvent::Stopped { .. }) {
+                // Tras un rato en pausa se suelta la salida de audio: con el flujo abierto,
+                // Windows da el dispositivo por ocupado aunque solo suene silencio, y unos
+                // auriculares Bluetooth multipunto no cambian al teléfono. Si en ese tiempo se
+                // vuelve a reproducir, el reproductor ignora la orden.
+                let player = player_weak.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(RELEASE_AUDIO_AFTER_PAUSE).await;
+                    if let Some(p) = player.upgrade() {
+                        p.release_sink();
+                    }
+                });
+            }
             if let PlayerEvent::ClusterSnapshot { cluster } = &ev {
                 use protobuf::Message as _;
                 match librespot_protocol::connect::Cluster::parse_from_bytes(cluster) {
@@ -800,6 +818,11 @@ impl Sink for LazySink {
         match self.inner.as_mut() {
             Some(s) => s.stop(),
             None => Ok(()),
+        }
+    }
+    fn release(&mut self) {
+        if let Some(s) = self.inner.as_mut() {
+            s.release();
         }
     }
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {

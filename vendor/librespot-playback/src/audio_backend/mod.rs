@@ -30,6 +30,9 @@ pub trait Sink {
     fn stop(&mut self) -> SinkResult<()> {
         Ok(())
     }
+    /// Suelta el dispositivo de salida tras un rato en pausa (lo pide el reproductor); el
+    /// siguiente `start` lo vuelve a abrir.
+    fn release(&mut self) {}
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()>;
 }
 

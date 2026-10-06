@@ -106,7 +106,7 @@ pub enum SideTab {
 }
 
 /// Clave de la caché de secciones del inicio (ver `home_sections`).
-pub type HomeCacheKey = (usize, usize, usize, Vec<String>, usize, Vec<String>, usize, Vec<String>);
+pub type HomeCacheKey = (usize, usize, usize, Vec<String>, usize, Vec<String>, usize, Vec<String>, bool);
 
 /// Diálogo «Añadir a una playlist».
 #[derive(Default)]
@@ -158,6 +158,38 @@ pub struct TrackList {
     pub tracks: Vec<Track>,
     pub total: u32,
     pub loading: bool,
+    /// Versión de `tracks`: cambia con cada cambio de sus pistas (lote, sustitución, edición) y
+    /// guía lo que las páginas guardan calculado (resumen, búsqueda interna). Las páginas sacan
+    /// la lista de `lists` en cada fotograma y la vuelven a meter: deben devolverla tal cual.
+    pub gen: u64,
+}
+
+impl TrackList {
+    /// Lista nueva con versión propia.
+    fn new(tracks: Vec<Track>, total: u32, gen: &mut u64) -> Self {
+        let mut list = TrackList { tracks, total, loading: false, gen: 0 };
+        list.touch(gen);
+        list
+    }
+
+    /// Marca un cambio en sus pistas. El contador es de toda la app (`App::list_gen`), no de la
+    /// lista: una borrada y vuelta a crear (cierre de sesión, recarga de la biblioteca) nunca
+    /// repite una versión que ya tenga algo calculado guardado.
+    fn touch(&mut self, gen: &mut u64) {
+        *gen += 1;
+        self.gen = *gen;
+    }
+}
+
+/// Lo que las páginas de lista sacan de todas sus pistas. Se calcula una vez por versión de la
+/// lista: en cada fotograma, con miles de pistas, costaba milisegundos al desplazarse.
+pub struct ListSummary {
+    pub total_ms: u64,
+    /// Artistas más presentes.
+    pub top: Vec<ArtistRef>,
+    /// Quienes añadieron canciones, sin repetir y por orden de aparición. Sin el propietario
+    /// delante: sus datos pueden llegar después que las pistas.
+    pub added_by: Vec<String>,
 }
 
 #[derive(Default)]
@@ -212,19 +244,177 @@ pub enum PlayTarget {
 
 /// Copia en disco de una playlist (o radio): se muestra al instante al volver a abrirla, también
 /// tras reiniciar, mientras llega la versión fresca.
+/// La API lee también `tracks`, `meta_at` y `country` (`ListCopy` en api.rs) para no volver a
+/// pedir las pistas que ya tiene.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct CachedList {
+pub struct CachedList {
     meta: Option<Playlist>,
     tracks: Vec<Track>,
+    /// snapshot_id que tenía la playlist en el listado cuando se pidió esta versión (no al
+    /// guardarla: pudo cambiar mientras llegaba). Sin él (radios, de otros) no se da por buena.
+    #[serde(default)]
+    snapshot_id: Option<String>,
+    /// Cuándo se guardó (segundos Unix).
+    #[serde(default)]
+    saved_at: u64,
+    /// De cuándo son los metadatos más antiguos de sus pistas y para qué país se pidieron.
+    #[serde(default)]
+    meta_at: u64,
+    #[serde(default)]
+    country: Option<String>,
+}
+
+/// Lo que se sabe de la copia en disco de una playlist (leída por warm_list/on_warmed o escrita
+/// por save_list): su snapshot_id, cuándo se guardó y qué versión de la lista en memoria es ella
+/// (`TrackList::gen`). Si la lista cambió después (edición, otra carga) ya no es la copia.
+struct ListDisk {
+    snapshot_id: Option<String>,
+    saved_at: u64,
+    gen: u64,
+}
+
+/// Lo que la API manda antes del último lote de una carga de playlist para su copia en disco
+/// (ver `Resp::PlaylistCopyInfo`). Sin él (`Default`) la recarga siguiente las pide todas.
+#[derive(Default)]
+struct CopyInfo {
+    meta_at: u64,
+    country: Option<String>,
 }
 
 /// Copias en disco que se conservan por carpeta (playlists/radios y álbumes): unas pocas decenas
 /// de KB cada una; las abiertas hace más tiempo se borran.
 const CACHED_MAX: usize = 400;
 
+/// Precarga de playlists al conectar: como mucho estas por tanda (cada una es la playlist4 y sus
+/// lotes de metadatos, o solo lo nuevo respecto a su copia, a spclient, que limita a 300
+/// peticiones cada 30 s y comparte con el audio).
+const PREFETCH_MAX: usize = 10;
+/// La que ya tiene una copia en disco más reciente que esto, sin snapshot_id con que compararla
+/// (copias antiguas, o sin listado de esta sesión), no se precarga: al abrirla se ve esa copia
+/// al instante y se refresca entonces. Con él decide `skip_unchanged`.
+const PREFETCH_FRESH: Duration = Duration::from_secs(6 * 3600);
+/// Si la respuesta de una precarga se pierde (sesión caída, cierre), tras esto sale la siguiente.
+const PREFETCH_STALE: Duration = Duration::from_secs(60);
+/// Una copia en disco con el mismo snapshot_id que el listado de esta sesión se da por buena sin
+/// pedir nada si tiene menos de esto (24 h): pasado, se recarga igualmente (barata: la API
+/// reutiliza sus pistas), por si algún cambio no hubiera movido el snapshot_id.
+const LIST_UNCHANGED_SECS: u64 = 24 * 3600;
+/// Tiempo durante el que el listado de playlists de esta sesión decide si una copia en disco
+/// sigue al día (ver `App::listing_fresh`).
+const LISTING_TRUST: Duration = Duration::from_secs(10 * 60);
+/// Una carga de playlist sin noticias (ni un lote) durante esto se da por perdida (un hilo
+/// colgado, una respuesta que no llegará) y deja pasar otra de la misma playlist.
+const PL_INFLIGHT_STALE: Duration = Duration::from_secs(60);
+/// Me gusta se recarga entera como mucho cada tanto: en medio basta con lo reciente (1-2
+/// páginas) y la cuenta de Spotify, que delata lo quitado en otro dispositivo.
+const LIKED_FULL_SYNC_SECS: u64 = 7 * 24 * 3600;
+/// Los artistas seguidos de la instantánea se dan por buenos durante este tiempo.
+const ARTISTS_SYNC_SECS: u64 = 6 * 3600;
+/// Espera antes de cada reintento automático de una playlist cuya carga falló a medias (sesión
+/// caída, límite de librespot). Agotados, queda a la vista lo que llegó con «Reintentar».
+const LIST_RETRY_DELAYS: [Duration; 3] = [Duration::from_secs(5), Duration::from_secs(20), Duration::from_secs(60)];
+/// Cola del contexto restaurado: espera antes de volver a pedir sus pistas tras cada fallo (como
+/// mucho estos reintentos) y plazo total tras el que se deja sin armar. Antes se pedía otra vez
+/// cada 1,2 s sin límite, aunque la anterior siguiera en curso.
+const RESTORE_CTX_RETRY: [Duration; 3] = [Duration::from_millis(1200), Duration::from_millis(2400), Duration::from_millis(4800)];
+const RESTORE_CTX_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Resultados de búsqueda recientes que se guardan en memoria (los usados hace más tiempo salen).
+const SEARCH_CACHE_MAX: usize = 50;
+/// Un resultado más reciente que esto se muestra tal cual, sin pedir nada.
+const SEARCH_FRESH: Duration = Duration::from_secs(30 * 60);
+/// Hasta esto se muestra al instante y se refresca detrás; pasado, se busca como si no estuviera.
+const SEARCH_KEEP: Duration = Duration::from_secs(24 * 3600);
+/// Entre dos refrescos de la misma consulta: ir y volver entre búsquedas no gasta cuota.
+const SEARCH_REFRESH_GAP: Duration = Duration::from_secs(10 * 60);
+
+/// Un resultado de búsqueda guardado en `App::search_cache`.
+struct CachedSearch {
+    /// Cuándo respondió Spotify: decide si vale tal cual o se refresca.
+    at: Instant,
+    /// Última vez que se pidió o se mostró: con más de SEARCH_CACHE_MAX sale el menos usado.
+    used: Instant,
+    /// Último refresco en segundo plano enviado (si su respuesta no llega, `at` no cambia y sin
+    /// esto cada vuelta a la consulta pediría otro).
+    asked: Option<Instant>,
+    result: SearchResult,
+}
+
+/// Clave de la caché de búsquedas: «Daft  Punk » y «daft punk» son la misma consulta.
+fn search_key(q: &str) -> String {
+    q.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Sin nada en ninguna categoría. No se guarda: puede ser el respaldo vacío de pathfinder con la
+/// Web API caída, y guardarlo escondería durante media hora los resultados reales.
+fn search_is_empty(s: &SearchResult) -> bool {
+    s.tracks.as_ref().is_none_or(|p| p.items.is_empty())
+        && s.albums.as_ref().is_none_or(|p| p.items.iter().all(Option::is_none))
+        && s.artists.as_ref().is_none_or(|p| p.items.iter().all(Option::is_none))
+        && s.playlists.as_ref().is_none_or(|p| p.items.iter().all(Option::is_none))
+        && s.shows.as_ref().is_none_or(|p| p.items.iter().all(Option::is_none))
+        && s.episodes.as_ref().is_none_or(|p| p.items.iter().all(Option::is_none))
+        && s.audiobooks.as_ref().is_none_or(|p| p.items.iter().all(Option::is_none))
+}
+
+/// Una playlist que llega con bastantes menos pistas de las que tiene (lotes que fallaron) no se
+/// guarda en disco ni sustituye a la copia que se ve. Unas pocas de menos sí se aceptan: las que
+/// Spotify ya no tiene no llegan nunca.
+fn list_short(len: usize, total: u32) -> bool {
+    let total = total as usize;
+    len + (total / 100).max(2) < total
+}
+
 /// Solo las playlists (id base62 de 22 caracteres) se guardan; «Me gusta» va en la instantánea.
 fn is_playlist_key(key: &str) -> bool {
     key.len() == 22 && key.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// De dónde salen las pistas de un contexto restaurado para armar su cola.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CtxKind {
+    /// Me gusta: su carga ya la lanza el arranque (Req::Liked / LikedRecent); no se pide nada.
+    Liked,
+    Album,
+    /// Playlist, también radios, Daily Mix y las de Spotify (37i9).
+    Playlist,
+}
+
+/// Lista de la que sale la cola de un contexto: (clave en `lists` o `albums`, tipo). Artistas,
+/// podcasts, emisoras y demás no tienen aquí una lista con sus pistas (su cola la dan el
+/// servidor o el clúster): antes su id se pedía como playlist y fallaba una y otra vez.
+fn ctx_list_key(uri: &str) -> Option<(String, CtxKind)> {
+    if uri.ends_with(":collection") || uri.contains("collection:tracks") {
+        return Some((LIKED.to_string(), CtxKind::Liked));
+    }
+    // Una emisora sembrada en una playlist o un álbum («spotify:station:playlist:…») suena una
+    // radio, no esa lista: su cola no sale de ella.
+    if uri.contains(":station:") {
+        return None;
+    }
+    let (kind, id) = if let Some((_, id)) = uri.split_once(":playlist:") {
+        (CtxKind::Playlist, id)
+    } else if let Some((_, id)) = uri.split_once(":album:") {
+        (CtxKind::Album, id)
+    } else {
+        return None;
+    };
+    is_playlist_key(id).then(|| (id.to_string(), kind))
+}
+
+/// Fecha de hoy (AAAA-MM-DD, UTC), como la de `added_at` que da playlist4.
+fn today_utc() -> String {
+    // Días desde 1970 a fecha civil (algoritmo de Howard Hinnant, «civil_from_days»).
+    let z = (crate::cache::now_secs() / 86400) as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// Dónde se cortó la reproducción al perder la conexión con Spotify: se retoma ahí al volver.
@@ -260,6 +450,9 @@ pub enum Action {
     OpenInTab(Page),
     CloseTab(usize),
     ActivateTab(usize),
+    /// «Reintentar» de una playlist a medias. Va como acción porque la página tiene la lista
+    /// fuera de `lists` mientras se dibuja, y el reintento necesita verla.
+    RetryList(String),
 }
 
 /// Estado del diálogo de crear / editar playlist.
@@ -292,6 +485,8 @@ pub struct App {
     pub hwnd: Option<*mut std::ffi::c_void>,
     rx: mpsc::Receiver<Msg>,
     ui_tx: UiTx,
+    /// Hilo de lecturas y escrituras de disco (ver `crate::cache::Disk`).
+    disk: crate::cache::Disk,
 
     pub auth: Auth,
     pub user: Option<User>,
@@ -312,8 +507,23 @@ pub struct App {
 
     pub playlists: Vec<Playlist>,
     pub playlists_loaded: bool,
+    /// Cuándo llegó `playlists` si es el listado pedido en esta sesión (no el de la
+    /// instantánea): solo sus snapshot_id, y mientras sea reciente (`listing_fresh`), sirven
+    /// para dar por buena una copia en disco sin pedirla. Uno restaurado puede coincidir con una
+    /// copia igual de vieja y esconder un cambio hecho en el móvil.
+    playlists_fresh: Option<Instant>,
+    /// Hay un listado pedido al conectar (arranque o reconexión) que aún no ha respondido: el
+    /// inicio espera a él para decidir si sus secciones de playlists hace falta pedirlas.
+    playlists_asked: bool,
     pub playlist_meta: HashMap<String, Playlist>,
     pub lists: HashMap<String, TrackList>,
+    /// Última versión dada a una lista (ver `TrackList::gen`).
+    list_gen: u64,
+    /// Resumen de cada lista vista (clave → versión y pistas con que se calculó, resumen).
+    page_cache: HashMap<String, (u64, usize, std::rc::Rc<ListSummary>)>,
+    /// Último resultado de la búsqueda interna en una lista (clave, consulta, versión, pistas,
+    /// coincidencias): mientras no cambien no se vuelve a filtrar ni a copiar en cada fotograma.
+    filter_cache: Option<(String, String, u64, usize, std::rc::Rc<[Track]>)>,
     pub saved_albums: Vec<Album>,
     pub followed_artists: Vec<Artist>,
     pub artists_loaded: bool,
@@ -335,6 +545,31 @@ pub struct App {
     /// (`list_fresh`) y la sustituye entera al terminar, sin parpadeos ni listas a medias.
     list_cached: HashSet<String>,
     list_fresh: HashMap<String, Vec<Track>>,
+    /// Copias en disco que se están leyendo en el hilo del disco (id → número de la lectura):
+    /// llegan con `Msg::Warmed` y solo se ponen si nada fresco se adelantó (ver `on_warmed`).
+    warming: HashMap<String, u64>,
+    warm_seq: u64,
+    /// Playlists cuya carga falló o llegó con huecos: (cuándo toca el siguiente reintento
+    /// automático, si queda alguno; reintentos ya lanzados). Mientras estén aquí la página no las
+    /// vuelve a pedir por su cuenta (lo hace tick, con espera) y muestra «Reintentar». Sin hora,
+    /// con una carga en vuelo, se está reintentando; sin hora y sin carga, solo queda el manual.
+    list_retry: HashMap<String, (Option<Instant>, u8)>,
+    /// Cargas de playlist en vuelo (id → última noticia: el envío o un lote). Todas salen por
+    /// `load_playlist`, que nunca lanza una segunda de la misma: dos a la vez mezclaban sus lotes
+    /// en la lista, y lo guardado en disco quedaba con pistas repetidas o cortado.
+    pl_inflight: HashMap<String, Instant>,
+    /// Playlists que se vuelven a cargar en cuanto termine la que está en vuelo: una edición o
+    /// una recarga forzada llegó mientras corría y lo que esa trae puede ser de antes del cambio.
+    pl_rerun: HashSet<String>,
+    /// snapshot_id del listado al pedir cada carga de playlist: es el que guarda su copia.
+    pl_snap: HashMap<String, Option<String>>,
+    /// Lo que la API dijo de la carga en curso de cada playlist para su copia en disco.
+    pl_copy_info: HashMap<String, CopyInfo>,
+    /// Copias en disco ya leídas o escritas en esta sesión (ver `ListDisk`).
+    list_disk: HashMap<String, ListDisk>,
+    /// Playlists cuyo nombre, descripción o portada se acaban de editar y cuyos metadatos se
+    /// piden otra vez a la Web API: si esta falla (límite), se toman de la playlist4.
+    meta_after_edit: HashSet<String>,
     /// Radios ya resueltas (canción semilla → playlist); se carga del disco al primer uso.
     radios: Option<HashMap<String, String>>,
     /// Reproducción guardada pendiente de cargar en el reproductor (tras conectar).
@@ -370,13 +605,28 @@ pub struct App {
     restore_fallback_at: Option<Instant>,
     /// Prueba (`--page loadctx:<uri>`): contexto que se carga en pausa al iniciar sesión.
     pending_loadctx: Option<String>,
-    /// Contexto (id, pista actual) que se está restaurando: al llegar sus pistas se arma la cola.
-    restore_ctx: Option<(String, String)>,
-    /// Cuándo reintentar pedir las pistas del contexto (hasta que la sesión esté lista).
+    /// Contexto que se está restaurando (clave de su lista, tipo, pista actual): al llegar sus
+    /// pistas se arma la cola.
+    restore_ctx: Option<(String, CtxKind, String)>,
+    /// Cuándo pedir sus pistas: la primera vez en cuanto haya sesión y después solo tras un
+    /// fallo, con espera. `None`: ya pedidas (su respuesta despierta la interfaz) o nada que pedir.
     restore_ctx_at: Option<Instant>,
+    /// Fallos de esa petición hasta ahora (cuál de RESTORE_CTX_RETRY toca).
+    restore_ctx_fails: u8,
+    /// Pasado esto se deja la cola sin armar: nunca se espera (ni se repinta) indefinidamente.
+    restore_ctx_until: Option<Instant>,
     /// Playlists cuyas pistas se precargan en segundo plano (para que abrirlas sea instantáneo).
     prefetch_ids: std::collections::VecDeque<String>,
     prefetch_at: Option<Instant>,
+    /// Precarga en vuelo (id, cuándo salió): solo una a la vez, para que la cola de la API no
+    /// se llene de playlists enteras delante de lo que ella abre o busca.
+    prefetch_inflight: Option<(String, Instant)>,
+    /// La precarga espera la copia en disco de esta playlist (se lee en el hilo del disco) para
+    /// decidir si pedirla.
+    prefetch_warm: Option<String>,
+    /// Medida para el registro: playlist abierta (id, último fotograma en que se dibujó, cuándo
+    /// se abrió mientras no se haya visto aún su primera fila).
+    pl_open_mark: Option<(String, u64, Option<Instant>)>,
     /// Ya se restauró (o descartó) la sesión con el estado del clúster en este arranque.
     cluster_restored: bool,
     /// Última actividad del servidor: `None` = aún no consultada; `Some(None)` = sin historial.
@@ -409,9 +659,13 @@ pub struct App {
     /// añadir).
     pending_queue: Option<(Instant, Option<u32>, Vec<String>)>,
     pub shows: HashMap<String, (Show, Vec<Episode>)>,
-    pub play_log: PlayLog,
+    /// Compartido con el hilo del disco mientras se guarda (ver `PlayLog::save_async`): se
+    /// modifica con `Arc::make_mut`.
+    pub play_log: std::sync::Arc<PlayLog>,
     play_log_path: PathBuf,
     play_log_dirty: bool,
+    /// Propio: con el de la instantánea, guardar una retrasaba el guardado del otro.
+    play_log_saved_at: Instant,
     pub artist_search: String,
     pub artist_search_open: bool,
     pub artist_search_focus: bool,
@@ -489,6 +743,27 @@ pub struct App {
     pub search_query: String,
     pub search_result: Option<SearchResult>,
     pub search_loading: bool,
+    /// Consulta enviada cuya respuesta se espera. Solo se acepta la de esta (no la del texto
+    /// de la caja, que ella puede haber cambiado ya), y las respuestas viejas se ignoran.
+    pub search_pending: Option<String>,
+    /// Reintento automático de la consulta en vuelo tras un 429 corto: (cuándo, consulta). Solo
+    /// se envía si esa consulta sigue siendo la pendiente.
+    pub search_retry: Option<(Instant, String)>,
+    /// Reintentos automáticos ya enviados de la consulta en vuelo (máximo 2).
+    pub search_retries: u8,
+    /// Consulta a la que pertenecen los resultados mostrados (siguen a la vista, atenuados,
+    /// mientras llega la siguiente búsqueda).
+    pub search_result_for: Option<String>,
+    /// Resultados recientes por consulta (clave `search_key`): volver a una búsqueda reciente es
+    /// instantáneo y no gasta cuota. Solo en memoria y se vacía al cerrar sesión, para que dos
+    /// cuentas del mismo PC no vean las búsquedas de la otra.
+    search_cache: HashMap<String, CachedSearch>,
+    /// Consultas enviadas para refrescar un resultado de la caché que ya está a la vista: si
+    /// fallan solo se anota (ni aviso rojo encima de resultados válidos ni reintento).
+    search_refreshing: HashSet<String>,
+    /// Consulta lanzada en Perfiles: ahí solo se pide el perfil, y su búsqueda general se pide al
+    /// pasar a otra pestaña de resultados (antes se gastaba una /search que nadie miraba).
+    pub search_pending_profile: Option<String>,
     pub focus_search: bool,
 
     /// Pestañas de contenido (Inicio y Buscar son fijas y no están aquí).
@@ -557,7 +832,10 @@ pub struct App {
     snapshot_path: PathBuf,
     snapshot_dirty: bool,
     snapshot_saved_at: Instant,
-    snapshot_age: Option<u64>,
+    /// Ver `Snapshot::liked_synced_at`, `liked_server_total` y `artists_synced_at`.
+    liked_synced_at: u64,
+    liked_server_total: u64,
+    artists_synced_at: u64,
     /// Un `Req::Liked` completo está en curso: la primera página sustituye la lista cacheada.
     liked_refresh_pending: bool,
     /// Páginas de la recarga completa de Me gusta; sustituyen la lista solo al terminar.
@@ -590,6 +868,7 @@ impl App {
             backend.shared.clone(),
             backend.handle.clone(),
             web,
+            paths.cache_dir.join("lists"),
             ui_tx.clone(),
         );
         crate::tmark("api");
@@ -619,7 +898,7 @@ impl App {
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
         let play_log_path = paths.state_dir.join("plays.json");
-        let play_log = PlayLog::load(&play_log_path);
+        let play_log = std::sync::Arc::new(PlayLog::load(&play_log_path));
         crate::tmark("home+plays");
         let volume = vol_pct_to_raw(settings.volume as f32);
         let side = settings.lyrics_open.then_some(SideTab::Lyrics);
@@ -641,6 +920,7 @@ impl App {
             hwnd: handles.hwnd,
             rx,
             ui_tx,
+            disk: crate::cache::Disk::start(),
             auth: Auth::LoggedOut,
             user: None,
             device_id: device_id0,
@@ -654,8 +934,13 @@ impl App {
             update_check_at,
             playlists: Vec::new(),
             playlists_loaded: false,
+            playlists_fresh: None,
+            playlists_asked: false,
             playlist_meta: HashMap::new(),
             lists: HashMap::new(),
+            list_gen: 0,
+            page_cache: HashMap::new(),
+            filter_cache: None,
             saved_albums: Vec::new(),
             followed_artists: Vec::new(),
             artists_loaded: false,
@@ -671,6 +956,15 @@ impl App {
             lists_dir,
             list_cached: HashSet::new(),
             list_fresh: HashMap::new(),
+            warming: HashMap::new(),
+            warm_seq: 0,
+            list_retry: HashMap::new(),
+            pl_inflight: HashMap::new(),
+            pl_rerun: HashSet::new(),
+            pl_snap: HashMap::new(),
+            pl_copy_info: HashMap::new(),
+            list_disk: HashMap::new(),
+            meta_after_edit: HashSet::new(),
             radios: None,
             restore_pending: None,
             restore_wanted: true,
@@ -687,8 +981,13 @@ impl App {
             pending_loadctx: None,
             restore_ctx: None,
             restore_ctx_at: None,
+            restore_ctx_fails: 0,
+            restore_ctx_until: None,
             prefetch_ids: std::collections::VecDeque::new(),
             prefetch_at: None,
+            prefetch_inflight: None,
+            prefetch_warm: None,
+            pl_open_mark: None,
             cluster_restored: false,
             server_last: None,
             server_now: None,
@@ -708,6 +1007,7 @@ impl App {
             play_log,
             play_log_path,
             play_log_dirty: false,
+            play_log_saved_at: Instant::now(),
             artist_search: String::new(),
             artist_search_open: false,
             artist_search_focus: false,
@@ -768,6 +1068,13 @@ impl App {
             search_query: String::new(),
             search_result: None,
             search_loading: false,
+            search_pending: None,
+            search_retry: None,
+            search_retries: 0,
+            search_result_for: None,
+            search_cache: HashMap::new(),
+            search_refreshing: HashSet::new(),
+            search_pending_profile: None,
             focus_search: false,
             tabs: Vec::new(),
             active: ActiveTab::Home,
@@ -822,7 +1129,9 @@ impl App {
             snapshot_path,
             snapshot_dirty: false,
             snapshot_saved_at: Instant::now(),
-            snapshot_age: None,
+            liked_synced_at: 0,
+            liked_server_total: 0,
+            artists_synced_at: 0,
             liked_refresh_pending: false,
             liked_reload: Vec::new(),
             liked_reload_ids: HashSet::new(),
@@ -875,7 +1184,9 @@ impl App {
 
     /// Rellena la interfaz con la última instantánea antes de que llegue la red.
     fn apply_snapshot(&mut self, snap: Snapshot) {
-        self.snapshot_age = Some(snap.age_secs());
+        self.liked_synced_at = snap.liked_synced_at;
+        self.liked_server_total = snap.liked_server_total;
+        self.artists_synced_at = snap.artists_synced_at;
         // Sin duplicados (una instantánea antigua podía tenerlos).
         let mut seen = HashSet::new();
         let liked: Vec<Track> = snap
@@ -887,8 +1198,14 @@ impl App {
         self.user = snap.user;
         self.playlists = snap.playlists;
         self.playlists_loaded = !self.playlists.is_empty();
+        // Sus snapshot_id son de la sesión anterior: no dicen si una copia sigue al día.
+        self.playlists_fresh = None;
         self.recent = snap.recent;
         self.saved_albums = snap.saved_albums;
+        // Una instantánea de antes los traía con sus pistas: así el próximo guardado ya encoge.
+        for a in &mut self.saved_albums {
+            a.tracks = None;
+        }
         if !self.saved_albums.is_empty() {
             self.requested.insert("albums".to_string());
         }
@@ -903,20 +1220,25 @@ impl App {
         self.followed_artists = snap.followed_artists;
         if !liked.is_empty() {
             self.liked_set = liked.iter().filter_map(|t| t.id.clone()).collect();
-            self.lists.insert(
-                LIKED.to_string(),
-                TrackList {
-                    total: liked_total.max(liked.len() as u32),
-                    tracks: liked,
-                    loading: false,
-                },
-            );
+            // Lo marcado aquí sin fila: corazón encendido y, al llegar con lo reciente, entra en
+            // la lista sin contarse otra vez como nuevo de fuera.
+            self.liked_set.extend(snap.liked_extra);
+            let total = liked_total.max(liked.len() as u32);
+            self.lists.insert(LIKED.to_string(), TrackList::new(liked, total, &mut self.list_gen));
             self.requested.insert(LIKED.to_string());
         }
     }
 
     fn snapshot(&self) -> Snapshot {
         let liked = self.lists.get(LIKED);
+        // Ver `Snapshot::liked_extra`: lo marcado aquí que aún no tiene fila.
+        let liked_extra: Vec<String> = match liked {
+            Some(l) => {
+                let rows: HashSet<&str> = l.tracks.iter().filter_map(|t| t.id.as_deref()).collect();
+                self.liked_set.iter().filter(|id| !rows.contains(id.as_str())).cloned().collect()
+            }
+            None => Vec::new(),
+        };
         Snapshot {
             saved_at: crate::cache::now_secs(),
             user: self.user.clone(),
@@ -926,6 +1248,10 @@ impl App {
             followed_artists: self.followed_artists.clone(),
             liked: liked.map(|l| l.tracks.clone()).unwrap_or_default(),
             liked_total: liked.map(|l| l.total).unwrap_or(0),
+            liked_synced_at: self.liked_synced_at,
+            liked_server_total: self.liked_server_total,
+            liked_extra,
+            artists_synced_at: self.artists_synced_at,
         }
     }
 
@@ -933,11 +1259,12 @@ impl App {
         if !self.play_log_dirty {
             return;
         }
-        if !force && self.snapshot_saved_at.elapsed() < Duration::from_secs(5) {
+        if !force && self.play_log_saved_at.elapsed() < Duration::from_secs(5) {
             return;
         }
         self.play_log_dirty = false;
-        self.play_log.save_async(self.play_log_path.clone());
+        self.play_log_saved_at = Instant::now();
+        self.play_log.clone().save_async(&self.disk, self.play_log_path.clone());
     }
 
     fn save_snapshot_if_needed(&mut self, force: bool) {
@@ -949,7 +1276,8 @@ impl App {
         }
         self.snapshot_dirty = false;
         self.snapshot_saved_at = Instant::now();
-        self.snapshot().save_async(self.snapshot_path.clone());
+        // Aquí solo la copia de los datos; serializarla y escribirla, en el hilo del disco.
+        self.snapshot().save_async(&self.disk, self.snapshot_path.clone());
     }
 
     /// Registra las teclas multimedia la primera vez que suena algo.
@@ -1536,29 +1864,281 @@ impl App {
         }
     }
 
+    /// Nombre e imagen de estos artistas en UNA petición (lote de metadatos internos), cada uno
+    /// una vez por sesión con la misma clave que usaba la tarjeta. Antes era un Req::Artist por
+    /// artista: una lectura de la Web API y segundos de búsqueda de géneros en los hilos comunes.
+    pub fn request_artist_thumbs(&mut self, ids: Vec<String>) {
+        if !self.logged_in() {
+            return;
+        }
+        let ids: Vec<String> = ids.into_iter().filter(|id| self.requested.insert(format!("artistmeta:{id}"))).collect();
+        if !ids.is_empty() {
+            self.api.send(Req::ArtistThumbs(ids));
+        }
+    }
+
     pub fn invalidate(&mut self, key: &str) {
         self.requested.remove(key);
     }
 
-    /// Si una playlist aún no está en memoria, muestra al instante su última copia en disco.
-    /// La petición a Spotify sigue su curso y la sustituye al llegar.
-    pub fn warm_list(&mut self, id: &str) {
-        if self.lists.contains_key(id) || !is_playlist_key(id) || self.requested.contains(&format!("pl:{id}")) {
+    /// Pide las pistas de una playlist (una vez por sesión), salvo si espera un reintento tras
+    /// una carga fallida: ese lo lanza tick con su espera, o ella con «Reintentar». Pedirla aquí
+    /// en cada fotograma lo repetiría en bucle.
+    pub fn request_list(&mut self, id: &str) {
+        if !self.list_retry.contains_key(id) && !self.requested.contains(&format!("pl:{id}")) {
+            self.load_playlist(id, false, false);
+        }
+    }
+
+    /// Hay una carga de esa playlist en vuelo (con noticias recientes).
+    fn pl_busy(&self, id: &str) -> bool {
+        self.pl_inflight.get(id).is_some_and(|t| t.elapsed() < PL_INFLIGHT_STALE)
+    }
+
+    /// Única puerta para pedir las pistas de una playlist (página, inicio, precarga,
+    /// restauración, reintentos, ediciones). Nunca lanza dos cargas de la misma a la vez: sus
+    /// lotes se mezclaban y la lista (y su copia en disco) quedaba con pistas repetidas o cortada.
+    /// Con una ya en vuelo no hace nada, salvo `force` (una edición, una recarga pedida): entonces
+    /// se repite en cuanto termine esa, que puede traer la versión de antes del cambio.
+    pub fn load_playlist(&mut self, id: &str, prio: bool, force: bool) {
+        if !self.logged_in() {
             return;
         }
-        let Ok(text) = std::fs::read_to_string(self.lists_dir.join(format!("{id}.json"))) else { return };
-        let Ok(cached) = serde_json::from_str::<CachedList>(&text) else { return };
+        if self.pl_busy(id) {
+            if force {
+                self.pl_rerun.insert(id.to_string());
+            }
+            return;
+        }
+        // La copia que deje esta carga lleva el snapshot_id del listado de ahora: lo que llegue
+        // es al menos igual de nuevo. Si la anterior se dio por perdida y aún responde, su lista
+        // (quizá de antes) se guardaría con este: mejor sin ninguno, que solo cuesta recargarla.
+        let snap = self.playlists.iter().find(|p| p.id == id).and_then(|p| p.snapshot_id.clone());
+        let lost = self.pl_inflight.remove(id);
+        if let Some(t) = lost {
+            log::info!("playlist {id}: la carga anterior lleva {} s sin noticias; se pide otra", t.elapsed().as_secs());
+        }
+        self.pl_snap.insert(id.to_string(), snap.filter(|_| lost.is_none()));
+        self.pl_copy_info.remove(id);
+        // Sin otra en vuelo, lo que quede aparte es de una carga que no terminó.
+        self.list_fresh.remove(id);
+        // Si ya se ve (en memoria o la copia del disco), lo nuevo se junta aparte y la sustituye
+        // entera al terminar: tras una reconexión o una edición, la playlist abierta ya no se
+        // vacía para volver de 100 en 100. Si no se ve nada, mejor que salga según llega.
+        if self.lists.get(id).is_some_and(|l| !l.tracks.is_empty()) {
+            self.list_cached.insert(id.to_string());
+        }
+        self.requested.insert(format!("pl:{id}"));
+        self.pl_inflight.insert(id.to_string(), Instant::now());
+        let req = Req::PlaylistTracks(id.to_string());
+        if prio {
+            self.api.send_priority(req);
+        } else {
+            self.api.send(req);
+        }
+    }
+
+    /// Hay un reintento de esa playlist en vuelo.
+    pub fn list_retry_busy(&self, id: &str) -> bool {
+        self.list_retry.get(id).is_some_and(|r| r.0.is_none()) && self.pl_busy(id)
+    }
+
+    /// Vuelve a pedir una playlist que quedó a medias (reintento automático o «Reintentar»).
+    pub fn retry_list(&mut self, id: &str) {
+        if !self.logged_in() {
+            return;
+        }
+        let sent = self.list_retry.get(id).map_or(0, |r| r.1);
+        // Con otra carga en vuelo, una segunda mezclaría sus lotes: esa hace de reintento. Si
+        // termina completa se quita de aquí; si falla, su error programa el siguiente.
+        if self.pl_busy(id) {
+            if let Some(r) = self.list_retry.get_mut(id) {
+                r.0 = None;
+            }
+            return;
+        }
+        self.list_retry.insert(id.to_string(), (None, sent.saturating_add(1)));
+        self.load_playlist(id, false, false);
+    }
+
+    /// Programa el siguiente reintento de una playlist cuya carga falló, con espera creciente.
+    fn schedule_list_retry(&mut self, id: &str, e: &str) {
+        // La restauración de la sesión ya la repite por su cuenta: otra carga a la vez mezclaría
+        // sus lotes.
+        if self.restoring_playlist(id) {
+            self.list_retry.remove(id);
+            return;
+        }
+        let mut sent = self.list_retry.get(id).map_or(0, |r| r.1);
+        // Sin sesión (reconexión en curso) falla al momento y no cuenta como intento: la sesión
+        // suele volver en segundos y no deben gastarse los reintentos esperándola.
+        if e.contains("no has iniciado sesión") {
+            sent = sent.saturating_sub(1);
+        }
+        match LIST_RETRY_DELAYS.get(sent as usize) {
+            Some(wait) => {
+                log::info!("playlist {id}: {e}; reintento {} en {} s", sent + 1, wait.as_secs());
+                self.list_retry.insert(id.to_string(), (Some(Instant::now() + *wait), sent));
+            }
+            None => {
+                log::info!("playlist {id}: {e}; sin más reintentos automáticos");
+                self.list_retry.insert(id.to_string(), (None, sent));
+            }
+        }
+    }
+
+    /// Si una playlist aún no está en memoria, pide leer su última copia en disco para mostrarla
+    /// en cuanto llegue (`on_warmed`, uno o dos fotogramas). La petición a Spotify sigue su
+    /// curso y la sustituye al llegar.
+    pub fn warm_list(&mut self, id: &str) {
+        if self.lists.contains_key(id) || !is_playlist_key(id) {
+            return;
+        }
+        // Aunque su carga ya esté pedida (p. ej. por la precarga) se muestra la copia: mientras
+        // no llegue el primer lote no hay nada en `lists`, y con `list_cached` lo fresco se junta
+        // aparte y la sustituye entera al terminar. Una sola lectura del disco por id: la página
+        // llama aquí en cada fotograma y, sin copia, se releería un fichero que no existe.
+        if !self.requested.insert(format!("warm:{id}")) {
+            return;
+        }
+        // Aquí solo se mira si existe (barato): leer y parsear una copia de miles de pistas
+        // costaba 5-20 ms del fotograma al abrirla. Sin copia no se espera nada: las pistas se
+        // ven según llegan, como siempre.
+        let path = self.lists_dir.join(format!("{id}.json"));
+        if !path.is_file() {
+            return;
+        }
+        self.warm_seq += 1;
+        let seq = self.warm_seq;
+        self.warming.insert(id.to_string(), seq);
+        let (tx, id) = (self.ui_tx.clone(), id.to_string());
+        self.disk.run(move || {
+            let list = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<CachedList>(&t).ok())
+                .map(Box::new);
+            tx.send(Msg::Warmed { id, seq, list });
+        });
+    }
+
+    /// Llegó la copia en disco pedida por `warm_list`. Se pone solo si sigue siendo la última
+    /// lectura pedida de esa playlist y nada fresco se adelantó: ni un lote (que la quita de
+    /// `warming`) ni otra copia a la vista. Lo que haya en `lists` tiene que ser el hueco vacío
+    /// que deja la página mientras espera. Nunca se cambia una carga a medias por la copia: sus
+    /// lotes siguientes irían aparte (`list_fresh`) y la lista acabaría mezclada.
+    fn on_warmed(&mut self, id: String, seq: u64, list: Option<Box<CachedList>>) {
+        if self.warming.get(&id) != Some(&seq) {
+            return;
+        }
+        self.warming.remove(&id);
+        // Las secciones del inicio la esperaban para decidir si pedirla: sin copia legible, su
+        // clave de caché no cambia y no se volverían a mirar.
+        if self.settings.home_custom.contains(&id) {
+            self.home_cache = None;
+        }
+        let Some(cached) = list else {
+            self.playlist_meta_fallback(&id);
+            return;
+        };
+        let placeholder = self.lists.get(&id).map_or(true, |l| l.tracks.is_empty() && !l.loading);
+        if !placeholder || self.list_cached.contains(&id) || self.list_fresh.contains_key(&id) {
+            return;
+        }
+        let cached = *cached;
         if let Some(meta) = cached.meta {
-            self.playlist_meta.entry(id.to_string()).or_insert(meta);
+            self.playlist_meta.entry(id.clone()).or_insert(meta);
         }
         let total = cached.tracks.len() as u32;
-        self.lists.insert(id.to_string(), TrackList { tracks: cached.tracks, total, loading: false });
-        self.list_cached.insert(id.to_string());
+        let list = TrackList::new(cached.tracks, total, &mut self.list_gen);
+        self.list_disk.insert(id.clone(), ListDisk { snapshot_id: cached.snapshot_id, saved_at: cached.saved_at, gen: list.gen });
+        self.lists.insert(id.clone(), list);
+        self.list_cached.insert(id.clone());
+        // Puede ser el contexto de la sesión restaurada: su cola se arma ya con la copia.
+        self.restore_ctx_arrived(&id);
+        // Después: si la cola salió de la copia, ya no hay carga de la restauración que lo traiga.
+        self.playlist_meta_fallback(&id);
+    }
+
+    /// La copia en disco que iba a dar el nombre de una playlist de fuera de la biblioteca no lo
+    /// dio (ilegible o guardada sin metadatos) y ninguna carga lo traerá: se piden a la Web API,
+    /// como antes de esperar a la copia (ver ensure_context_meta).
+    fn playlist_meta_fallback(&mut self, id: &str) {
+        if self.playlist_meta.contains_key(id)
+            || self.playlists.iter().any(|p| p.id == id)
+            || self.pl_busy(id)
+            || self.restoring_playlist(id)
+        {
+            return;
+        }
+        self.request_once(&format!("plmeta:{id}"), Req::PlaylistMeta(id.to_string()));
+    }
+
+    /// Muestra una playlist (su copia en disco si aún no está en memoria) y pide sus pistas si
+    /// hace falta. Para la página, las secciones del inicio y la precarga: antes cada arranque
+    /// volvía a bajar entera cada playlist abierta, precargada o del inicio aunque no cambiara.
+    pub fn ensure_playlist(&mut self, id: &str) {
+        self.warm_list(id);
+        // Su copia se está leyendo: hasta tenerla no se sabe si sigue al día (`skip_unchanged`).
+        // Al llegar despierta la interfaz y se decide entonces.
+        if self.warming.contains_key(id) {
+            return;
+        }
+        if self.requested.contains(&format!("pl:{id}")) || self.skip_unchanged(id) {
+            return;
+        }
+        self.request_list(id);
+    }
+
+    /// Hay un listado de playlists de esta sesión y es reciente. Uno de hace horas ya no dice si
+    /// una playlist que se abre por primera vez sigue igual (pudo editarse en el móvil
+    /// mientras tanto): pasado LISTING_TRUST se pide como antes (y es barata: la API reutiliza
+    /// las pistas que ya tiene su copia).
+    fn listing_fresh(&self) -> bool {
+        self.playlists_fresh.is_some_and(|t| t.elapsed() < LISTING_TRUST)
+    }
+
+    /// Ya no se espera el listado pedido al conectar: llegó (y es reciente) o falló. Hasta
+    /// entonces, lo que solo se ve de paso (las secciones del inicio) se queda con su copia en
+    /// disco en vez de pedirse sin saber si cambió.
+    fn listing_settled(&self) -> bool {
+        self.listing_fresh() || !self.playlists_asked
+    }
+
+    /// La lista que se ve de esa playlist es su copia en disco y el listado de esta sesión dice
+    /// que no ha cambiado desde que se guardó (mismo snapshot_id, guardada hace menos de
+    /// LIST_UNCHANGED_SECS). Nunca con una carga en vuelo o un reintento pendiente.
+    fn list_unchanged(&self, id: &str) -> bool {
+        if !self.listing_fresh() || self.pl_busy(id) || self.list_retry.contains_key(id) {
+            return false;
+        }
+        let (Some(list), Some(disk)) = (self.lists.get(id), self.list_disk.get(id)) else { return false };
+        let Some(snap) = disk.snapshot_id.as_deref() else { return false };
+        let listed = self.playlists.iter().find(|p| p.id == id).and_then(|p| p.snapshot_id.as_deref());
+        // Una fecha futura (reloj atrasado al guardarla) no cuenta como reciente.
+        let age = crate::cache::now_secs().checked_sub(disk.saved_at);
+        list.gen == disk.gen && listed == Some(snap) && age.is_some_and(|a| a < LIST_UNCHANGED_SECS)
+    }
+
+    /// Si la copia que se ve está al día (`list_unchanged`), la da por cargada sin pedir nada:
+    /// ya no espera una versión fresca y la página no la vuelve a pedir en esta sesión (salvo
+    /// reconexión, edición o «Reintentar»).
+    fn skip_unchanged(&mut self, id: &str) -> bool {
+        if !self.list_unchanged(id) {
+            return false;
+        }
+        self.list_cached.remove(id);
+        self.list_fresh.remove(id);
+        if let Some(l) = self.lists.get_mut(id) {
+            l.loading = false;
+        }
+        self.requested.insert(format!("pl:{id}"));
+        log::info!("playlist {id}: sin cambios desde su copia en disco (snapshot_id); no se pide");
+        true
     }
 
     /// Igual que `warm_list`, para un álbum: su última copia en disco mientras llega la fresca.
     pub fn warm_album(&mut self, id: &str) {
-        if self.albums.contains_key(id) || !is_playlist_key(id) || self.requested.contains(&format!("album:{id}")) {
+        if self.albums.contains_key(id) || !is_playlist_key(id) || !self.requested.insert(format!("warmalb:{id}")) {
             return;
         }
         let path = self.lists_dir.with_file_name("albums").join(format!("{id}.json"));
@@ -1574,19 +2154,68 @@ impl App {
         let dir = self.lists_dir.with_file_name("albums");
         let path = dir.join(format!("{}.json", album.id));
         if let Ok(text) = serde_json::to_string(album) {
-            std::thread::spawn(move || {
+            // Como save_list: en orden, sin dos escrituras del mismo fichero a la vez.
+            self.disk.run(move || {
                 crate::cache::write_atomic(&path, &text);
                 crate::cache::prune_dir(&dir, CACHED_MAX);
             });
         }
     }
 
-    /// Guarda en disco (en segundo plano) la versión completa de una playlist.
-    fn save_list(&self, id: &str) {
+    /// Antigüedad de la copia en disco de una playlist (`None` si no hay copia). Una fecha en el
+    /// futuro (reloj atrasado) cuenta como recién guardada.
+    fn list_copy_age(&self, id: &str) -> Option<Duration> {
+        let modified = std::fs::metadata(self.lists_dir.join(format!("{id}.json"))).ok()?.modified().ok()?;
+        Some(modified.elapsed().unwrap_or_default())
+    }
+
+    /// Lo mismo para todas las copias, de una pasada por la carpeta: en Windows la fecha viene con
+    /// la propia enumeración, sin abrir fichero a fichero cuando hay cientos de playlists.
+    fn list_copy_ages(&self) -> HashMap<String, Duration> {
+        let Ok(dir) = std::fs::read_dir(&self.lists_dir) else { return HashMap::new() };
+        dir.flatten()
+            .filter_map(|e| {
+                let id = e.file_name().into_string().ok()?.strip_suffix(".json")?.to_string();
+                let modified = e.metadata().ok()?.modified().ok()?;
+                Some((id, modified.elapsed().unwrap_or_default()))
+            })
+            .collect()
+    }
+
+    /// Guarda los metadatos de una playlist (ya mezclados con los anteriores).
+    fn store_playlist_meta(&mut self, mut p: Playlist) {
+        // Radios y mixes: la portada generada por Spotify solo llega en el feed de inicio.
+        if p.images.as_ref().map(|v| v.is_empty()).unwrap_or(true) {
+            if let Some(it) = self.home_feed.iter().flat_map(|s| s.items.iter()).find(|it| it.uri == p.uri) {
+                p.images = it.image.as_ref().map(|u| vec![Image { url: u.clone(), width: Some(300), height: Some(300) }]);
+            }
+        }
+        self.playlist_meta.insert(p.id.clone(), p);
+    }
+
+    /// Guarda en disco (en segundo plano) la versión completa de una playlist, con el
+    /// snapshot_id de cuando se pidió y lo que dijo la API de sus metadatos.
+    fn save_list(&mut self, id: &str) {
         let Some(list) = self.lists.get(id) else { return };
-        let cached = CachedList { meta: self.playlist_meta.get(id).cloned(), tracks: list.tracks.clone() };
+        let (tracks, gen) = (list.tracks.clone(), list.gen);
+        let snapshot_id = self.pl_snap.remove(id).flatten();
+        let info = self.pl_copy_info.remove(id).unwrap_or_default();
+        let saved_at = crate::cache::now_secs();
+        self.list_disk.insert(id.to_string(), ListDisk { snapshot_id: snapshot_id.clone(), saved_at, gen });
+        let cached = CachedList {
+            meta: self.playlist_meta.get(id).cloned(),
+            tracks,
+            snapshot_id,
+            saved_at,
+            meta_at: info.meta_at,
+            country: info.country,
+        };
         let (dir, path) = (self.lists_dir.clone(), self.lists_dir.join(format!("{id}.json")));
-        std::thread::spawn(move || {
+        // En el hilo del disco y en orden con las lecturas de warm_list y el borrado de
+        // forget_list: con un hilo por guardado, dos cargas seguidas (una edición mientras
+        // llegaba) podían pisarse el mismo `.json.tmp`, o una vieja quedar encima de la última o
+        // resucitar una copia ya olvidada.
+        self.disk.run(move || {
             if let Ok(text) = serde_json::to_string(&cached) {
                 crate::cache::write_atomic(&path, &text);
                 crate::cache::prune_dir(&dir, CACHED_MAX);
@@ -1642,15 +2271,90 @@ impl App {
         let Some(map) = self.radios.as_ref() else { return };
         let path = self.lists_dir.join("radios.json");
         if let Ok(text) = serde_json::to_string(map) {
-            std::thread::spawn(move || crate::cache::write_atomic(&path, &text));
+            self.disk.run(move || crate::cache::write_atomic(&path, &text));
         }
+    }
+
+    /// Una edición propia (añadir o quitar canciones) que Spotify ya aceptó: se aplica al momento
+    /// a la lista en memoria y se pide la fresca, que la sustituye entera al terminar y la guarda
+    /// en disco. Si ya había una carga en vuelo (quizá de antes del cambio), la fresca sale detrás.
+    fn apply_playlist_edit(&mut self, id: &str, uris: &[String], add: bool) {
+        if !self.lists.contains_key(id) && !self.pl_busy(id) {
+            // Ni a la vista ni cargándose: basta con olvidar la copia del disco, que ya no es la
+            // de Spotify; se cargará entera al abrirla.
+            self.forget_list(id);
+            self.invalidate(&format!("pl:{id}"));
+            self.invalidate(&format!("warm:{id}"));
+            return;
+        }
+        // La copia que se esté leyendo es de antes del cambio: no se pone encima de él.
+        self.warming.remove(id);
+        if add {
+            // Solo las que ya están en memoria (en otra lista o en Me gusta); el resto llega con
+            // la recarga. Nunca en una carga a medias: sus lotes siguientes quedarían detrás.
+            if self.lists.get(id).is_some_and(|l| !l.loading) {
+                let me = self.my_id().map(str::to_string);
+                let today = today_utc();
+                let mut found: Vec<Track> = Vec::new();
+                for uri in uris {
+                    let Some(tid) = uri.strip_prefix("spotify:track:") else { continue };
+                    let t = self.find_loaded_track(tid).or_else(|| {
+                        self.lists.get(LIKED).and_then(|l| l.tracks.iter().find(|t| t.id.as_deref() == Some(tid)).cloned())
+                    });
+                    if let Some(mut t) = t {
+                        t.added_at = Some(today.clone());
+                        t.added_by = me.clone();
+                        found.push(t);
+                    }
+                }
+                if let Some(l) = self.lists.get_mut(id) {
+                    l.total = l.total.saturating_add(found.len() as u32);
+                    l.tracks.extend(found);
+                    l.touch(&mut self.list_gen);
+                }
+            }
+        } else {
+            // Spotify quita todas las copias de cada canción; también de lo que ya llegó aparte.
+            let gone: HashSet<&str> = uris.iter().map(String::as_str).collect();
+            if let Some(l) = self.lists.get_mut(id) {
+                let before = l.tracks.len();
+                l.tracks.retain(|t| !gone.contains(t.uri.as_str()));
+                l.total = l.total.saturating_sub((before - l.tracks.len()) as u32);
+                l.touch(&mut self.list_gen);
+            }
+            if let Some(f) = self.list_fresh.get_mut(id) {
+                f.retain(|t| !gone.contains(t.uri.as_str()));
+            }
+        }
+        self.load_playlist(id, false, true);
+    }
+
+    /// Tras vaciar `lists` (cierre de sesión, recarga de la biblioteca): las marcas de «se ve la
+    /// copia, lo fresco va aparte» ya no tienen copia detrás. Quedaban las de copias que nunca se
+    /// recargaron (precarga, fallos) y on_warmed rechazaba por ellas la copia al volver a abrir la
+    /// playlist: sin filas hasta el final de su carga. Solo siguen las de cargas en vuelo, que al
+    /// terminar sustituyen la lista entera con lo que juntaron aparte.
+    fn drop_list_staging(&mut self) {
+        let inflight: HashSet<String> = self.list_cached.iter().filter(|id| self.pl_busy(id)).cloned().collect();
+        self.list_cached.retain(|id| inflight.contains(id));
+        self.list_fresh.retain(|id, _| inflight.contains(id));
     }
 
     /// Olvida la copia en disco (la playlist cambió: no debe verse la versión vieja).
     fn forget_list(&mut self, id: &str) {
         self.list_cached.remove(id);
         self.list_fresh.remove(id);
-        let _ = std::fs::remove_file(self.lists_dir.join(format!("{id}.json")));
+        // La que se esté leyendo ya no vale.
+        self.warming.remove(id);
+        self.list_retry.remove(id);
+        self.pl_rerun.remove(id);
+        self.list_disk.remove(id);
+        // Detrás de un guardado aún encolado de esa playlist: borrarla antes lo dejaría escribirla
+        // otra vez después.
+        let path = self.lists_dir.join(format!("{id}.json"));
+        self.disk.run(move || {
+            let _ = std::fs::remove_file(path);
+        });
     }
 
     pub fn login(&mut self) {
@@ -1708,7 +2412,12 @@ impl App {
                     ui_phase("respuesta de la API", || short(format!("{:?}", r.req)));
                     self.on_api(r)
                 }
-                Msg::Image { key, image } => self.images.loaded(ctx, &key, image),
+                Msg::Image { key, image, retry } => self.images.loaded(ctx, &key, image, retry),
+                Msg::ImageDropped { key, wanted } => self.images.dropped(&key, &wanted),
+                Msg::Warmed { id, seq, list } => {
+                    ui_phase("copia de playlist leída", || id.clone());
+                    self.on_warmed(id, seq, list)
+                }
                 Msg::Media(ev) => {
                     ui_phase("tecla multimedia", || format!("{ev:?}"));
                     self.on_media(ev)
@@ -1793,7 +2502,10 @@ impl App {
                 device_id,
             } => {
                 // Foto y nombre del perfil por el protocolo interno (no gasta cuota de la Web API).
-                if !self.users.contains_key(&username) {
+                // Sale la primera, antes de la tanda de refresh_from_network; su clave se marca
+                // después de esa (que vacía `requested`), para que Resp::Me no lo pida otra vez.
+                let user_key = (!self.users.contains_key(&username)).then(|| format!("user:{username}"));
+                if user_key.is_some() {
                     self.api.send(Req::User(username.clone()));
                 }
                 self.auth = Auth::LoggedIn { username };
@@ -1817,7 +2529,10 @@ impl App {
                     }
                     self.try_decide_restore(false);
                 }
-                self.refresh_from_network();
+                self.refresh_from_network(false);
+                if let Some(k) = user_key {
+                    self.requested.insert(k);
+                }
                 if let Some(id) = self.pending_radio.take() {
                     self.api.send(Req::RadioPlaylist(id));
                 }
@@ -1843,8 +2558,17 @@ impl App {
                 self.user = None;
                 self.playlists.clear();
                 self.playlists_loaded = false;
+                self.playlists_fresh = None;
+                self.playlists_asked = false;
                 self.playlist_meta.clear();
                 self.lists.clear();
+                self.list_disk.clear();
+                self.warming.clear();
+                self.drop_list_staging();
+                self.pl_copy_info.clear();
+                self.pl_snap.clear();
+                self.page_cache.clear();
+                self.filter_cache = None;
                 self.saved_albums.clear();
                 self.followed_artists.clear();
                 self.albums.clear();
@@ -1854,8 +2578,37 @@ impl App {
                 self.following.clear();
                 self.recent.clear();
                 self.requested.clear();
+                self.prefetch_inflight = None;
+                // La precarga es de las playlists de esta cuenta: la rehace el listado de la próxima.
+                self.prefetch_ids.clear();
+                self.prefetch_at = None;
+                self.prefetch_warm = None;
+                self.list_retry.clear();
+                self.clear_restore_ctx();
+                // Las cargas en vuelo siguen contando hasta que respondan (si no, una de la
+                // sesión siguiente podría mezclarse con sus lotes), pero no se repiten.
+                self.pl_rerun.clear();
+                self.meta_after_edit.clear();
                 self.search_result = None;
+                self.search_result_for = None;
+                // La respuesta en vuelo ya no se aceptará: sin esto «Buscando» quedaría fijo.
+                self.search_loading = false;
+                self.search_pending = None;
+                self.search_retry = None;
+                self.search_retries = 0;
+                self.search_cache.clear();
+                self.search_refreshing.clear();
+                self.search_pending_profile = None;
                 self.liked_set.clear();
+                // Una recarga completa a medias no debe impedir la de la próxima sesión
+                // (request_liked_full no lanza otra mientras esta conste en curso).
+                self.liked_refresh_pending = false;
+                self.liked_reload.clear();
+                self.liked_reload_ids.clear();
+                // Sin lista no hay base: la próxima sesión recarga Me gusta y artistas enteros.
+                self.liked_synced_at = 0;
+                self.liked_server_total = 0;
+                self.artists_synced_at = 0;
                 self.devices.clear();
                 self.queue = None;
                 self.lyrics = None;
@@ -1997,6 +2750,10 @@ impl App {
             Event::Reconnected => {
                 self.status("Conexión con Spotify restablecida");
                 self.loading_since = None;
+                // Las miniaturas de artistas que fallaron con la sesión caída siguen marcadas como
+                // pedidas (para no repetirlas en cada fotograma): se pueden volver a pedir. Las
+                // que ya tienen imagen no se piden; el resto, en un lote por tarjeta a la vista.
+                self.requested.retain(|k| !k.starts_with("artistmeta:"));
                 let resume = self.reconnect_resume.take();
                 if let Some(cmd) = self.pending_load.clone() {
                     // Lo último que se pidió no llegó a sonar: se pide otra vez.
@@ -2058,7 +2815,7 @@ impl App {
                 self.request_once(&format!("trackinfo:{id}"), Req::TrackInfo(id));
             }
         }
-        self.play_log.record(played.clone());
+        std::sync::Arc::make_mut(&mut self.play_log).record(played.clone());
         // Historial en tiempo real: la canción que empieza va arriba (Spotify la registrará después).
         if self.recent.first().map(|r| r.uri != played.uri).unwrap_or(true) {
             self.recent.insert(0, played);
@@ -2098,6 +2855,67 @@ impl App {
     }
 
     fn on_api(&mut self, r: ApiResult) {
+        // Carga de playlist: con su último lote o su error deja de estar en vuelo; cada lote
+        // intermedio cuenta como noticia (una de miles de pistas puede tardar en total más que
+        // PL_INFLIGHT_STALE).
+        let pl_end = match (&r.req, &r.result) {
+            (Req::PlaylistTracks(id), Err(_) | Ok(Resp::Tracks { done: true, .. })) => {
+                self.pl_inflight.remove(id);
+                Some(id.clone())
+            }
+            (Req::PlaylistTracks(id), Ok(_)) => {
+                if let Some(t) = self.pl_inflight.get_mut(id) {
+                    *t = Instant::now();
+                }
+                None
+            }
+            _ => None,
+        };
+        // Llegó un lote fresco (aunque sea el último y vacío): la copia en disco que se esté
+        // leyendo ya no se pone. Ver `on_warmed`.
+        if let (Req::PlaylistTracks(id), Ok(Resp::Tracks { .. })) = (&r.req, &r.result) {
+            self.warming.remove(id);
+        }
+        let gone = matches!(&r.result, Err(e) if e.contains("404"));
+        // Falló lo que la restauración de la sesión espera para armar la cola: se decide antes de
+        // repartir el error, para que, si se deja, sus brazos lo traten como uno cualquiera.
+        if let Err(e) = &r.result {
+            let restoring = match &r.req {
+                Req::PlaylistTracks(id) => self.restoring_playlist(id),
+                Req::Album(id) => self.restore_ctx.as_ref().is_some_and(|(k, kind, _)| *kind == CtxKind::Album && k == id),
+                _ => false,
+            };
+            if restoring {
+                self.restore_ctx_failed(e);
+            }
+        }
+        self.dispatch_api(r);
+        // La repetición pedida mientras corría sale después de repartir esta respuesta: antes,
+        // su `list_cached` desviaría el último lote de esta y lo guardaría como la lista entera.
+        // Si la playlist ya no existe, no se repite.
+        if let Some(id) = pl_end {
+            if self.pl_rerun.remove(&id) && !gone {
+                log::info!("playlist {id}: cambió mientras se cargaba; se carga otra vez");
+                self.load_playlist(&id, false, false);
+            }
+        }
+    }
+
+    fn dispatch_api(&mut self, r: ApiResult) {
+        // La precarga en vuelo terminó (completa o con error): deja paso a la siguiente. Se mira
+        // aquí, antes de repartir, porque varios brazos de error y de pistas salen con `return`.
+        let prefetch_done = matches!(&r.req, Req::PlaylistTracks(id)
+            if self.prefetch_inflight.as_ref().is_some_and(|(p, _)| p == id))
+            && matches!(r.result, Err(_) | Ok(Resp::Tracks { done: true, .. }));
+        if prefetch_done {
+            self.prefetch_inflight = None;
+        } else if let (Req::PlaylistTracks(id), Some((p, t))) = (&r.req, self.prefetch_inflight.as_mut()) {
+            // Un lote intermedio: sigue avanzando, así que no cuenta como perdida. Una playlist de
+            // miles de pistas con el limitador frenando puede tardar más de PREFETCH_STALE en total.
+            if p == id {
+                *t = Instant::now();
+            }
+        }
         let resp = match r.result {
             Ok(resp) => resp,
             Err(e) => {
@@ -2105,15 +2923,32 @@ impl App {
                     Req::PlayerState | Req::Devices | Req::Queue => {
                         log::warn!("{e}")
                     }
-                    // Se ve la copia del disco y la fresca no llegó (sin red, límite de ritmo): se
-                    // mantiene la copia y se reintenta al volver a abrirla. Si la playlist ya no
-                    // existe (una radio caducada), se olvidan la copia y la radio.
+                    // Se ve la copia del disco (o una carga a medias) y la fresca no llegó (sin
+                    // red, límite de ritmo): se mantiene y se reintenta con espera creciente. Antes
+                    // se desmarcaba sin más y la página abierta la pedía otra vez al fotograma
+                    // siguiente, en bucle mientras durara el fallo. Si la playlist ya no existe
+                    // (una radio caducada), se olvidan la copia y la radio.
                     Req::PlaylistTracks(ref id) if self.list_cached.contains(id) => {
                         self.list_fresh.remove(id);
-                        self.requested.remove(&format!("pl:{id}"));
+                        // Lo que se ve puede ser una carga a medias de una anterior que se perdió
+                        // (load_playlist la deja a la vista): que no quede en «Cargando».
+                        if let Some(l) = self.lists.get_mut(id) {
+                            l.loading = false;
+                        }
                         if e.contains("404") {
+                            self.requested.remove(&format!("pl:{id}"));
                             self.forget_list(id);
                             self.forget_radio(id);
+                        } else if self.pl_rerun.contains(id) {
+                            // Hay otra carga pedida (una edición, una recarga forzada) que sale en
+                            // cuanto se reparta este error: esa hace de reintento.
+                        } else {
+                            self.schedule_list_retry(id, &e);
+                            // Sin reintento programado (contexto en restauración, que la repite
+                            // por su cuenta) sigue marcada, por lo mismo.
+                            if self.list_retry.contains_key(id.as_str()) {
+                                self.requested.remove(&format!("pl:{id}"));
+                            }
                         }
                         log::info!("playlist {id}: {e}; se mantiene la copia guardada");
                     }
@@ -2126,13 +2961,122 @@ impl App {
                         self.requested.remove(&format!("pl:{id}"));
                         log::info!("precarga de playlist {id} falló ({e}); se reintentará al abrirla");
                     }
+                    // Falló a medias con parte de la lista a la vista (sesión caída, límite de
+                    // librespot): antes se quedaba en «Cargando X de Y» (repintando a 4 Hz) toda
+                    // la sesión. Se conserva lo que llegó y se reintenta sola con espera; la
+                    // carga nueva se junta aparte y sustituye entera a la parcial.
+                    // También la que la página abrió vacía y falló en el primer lote (aún sin
+                    // total): si no, quedaba vacía y marcada como pedida toda la sesión.
+                    Req::PlaylistTracks(ref id)
+                        if self
+                            .lists
+                            .get(id)
+                            .is_some_and(|l| l.loading || l.tracks.is_empty() || l.tracks.len() < l.total as usize) =>
+                    {
+                        let short = match self.lists.get_mut(id) {
+                            Some(l) => {
+                                l.loading = false;
+                                l.tracks.is_empty() || l.tracks.len() < l.total as usize
+                            }
+                            None => false,
+                        };
+                        self.list_fresh.remove(id);
+                        if e.contains("404") {
+                            // Ya no existe (una radio caducada): ni copia ni reintentos, y sigue
+                            // marcada como pedida para que la página no la repita.
+                            self.forget_list(id);
+                            self.forget_radio(id);
+                            self.status_err(e);
+                        } else if self.pl_rerun.contains(id) {
+                            // Otra carga pedida sale en cuanto se reparta este error y sustituye
+                            // entera a lo que llegó: hace de reintento.
+                            log::info!("playlist {id}: {e}; se repite ya");
+                        } else if short {
+                            // Sin nada a la vista (no hay copia ni llegó ningún lote), un aviso la
+                            // primera vez: la página vacía no dice por qué. Los reintentos, callados.
+                            let nothing = self.lists.get(id).is_none_or(|l| l.tracks.is_empty());
+                            if nothing && !self.list_retry.contains_key(id.as_str()) {
+                                self.status_err(format!("No se pudo cargar la playlist ({e}); se reintentará sola"));
+                            }
+                            self.schedule_list_retry(id, &e);
+                            // Sin reintento programado (es el contexto en restauración, que la
+                            // repite por su cuenta) sigue marcada: si no, la página abierta la
+                            // pediría otra vez en el fotograma siguiente, en bucle.
+                            if self.list_retry.contains_key(id.as_str()) {
+                                self.requested.remove(&format!("pl:{id}"));
+                            }
+                        } else {
+                            log::info!("playlist {id}: {e}; se mantiene lo que llegó");
+                        }
+                    }
+                    // La página ya tiene nombre y portada por la carga de pistas: los de la Web API
+                    // solo completaban (privacidad, seguidores), así que no merece un aviso. Sigue
+                    // marcada como pedida: la página la pide en cada fotograma y, con Spotify
+                    // limitando, fallaría al momento en bucle gastando el ritmo de la búsqueda.
+                    // Se vuelve a pedir al reconectar o al editar la playlist.
+                    // Tras editar nombre, descripción o portada sí hacen falta: sin ellos se vería
+                    // la versión de antes. Salen de la playlist4 recargando sus pistas (sin vaciar
+                    // lo que se ve); sin la lista en memoria, de la carga al abrirla.
+                    Req::PlaylistMeta(ref id) if self.meta_after_edit.contains(id) => {
+                        self.meta_after_edit.remove(id);
+                        log::info!("metadatos de la playlist {id} tras editarla: {e}; se toman de la playlist4");
+                        if self.lists.contains_key(id) {
+                            self.load_playlist(id, false, true);
+                        } else {
+                            self.invalidate(&format!("pl:{id}"));
+                        }
+                    }
+                    Req::PlaylistMeta(ref id) => log::info!("metadatos de la playlist {id} por la Web API: {e}"),
                     Req::FollowContains { .. } => log::warn!("{e}"),
-                    Req::Search(_) => {
-                        self.search_loading = false;
+                    // Miniaturas de las tarjetas: sin aviso, la tarjeta deja la inicial. Siguen
+                    // marcadas como pedidas (si no, se pedirían en cada fotograma); se desmarcan
+                    // al reconectar (Event::Reconnected) o al iniciar sesión.
+                    Req::ArtistThumbs(_) => log::info!("miniaturas de artistas: {e}"),
+                    // El perfil propio que se pide al conectar deja su clave marcada (para que
+                    // Resp::Me no lo repita): si falla, se desmarca una vez, para que Resp::Me o
+                    // la página del perfil lo vuelvan a pedir en vez de quedar sin avatar ni
+                    // perfil toda la sesión. Solo una: fallando en bucle se pediría sin parar.
+                    Req::User(ref id)
+                        if matches!(&self.auth, Auth::LoggedIn { username } if username == id)
+                            && !self.requested.contains(&format!("userretry:{id}")) =>
+                    {
+                        self.requested.insert(format!("userretry:{id}"));
+                        self.requested.remove(&format!("user:{id}"));
                         self.status_err(e);
                     }
+                    // Refresco de un resultado de la caché que ya se ve: sigue a la vista, sin
+                    // aviso ni reintento; se volverá a probar la próxima vez que lo busque.
+                    Req::Search(ref q) if self.search_refreshing.contains(q.as_str()) => {
+                        self.search_refreshing.remove(q.as_str());
+                        if self.search_pending.as_deref() == Some(q.as_str()) {
+                            self.search_loading = false;
+                            self.search_pending = None;
+                        }
+                        log::info!("refresco de la búsqueda «{q}» falló ({e}); queda lo guardado");
+                    }
+                    // Solo el error de la consulta enviada la última quita «Buscando» y avisa; el
+                    // de una anterior (ya sustituida) no debe tapar la que sigue en vuelo.
+                    Req::Search(ref q) if self.search_pending.as_deref() == Some(q.as_str()) => {
+                        match crate::api::retry_secs(&e) {
+                            // Límite corto de Spotify (429): la búsqueda ya no duerme un hilo; se
+                            // repite sola cuando pasa la espera (hasta 2 veces) y «Buscando»
+                            // sigue a la vista en vez de un error que obligue a pulsar Intro.
+                            Some(n) if n <= 30 && self.search_retries < 2 => {
+                                log::info!("búsqueda «{q}» limitada por Spotify; se reintenta en {n} s");
+                                self.search_retry = Some((Instant::now() + Duration::from_secs(n), q.clone()));
+                                self.status(format!("Spotify limita; reintentando en {n} s"));
+                            }
+                            _ => {
+                                self.search_loading = false;
+                                self.search_pending = None;
+                                self.status_err(e);
+                            }
+                        }
+                    }
+                    Req::Search(ref q) => log::info!("búsqueda antigua «{q}» falló ({e}); se ignora"),
                     Req::Playlists => {
                         self.playlists_loaded = true;
+                        self.playlists_asked = false;
                         self.status_err(e);
                     }
                     Req::Liked if self.liked_refresh_pending => {
@@ -2140,11 +3084,29 @@ impl App {
                         self.liked_refresh_pending = false;
                         self.liked_reload.clear();
                         self.liked_reload_ids.clear();
-                        self.requested.remove(LIKED);
+                        let have_list = self.lists.get(LIKED).is_some_and(|l| !l.tracks.is_empty());
                         if let Some(l) = self.lists.get_mut(LIKED) {
                             l.loading = false;
                         }
-                        self.status_err(e);
+                        if have_list {
+                            // Con la copia a la vista no se vuelve a pedir en esta sesión: al abrir
+                            // la página saldría al momento y, con Spotify limitando, fallaría en
+                            // bucle. La fecha de sincronización no cambia: el próximo arranque (o
+                            // reconexión) lo reintenta en segundo plano.
+                            log::info!("recarga completa de Me gusta fallida ({e}); se mantiene la copia");
+                            // Un límite pasajero en una recarga de fondo no merece aviso: ella
+                            // sigue viendo su lista y no ha pedido nada.
+                            if crate::api::retry_secs(&e).is_none() {
+                                self.status_err(e);
+                            }
+                        } else {
+                            self.requested.remove(LIKED);
+                            self.status_err(e);
+                        }
+                    }
+                    // Igual con los artistas seguidos de la instantánea (carril de fondo).
+                    Req::FollowedArtists if self.artists_loaded && crate::api::retry_secs(&e).is_some() => {
+                        log::info!("artistas seguidos: {e}; se mantiene la copia");
                     }
                     _ if e.starts_with("Spotify ha agotado la cuota") => {
                         // Un único aviso; el resto de peticiones fallan en local sin ruido.
@@ -2196,9 +3158,10 @@ impl App {
                 if self.diag {
                     log::info!("[diag] me: id={} nombre={:?}", u.id, u.display_name);
                 }
-                // Perfil completo (foto) por el protocolo interno, para el avatar de la barra superior.
+                // Perfil completo (foto) por el protocolo interno, para el avatar de la barra
+                // superior. Con la misma clave que al conectar: si ya está en vuelo, no se repite.
                 if !self.users.contains_key(&u.id) {
-                    self.api.send(Req::User(u.id.clone()));
+                    self.request_once(&format!("user:{}", u.id), Req::User(u.id.clone()));
                 }
                 self.user = Some(u)
             }
@@ -2206,14 +3169,17 @@ impl App {
                 if self.diag {
                     log::info!("[diag] playlists: {}", p.len());
                     if let Some(first) = p.first() {
-                        self.api.send(Req::PlaylistTracks(first.id.clone()));
+                        self.load_playlist(&first.id, false, false);
                         self.api.send(Req::PlaylistMeta(first.id.clone()));
                     }
                 }
                 self.playlists = p;
                 self.playlists_loaded = true;
-                // Precarga en segundo plano: primero las fijadas, luego las propias. Así cambiar
-                // entre playlists es instantáneo (ya están en memoria al abrirlas).
+                self.playlists_fresh = Some(Instant::now());
+                self.playlists_asked = false;
+                // Precarga en segundo plano: primero las fijadas, luego las propias, de la copia en
+                // disco más reciente (las que más abre) a las que no tienen. Así cambiar entre
+                // playlists es instantáneo (ya están en memoria al abrirlas).
                 let pinned = self.settings.pinned.clone();
                 let mut order: Vec<String> = Vec::new();
                 for id in &pinned {
@@ -2221,14 +3187,24 @@ impl App {
                         order.push(id.clone());
                     }
                 }
-                let owned: Vec<String> = self.playlists.iter().filter(|p| self.is_mine(p)).map(|p| p.id.clone()).collect();
-                for id in owned {
+                let ages = self.list_copy_ages();
+                let mut owned: Vec<(String, Duration)> = self
+                    .playlists
+                    .iter()
+                    .filter(|p| self.is_mine(p))
+                    .map(|p| (p.id.clone(), ages.get(&p.id).copied().unwrap_or(Duration::MAX)))
+                    .collect();
+                owned.sort_by_key(|(_, age)| *age);
+                for (id, _) in owned {
                     if !order.contains(&id) {
                         order.push(id);
                     }
                 }
-                self.prefetch_ids = order.into_iter().take(30).collect();
-                self.prefetch_at = Some(Instant::now() + Duration::from_secs(2));
+                self.prefetch_ids = order.into_iter().take(PREFETCH_MAX).collect();
+                // No antes de 8 s desde el arranque: la ráfaga inicial (inicio, Me gusta, la sesión
+                // a restaurar) va primero y la precarga no compite con ella.
+                let launch = crate::START.get().copied().unwrap_or_else(Instant::now);
+                self.prefetch_at = Some((Instant::now() + Duration::from_secs(2)).max(launch + Duration::from_secs(8)));
                 if let Some(id) = self.pending_editor.take() {
                     if let Some(pl) = self.playlists.iter().find(|p| p.id == id).cloned() {
                         self.actions.push(Action::OpenEditor(Some(pl)));
@@ -2237,6 +3213,7 @@ impl App {
                 self.snapshot_dirty = true;
             }
             Resp::PlaylistMeta(mut p) => {
+                self.meta_after_edit.remove(&p.id);
                 if let Some(old) = self.playlist_meta.get(&p.id) {
                     if p.images.as_ref().map(|v| v.is_empty()).unwrap_or(true) {
                         p.images = old.images.clone();
@@ -2248,13 +3225,53 @@ impl App {
                         p.owner = old.owner.clone();
                     }
                 }
-                // Radios y mixes: la portada generada por Spotify solo llega en el feed de inicio.
-                if p.images.as_ref().map(|v| v.is_empty()).unwrap_or(true) {
-                    if let Some(it) = self.home_feed.iter().flat_map(|s| s.items.iter()).find(|it| it.uri == p.uri) {
-                        p.images = it.image.as_ref().map(|u| vec![Image { url: u.clone(), width: Some(300), height: Some(300) }]);
-                    }
+                self.store_playlist_meta(p);
+            }
+            Resp::PlaylistMetaPartial(p) => {
+                if matches!(r.req, Req::PlaylistMeta(_)) {
+                    self.meta_after_edit.remove(&p.id);
                 }
-                self.playlist_meta.insert(p.id.clone(), p);
+                // De playlist4 (llega con cada carga de pistas, también de la precarga y la
+                // restauración): manda en nombre, portada, descripción, tamaño y si es
+                // colaborativa. Propietario, privacidad y seguidores no los trae: se conservan
+                // los de la Web API o la biblioteca. Si no, sus propias playlists perderían
+                // «Tu playlist», el menú de edición y la privacidad (la página prefiere esta
+                // entrada a la de la biblioteca).
+                let base = self
+                    .playlist_meta
+                    .get(&p.id)
+                    .or_else(|| self.playlists.iter().find(|x| x.id == p.id))
+                    .cloned();
+                let merged = match base {
+                    Some(mut m) => {
+                        if !p.name.is_empty() {
+                            m.name = p.name;
+                        }
+                        if p.images.as_ref().is_some_and(|v| !v.is_empty()) {
+                            m.images = p.images;
+                        }
+                        // En las de usuarios playlist4 es la fuente de la descripción: vacía es que
+                        // la borró. Conservar la anterior (de una copia en disco o de la biblioteca)
+                        // la dejaría en el editor y guardar otro cambio la volvería a poner. En las
+                        // de Spotify sí se conserva la que trajo el feed si playlist4 no trae.
+                        if p.description.is_some() || !p.id.starts_with("37i9dQZ") {
+                            m.description = p.description;
+                        }
+                        m.tracks = p.tracks.or(m.tracks);
+                        m.collaborative = p.collaborative.or(m.collaborative);
+                        m.owner.display_name = m.owner.display_name.or(p.owner.display_name);
+                        m.owner.id = m.owner.id.or(p.owner.id);
+                        m.public = m.public.or(p.public);
+                        m.followers = m.followers.or(p.followers);
+                        m
+                    }
+                    None => p,
+                };
+                self.store_playlist_meta(merged);
+            }
+            // Llega justo antes del último lote; save_list lo guarda con la copia.
+            Resp::PlaylistCopyInfo { id, meta_at, country } => {
+                self.pl_copy_info.insert(id, CopyInfo { meta_at, country: Some(country) });
             }
             Resp::Tracks {
                 key,
@@ -2266,27 +3283,48 @@ impl App {
                     log::info!("[diag] tracks key={key} +{} total={total} done={done}", tracks.len());
                 }
                 if key == "liked_recent" {
-                    // Fusiona lo guardado recientemente con la lista de la instantánea.
+                    // Fusiona lo guardado recientemente con la lista de la instantánea. Entran
+                    // también las que se marcaron aquí sin tener la fila a mano (set_liked solo
+                    // sabía el id): ahora que la recarga completa es semanal, si no, tardarían días.
                     let list = self.lists.entry(LIKED.to_string()).or_default();
-                    let mut fresh: Vec<Track> = tracks
-                        .into_iter()
-                        .filter(|t| t.id.as_ref().map(|id| !self.liked_set.contains(id)).unwrap_or(false))
-                        .collect();
-                    for t in &fresh {
-                        if let Some(id) = &t.id {
-                            self.liked_set.insert(id.clone());
+                    let mut in_list: HashSet<String> = list.tracks.iter().filter_map(|t| t.id.clone()).collect();
+                    let mut fresh: Vec<Track> = Vec::new();
+                    // Solo las de otro dispositivo cuentan: las de aquí ya sumaron en set_liked.
+                    let mut elsewhere: u64 = 0;
+                    for t in tracks {
+                        let Some(id) = t.id.clone() else { continue };
+                        if !in_list.insert(id.clone()) {
+                            continue;
                         }
+                        if self.liked_set.insert(id) {
+                            elsewhere += 1;
+                        }
+                        fresh.push(t);
                     }
                     if !fresh.is_empty() {
                         fresh.extend(std::mem::take(&mut list.tracks));
                         list.tracks = fresh;
+                        list.touch(&mut self.list_gen);
                     }
-                    list.total = total.max(list.tracks.len() as u32);
+                    // La cuenta de Spotify tal cual (sin max): max() escondía lo quitado fuera.
+                    list.total = total;
                     list.loading = false;
+                    // Si Spotify no dice lo esperado (la base más lo nuevo de fuera), se quitó algo
+                    // en otro dispositivo o hay más nuevas de las que caben en dos páginas: toca
+                    // reconciliar entera, en segundo plano. La base suma lo nuevo y no se iguala a
+                    // la cuenta: así el descuadre sigue a la vista (y se reintenta) hasta que una
+                    // recarga completa termine.
+                    let expected = self.liked_server_total + elsewhere;
+                    self.liked_server_total = expected;
+                    if total as u64 != expected {
+                        self.request_liked_full(&format!("Spotify dice {total} y se esperaban {expected}"));
+                    }
                     if let Some(id) = self.player.now.as_ref().and_then(|n| n.id.clone()) {
                         self.player.liked = Some(self.liked_set.contains(&id));
                     }
                     self.snapshot_dirty = true;
+                    // Lo guardado en otro dispositivo puede ser justo la pista restaurada.
+                    self.restore_ctx_arrived(LIKED);
                     return;
                 }
                 let mut tracks = tracks;
@@ -2304,12 +3342,21 @@ impl App {
                         self.liked_set = std::mem::take(&mut self.liked_reload_ids);
                         let list = self.lists.entry(LIKED.to_string()).or_default();
                         list.tracks = fresh;
+                        list.touch(&mut self.list_gen);
                         list.total = total.max(list.tracks.len() as u32);
                         list.loading = false;
+                        // La cuenta cruda de Spotify, no la de filas: las no disponibles, las sin
+                        // uri y el tope de páginas la dejan por encima, y comparar con las filas
+                        // pedía otra recarga completa en cada arranque.
+                        self.liked_server_total = total as u64;
+                        self.liked_synced_at = crate::cache::now_secs();
                         if let Some(id) = self.player.now.as_ref().and_then(|n| n.id.clone()) {
                             self.player.liked = Some(self.liked_set.contains(&id));
                         }
                         self.snapshot_dirty = true;
+                        // La recarga completa (sin instantánea, la única vía) puede traer la pista
+                        // de una sesión restaurada desde Me gusta: se arma ya su cola.
+                        self.restore_ctx_arrived(LIKED);
                     } else if let Some(list) = self.lists.get_mut(LIKED) {
                         list.total = total;
                     }
@@ -2328,6 +3375,7 @@ impl App {
                         self.snapshot_dirty = true;
                     }
                 }
+                let mut keep_shown = false;
                 if self.list_cached.contains(&key) {
                     // Se está viendo la copia del disco: la fresca se junta aparte y la sustituye
                     // entera al final (sin encoger a 100 filas mientras llega el resto).
@@ -2340,29 +3388,64 @@ impl App {
                     self.list_cached.remove(&key);
                     if let Some(l) = self.lists.get_mut(&key) {
                         l.loading = false;
+                        // Llegó con huecos (lotes que fallaron) y lo que se ve (la copia del
+                        // disco) no es más corto: se queda esa en vez de una lista agujereada.
+                        if is_playlist_key(&key) && list_short(tracks.len(), total) && l.tracks.len() >= tracks.len() {
+                            log::info!("playlist {key}: llegaron {} de {total} pistas; se mantiene la que se ve", tracks.len());
+                            keep_shown = true;
+                        } else if self.pl_rerun.contains(&key) {
+                            // Cambió mientras llegaba (una edición ya aplicada a lo que se ve):
+                            // esta puede ser de antes y desharía el cambio un momento. Se queda la
+                            // que se ve hasta la carga que sale ahora detrás.
+                            keep_shown = true;
+                        } else if is_playlist_key(&key) && tracks.len() > total as usize {
+                            // Una sola carga nunca trae más filas que posiciones: se mezclaron dos
+                            // (una dada por perdida que sí respondió). No se ve ni se guarda.
+                            log::warn!("playlist {key}: llegaron {} filas para {total} posiciones; se descarta", tracks.len());
+                            keep_shown = true;
+                        }
                     }
                 }
                 let list_key = key.clone();
-                let list = self.lists.entry(key).or_default();
-                if !list.loading {
-                    // Primer lote de una carga nueva: sustituye a la lista anterior en vez de
-                    // anexarse a ella (si no, cada recarga duplicaba las canciones).
-                    list.tracks.clear();
-                }
-                list.tracks.extend(tracks);
-                list.total = total;
-                list.loading = !done;
-                if self.diag {
-                    log::info!("[diag] lista {} -> {} pistas", list_key, list.tracks.len());
-                }
-                if done && is_playlist_key(&list_key) {
-                    self.save_list(&list_key);
-                }
-                if let Some((ctx, cur)) = self.restore_ctx.clone() {
-                    if ctx == list_key && self.build_context_queue(&ctx, &cur) {
-                        self.restore_ctx = None;
+                if !keep_shown {
+                    let list = self.lists.entry(key).or_default();
+                    if !list.loading {
+                        // Primer lote de una carga nueva: sustituye a la lista anterior en vez de
+                        // anexarse a ella (si no, cada recarga duplicaba las canciones).
+                        list.tracks.clear();
+                    }
+                    list.tracks.extend(tracks);
+                    list.touch(&mut self.list_gen);
+                    list.total = total;
+                    list.loading = !done;
+                    if self.diag {
+                        log::info!("[diag] lista {} -> {} pistas", list_key, list.tracks.len());
                     }
                 }
+                if done && is_playlist_key(&list_key) {
+                    let short = self.lists.get(&list_key).is_some_and(|l| list_short(l.tracks.len(), l.total));
+                    if short {
+                        // Con huecos no se guarda: en disco quedaría como buena y se vería así al
+                        // abrirla. No se reintenta sola (las que faltan pueden no volver nunca),
+                        // pero la página ofrece «Reintentar».
+                        log::info!("playlist {list_key}: incompleta; no se guarda en disco");
+                        self.list_retry.insert(list_key.clone(), (None, LIST_RETRY_DELAYS.len() as u8));
+                        self.requested.remove(&format!("pl:{list_key}"));
+                    } else {
+                        self.list_retry.remove(&list_key);
+                        // Con una repetición pendiente (una edición mientras llegaba) esta puede ser
+                        // de antes del cambio: guarda la que sale detrás. Con más filas que
+                        // posiciones se mezclaron dos cargas: en disco quedaría con repetidas.
+                        let mixed = self.lists.get(&list_key).is_some_and(|l| l.tracks.len() > l.total as usize);
+                        if mixed && !keep_shown {
+                            log::warn!("playlist {list_key}: más filas que posiciones; no se guarda en disco");
+                        }
+                        if !keep_shown && !mixed && !self.pl_rerun.contains(&list_key) {
+                            self.save_list(&list_key);
+                        }
+                    }
+                }
+                self.restore_ctx_arrived(&list_key);
             }
             Resp::SavedAlbums(a) => {
                 self.saved_albums = a;
@@ -2375,21 +3458,70 @@ impl App {
                 }
                 self.followed_artists = a;
                 self.artists_loaded = true;
+                self.artists_synced_at = crate::cache::now_secs();
                 self.snapshot_dirty = true;
             }
-            Resp::Album(a) => {
+            Resp::Album(mut a) => {
                 let id = a.id.clone();
+                // Los géneros llegan aparte (Resp::Genres) y pueden adelantarse a una respuesta
+                // que salió sin ellos: no se pierden.
+                if a.genres.is_empty() {
+                    if let Some(old) = self.albums.get(&id).filter(|o| !o.genres.is_empty()) {
+                        a.genres = old.genres.clone();
+                    }
+                }
                 self.save_album(&a);
                 self.albums.insert(a.id.clone(), a);
-                if let Some((ctx, cur)) = self.restore_ctx.clone() {
-                    if ctx == id && self.build_context_queue(&ctx, &cur) {
-                        self.restore_ctx = None;
+                self.restore_ctx_arrived(&id);
+            }
+            Resp::Artist(mut a) => {
+                let page = self.artists.entry(a.id.clone()).or_default();
+                // Lo mismo con los géneros del artista, y con los seguidores: el de los metadatos
+                // internos (respaldo de /artists, otra página que lo pide con Spotify limitando)
+                // no los trae y no debe borrar los que ya llegaron.
+                if let Some(old) = page.artist.as_ref() {
+                    if a.genres.is_empty() && !old.genres.is_empty() {
+                        a.genres = old.genres.clone();
+                    }
+                    if a.followers.as_ref().and_then(|f| f.total).is_none() && old.followers.is_some() {
+                        a.followers = old.followers.clone();
+                    }
+                }
+                page.artist = Some(a);
+            }
+            Resp::ArtistThumbs(list) => {
+                // Solo completan lo que falta: una miniatura que llega tarde no debe pisar al
+                // artista entero de su página (seguidores, géneros), que llega por Req::Artist.
+                for a in list {
+                    let page = self.artists.entry(a.id.clone()).or_default();
+                    match page.artist.as_mut() {
+                        None => page.artist = Some(a),
+                        Some(old) => {
+                            if old.images.is_empty() {
+                                old.images = a.images;
+                            }
+                            if old.genres.is_empty() {
+                                old.genres = a.genres;
+                            }
+                        }
                     }
                 }
             }
-            Resp::Artist(a) => {
-                let id = a.id.clone();
-                self.artists.entry(id).or_default().artist = Some(a);
+            Resp::Genres { key, genres } => {
+                // Del carril de enriquecimiento, cuando la página ya se ve. Lo que no esté en
+                // memoria no importa: la próxima respuesta del álbum o artista ya los trae.
+                if let Some(id) = key.strip_prefix("album:") {
+                    if let Some(a) = self.albums.get_mut(id) {
+                        a.genres = genres;
+                    }
+                    if let Some(a) = self.albums.get(id) {
+                        self.save_album(a);
+                    }
+                } else if let Some(id) = key.strip_prefix("artist:") {
+                    if let Some(a) = self.artists.get_mut(id).and_then(|p| p.artist.as_mut()) {
+                        a.genres = genres;
+                    }
+                }
             }
             Resp::ArtistTop(t) => {
                 if let Req::ArtistTop(id) = r.req {
@@ -2428,20 +3560,37 @@ impl App {
             }
             Resp::Search(s) => {
                 // Dos búsquedas seguidas pueden responder desordenadas: solo vale la de la
-                // consulta actual (si el usuario ya ha vuelto a escribir, se ignora la vieja).
-                let stale = matches!(&r.req, Req::Search(q) if q.trim() != self.search_query.trim() && !self.search_query.trim().is_empty());
-                if !stale {
-                    self.search_result = Some(s);
-                    self.search_loading = false;
+                // consulta enviada la última. Se compara con lo enviado, no con el texto de la
+                // caja: si ella edita tras pulsar Intro, la respuesta llega igual y «Buscando»
+                // no se queda fijo.
+                if let Req::Search(q) = r.req {
+                    let refresh = self.search_refreshing.remove(&q);
+                    let current = self.search_pending.as_ref() == Some(&q);
+                    if current {
+                        self.search_loading = false;
+                        self.search_pending = None;
+                    }
+                    // Un refresco que vuelve vacío (pathfinder sin nada y la Web API caída) no
+                    // tapa lo guardado que ya se ve. Las respuestas que no se muestran también se
+                    // guardan: valen para su consulta, y si ella vuelve a escribirla aparece al
+                    // instante.
+                    if current && !(refresh && search_is_empty(&s)) {
+                        self.cache_search(&q, s.clone());
+                        self.search_result = Some(s);
+                        self.search_result_for = Some(q);
+                    } else {
+                        self.cache_search(&q, s);
+                    }
                 }
             }
             Resp::Recent(t) => {
                 if !self.play_log.seeded {
                     // Primera vez: el historial de Spotify sirve de semilla del registro local.
+                    let plays = std::sync::Arc::make_mut(&mut self.play_log);
                     for tr in t.iter().rev() {
-                        self.play_log.record(tr.clone());
+                        plays.record(tr.clone());
                     }
-                    self.play_log.seeded = true;
+                    plays.seeded = true;
                     self.play_log_dirty = true;
                 }
                 self.recent = t;
@@ -2621,12 +3770,31 @@ impl App {
                 self.go(Page::Playlist(id));
             }
             Resp::PlaylistChanged(id) => {
-                // Recarga metadatos y pistas de esa playlist y la lista de la biblioteca.
-                self.playlist_meta.remove(&id);
-                self.lists.remove(&id);
-                self.forget_list(&id);
-                self.invalidate(&format!("plmeta:{id}"));
-                self.invalidate(&format!("pl:{id}"));
+                // La edición le da otro snapshot_id. Hasta que llegue el listado nuevo (se pide
+                // abajo), el que se tiene ya no vale para dar por buena su copia en disco, ni
+                // para guardarlo con la recarga que sale ahora.
+                if let Some(p) = self.playlists.iter_mut().find(|p| p.id == id) {
+                    p.snapshot_id = None;
+                }
+                match &r.req {
+                    // Añadir o quitar: se aplica ya a la lista que se ve y la fresca la sustituye
+                    // al llegar. Antes se borraba y la página abierta volvía de 100 en 100.
+                    Req::AddToPlaylist { uris, .. } => self.apply_playlist_edit(&id, uris, true),
+                    Req::RemoveFromPlaylist { uris, .. } => self.apply_playlist_edit(&id, uris, false),
+                    // Nombre, descripción, privacidad, portada o seguirla: las pistas no cambian;
+                    // solo se piden otra vez los metadatos.
+                    other => {
+                        self.invalidate(&format!("plmeta:{id}"));
+                        // Seguirla o dejarla solo cambia la biblioteca (Req::Playlists, abajo): la
+                        // página abierta los vuelve a pedir si le hacen falta, sin gastar una
+                        // lectura de la Web API por cada clic desde un menú.
+                        if matches!(other, Req::UpdatePlaylist { .. } | Req::SetPlaylistImage { .. }) {
+                            self.playlist_meta.remove(&id);
+                            self.meta_after_edit.insert(id.clone());
+                            self.request_once(&format!("plmeta:{id}"), Req::PlaylistMeta(id.clone()));
+                        }
+                    }
+                }
                 self.api.send(Req::Playlists);
                 if let Some(ed) = self.editor.as_mut() {
                     ed.busy = false;
@@ -2747,32 +3915,91 @@ impl App {
 
     /// Refresca en segundo plano lo que ya se muestra desde la instantánea. Me gusta y
     /// artistas seguidos son la fuente de verdad de los corazones y de «Siguiendo» (Spotify
-    /// no permite consultarlo pista a pista), así que se cargan aquí.
-    fn refresh_from_network(&mut self) {
+    /// no permite consultarlo pista a pista), así que se cargan aquí. `force` (tras conectar la
+    /// app propia) recarga además Me gusta y los artistas enteros aunque estén al día.
+    fn refresh_from_network(&mut self, force: bool) {
         let have_snapshot = self.lists.contains_key(LIKED);
         self.requested.retain(|k| k == "albums" || k == "artists" || k == LIKED);
+        // El listado que se tenga (de la instantánea, o de antes de una caída de la sesión) ya
+        // no dice si las copias siguen al día: hasta que llegue el que se pide abajo, lo que
+        // se abra se pide.
+        self.playlists_fresh = None;
+        self.playlists_asked = true;
+        // La lista de playlists que se pide aquí vuelve a armar la precarga: una que quedara en
+        // vuelo de la sesión anterior (quizá sin respuesta) no debe frenarla.
+        self.prefetch_inflight = None;
         // Primero el estado del reproductor: decide la restauración de la sesión y el worker
         // de la API es secuencial (detrás del inicio y las playlists tardaba segundos).
+        // Inicio, playlists, recientes y perfil siguen en primer plano: la portada y la barra
+        // lateral los esperan.
         self.api.send(Req::PlayerState);
         self.api.send(Req::Me);
         self.api.send(Req::HomeFeed);
         self.api.send(Req::Playlists);
         self.api.send(Req::Recent);
-        self.api.send(Req::FollowedArtists);
-        self.requested.insert("artists".to_string());
-        let stale = self.snapshot_age.map(|a| a > 6 * 3600).unwrap_or(true);
-        // Instantánea incompleta (p. ej. una recarga cortada por la cuota): se recarga entera.
-        let incomplete = self
+        let now = crate::cache::now_secs();
+        // Artistas seguidos: antes en cada arranque y cada reconexión; ahora solo sin copia o si
+        // la copia ya tiene unas horas, y por el carril de fondo (la de la instantánea ya se ve).
+        // Va antes que Me gusta: el carril es uno y en orden. Sin copia va en primer plano: el
+        // de fondo falla al primer 429 (la identidad de primera parte en frío los da al arrancar)
+        // y «artists» quedaría pedido sin respuesta, con «Siguiendo» vacío toda la sesión.
+        if !self.artists_loaded {
+            self.api.send(Req::FollowedArtists);
+            self.requested.insert("artists".to_string());
+        } else if force || now.saturating_sub(self.artists_synced_at) > ARTISTS_SYNC_SECS {
+            self.api.send_bg(Req::FollowedArtists);
+            self.requested.insert("artists".to_string());
+        }
+        // Me gusta: con copia, siempre lo reciente (1-2 páginas en primer plano); su respuesta
+        // compara la cuenta de Spotify con la esperada y pide la recarga completa si no cuadra.
+        // La completa sale ya solo sin copia, si la última tiene más de una semana o si la cuenta
+        // no cuadraba desde la sesión anterior (una reconciliación pendiente o que falló). Ya no
+        // cuenta la edad de la instantánea: cambia con cada guardado, no con cada sincronización.
+        if have_snapshot {
+            // Con la copia a la vista, la página no debe pedir la lista por su cuenta: esa carga
+            // simple descarta lo que ya está en liked_set y dejaría la lista casi vacía.
+            self.requested.insert(LIKED.to_string());
+            self.api.send(Req::LikedRecent);
+        }
+        let synced_ago = now.saturating_sub(self.liked_synced_at);
+        let mismatch = self
             .lists
             .get(LIKED)
-            .map(|l| l.total as usize > l.tracks.len() + 5)
-            .unwrap_or(true);
-        if have_snapshot && !stale && !incomplete {
-            // Solo lo añadido recientemente: dos páginas en vez de veinte.
-            self.api.send(Req::LikedRecent);
+            .is_some_and(|l| l.total as u64 != self.liked_server_total);
+        let why = if !have_snapshot {
+            Some("sin copia")
+        } else if force {
+            Some("recarga pedida")
+        } else if synced_ago > LIKED_FULL_SYNC_SECS {
+            Some("última sincronización completa hace más de una semana")
+        } else if mismatch {
+            Some("la cuenta no cuadraba con la última sincronización")
         } else {
-            self.liked_refresh_pending = true;
-            self.requested.insert(LIKED.to_string());
+            None
+        };
+        match why {
+            Some(why) => self.request_liked_full(why),
+            None => log::info!("Me gusta: solo lo reciente (sincronizada hace {} h)", synced_ago / 3600),
+        }
+    }
+
+    /// Recarga completa de Me gusta por el carril de fondo. Se junta aparte y sustituye a la
+    /// lista al terminar (ver `liked_refresh_pending`). Nunca dos a la vez: la segunda se
+    /// mezclaría con la primera y, tras el `done` de esta, sus páginas vaciarían la lista.
+    /// Sin lista a la vista (primer arranque) va en primer plano, como antes: ella la está
+    /// esperando y el carril de fondo, que falla al primer 429, la dejaría sin corazones.
+    fn request_liked_full(&mut self, why: &str) {
+        if self.liked_refresh_pending {
+            log::info!("Me gusta: {why}; ya hay una recarga completa en curso");
+            return;
+        }
+        self.liked_refresh_pending = true;
+        self.requested.insert(LIKED.to_string());
+        if self.lists.get(LIKED).is_some_and(|l| !l.tracks.is_empty()) {
+            log::info!("Me gusta: recarga completa en segundo plano ({why})");
+            self.api.send_bg(Req::Liked);
+        } else {
+            log::info!("Me gusta: recarga completa ({why})");
             self.api.send(Req::Liked);
         }
     }
@@ -2780,16 +4007,22 @@ impl App {
     /// Vuelve a pedir todo lo que depende de la Web API (tras conectar la app propia).
     pub fn reload_library(&mut self) {
         self.requested.clear();
+        self.prefetch_inflight = None;
+        // Las listas a medias se descartan abajo: se piden de nuevo al abrirlas.
+        self.list_retry.clear();
         self.playlists_loaded = false;
         // Lo que ya se ve se conserva hasta que llegue lo nuevo: si la red falla (cuota, sin
         // conexión) la biblioteca no se queda vacía ni la instantánea se guarda a ceros.
         self.lists.retain(|k, _| k == LIKED);
+        self.warming.clear();
+        self.drop_list_staging();
+        self.page_cache.retain(|k, _| k == LIKED);
+        self.filter_cache = None;
         self.albums.clear();
         self.artists.clear();
         self.users.clear();
         self.user_playlists.clear();
-        self.snapshot_age = None;
-        self.refresh_from_network();
+        self.refresh_from_network(true);
     }
 
     /// Busca el objeto `Track` completo de una canción por id entre las listas ya cargadas
@@ -2814,23 +4047,35 @@ impl App {
             // gustan» (sin esperar a recargar desde Spotify). Se toma el objeto Track completo de
             // alguna lista ya cargada (la que se está viendo, la cola, el álbum…).
             if nuevo {
-                if let Some(track) = self.find_loaded_track(id) {
-                    if let Some(list) = self.lists.get_mut(LIKED) {
+                // En Spotify hay una más aunque aquí no se tenga la fila (entra con lo reciente
+                // del próximo arranque): la cuenta y la base siguen al id, no a la fila, para que
+                // LikedRecent no lo tome por un cambio hecho fuera y pida una recarga completa.
+                self.liked_server_total += 1;
+                let track = self.find_loaded_track(id);
+                if let Some(list) = self.lists.get_mut(LIKED) {
+                    list.total = list.total.saturating_add(1);
+                    if let Some(track) = track {
                         if !list.tracks.iter().any(|t| t.id.as_deref() == Some(id)) {
                             list.tracks.insert(0, track);
-                            list.total = list.total.saturating_add(1);
+                            list.touch(&mut self.list_gen);
                         }
                     }
                 }
             }
         } else {
-            self.liked_set.remove(id);
+            let estaba = self.liked_set.remove(id);
+            if estaba {
+                self.liked_server_total = self.liked_server_total.saturating_sub(1);
+            }
             // Al quitar el like, la canción desaparece al instante de «Canciones que te gustan»
             // (no se espera a recargar desde Spotify).
             if let Some(list) = self.lists.get_mut(LIKED) {
                 let before = list.tracks.len();
                 list.tracks.retain(|t| t.id.as_deref() != Some(id));
                 if list.tracks.len() != before {
+                    list.touch(&mut self.list_gen);
+                }
+                if estaba || list.tracks.len() != before {
                     list.total = list.total.saturating_sub(1);
                 }
             }
@@ -2915,6 +4160,11 @@ impl App {
             self.api.send(Req::Devices);
             self.api.send(Req::Queue);
             self.api.send(Req::LikedRecent);
+            // Se marca como la consulta en vuelo; si no, su respuesta se ignoraría.
+            self.search_pending = Some("daft punk".to_string());
+            self.search_refreshing.clear();
+            self.search_retry = None;
+            self.search_retries = 0;
             self.api.send(Req::Search("daft punk".to_string()));
             self.api.send(Req::Album("4m2880jivSbbyEGAKfITCa".to_string()));
             self.api.send(Req::Artist("4tZwfgrHOc3mvqYlEYSvVi".to_string()));
@@ -2969,24 +4219,126 @@ impl App {
         }
         self.flush_volume(ctx);
         self.poll_restore_queue(ctx);
-        // Precarga suave de playlists (una cada 250 ms) para que abrirlas sea instantáneo.
+        // Búsqueda limitada por Spotify (429 corto): se repite sola al pasar la espera, solo si
+        // ella no ha lanzado otra consulta mientras tanto.
+        if let Some(at) = self.search_retry.as_ref().map(|r| r.0) {
+            let now = Instant::now();
+            if now >= at {
+                if let Some((_, q)) = self.search_retry.take() {
+                    if self.search_pending.as_deref() == Some(q.as_str()) {
+                        self.search_retries += 1;
+                        log::info!("reintento {} de la búsqueda «{q}»", self.search_retries);
+                        self.api.send(Req::Search(q));
+                    }
+                }
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
+        // Precarga suave de playlists para que abrirlas sea instantáneo: de una en una, la
+        // siguiente cuando termina la anterior (o si su respuesta se perdió). Antes salía una cada
+        // 500 ms sin esperar y llenaba la cola de la API delante de lo que ella abría o buscaba.
         if let Some(at) = self.prefetch_at {
-            if Instant::now() >= at && self.logged_in() {
+            let now = Instant::now();
+            let busy = self.prefetch_inflight.as_ref().map(|(_, t)| now.duration_since(*t)).filter(|d| *d < PREFETCH_STALE);
+            if now < at {
+                ctx.request_repaint_after(at - now);
+            } else if let Some(waited) = busy {
+                // Al terminar la respuesta repinta sola; esto es solo por si se pierde.
+                ctx.request_repaint_after(PREFETCH_STALE - waited);
+            } else if self.logged_in() {
+                if let Some((lost, _)) = self.prefetch_inflight.take() {
+                    log::info!("precarga de playlist {lost}: sin respuesta en {} s; se sigue con la siguiente", PREFETCH_STALE.as_secs());
+                }
                 while let Some(id) = self.prefetch_ids.pop_front() {
-                    if self.lists.contains_key(&id) || self.requested.contains(&format!("pl:{id}")) {
+                    // Vuelve de esperar su copia del disco: estar en memoria (es esa copia) no la
+                    // descarta, aún falta decidir si pedirla.
+                    // Solo se suelta con la suya: si el listado rehízo la cola mientras se leía,
+                    // otra delante no le quita la marca y, al llegarle el turno, aún se decide.
+                    let warmed = self.prefetch_warm.as_deref() == Some(id.as_str());
+                    if warmed {
+                        self.prefetch_warm = None;
+                    }
+                    // La que ya está en memoria o pedida (página abierta, restauración de la
+                    // sesión) no se pide otra vez: dos cargas de una misma playlist a la vez
+                    // mezclan sus lotes.
+                    let restoring = self.restoring_playlist(&id);
+                    if (self.lists.contains_key(&id) && !warmed)
+                        || self.requested.contains(&format!("pl:{id}"))
+                        || self.pl_busy(&id)
+                        || restoring
+                    {
                         continue;
                     }
-                    self.request_once(&format!("pl:{id}"), Req::PlaylistTracks(id.clone()));
+                    // Con el listado de esta sesión, la copia en disco dice si hace falta pedirla:
+                    // se pone en memoria (al abrirla se ve al instante) y, si su snapshot_id es el
+                    // del listado, no se pide nada. Antes cada arranque volvía a bajar entera cada
+                    // playlist precargada. Una lectura del disco cada vez: varias seguidas, de
+                    // listas de miles de pistas, ocuparían el hilo del disco delante de lo demás.
+                    let read = warmed || (self.listing_fresh() && !self.requested.contains(&format!("warm:{id}")));
+                    if read {
+                        self.warm_list(&id);
+                        if self.warming.contains_key(&id) {
+                            // Se lee en el hilo del disco: su llegada despierta la interfaz y se
+                            // sigue entonces por esta misma.
+                            self.prefetch_warm = Some(id.clone());
+                            self.prefetch_ids.push_front(id);
+                            break;
+                        }
+                        if self.skip_unchanged(&id) {
+                            ctx.request_repaint();
+                            break;
+                        }
+                    }
+                    // Copia reciente sin snapshot_id con que compararla (de antes de guardarlo, o
+                    // sin listado de esta sesión): no se pide, y al abrirla se refresca entonces.
+                    let comparable = self.listing_fresh() && self.list_disk.get(&id).is_some_and(|d| d.snapshot_id.is_some());
+                    if !comparable && self.list_copy_age(&id).is_some_and(|age| age < PREFETCH_FRESH) {
+                        if read {
+                            ctx.request_repaint();
+                            break;
+                        }
+                        continue;
+                    }
+                    log::info!("precarga de playlist {id}");
+                    self.load_playlist(&id, false, false);
+                    self.prefetch_inflight = Some((id, now));
                     break;
                 }
-                self.prefetch_at = if self.prefetch_ids.is_empty() {
-                    None
-                } else {
-                    Some(Instant::now() + Duration::from_millis(500))
-                };
-                if self.prefetch_at.is_some() {
-                    ctx.request_repaint_after(Duration::from_millis(500));
+                if self.prefetch_ids.is_empty() {
+                    self.prefetch_at = None;
                 }
+            }
+        }
+        // Playlists que se quedaron a medias: el reintento que toque, solo con sesión. Con el
+        // aviso de cuota a la vista Spotify está limitando: se espera a que se vaya (8 s).
+        if !self.list_retry.is_empty() && self.logged_in() {
+            let now = Instant::now();
+            let mut due: Vec<String> = Vec::new();
+            let mut next: Option<Instant> = None;
+            for (id, (at, _)) in &self.list_retry {
+                match *at {
+                    Some(at) if at <= now => due.push(id.clone()),
+                    Some(at) => next = Some(next.map_or(at, |n| n.min(at))),
+                    None => {}
+                }
+            }
+            let quota = self.status.as_ref().is_some_and(|s| s.0.starts_with("Spotify ha agotado"));
+            if !due.is_empty() && quota {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            } else {
+                for id in due {
+                    // La restauración de la sesión ya la pide por su cuenta.
+                    if self.restoring_playlist(&id) {
+                        self.list_retry.remove(&id);
+                        continue;
+                    }
+                    log::info!("playlist {id}: reintento automático");
+                    self.retry_list(&id);
+                }
+            }
+            if let Some(at) = next {
+                ctx.request_repaint_after(at - now);
             }
         }
         // Cola tras restaurar: reintentos cada ~1,2 s hasta que llegue con contenido (máx. 8).
@@ -3352,6 +4704,7 @@ impl App {
                     }
                     self.settings.save(&self.paths);
                 }
+                Action::RetryList(id) => self.retry_list(&id),
             }
         }
     }
@@ -3637,70 +4990,237 @@ impl App {
     }
 
 
-    /// Prepara la cola desde las pistas del contexto (playlist/álbum): si ya están en memoria
-    /// las usa; si no, las pide y se arma al llegar (Resp::Tracks / Resp::Album).
+    /// Prepara la cola desde las pistas del contexto (playlist, álbum o Me gusta): de memoria o
+    /// de la copia en disco, sin petición alguna; si no están (o la copia no tiene la pista
+    /// actual), se piden una vez en cuanto haya sesión y se arma al llegar (Resp::Tracks /
+    /// Resp::Album).
     fn prepare_context_queue(&mut self, context_uri: Option<&str>, current: &str) {
+        self.abandon_restore_ctx();
         let Some(uri) = context_uri else { return };
-        let Some(id) = uri.rsplit(':').next().map(|s| s.to_string()) else { return };
-        let is_album = uri.contains(":album:");
-        self.restore_ctx = Some((id.clone(), current.to_string()));
-        if self.build_context_queue(&id, current) {
-            self.restore_ctx = None;
+        let Some((key, kind)) = ctx_list_key(uri) else {
+            log::debug!("[cola-ctx] {uri}: contexto sin lista propia; la cola llega del servidor");
+            return;
+        };
+        // Antes nunca se miraba el disco: la restauración esperaba siempre a la red. La copia de
+        // una playlist se lee en el hilo del disco: al llegar (`on_warmed`) arma la cola, y el
+        // tick no la pide mientras tanto.
+        match kind {
+            CtxKind::Playlist => self.warm_list(&key),
+            CtxKind::Album => self.warm_album(&key),
+            CtxKind::Liked => {}
+        }
+        if self.build_context_queue(&key, kind, current) {
             return;
         }
-        // La petición de pistas necesita la sesión de librespot; el tick la lanza y reintenta
-        // en cuanto haya sesión.
-        let _ = is_album;
-        self.restore_ctx_at = Some(Instant::now());
+        // La petición necesita la sesión de librespot: el tick la lanza en cuanto la haya.
+        let now = Instant::now();
+        self.restore_ctx_at = (kind != CtxKind::Liked).then_some(now);
+        self.restore_ctx_until = Some(now + RESTORE_CTX_DEADLINE);
+        self.restore_ctx = Some((key, kind, current.to_string()));
     }
 
-    /// Pide las pistas del contexto en restauración cuando la sesión está lista, y arma la cola.
-    fn poll_restore_queue(&mut self, ctx_ui: &egui::Context) {
-        let Some((id, cur)) = self.restore_ctx.clone() else { return };
-        if self.build_context_queue(&id, &cur) {
-            self.restore_ctx = None;
-            self.restore_ctx_at = None;
+    /// Esa playlist es el contexto cuya cola se está restaurando: la restauración la pide y la
+    /// reintenta por su cuenta.
+    fn restoring_playlist(&self, id: &str) -> bool {
+        self.restore_ctx.as_ref().is_some_and(|(k, kind, _)| *kind == CtxKind::Playlist && k == id)
+    }
+
+    fn clear_restore_ctx(&mut self) {
+        self.restore_ctx = None;
+        self.restore_ctx_at = None;
+        self.restore_ctx_fails = 0;
+        self.restore_ctx_until = None;
+    }
+
+    /// Se deja la restauración sin haber armado la cola (plazo agotado, otra reproducción, otra
+    /// restauración). Mientras la llevaba, los fallos de esa playlist no programaban reintentos
+    /// y la dejaban pedida (`pl:`): si nada más se ocupa de ella, se desmarca para que abrirla la
+    /// pida otra vez en vez de quedarse a medias sin «Reintentar».
+    fn abandon_restore_ctx(&mut self) {
+        if let Some((key, kind, _)) = self.restore_ctx.take() {
+            if kind == CtxKind::Playlist && !self.pl_busy(&key) && !self.list_retry.contains_key(&key) {
+                self.invalidate(&format!("pl:{key}"));
+            }
+        }
+        self.clear_restore_ctx();
+    }
+
+    /// Llegaron pistas de `key` (playlist, álbum o Me gusta): si es el contexto en restauración,
+    /// se intenta armar su cola. Es lo que la arma: el tick ya no lo intenta en cada fotograma.
+    fn restore_ctx_arrived(&mut self, key: &str) {
+        let Some((k, kind, cur)) = self.restore_ctx.as_ref() else { return };
+        if k != key {
             return;
         }
+        let (kind, cur) = (*kind, cur.clone());
+        if self.build_context_queue(key, kind, &cur) {
+            self.clear_restore_ctx();
+        }
+    }
+
+    /// Falló la carga de las pistas del contexto en restauración (la suya o la de quien la pidió
+    /// antes, p. ej. la página abierta): se vuelve a pedir con espera creciente, o se deja si se
+    /// agotan los reintentos o el contexto ya no existe. Se llama antes de repartir el error: si
+    /// se deja, sus brazos la tratan como a cualquier otra (reintentos, «Reintentar»).
+    fn restore_ctx_failed(&mut self, e: &str) {
+        let Some((key, kind)) = self.restore_ctx.as_ref().map(|c| (c.0.clone(), c.1)) else { return };
+        if e.contains("404") {
+            log::info!("[restore] contexto {key}: ya no existe; la cola se deja sin armar");
+            self.clear_restore_ctx();
+            return;
+        }
+        // Ya hay un envío programado: este fallo es de otra carga, no de la última pedida.
+        if self.restore_ctx_at.is_some() {
+            // Salvo un álbum antes del primer envío: era la petición de «Siguientes de», la que
+            // la restauración iba a compartir, y sigue marcada (su error no la desmarca); sin
+            // desmarcarla, el envío programado no saldría.
+            if kind == CtxKind::Album && self.restore_ctx_fails == 0 {
+                self.invalidate(&format!("album:{key}"));
+            }
+            return;
+        }
+        // Sin sesión (reconexión en curso) una playlist falla al momento y no gasta intento: lo
+        // acota el plazo. Un álbum sí lo gasta: con cero fallos no se desmarcaría para repetirlo.
+        let counts = kind == CtxKind::Album || !e.contains("no has iniciado sesión");
+        let fails = self.restore_ctx_fails + u8::from(counts);
+        if fails as usize > RESTORE_CTX_RETRY.len() {
+            log::info!("[restore] contexto {key}: {e}; sin más reintentos, la cola se deja sin armar");
+            self.clear_restore_ctx();
+            return;
+        }
+        let wait = RESTORE_CTX_RETRY[(fails as usize).saturating_sub(1)];
+        log::info!("[restore] contexto {key}: {e}; se pide otra vez en {} ms", wait.as_millis());
+        self.restore_ctx_fails = fails;
+        self.restore_ctx_at = Some(Instant::now() + wait);
+    }
+
+    /// Pide las pistas del contexto en restauración: una vez en cuanto haya sesión y otra solo
+    /// tras un fallo (ver `restore_ctx_failed`). Antes las pedía cada 1,2 s sin fin (una
+    /// playlist de miles de pistas entera cada vez) y repintaba sin parar mientras tanto.
+    fn poll_restore_queue(&mut self, ctx_ui: &egui::Context) {
+        if self.restore_ctx.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        if self.restore_ctx_until.is_some_and(|t| now >= t) {
+            if let Some((key, _, _)) = self.restore_ctx.as_ref() {
+                log::info!("[restore] cola del contexto {key}: sin armar tras {} s; se deja", RESTORE_CTX_DEADLINE.as_secs());
+            }
+            self.abandon_restore_ctx();
+            return;
+        }
+        // Ya pedidas (o Me gusta, que no se pide): su respuesta, lote o error, despierta la
+        // interfaz y arma la cola; no hace falta repintar mientras tanto.
+        let Some(at) = self.restore_ctx_at else { return };
         if !self.logged_in() {
+            // Sin sesión no hay a quién pedir: se mira otra vez en breve (hasta el plazo).
             ctx_ui.request_repaint_after(Duration::from_millis(300));
             return;
         }
-        if let Some(at) = self.restore_ctx_at {
-            if Instant::now() >= at {
-                // Reintenta cada 1.2 s (la primera petición puede fallar si la sesión aún no está).
-                self.restore_ctx_at = Some(Instant::now() + Duration::from_millis(1200));
-                self.requested.remove(&format!("pl:{id}"));
-                self.requested.remove(&format!("album:{id}"));
-                if id.starts_with("37i9") || id.len() == 22 {
-                    self.api.send_priority(Req::PlaylistTracks(id.clone()));
+        if now < at {
+            ctx_ui.request_repaint_after(at - now);
+            return;
+        }
+        // Su copia en disco se está leyendo: al llegar arma la cola (`on_warmed`) o, si no
+        // basta, se pide entonces. Pedirla ya gastaría una carga entera que la copia evita.
+        if self.restore_ctx.as_ref().is_some_and(|(k, kind, _)| *kind == CtxKind::Playlist && self.warming.contains_key(k)) {
+            return;
+        }
+        self.restore_ctx_at = None;
+        let Some((key, kind, cur)) = self.restore_ctx.clone() else { return };
+        // Pudieron llegar por un camino que no avisa (la página abierta mostró la copia del disco).
+        if self.build_context_queue(&key, kind, &cur) {
+            self.clear_restore_ctx();
+            return;
+        }
+        match kind {
+            // Con una carga ya en vuelo (la de la página o la precarga) no sale otra: se espera a
+            // esa, y su lote final o su error cuentan igual para la restauración.
+            CtxKind::Playlist => self.load_playlist(&key, true, false),
+            CtxKind::Album => {
+                // La misma clave que la página y «Siguientes de»: una sola petición entre todos.
+                // Tras un fallo sigue marcada (el error no la desmarca): se desmarca para repetirla.
+                let k = format!("album:{key}");
+                if self.restore_ctx_fails > 0 {
+                    self.invalidate(&k);
                 }
+                self.request_once(&k, Req::Album(key));
             }
-            ctx_ui.request_repaint_after(Duration::from_millis(400));
+            CtxKind::Liked => {}
         }
     }
 
-    /// Arma `self.queue` con las pistas del contexto tras la actual. Devuelve true si lo logró.
-    fn build_context_queue(&mut self, ctx_id: &str, current: &str) -> bool {
-        let tracks: Vec<Track> = match self.lists.get(ctx_id) {
-            Some(l) if !l.tracks.is_empty() => l.tracks.clone(),
-            _ => match self.albums.get(ctx_id).and_then(|a| a.tracks.as_ref()) {
-                Some(p) if !p.items.is_empty() => p.items.clone(),
-                _ => {
-                    log::debug!("[cola-ctx] {ctx_id}: aún sin pistas");
-                    return false;
+    /// Arma `self.queue` con las pistas del contexto tras la actual. Devuelve true si ya no hay
+    /// nada que esperar: la cola armada, o la lista completa sin la pista actual (antes se armaba
+    /// entonces desde la primera, una cola equivocada). Solo se clonan la actual y las 80
+    /// siguientes (antes, la lista entera en cada intento, y el tick lo intentaba cada fotograma).
+    fn build_context_queue(&mut self, key: &str, kind: CtxKind, current: &str) -> bool {
+        // En una Jam (o con la cola de muestra) la cola que se ve no es la de este contexto.
+        if self.jam_queue_active || self.queue_frozen {
+            return true;
+        }
+        // Ya está la cola exacta de esta pista (la del servidor por Req::Queue, o la guardada al
+        // cerrar): es mejor que la del contexto (trae el orden aleatorio y lo añadido a mano) y
+        // no se pisa. Pasaba sobre todo con Me gusta, cuya recarga completa llega tarde.
+        if self.queue.as_ref().is_some_and(|q| {
+            !q.queue.is_empty() && q.currently_playing.as_ref().is_some_and(|t| t.uri == current)
+        }) {
+            return true;
+        }
+        let (now, upcoming) = {
+            // (pistas, si siguen llegando a esta misma lista, si ya es la definitiva)
+            let (tracks, more, settled): (&[Track], bool, bool) = match kind {
+                // La respuesta de un álbum trae todas sus pistas.
+                CtxKind::Album => match self.albums.get(key).and_then(|a| a.tracks.as_ref()) {
+                    Some(p) => (p.items.as_slice(), false, true),
+                    None => (&[], false, false),
+                },
+                // Una copia del disco o una carga a medias aún pueden cambiar: sin la pista actual
+                // se espera a la fresca. Me gusta nunca se da por definitiva (lo guardado en otro
+                // dispositivo llega aparte, en LikedRecent); la acota el plazo. Con una repetición
+                // pendiente (cambió mientras llegaba) la que trae la pista puede ser la que sigue.
+                CtxKind::Playlist | CtxKind::Liked => match self.lists.get(key) {
+                    Some(l) => {
+                        let settled = kind == CtxKind::Playlist
+                            && !l.loading
+                            && !self.list_cached.contains(key)
+                            && !self.pl_rerun.contains(key)
+                            && !list_short(l.tracks.len(), l.total);
+                        (l.tracks.as_slice(), l.loading, settled)
+                    }
+                    None => (&[], false, false),
+                },
+            };
+            if tracks.is_empty() {
+                log::debug!("[cola-ctx] {key}: aún sin pistas");
+                return false;
+            }
+            let Some(cur) = tracks.iter().position(|t| t.uri == current) else {
+                if settled {
+                    log::info!("[cola-ctx] {key}: la pista actual no está en el contexto; sin cola");
                 }
-            },
+                return settled;
+            };
+            let upcoming = &tracks[cur + 1..];
+            // Una carga que sigue llegando trae más detrás: se esperan las 80 en vez de armar una
+            // cola corta con lo llegado hasta ahora.
+            if more && upcoming.len() < 80 {
+                return false;
+            }
+            (tracks[cur].clone(), upcoming.iter().take(80).cloned().collect::<Vec<Track>>())
         };
-        log::debug!("[cola-ctx] {ctx_id}: {} pistas, actual={current}", tracks.len());
-        let cur = tracks.iter().position(|t| t.uri == current).unwrap_or(0);
-        let upcoming: Vec<Track> = tracks.iter().skip(cur + 1).take(80).cloned().collect();
+        log::debug!("[cola-ctx] {key}: actual={current}, {} detrás", upcoming.len());
         if upcoming.is_empty() {
-            return false;
+            // La última del contexto: no hay nada detrás y eso también es haberla armado (antes se
+            // reintentaba sin fin). No pisa la cola exacta del servidor si ya llegó.
+            if self.queue.is_none() {
+                self.queue = Some(QueueResponse { currently_playing: Some(now), queue: Vec::new() });
+            }
+            return true;
         }
         let n = upcoming.len();
         self.queue = Some(QueueResponse {
-            currently_playing: tracks.get(cur).cloned(),
+            currently_playing: Some(now),
             queue: upcoming,
         });
         crate::tmark(&format!("cola del contexto: {n} pistas ({} ms)", crate::since_start_ms()));
@@ -3726,7 +5246,6 @@ impl App {
         };
         if let Some(uri) = &ctx {
             self.last_play = Some(PlayTarget::Context { uri: uri.clone(), track_uri: Some(item.uri.clone()), index: None, shuffle });
-            self.ensure_context_meta(&uri.clone());
         } else {
             self.last_play = Some(PlayTarget::Tracks { uris: vec![item.uri.clone()], index: Some(0), shuffle: false });
         }
@@ -3755,6 +5274,11 @@ impl App {
         self.queue_at = Instant::now();
         self.queue_retry = Some((Instant::now() + Duration::from_millis(400), 0));
         self.prepare_context_queue(ctx.as_deref(), &item.uri);
+        // Después de preparar la cola: si la restauración va a cargar la playlist del contexto,
+        // esa carga ya trae su nombre y no se pide aparte (ver ensure_context_meta).
+        if let Some(uri) = &ctx {
+            self.ensure_context_meta(uri);
+        }
         self.media_dirty = true;
         log::info!("[restore] servidor: {} en {} ms (ctx {:?})", item.name, pos, ctx);
     }
@@ -3811,10 +5335,28 @@ impl App {
         let mut parts = uri.splitn(3, ':');
         let (Some(_), Some(kind), Some(id)) = (parts.next(), parts.next(), parts.next()) else { return };
         let id = id.to_string();
+        // La copia en disco del álbum ya trae el nombre (y la restauración la mira justo después
+        // para la cola): con ella no se gasta una petición a la Web API solo para «Siguientes de».
+        // Abrir su página lo pide fresco igualmente.
+        if kind == "album" {
+            self.warm_album(&id);
+        }
+        if kind == "playlist" && !self.playlist_meta.contains_key(&id) && !self.playlists.iter().any(|p| p.id == id) {
+            // Su copia en disco trae el nombre (se lee en el hilo del disco), y la carga de sus
+            // pistas (la de la restauración o una ya en vuelo) lo manda antes de la primera fila
+            // (PlaylistMetaPartial). Pedirlo aparte gastaba una lectura de la Web API o, en las
+            // de Spotify (37i9), otra descarga entera de la misma playlist4.
+            self.warm_list(&id);
+            if self.warming.contains_key(&id) || self.pl_busy(&id) || self.restoring_playlist(&id) {
+                return;
+            }
+        }
         let (key, req) = match kind {
             "album" if !self.albums.contains_key(&id) => (format!("album:{id}"), Req::Album(id)),
             "playlist" if !self.playlist_meta.contains_key(&id) && !self.playlists.iter().any(|p| p.id == id) => (format!("plmeta:{id}"), Req::PlaylistMeta(id)),
-            "artist" if !self.artists.contains_key(&id) => (format!("artistmeta:{id}"), Req::Artist(id)),
+            // Del artista basta el nombre: el lote de metadatos internos, sin la lectura de la Web
+            // API ni la búsqueda de géneros de Req::Artist (eso lo pide su página al abrirla).
+            "artist" if !self.artists.contains_key(&id) => (format!("artistmeta:{id}"), Req::ArtistThumbs(vec![id])),
             _ => return,
         };
         if self.requested.insert(key) {
@@ -3932,12 +5474,14 @@ impl App {
             queue,
             saved_at: crate::cache::now_secs(),
         };
-        if let Ok(text) = serde_json::to_string(&saved) {
-            let tmp = self.playback_path.with_extension("tmp");
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.playback_path);
+        // Se arma aquí (es lo de este instante); serializar y escribir, en el hilo del disco y en
+        // orden: la del cierre no puede quedar debajo de una periódica anterior.
+        let path = self.playback_path.clone();
+        self.disk.run(move || {
+            if let Ok(text) = serde_json::to_string(&saved) {
+                crate::cache::write_atomic(&path, &text);
             }
-        }
+        });
     }
 
     /// La canción con la que empezará `t`, si ya la tenemos en pantalla (lista, álbum, cola,
@@ -3976,6 +5520,9 @@ impl App {
         self.restore_wanted = false;
         self.restore_pending = None;
         self.restore_deadline = None;
+        // Lo que suena ahora trae su propia cola: la del contexto restaurado ya no corresponde y,
+        // si llegara después, la pisaría.
+        self.abandon_restore_ctx();
         if let Some(dev) = self.player.remote.clone() {
             let req = match t {
                 PlayTarget::Context {
@@ -4329,6 +5876,12 @@ impl App {
 
     pub fn run_search(&mut self) {
         let q = self.search_query.trim().to_string();
+        self.search_for(q);
+    }
+
+    /// Busca `q` (ya sin espacios a los lados): lo escrito en la caja o la consulta que quedó
+    /// pendiente en Perfiles al pasar a otra pestaña de resultados.
+    fn search_for(&mut self, q: String) {
         if q.is_empty() {
             return;
         }
@@ -4341,15 +5894,122 @@ impl App {
             self.search_query.clear();
             return;
         }
-        self.search_loading = true;
-        self.search_result = None;
         if self.search_filter == 8 {
-            // Perfiles: Spotify no busca usuarios; se prueba el nombre de usuario tal cual.
-            self.api.send(Req::User(q.clone()));
-            self.search_loading = false;
+            // Perfiles: Spotify no busca usuarios; se prueba el nombre de usuario tal cual (por
+            // spclient, sin cuota) si no se tiene ya. La búsqueda general no sale: aquí no se
+            // ve, y se pide al pasar a otra pestaña (set_search_filter).
+            if !self.users.contains_key(&q) {
+                self.api.send(Req::User(q.clone()));
+            }
+            // Lo que siga en vuelo es de otra consulta y ya no debe sustituir a nada (si es de
+            // esta, su respuesta valdrá al pasar a otra pestaña).
+            if self.search_pending.as_deref() != Some(q.as_str()) {
+                self.search_loading = false;
+                self.search_pending = None;
+                self.search_retry = None;
+            }
+            self.search_pending_profile = Some(q);
+            self.go(Page::Search);
+            return;
         }
+        self.search_pending_profile = None;
+        // Resultado reciente de esta consulta: a la vista al instante, sin «Buscando» ni petición.
+        if let Some(c) = self.search_cache.get_mut(&search_key(&q)) {
+            let age = c.at.elapsed();
+            if age < SEARCH_KEEP {
+                let now = Instant::now();
+                c.used = now;
+                // Si la de esta consulta ya está en vuelo (y no esperando un reintento tras un
+                // 429), su respuesta sirve de refresco. Si no, pasada la media hora se pide otra
+                // detrás, como mucho una cada SEARCH_REFRESH_GAP.
+                let inflight = self.search_pending.as_deref() == Some(q.as_str()) && self.search_retry.is_none();
+                let refresh = !inflight && age >= SEARCH_FRESH && c.asked.is_none_or(|t| t.elapsed() >= SEARCH_REFRESH_GAP);
+                if refresh {
+                    c.asked = Some(now);
+                }
+                self.search_result = Some(c.result.clone());
+                self.search_result_for = Some(q.clone());
+                self.search_loading = false;
+                self.search_retry = None;
+                self.search_retries = 0;
+                log::info!("búsqueda «{q}» desde la caché (de hace {} min){}", age.as_secs() / 60, if refresh { "; se refresca detrás" } else { "" });
+                if refresh {
+                    // El carril de búsquedas descarta sin respuesta las que siguen en cola al
+                    // llegar otra: un refresco anterior podría no contestar nunca y quedarse
+                    // marcado (y callaría los errores de esa consulta para siempre).
+                    self.search_refreshing.clear();
+                }
+                if inflight || refresh {
+                    self.search_refreshing.insert(q.clone());
+                    self.search_pending = Some(q.clone());
+                } else {
+                    // Lo que siga en vuelo es de otra consulta: al llegar se guarda, pero ya no
+                    // sustituye a lo que se ve.
+                    self.search_pending = None;
+                }
+                if refresh {
+                    self.api.send(Req::Search(q));
+                }
+                self.go(Page::Search);
+                return;
+            }
+        }
+        // Los resultados anteriores no se borran: siguen a la vista, atenuados, hasta que
+        // llega la respuesta de esta consulta.
+        self.search_loading = true;
+        // Esta vez la espera ella: si falla, se avisa y se reintenta como cualquier búsqueda. Los
+        // refrescos de otras consultas también se desmarcan: el carril «gana la última» puede
+        // descartarlos sin respuesta, y si contestan basta con guardarlos (no son la pendiente).
+        self.search_refreshing.clear();
+        // Intro de nuevo con la misma consulta aún en vuelo (o esperando su reintento tras un
+        // 429): su respuesta se aceptará igual, así que repetirla solo gastaría cuota. Tras un
+        // error pending ya está vacío y se reintenta.
+        if self.search_pending.as_deref() == Some(q.as_str()) {
+            self.go(Page::Search);
+            return;
+        }
+        // Una consulta nueva anula el reintento programado de la anterior.
+        self.search_retry = None;
+        self.search_retries = 0;
+        self.search_pending = Some(q.clone());
         self.api.send(Req::Search(q));
         self.go(Page::Search);
+    }
+
+    /// Guarda la respuesta de `q` en la caché de búsquedas (ver `search_cache`).
+    fn cache_search(&mut self, q: &str, s: SearchResult) {
+        // Una respuesta que llega tras cerrar sesión no entra en la caché de la sesión siguiente.
+        if search_is_empty(&s) || !self.signed_in() {
+            return;
+        }
+        let now = Instant::now();
+        self.search_cache.insert(search_key(q), CachedSearch { at: now, used: now, asked: None, result: s });
+        self.search_cache.retain(|_, c| c.at.elapsed() < SEARCH_KEEP);
+        while self.search_cache.len() > SEARCH_CACHE_MAX {
+            let Some(old) = self.search_cache.iter().min_by_key(|(_, c)| c.used).map(|(k, _)| k.clone()) else {
+                break;
+            };
+            self.search_cache.remove(&old);
+        }
+    }
+
+    /// Cambia la pestaña de resultados (las píldoras de la página y el modo de control).
+    pub fn set_search_filter(&mut self, f: u8) {
+        self.search_filter = f;
+        if f == 8 {
+            // Perfiles: el nombre de usuario tal cual, solo si no se tiene ya (antes se repetía
+            // en cada clic).
+            let q = self.search_query.trim();
+            if !q.is_empty() && !self.users.contains_key(q) {
+                self.api.send(Req::User(q.to_string()));
+            }
+        } else if self.logged_in() {
+            // La consulta lanzada en Perfiles no buscó nada más: se busca ahora que hace falta
+            // (o sale de la caché). Aún conectando se deja para el próximo clic.
+            if let Some(q) = self.search_pending_profile.take() {
+                self.search_for(q);
+            }
+        }
     }
 
     pub fn save_settings(&mut self, ctx: &egui::Context) {
@@ -4437,7 +6097,12 @@ impl App {
     pub(crate) fn run_shortcut(&mut self, a: Shortcut, ctx: &egui::Context) {
         match a {
             Shortcut::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            Shortcut::Search => self.focus_search = true,
+            // Desde cualquier página abre Búsqueda con el cursor en la caja. go() ya enfoca al
+            // cambiar de página, pero vuelve sin hacer nada si Búsqueda ya está abierta.
+            Shortcut::Search => {
+                self.focus_search = true;
+                self.go(Page::Search);
+            }
             Shortcut::Next => self.next(),
             Shortcut::Prev => self.prev(),
             Shortcut::VolUp => self.volume_by(5),
@@ -4620,17 +6285,19 @@ impl crate::shell::UiApp for App {
             self.settings.save(&self.paths);
         }
         // El backend empieza a desconectar (avisa a Spotify de la pausa y del dispositivo
-        // inactivo) mientras aquí se escriben los ficheros: son pequeños y va en este hilo,
-        // así el process::exit no los corta a medias.
+        // inactivo) mientras se escriben los ficheros. Van al hilo del disco detrás de lo que
+        // ya tuviera encolado y se espera a que termine: así ninguna escritura periódica
+        // anterior queda encima de la última, y el process::exit no las corta a medias.
         self.backend.send(Cmd::Shutdown);
         if self.snapshot_dirty && self.logged_in() {
             self.snapshot_dirty = false;
-            self.snapshot().save_now(&self.snapshot_path);
+            self.snapshot().save_async(&self.disk, self.snapshot_path.clone());
         }
         if self.play_log_dirty {
             self.play_log_dirty = false;
-            self.play_log.save_now(&self.play_log_path);
+            self.play_log.clone().save_async(&self.disk, self.play_log_path.clone());
         }
+        self.disk.finish();
         // Un margen corto para que salga el aviso de desconexión; si Spotify tarda más, se
         // cierra igual: la copia local de la reproducción ya está guardada y el servidor
         // detecta la desconexión por sí mismo.

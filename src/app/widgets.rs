@@ -25,6 +25,24 @@ pub enum Source<'a> {
     Tracks,
 }
 
+/// Pistas a la vista de una lista (ver `App::filter_tracks`): todas, prestadas, o las que
+/// coinciden con la búsqueda interna, compartidas con lo guardado (sin copiarlas otra vez).
+pub enum Shown<'t> {
+    All(&'t [Track]),
+    Filtered(std::rc::Rc<[Track]>),
+}
+
+impl std::ops::Deref for Shown<'_> {
+    type Target = [Track];
+
+    fn deref(&self) -> &[Track] {
+        match self {
+            Shown::All(t) => t,
+            Shown::Filtered(t) => t,
+        }
+    }
+}
+
 /// Dónde se abre el menú de canción.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MenuKind {
@@ -99,6 +117,14 @@ pub struct CardInfo<'a> {
 /// Sub-`Ui` sobre un rectángulo concreto con un layout dado.
 pub fn child_in(ui: &mut egui::Ui, rect: Rect, layout: Layout) -> egui::Ui {
     ui.new_child(UiBuilder::new().max_rect(rect).layout(layout))
+}
+
+/// Sub-`Ui` sobre `rect` con un id propio del elemento y no de su posición: en las listas que
+/// solo dibujan lo visible, el hover y el menú contextual siguen al elemento aunque el filtro,
+/// el orden o el desplazamiento lo cambien de sitio.
+pub fn keyed_child(ui: &mut egui::Ui, rect: Rect, key: impl egui::AsIdSalt) -> egui::Ui {
+    let id = ui.id().with(key);
+    ui.new_child(UiBuilder::new().id(id).max_rect(rect).layout(Layout::top_down(Align::Min)))
 }
 
 /// Degradado vertical (arriba → abajo) sobre un rectángulo.
@@ -455,23 +481,37 @@ impl App {
     }
 
     /// Pistas que coinciden con la búsqueda interna; sin búsqueda devuelve la lista prestada
-    /// (sin copiar cientos de pistas en cada fotograma).
-    pub fn filter_tracks<'t>(&self, list_id: &str, tracks: &'t [Track]) -> std::borrow::Cow<'t, [Track]> {
+    /// (sin copiar cientos de pistas en cada fotograma). Con la versión de la lista (`gen`, las
+    /// de `lists`) el resultado se guarda y se reutiliza mientras no cambien la consulta ni sus
+    /// pistas: si no, cada fotograma pasaba a minúsculas y copiaba miles de pistas. Sin versión
+    /// (álbumes, historial, listas cortas) se filtra cada vez.
+    pub fn filter_tracks<'t>(&mut self, list_id: &str, gen: Option<u64>, tracks: &'t [Track]) -> Shown<'t> {
         let q = self.list_query(list_id);
         if q.is_empty() {
-            return std::borrow::Cow::Borrowed(tracks);
+            // Búsqueda borrada: su resultado (copia de miles de pistas, quizá) no se guarda más.
+            if self.filter_cache.as_ref().is_some_and(|c| c.0 == list_id) {
+                self.filter_cache = None;
+            }
+            return Shown::All(tracks);
         }
-        std::borrow::Cow::Owned(
-            tracks
-                .iter()
-                .filter(|t| {
-                    t.name.to_lowercase().contains(&q)
-                        || t.artists.iter().any(|a| a.name.to_lowercase().contains(&q))
-                        || t.album.as_ref().map(|a| a.name.to_lowercase().contains(&q)).unwrap_or(false)
-                })
-                .cloned()
-                .collect(),
-        )
+        if let (Some(gen), Some((id, cq, cgen, len, hit))) = (gen, &self.filter_cache) {
+            if id == list_id && *cq == q && *cgen == gen && *len == tracks.len() {
+                return Shown::Filtered(hit.clone());
+            }
+        }
+        let found: std::rc::Rc<[Track]> = tracks
+            .iter()
+            .filter(|t| {
+                t.name.to_lowercase().contains(&q)
+                    || t.artists.iter().any(|a| a.name.to_lowercase().contains(&q))
+                    || t.album.as_ref().map(|a| a.name.to_lowercase().contains(&q)).unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if let Some(gen) = gen {
+            self.filter_cache = Some((list_id.to_string(), q, gen, tracks.len(), found.clone()));
+        }
+        Shown::Filtered(found)
     }
 
     /// Barra de acciones de una colección de pistas. Con selección activa se convierte en la
@@ -499,28 +539,34 @@ impl App {
             return;
         }
         let p = theme::palette(ui.ctx());
-        let ids: Vec<String> = all.iter().filter_map(|t| t.id.clone()).collect();
-        let uris: Vec<String> = all.iter().map(|t| t.uri.clone()).collect();
+        // Ids y uris se recorren o se copian solo al usarse: copiarlos en cada fotograma costaba
+        // con listas de miles de pistas.
+        let ids = || all.iter().filter_map(|t| t.id.as_ref());
         let target = |shuffle: bool| match context {
             Some(uri) => PlayTarget::Context { uri: uri.to_string(), track_uri: None, index: None, shuffle },
-            None => PlayTarget::Tracks { uris: uris.clone(), index: if shuffle { None } else { Some(0) }, shuffle },
+            None => PlayTarget::Tracks {
+                uris: all.iter().map(|t| t.uri.clone()).collect(),
+                index: if shuffle { None } else { Some(0) },
+                shuffle,
+            },
         };
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if icons::round_button(ui, Icon::Play, 44.0, GREEN, Color32::BLACK).on_hover_text("Reproducir").clicked() && !uris.is_empty() {
+            if icons::round_button(ui, Icon::Play, 44.0, GREEN, Color32::BLACK).on_hover_text("Reproducir").clicked() && !all.is_empty() {
                 self.actions.push(Action::Play(target(false)));
             }
-            if icons::button(ui, Icon::Shuffle, 34.0, p.weak).on_hover_text("Aleatorio").clicked() && !uris.is_empty() {
+            if icons::button(ui, Icon::Shuffle, 34.0, p.weak).on_hover_text("Aleatorio").clicked() && !all.is_empty() {
                 self.actions.push(Action::Play(target(true)));
             }
             extra(self, ui);
             if icons::button(ui, Icon::Queue, 34.0, p.weak).on_hover_text("Añadir a la cola").clicked() {
-                for u in &uris {
-                    self.actions.push(Action::AddToQueue(u.clone()));
+                for t in all {
+                    self.actions.push(Action::AddToQueue(t.uri.clone()));
                 }
             }
-            let all_dl = !ids.is_empty() && ids.iter().all(|i| self.downloaded.contains(i));
-            let busy = ids.iter().any(|i| self.downloading.contains(i));
+            // Sin guardar: lo descargado cambia por su cuenta, aparte de la lista.
+            let all_dl = ids().next().is_some() && ids().all(|i| self.downloaded.contains(i));
+            let busy = !self.downloading.is_empty() && ids().any(|i| self.downloading.contains(i));
             let (icon, color, tip) = if all_dl {
                 (Icon::Download, GREEN, "Descargado (en la caché de audio)")
             } else if busy {
@@ -529,10 +575,11 @@ impl App {
                 (Icon::Download, p.weak, "Descargar")
             };
             if icons::button(ui, icon, 34.0, color).on_hover_text(tip).clicked() && !all_dl && !busy {
+                let ids: Vec<String> = ids().cloned().collect();
                 if all.first().and_then(|t| t.kind.as_deref()) == Some("episode") {
-                    self.actions.push(Action::DownloadEpisodes(ids.clone()));
+                    self.actions.push(Action::DownloadEpisodes(ids));
                 } else {
-                    self.actions.push(Action::Download(ids.clone()));
+                    self.actions.push(Action::Download(ids));
                 }
             }
             if let Some(link) = link {
@@ -1179,8 +1226,12 @@ impl App {
                             }
                         }
                         let more = icons::button(&mut c, Icon::More, 28.0, p.weak).on_hover_text("Más");
-                        let target = opts.target(i, tracks, shuffle);
-                        egui::Popup::menu(&more).id(more_id).show(|ui| self.track_menu(ui, t, target, &opts));
+                        // El destino solo con el menú abierto: sin contexto copia todos los uris de
+                        // la lista, y la fila bajo el ratón lo hacía en cada fotograma.
+                        egui::Popup::menu(&more).id(more_id).show(|ui| {
+                            let target = opts.target(i, tracks, shuffle);
+                            self.track_menu(ui, t, target, &opts)
+                        });
                     }
                 }
             } else {

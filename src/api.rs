@@ -13,24 +13,118 @@ use serde_json::{json, Value};
 use crate::backend::Shared;
 use crate::bus::{Msg, UiTx};
 use crate::model::*;
+use crate::pathfinder::{PfErr, Pathfinder};
 use crate::webauth::WebAuth;
 use librespot_core::SpotifyUri;
 use librespot_metadata::Metadata;
 
-#[derive(serde::Deserialize)]
-struct TracksResponse {
-    #[serde(default)]
-    tracks: Vec<Option<Track>>,
-}
-
 const BASE: &str = "https://api.spotify.com/v1";
 const WORKERS: usize = 2;
+/// Elementos que se piden uno a uno como mucho por llamada (los que un lote de metadatos no
+/// trajo, o un lote pequeño que falló), y cuántos a la vez. Sin tope, un lote fallido de
+/// cientos agotaba el cupo de librespot (300 cada 30 s) y la canción que suena no cargaba.
+const SINGLE_GET_MAX: usize = 20;
+const SINGLE_GET_PARALLEL: usize = 4;
+/// Sueltos como mucho en toda la carga de una playlist (lo que sus lotes no trajeron), sumando
+/// todos los lotes: con 3 en vuelo y 20 por lote, una lista de miles podía pedir cientos.
+const SINGLE_GET_LOAD_MAX: usize = 3 * SINGLE_GET_MAX;
+/// Entidades por petición de extended-metadata.
+const BATCH_MAX: usize = 500;
+/// Primer lote de una playlist: pequeño, para que las primeras filas no esperen a uno de 500.
+const PLAYLIST_FIRST_BATCH: usize = 100;
+/// Lotes de una playlist en vuelo a la vez. No más: el otro hilo y la reproducción comparten
+/// el cupo de librespot (300 peticiones cada 30 s).
+const PLAYLIST_BATCH_PARALLEL: usize = 3;
 /// Limitador de ritmo de la Web API (token bucket). Permite una rafaga inicial (el arranque
 /// pide varias cosas a la vez) y luego un ritmo sostenido bajo el umbral de Spotify.
 const RATE_BURST: f64 = 6.0;
 /// Fichas por segundo que se reponen (ritmo sostenido). Conservador para no disparar el límite
 /// por usuario del id compartido de primera parte.
 const RATE_REFILL: f64 = 2.0;
+/// Fichas que el carril de fondo deja siempre en el limitador: lo que ella pide (una búsqueda,
+/// una página) encuentra al menos dos al momento aunque haya una recarga larga en curso.
+const BG_RESERVE: f64 = 2.0;
+/// Artistas por petición de miniaturas (nombre e imagen por extended-metadata).
+const THUMBS_BATCH: usize = 100;
+/// Un álbum o artista sin géneros en ninguna fuente no se vuelve a buscar hasta pasados estos
+/// segundos (30 días): cada búsqueda son varias consultas externas en serie.
+const GENRES_MISS_TTL: u64 = 30 * 86_400;
+/// Una playlist se recarga reutilizando los metadatos de pistas de su copia en disco mientras
+/// estos tengan menos de esto (7 días); pasado, se piden todos otra vez (nombres, portadas y
+/// pistas retiradas cambian, aunque poco).
+const LIST_META_TTL: u64 = 7 * 86_400;
+/// Búsquedas de géneros en cola como mucho. Al pasar de ahí se descartan las más viejas (de
+/// páginas que ya no se ven); se encargan otra vez la próxima vez que se pida ese álbum o ese
+/// artista (tras reconectar o en otra sesión).
+const ENRICH_GENRES_MAX: usize = 20;
+/// Plazos de las llamadas de librespot (metadatos, spclient, login5). Sin ellos, una conexión
+/// que se quedó colgada (tras suspender el equipo o cambiar de wifi) dejaba un hilo de la API
+/// esperando para siempre, y detrás las búsquedas y páginas que no cargaban hasta reiniciar.
+/// Al vencer, quien pidió conserva lo que tenía y su reintento hace el resto.
+/// Una entidad suelta (artista, álbum, podcast, perfil, una pista) o un token.
+const TIMEOUT_ITEM: Duration = Duration::from_secs(10);
+/// Una lista entera (playlist4, rootlist): con miles de pistas tarda más.
+const TIMEOUT_LIST: Duration = Duration::from_secs(20);
+/// Lecturas de spclient, incluido cada lote de extended-metadata (hasta 500 entidades).
+const TIMEOUT_SP_READ: Duration = Duration::from_secs(15);
+/// Escrituras de spclient (cambios de playlist, permisos, Jam): con más margen, porque cortar
+/// una que quizá ya se aplicó deja la duda, y al repetirla se podría añadir dos veces.
+const TIMEOUT_SP_WRITE: Duration = Duration::from_secs(30);
+/// Metadatos de una descarga (va en su propio hilo; abrir el audio no tiene plazo).
+const TIMEOUT_DOWNLOAD_META: Duration = Duration::from_secs(60);
+/// Segundos que una escritura del carril del reproductor (mandos remotos, cola, transferir)
+/// espera como mucho ante un 429. Detrás van la pausa y el siguiente que ella pulse: mejor
+/// fallar y que el sondeo del estado del reproductor lo reconcilie que dormir el hilo hasta
+/// 35 s. No se aplazan a otro carril: una pausa aplazada podría llegar después de un reanudar.
+const PLAYER_WRITE_WAIT: u64 = 3;
+
+thread_local! {
+    /// `true` en el hilo del carril de fondo (`Api::send_bg`): cede el limitador a lo de primer
+    /// plano y nunca duerme un Retry-After.
+    static BG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `true` en el hilo del carril del reproductor: sus escrituras esperan poco ante un 429.
+    static PLAYER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn on_bg_lane() -> bool {
+    BG.with(|b| b.get())
+}
+
+fn on_player_lane() -> bool {
+    PLAYER.with(|p| p.get())
+}
+
+/// Trabajo del carril de enriquecimiento (letras y géneros de fuentes externas). No es un canal
+/// porque hay que poder sustituir y descartar lo que espera: las letras de una canción ya
+/// saltada o los géneros de páginas que ya no se ven.
+#[derive(Default)]
+struct EnrichQueue {
+    /// Letras de la canción que suena. Van antes que cualquier género y solo cuenta la última:
+    /// una petición nueva sustituye a la que aún espera.
+    lyrics: Option<Req>,
+    /// Géneros por buscar: (clave, artista, álbum). Se sirven de la más nueva a la más vieja,
+    /// para que la página abierta los tenga antes que las que ya se dejaron atrás.
+    genres: std::collections::VecDeque<(String, String, Option<String>)>,
+    /// Claves en cola o en curso: abrir dos veces la misma página no las busca dos veces.
+    queued: std::collections::HashSet<String>,
+    /// La app se cierra: el hilo termina (como los otros carriles al soltar su canal).
+    closed: bool,
+}
+
+type Enrich = Arc<(Mutex<EnrichQueue>, std::sync::Condvar)>;
+
+/// Lo que la recarga de una playlist usa de su copia en disco (la escribe la interfaz:
+/// `CachedList` en app/mod.rs; lo demás se ignora). Sin fecha de metadatos ni país (copias de
+/// antes de guardarlos) no se reutiliza nada.
+#[derive(serde::Deserialize)]
+struct ListCopy {
+    #[serde(default)]
+    tracks: Vec<Track>,
+    #[serde(default)]
+    meta_at: u64,
+    #[serde(default)]
+    country: Option<String>,
+}
 
 #[derive(Clone, Debug)]
 pub enum Req {
@@ -45,6 +139,12 @@ pub enum Req {
     FollowedArtists,
     Album(String),
     Artist(String),
+    /// Nombre e imagen de varios artistas de una vez (tarjetas de información), por un lote de
+    /// metadatos internos: sin cuota de la Web API ni búsqueda de géneros.
+    ArtistThumbs(Vec<String>),
+    /// Solo etiqueta los géneros que manda el carril de enriquecimiento (Resp::Genres); enviada
+    /// a la API devuelve los ya conocidos, sin red.
+    Genres { key: String },
     ArtistTop(String),
     /// Pista completa (álbum, portada) por los metadatos internos.
     TrackInfo(String),
@@ -188,6 +288,10 @@ pub enum Resp {
     Me(User),
     Playlists(Vec<Playlist>),
     PlaylistMeta(Playlist),
+    /// Metadatos de una playlist sacados de playlist4 (librespot): nombre, portada, descripción,
+    /// tamaño y si es colaborativa. No traen el nombre visible del propietario, la privacidad ni
+    /// los seguidores, así que se mezclan campo a campo con lo que ya se sabía.
+    PlaylistMetaPartial(Playlist),
     /// Página de pistas de una lista (`key` = id de playlist o "liked").
     Tracks {
         key: String,
@@ -195,10 +299,20 @@ pub enum Resp {
         total: u32,
         done: bool,
     },
+    /// Llega antes del último lote de una carga de playlist: lo que su copia en disco debe
+    /// apuntar para que la carga siguiente reutilice sus pistas (ver `ListCopy`). `meta_at`
+    /// (segundos Unix) es de cuándo son los metadatos más antiguos que trae (los reutilizados
+    /// conservan su fecha) y `country`, para qué país se pidieron.
+    PlaylistCopyInfo { id: String, meta_at: u64, country: String },
     SavedAlbums(Vec<Album>),
     FollowedArtists(Vec<Artist>),
     Album(Album),
     Artist(Artist),
+    /// Artistas con nombre e imagen (y los géneros ya conocidos), sin seguidores: solo completan
+    /// lo que falte, nunca sustituyen a un artista entero.
+    ArtistThumbs(Vec<Artist>),
+    /// Géneros encontrados después de responder (`key` = "album:<id>" o "artist:<id>").
+    Genres { key: String, genres: Vec<String> },
     ArtistTop(Vec<Track>),
     TrackInfo(Track),
     RadioPlaylist { playlist_id: String },
@@ -262,8 +376,21 @@ pub struct ApiResult {
 pub struct Api {
     tx: mpsc::Sender<Req>,
     prio_tx: mpsc::Sender<Req>,
+    search_tx: mpsc::Sender<Req>,
+    bg_tx: mpsc::Sender<Req>,
+    enrich: Enrich,
     web: Arc<WebAuth>,
     web_personal: Arc<WebAuth>,
+}
+
+impl Drop for Api {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.enrich;
+        if let Ok(mut q) = lock.lock() {
+            q.closed = true;
+        }
+        cv.notify_all();
+    }
 }
 
 impl Api {
@@ -271,6 +398,7 @@ impl Api {
         shared: Arc<Shared>,
         handle: tokio::runtime::Handle,
         web: Arc<WebAuth>,
+        lists_dir: PathBuf,
         ui: UiTx,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Req>();
@@ -278,6 +406,16 @@ impl Api {
         // Carril prioritario: estado del reproductor, cola y mandos remotos nunca esperan
         // detrás de la biblioteca (inicio, playlists, canciones que te gustan…).
         let (prio_tx, prio_rx) = mpsc::channel::<Req>();
+        // Carril de búsqueda: lo que ella escribe no espera detrás de la precarga de playlists,
+        // la recarga de «Canciones que te gustan» ni los géneros que ocupan los dos hilos comunes.
+        let (search_tx, search_rx) = mpsc::channel::<Req>();
+        // Carril de fondo: recargas largas que nadie está mirando (Me gusta completa, artistas
+        // seguidos). Con su propio hilo no ocupan los dos comunes durante decenas de segundos.
+        let (bg_tx, bg_rx) = mpsc::channel::<Req>();
+        // Carril de enriquecimiento: letras y géneros de fuentes externas (LRCLIB, iTunes, Deezer,
+        // MusicBrainz), segundos de consultas en serie que antes ocupaban los dos hilos comunes
+        // después de dibujar la página. Las letras van primero.
+        let enrich: Enrich = Arc::new((Mutex::new(EnrichQueue::default()), std::sync::Condvar::new()));
         // Proveedor opcional de la app propia del usuario: lecturas con su propia cuota (rápidas,
         // sin compartir límite). Las escrituras siguen yendo por la identidad de primera parte.
         let web_personal = Arc::new(WebAuth::load_personal(web.state_dir().join("webapi_personal.json")));
@@ -286,8 +424,21 @@ impl Api {
             .provider(ureq::tls::TlsProvider::NativeTls)
             .root_certs(ureq::tls::RootCerts::PlatformVerifier)
             .build();
+        // Fuentes externas (letras, géneros): plazo corto. Con el de la Web API (20 s) una sola
+        // que no contesta dejaba el carril de enriquecimiento parado y las letras detrás.
+        let ext_config = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .timeout_connect(Some(Duration::from_secs(3)))
+            .http_status_as_error(false)
+            .tls_config(tls.clone())
+            .build();
+        // Conectar y recibir la cabecera de la respuesta con plazo propio, más corto que el
+        // total: una conexión que se cuelga tras suspender el equipo o cambiar de wifi falla en
+        // segundos, en vez de ocupar el hilo los 20 s enteros.
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(20)))
+            .timeout_connect(Some(Duration::from_secs(4)))
+            .timeout_recv_response(Some(Duration::from_secs(10)))
             .http_status_as_error(false)
             .tls_config(tls)
             .build();
@@ -297,12 +448,28 @@ impl Api {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
+        // Sin géneros en ninguna fuente, con la fecha en que se buscaron: pasados 30 días se
+        // vuelven a buscar (una fecha futura, de un reloj adelantado, también caduca).
+        let genres_miss_file = web.state_dir().join("genres_miss.json");
+        let now = crate::cache::now_secs();
+        let genres_miss: std::collections::HashMap<String, Option<u64>> = std::fs::read_to_string(&genres_miss_file)
+            .ok()
+            .and_then(|t| serde_json::from_str::<std::collections::HashMap<String, u64>>(&t).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, at)| *at <= now && now - *at < GENRES_MISS_TTL)
+            .map(|(k, at)| (k, Some(at)))
+            .collect();
         let cooldown_until = std::fs::read_to_string(&cooldown_file)
             .ok()
             .and_then(|t| t.trim().parse::<u64>().ok())
             .filter(|&until| until > crate::cache::now_secs());
+        let agent = ureq::Agent::new_with_config(config);
+        let pf = Pathfinder::new(agent.clone(), shared.clone(), handle.clone(), web.state_dir().join("pathfinder.json"));
         let client = Arc::new(Client {
-            agent: ureq::Agent::new_with_config(config),
+            agent,
+            ext_agent: ureq::Agent::new_with_config(ext_config),
+            pf,
             shared,
             handle,
             web: web.clone(),
@@ -312,10 +479,13 @@ impl Api {
             cooldown_file,
             genres: Mutex::new(genres),
             genres_file,
-            genres_miss: Mutex::new(std::collections::HashSet::new()),
-            tracks_blocked: std::sync::atomic::AtomicBool::new(false),
+            genres_miss: Mutex::new(genres_miss),
+            genres_miss_file,
+            lists_dir,
+            enrich: enrich.clone(),
             artist_albums_blocked: std::sync::atomic::AtomicBool::new(false),
             rate: Mutex::new((RATE_BURST, Instant::now())),
+            read_backoff: Mutex::new([None, None]),
         });
 
         fn run(req: Req, client: &Client, ui: &UiTx) {
@@ -354,13 +524,115 @@ impl Api {
                 .name("nanofy-api-player".into())
                 .stack_size(512 * 1024)
                 .spawn(move || {
+                    // Lo lee call(): las escrituras de este hilo esperan poco ante un 429.
+                    PLAYER.with(|p| p.set(true));
                     while let Ok(req) = prio_rx.recv() {
                         run(req, &client, &ui);
                     }
                 })
                 .expect("no se pudo crear el hilo de la API");
         }
-        Self { tx, prio_tx, web, web_personal }
+        {
+            let client = client.clone();
+            let ui = ui.clone();
+            std::thread::Builder::new()
+                .name("nanofy-api-search".into())
+                .stack_size(512 * 1024)
+                .spawn(move || loop {
+                    let Ok(mut req) = search_rx.recv() else { break };
+                    // Gana la última: una búsqueda que sigue en cola cuando llega otra ya no le
+                    // interesa a nadie (la app solo acepta la respuesta de la consulta enviada
+                    // la última), así que se descarta sin gastar cuota. Cualquier otra petición
+                    // que acabe en este carril se ejecuta igualmente, en orden.
+                    loop {
+                        match search_rx.try_recv() {
+                            Ok(newer @ Req::Search(_)) if matches!(req, Req::Search(_)) => {
+                                log::info!("api {:?} descartada: hay una búsqueda más nueva", req);
+                                req = newer;
+                            }
+                            Ok(next) => {
+                                run(req, &client, &ui);
+                                req = next;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    run(req, &client, &ui);
+                })
+                .expect("no se pudo crear el hilo de la API");
+        }
+        {
+            let client = client.clone();
+            let ui = ui.clone();
+            std::thread::Builder::new()
+                .name("nanofy-api-bg".into())
+                .stack_size(512 * 1024)
+                .spawn(move || {
+                    // Lo lee rate_acquire y call(): este hilo cede las fichas y falla rápido.
+                    BG.with(|b| b.set(true));
+                    while let Ok(req) = bg_rx.recv() {
+                        run(req, &client, &ui);
+                    }
+                })
+                .expect("no se pudo crear el hilo de la API");
+        }
+        {
+            let client = client.clone();
+            let ui = ui.clone();
+            let enrich = enrich.clone();
+            enum Job {
+                Lyrics(Req),
+                Genres(String, String, Option<String>),
+            }
+            std::thread::Builder::new()
+                .name("nanofy-enrich".into())
+                .stack_size(512 * 1024)
+                .spawn(move || loop {
+                    let job = {
+                        let (lock, cv) = &*enrich;
+                        let mut q = lock.lock().unwrap();
+                        loop {
+                            if q.closed {
+                                return;
+                            }
+                            // Las letras antes que nada: las espera la canción que suena, y
+                            // detrás de varias búsquedas de géneros tardarían más que antes.
+                            if let Some(req) = q.lyrics.take() {
+                                break Job::Lyrics(req);
+                            }
+                            if let Some((key, artist, album)) = q.genres.pop_back() {
+                                break Job::Genres(key, artist, album);
+                            }
+                            q = cv.wait(q).unwrap();
+                        }
+                    };
+                    match job {
+                        Job::Lyrics(req) => run(req, &client, &ui),
+                        Job::Genres(key, artist, album) => {
+                            let t0 = Instant::now();
+                            let lyrics_waiting = || {
+                                let req = enrich.0.lock().unwrap().lyrics.take();
+                                if let Some(req) = req {
+                                    run(req, &client, &ui);
+                                }
+                            };
+                            let genres = client.external_genres(&key, &artist, album.as_deref(), &lyrics_waiting);
+                            // Después de guardarlos: quien la encargue otra vez ya los encuentra.
+                            enrich.0.lock().unwrap().queued.remove(&key);
+                            log::debug!("[generos] {key} en {} ms", t0.elapsed().as_millis());
+                            // Sin géneros no hay nada que completar en la página.
+                            if !genres.is_empty() {
+                                ui.send(Msg::Api(ApiResult {
+                                    req: Req::Genres { key: key.clone() },
+                                    result: Ok(Resp::Genres { key, genres }),
+                                }));
+                            }
+                        }
+                    }
+                })
+                .expect("no se pudo crear el hilo de la API");
+        }
+        Self { tx, prio_tx, search_tx, bg_tx, enrich, web, web_personal }
     }
 
     /// Envía por el carril prioritario (no espera detrás de la biblioteca). Para la
@@ -369,7 +641,32 @@ impl Api {
         let _ = self.prio_tx.send(req);
     }
 
+    /// Envía por el carril de fondo, para lo que ya se ve desde la instantánea y solo se
+    /// refresca. Un único hilo que lee de la Web API solo cuando sobran fichas (deja
+    /// `BG_RESERVE`) y ante un 429 o el enfriamiento falla al momento en vez de esperar: quien
+    /// llama debe conservar lo que ya tiene si la respuesta es un error.
+    pub fn send_bg(&self, req: Req) {
+        let _ = self.bg_tx.send(req);
+    }
+
     pub fn send(&self, req: Req) {
+        // Solo la búsqueda va a su carril «gana la última». Req::User se queda en el común
+        // aunque la búsqueda de perfiles lo envíe junto a ella: descartarlo dejaría «user:x»
+        // pedido para siempre y el perfil o el avatar no llegarían nunca.
+        if matches!(req, Req::Search(_)) {
+            let _ = self.search_tx.send(req);
+            return;
+        }
+        // Las letras, a su hueco del carril de enriquecimiento: si aún espera la de una canción
+        // ya saltada, la sustituye (la app solo acepta la de la que suena).
+        if matches!(req, Req::Lyrics { .. }) {
+            let (lock, cv) = &*self.enrich;
+            if let Some(old) = lock.lock().unwrap().lyrics.replace(req) {
+                log::info!("api {:?} descartada: hay unas letras más nuevas", old);
+            }
+            cv.notify_one();
+            return;
+        }
         let player = matches!(
             req,
             Req::PlayerState
@@ -403,6 +700,10 @@ impl Api {
 
 struct Client {
     agent: ureq::Agent,
+    /// Para las fuentes externas (letras, géneros), con plazo corto.
+    ext_agent: ureq::Agent,
+    /// Búsqueda de los clientes oficiales (pathfinder), antes que la de la Web API.
+    pf: Pathfinder,
     shared: Arc<Shared>,
     handle: tokio::runtime::Handle,
     web: Arc<WebAuth>,
@@ -417,15 +718,30 @@ struct Client {
     /// Géneros por "artist:<id>" / "album:<id>" (fuentes externas; se guardan en disco).
     genres: Mutex<std::collections::HashMap<String, Vec<String>>>,
     genres_file: PathBuf,
-    /// Claves ya consultadas sin resultado en esta sesión (no se repiten).
-    genres_miss: Mutex<std::collections::HashSet<String>>,
-    /// Endpoints que Spotify ha rechazado (403/400) en esta sesión: se usa librespot directamente.
-    tracks_blocked: std::sync::atomic::AtomicBool,
+    /// Claves ya consultadas sin resultado (no se repiten). Con fecha si todas las fuentes
+    /// contestaron: se guardan en disco y valen 30 días. Sin fecha si alguna falló (sin red,
+    /// límite): solo esta sesión, porque con red quizá sí los habría.
+    genres_miss: Mutex<std::collections::HashMap<String, Option<u64>>>,
+    genres_miss_file: PathBuf,
+    /// Copias en disco de las playlists (las escribe la interfaz): al recargar una, sus pistas
+    /// ya conocidas no se vuelven a pedir.
+    lists_dir: PathBuf,
+    /// Cola del carril de enriquecimiento (la comparte con Api, que le pasa las letras).
+    enrich: Enrich,
+    /// /artists/{id}/albums rechazado por Spotify (403/400) en esta sesión: se usa librespot
+    /// directamente.
     artist_albums_blocked: std::sync::atomic::AtomicBool,
     /// Limitador de ritmo propio (token bucket) para la Web API: mantiene el ritmo por debajo
     /// del umbral de Spotify de forma proactiva, evitando los 429 en vez de reaccionar a ellos.
     /// (tokens disponibles, momento del último relleno).
     rate: Mutex<(f64, Instant)>,
+    /// Hasta cuándo un token de lectura está limitado tras un 429 corto (Retry-After), por
+    /// token: [app propia, primera parte]. Lo comparten todos los hilos, para que cada lectura
+    /// no descubra el mismo 429 gastando otra llamada y esperando por su cuenta. Solo en
+    /// memoria: el enfriamiento largo por cuota agotada es `cooldown_until`.
+    /// (cuándo llegó el 429, hasta cuándo): el primero evita que una respuesta de una petición
+    /// enviada ANTES del 429 (otro hilo, en vuelo) libere el token nada más limitarse.
+    read_backoff: Mutex<[Option<(Instant, Instant)>; 2]>,
 }
 
 impl Client {
@@ -436,6 +752,16 @@ impl Client {
             .unwrap()
             .clone()
             .ok_or_else(|| "no has iniciado sesión".to_string())
+    }
+
+    /// Espera una llamada de librespot desde un hilo de la API, con plazo `d`. Ver
+    /// `block_timeout`.
+    fn block<T, E: std::fmt::Display>(
+        &self,
+        d: Duration,
+        f: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, String> {
+        block_timeout(&self.handle, d, f)
     }
 
     /// Token para la Web API. `write`=escritura (Me gusta, seguir) -> SIEMPRE la identidad de
@@ -450,6 +776,13 @@ impl Client {
             .unwrap_or(false)
     }
 
+    /// Segundos que le quedan al enfriamiento por cuota agotada de la Web API, si lo hay.
+    fn web_cooldown_left(&self) -> Option<u64> {
+        let until = (*self.cooldown_until.lock().unwrap())?;
+        let now = crate::cache::now_secs();
+        (until > now).then(|| until - now)
+    }
+
     fn token(&self, write: bool) -> Result<(String, bool), String> {
         if !write && !self.personal_cooled() {
             if let Some(t) = self.web_personal.access_token()? {
@@ -461,8 +794,7 @@ impl Client {
         }
         let session = self.session()?;
         let token = self
-            .handle
-            .block_on(session.login5().auth_token())
+            .block(TIMEOUT_ITEM, session.login5().auth_token())
             .map_err(|e| format!("token: {e}"))?;
         Ok((token.access_token, false))
     }
@@ -471,34 +803,90 @@ impl Client {
     /// Token bucket: se reponen `RATE_REFILL` fichas por segundo hasta un máximo de `RATE_BURST`;
     /// cada petición consume una. Así una ráfaga corta pasa al instante y el ritmo sostenido
     /// queda por debajo del umbral de Spotify, evitando los 429 antes de que ocurran.
+    /// El carril de fondo solo toma una ficha si detrás quedan `BG_RESERVE`: una recarga de
+    /// decenas de páginas no se come el ritmo de la búsqueda ni de las páginas que ella abre.
     fn rate_acquire(&self) {
-        let sleep = {
-            let mut g = self.rate.lock().unwrap();
-            let (ref mut tokens, ref mut last) = *g;
-            let now = Instant::now();
-            *tokens = (*tokens + last.elapsed().as_secs_f64() * RATE_REFILL).min(RATE_BURST);
-            *last = now;
-            if *tokens >= 1.0 {
-                *tokens -= 1.0;
-                Duration::ZERO
-            } else {
-                let deficit = 1.0 - *tokens;
-                *tokens = 0.0;
-                Duration::from_secs_f64(deficit / RATE_REFILL)
+        let bg = on_bg_lane();
+        loop {
+            let (sleep, got) = {
+                let mut g = self.rate.lock().unwrap();
+                let (ref mut tokens, ref mut last) = *g;
+                let now = Instant::now();
+                *tokens = (*tokens + last.elapsed().as_secs_f64() * RATE_REFILL).min(RATE_BURST);
+                *last = now;
+                if bg {
+                    if *tokens >= 1.0 + BG_RESERVE {
+                        *tokens -= 1.0;
+                        (Duration::ZERO, true)
+                    } else {
+                        // No aparta nada (a diferencia del primer plano): vuelve a mirar cuando se
+                        // haya repuesto lo que falta, por si entretanto lo gastó otra petición.
+                        (Duration::from_secs_f64((1.0 + BG_RESERVE - *tokens) / RATE_REFILL), false)
+                    }
+                } else if *tokens >= 1.0 {
+                    *tokens -= 1.0;
+                    (Duration::ZERO, true)
+                } else {
+                    let deficit = 1.0 - *tokens;
+                    *tokens = 0.0;
+                    (Duration::from_secs_f64(deficit / RATE_REFILL), true)
+                }
+            };
+            if sleep > Duration::ZERO {
+                std::thread::sleep(sleep);
             }
-        };
-        if sleep > Duration::ZERO {
-            std::thread::sleep(sleep);
+            if got {
+                return;
+            }
         }
     }
 
+    /// Hueco del token en `read_backoff`: la app propia o la de primera parte. El de login5 no
+    /// tiene (ante un 429 ya se avisa con NO_APP_HINT).
+    fn backoff_slot(own_app: bool, personal: bool) -> Option<usize> {
+        if personal {
+            Some(0)
+        } else if own_app {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    /// Separa los tokens libres de los que siguen limitados tras un 429 de lectura; devuelve
+    /// los libres y lo que falta para que quede libre el primero de los otros.
+    fn open_tokens(&self, tokens: &[(String, bool, bool)]) -> (Vec<(String, bool, bool)>, Option<Duration>) {
+        let backoff = *self.read_backoff.lock().unwrap();
+        let now = Instant::now();
+        let mut open = Vec::new();
+        let mut min_left: Option<Duration> = None;
+        for t in tokens {
+            let left = Self::backoff_slot(t.1, t.2)
+                .and_then(|s| backoff[s])
+                .map(|(_, until)| until.saturating_duration_since(now))
+                .filter(|d| !d.is_zero());
+            match left {
+                Some(d) => min_left = Some(min_left.map_or(d, |m| m.min(d))),
+                None => open.push(t.clone()),
+            }
+        }
+        (open, min_left)
+    }
+
     /// Ejecuta una petición y devuelve (código HTTP, cuerpo). Reintenta una vez ante 429.
+    /// `wait_ok`=false (la búsqueda): una lectura limitada no espera el Retry-After; falla al
+    /// momento con «reintenta en N s» y la interfaz la repite sola, sin dormir un hilo.
     fn call(
         &self,
         method: &str,
         url: &str,
         body: Option<(&str, &[u8])>,
+        wait_ok: bool,
     ) -> Result<(u16, String), String> {
+        // El carril de fondo nunca duerme un Retry-After ni espera la limitación compartida:
+        // falla ya, quien lo pidió conserva su copia y se reintenta en otro arranque. Así no
+        // gasta más cuota mientras Spotify limita ni retiene la espera de las demás lecturas.
+        let wait_ok = wait_ok && !on_bg_lane();
         if let Some(until) = *self.cooldown_until.lock().unwrap() {
             let now = crate::cache::now_secs();
             if until > now {
@@ -529,12 +917,49 @@ impl Client {
             if v.is_empty() {
                 let session = self.session()?;
                 let token = self
-                    .handle
-                    .block_on(session.login5().auth_token())
+                    .block(TIMEOUT_ITEM, session.login5().auth_token())
                     .map_err(|e| format!("token: {e}"))?;
                 v.push((token.access_token, false, false));
             }
             v
+        };
+        // Lecturas con el último token disponible: un 429 corto (la identidad de primera
+        // parte «en frío» pide 10-20 s) se espera una vez en vez de fallar; si no, la
+        // búsqueda o la biblioteca no cargarían mientras la app propia esté sin cuota.
+        let mut read_waited = false;
+        // Lecturas: los tokens que acaban de recibir un 429 se saltan hasta que pase su
+        // Retry-After. Se filtra DESPUÉS de construir la lista: si se saltaran al construirla y
+        // no quedara ninguno, se usaría el token de login5, que ante un 429 diría «configura tu
+        // Client ID» en vez de «reintenta en N s». Las escrituras tienen su propio presupuesto.
+        // Si se saltó alguno, el último de la lista filtrada no es el último de verdad: un
+        // QUOTA_EXCEEDED de la app propia no debe acabar en el enfriamiento largo de toda la API.
+        let mut skipped = false;
+        let tokens = if write {
+            tokens
+        } else {
+            let (open, min_left) = self.open_tokens(&tokens);
+            skipped = min_left.is_some();
+            if open.is_empty() {
+                // Ninguno libre (la lista nunca está vacía, así que hay una espera). Quien puede
+                // esperar (biblioteca, playlists) espera solo lo que queda, una vez; la búsqueda
+                // falla ya con los segundos para reintentarse sola.
+                let left = min_left.unwrap_or_default();
+                let secs = ceil_secs(left);
+                if !wait_ok || secs > 25 {
+                    return Err(throttle_message(secs));
+                }
+                log::info!("Spotify limita las lecturas; se esperan los {secs} s que quedan del Retry-After");
+                std::thread::sleep(left);
+                read_waited = true;
+                let (open, min_left) = self.open_tokens(&tokens);
+                if open.is_empty() {
+                    return Err(throttle_message(ceil_secs(min_left.unwrap_or_default())));
+                }
+                skipped = min_left.is_some();
+                open
+            } else {
+                open
+            }
         };
         let last_i = tokens.len() - 1;
         // Guarda el resultado de un token que falló con 403/429 por si ningún otro token funciona.
@@ -547,14 +972,14 @@ impl Client {
             // Presupuesto total de espera para ESCRITURAS ante 429 (el id compartido de primera
             // parte está limitado por cuenta y en frío devuelve Retry-After de hasta ~21 s). La
             // interfaz es optimista, así que esperar en segundo plano evita que el Me gusta se
-            // revierta. La app propia casi nunca llega aquí (tiene su propia cuota).
-            let mut write_budget = 35u64;
+            // revierta. La app propia casi nunca llega aquí (tiene su propia cuota). En el carril
+            // del reproductor, solo PLAYER_WRITE_WAIT: detrás esperan los demás mandos.
+            let player_lane = on_player_lane();
+            let mut write_budget = if player_lane { PLAYER_WRITE_WAIT } else { 35u64 };
             let mut advance = false;
-            // Lecturas con el último token disponible: un 429 corto (la identidad de primera
-            // parte «en frío» pide 10-20 s) se espera una vez en vez de fallar; si no, la
-            // búsqueda o la biblioteca no cargarían mientras la app propia esté sin cuota.
-            let mut read_waited = false;
+            let slot = Self::backoff_slot(own_app, personal);
             for _ in 0..8 {
+                let sent_at = Instant::now();
                 let resp = match method {
                     "GET" => self.agent.get(url).header("Authorization", &bearer).call(),
                     "DELETE" => match body {
@@ -582,6 +1007,16 @@ impl Client {
                 };
                 let mut resp = resp.map_err(|e| format!("red: {e}"))?;
                 let status = resp.status().as_u16();
+                if status != 429 {
+                    // Respondió sin limitar: el token vuelve a estar libre para las lecturas. Solo
+                    // si esta petición salió después del 429; una que ya iba en vuelo no dice nada.
+                    if let Some(s) = slot {
+                        let mut b = self.read_backoff.lock().unwrap();
+                        if b[s].is_some_and(|(at, _)| at <= sent_at) {
+                            b[s] = None;
+                        }
+                    }
+                }
                 if status == 429 {
                     let retry_after = resp
                         .headers()
@@ -607,6 +1042,14 @@ impl Client {
                             advance = true;
                             break;
                         }
+                        // La app propia era la última solo porque la de primera parte está en su
+                        // espera corta: ya está apartada (personal_cooled), así que se repite con
+                        // la de primera parte, que espera o falla con «reintenta en N s». Antes de
+                        // la espera compartida se probaba esa directamente; no hay que bloquear
+                        // toda la Web API horas ni guardarlo en disco por eso.
+                        if personal && skipped {
+                            return self.call(method, url, body, wait_ok);
+                        }
                         let until = crate::cache::now_secs() + wait;
                         *self.cooldown_until.lock().unwrap() = Some(until);
                         let _ = std::fs::write(&self.cooldown_file, until.to_string());
@@ -618,7 +1061,16 @@ impl Client {
                         if !own_app {
                             return Err(NO_APP_HINT.to_string());
                         }
-                        if is_last && !read_waited && retry_after <= 25 {
+                        // Las demás lecturas saltan este token hasta que pase el Retry-After, en
+                        // vez de gastar otra llamada cada una para descubrir el mismo 429.
+                        // Un 429 que llega tarde con un Retry-After menor no acorta uno ya puesto.
+                        if let Some(s) = slot {
+                            let now = Instant::now();
+                            let mut b = self.read_backoff.lock().unwrap();
+                            let until = (now + Duration::from_secs(retry_after)).max(b[s].map_or(now, |(_, u)| u));
+                            b[s] = Some((now, until));
+                        }
+                        if is_last && !read_waited && retry_after <= 25 && wait_ok {
                             read_waited = true;
                             log::info!("Spotify limita las lecturas (Retry-After {retry_after} s); se espera una vez");
                             std::thread::sleep(Duration::from_secs(retry_after));
@@ -629,10 +1081,18 @@ impl Client {
                             advance = true;
                             break;
                         }
+                        // La búsqueda no duerme el hilo hasta 25 s mientras ella mira «Buscando»:
+                        // falla ya con los segundos y la interfaz la reintenta sola.
+                        if !wait_ok {
+                            return Err(throttle_message(retry_after));
+                        }
                         return Err("Spotify está limitando las peticiones; inténtalo de nuevo en unos segundos.".to_string());
                     }
                     // ESCRITURA: reintenta respetando el Retry-After real hasta agotar el presupuesto.
-                    if write_budget > 0 {
+                    // En el carril del reproductor, solo si el Retry-After cabe en lo que queda:
+                    // dormir 3 s para repetir una petición que sigue limitada gasta otra llamada
+                    // con el 429 seguro y retrasa igual los mandos que esperan detrás.
+                    if write_budget > 0 && !(player_lane && retry_after > write_budget) {
                         let wait = retry_after.min(write_budget).min(22);
                         write_budget = write_budget.saturating_sub(wait);
                         std::thread::sleep(Duration::from_secs(wait));
@@ -666,7 +1126,17 @@ impl Client {
     }
 
     fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, String> {
-        let (status, text) = self.call("GET", url, None)?;
+        self.get_json_wait(url, true)
+    }
+
+    /// Como `get_json`, pero ante un 429 no espera: falla al momento con «reintenta en N s»
+    /// (lo lee `retry_secs`). Para la búsqueda, que la interfaz reintenta sola.
+    fn get_json_nowait<T: DeserializeOwned>(&self, url: &str) -> Result<T, String> {
+        self.get_json_wait(url, false)
+    }
+
+    fn get_json_wait<T: DeserializeOwned>(&self, url: &str, wait_ok: bool) -> Result<T, String> {
+        let (status, text) = self.call("GET", url, None, wait_ok)?;
         if !(200..300).contains(&status) {
             return Err(http_error(status, &text));
         }
@@ -675,7 +1145,7 @@ impl Client {
 
     /// Como `get_json`, pero 204 (sin contenido) devuelve `None`.
     fn get_json_opt<T: DeserializeOwned>(&self, url: &str) -> Result<Option<T>, String> {
-        let (status, text) = self.call("GET", url, None)?;
+        let (status, text) = self.call("GET", url, None, true)?;
         if status == 204 || (status == 200 && text.trim().is_empty()) {
             return Ok(None);
         }
@@ -687,12 +1157,39 @@ impl Client {
             .map_err(|e| format!("respuesta inesperada: {e}"))
     }
 
+    /// Búsqueda por la Web API /search (la de respaldo de pathfinder). Ante un 429 falla al
+    /// momento con «reintenta en N s» en vez de esperar.
+    fn search_web(&self, q: &str) -> Result<SearchResult, String> {
+        let full = format!(
+            "{BASE}/search?q={}&type=track,album,artist,playlist,show,episode,audiobook&limit=10&market=from_token",
+            urlencode(q)
+        );
+        match self.get_json_nowait::<SearchResult>(&full) {
+            Ok(r) => Ok(r),
+            // Sin audiolibros solo si Spotify rechaza el tipo (400/403, de http_error) o
+            // si lo que devuelve no se puede leer (un audiolibro con campos raros). Un
+            // 429, el enfriamiento por cuota o un fallo de red se devuelven tal cual:
+            // repetir gastaría otra llamada de cuota y fallaría igual.
+            Err(e)
+                if e.starts_with("HTTP 400")
+                    || e.contains("(403)")
+                    || e.starts_with("respuesta inesperada") =>
+            {
+                self.get_json_nowait(&format!(
+                    "{BASE}/search?q={}&type=track,album,artist,playlist,show,episode&limit=10&market=from_token",
+                    urlencode(q)
+                ))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     fn send_json(&self, method: &str, url: &str, body: Option<Value>) -> Result<String, String> {
         let text = body.map(|b| b.to_string());
         let body = text
             .as_deref()
             .map(|t| ("application/json", t.as_bytes()));
-        let (status, resp) = self.call(method, url, body)?;
+        let (status, resp) = self.call(method, url, body, true)?;
         if (200..300).contains(&status) {
             Ok(resp)
         } else {
@@ -784,7 +1281,7 @@ impl Client {
         }
         let fetch = |url: &str| -> Option<Value> {
             let mut resp = match self
-                .agent
+                .ext_agent
                 .get(url)
                 .header("User-Agent", "Nanofy/0.1 (cliente nativo de Spotify)")
                 .call()
@@ -847,17 +1344,35 @@ impl Client {
         None
     }
 
-    /// Uris de las pistas de una playlist por el protocolo interno (playlist4).
-    /// (id de pista, usuario que la añadió) de una playlist, por librespot.
-    fn playlist_items(&self, id: &str) -> Result<Vec<(String, Option<String>, Option<String>)>, String> {
+    /// Una playlist por el protocolo interno (playlist4): pistas, atributos y propietario.
+    fn playlist4(&self, id: &str) -> Result<librespot_metadata::Playlist, String> {
         let session = self.session()?;
         let uri = SpotifyUri::from_uri(&format!("spotify:playlist:{id}"))
             .map_err(|e| e.to_string())?;
-        let pl = self
-            .handle
-            .block_on(librespot_metadata::Playlist::get(&session, &uri))
-            .map_err(|e| format!("playlist: {e}"))?;
-        Ok(pl
+        self.block(TIMEOUT_LIST, librespot_metadata::Playlist::get(&session, &uri))
+            .map_err(|e| format!("playlist: {e}"))
+    }
+
+    /// (id de pista, usuario que la añadió, fecha) de cada pista de una playlist por librespot,
+    /// y sus metadatos sacados de la misma descarga: así la página no espera a otra petición
+    /// (de la Web API, que puede estar limitada) para tener nombre y portada.
+    fn playlist_items(&self, id: &str) -> Result<(Vec<(String, Option<String>, Option<String>)>, Playlist), String> {
+        let pl = self.playlist4(id)?;
+        // Hoy Spotify manda la lista entera en una respuesta (se han visto 936 elementos), pero
+        // el mensaje dice su largo total y si viene cortada. Si faltara algo, la carga lo
+        // guardaría como la playlist completa: que al menos se vea en el registro. Cuentan todos
+        // los elementos (episodios y locales también), antes de quedarse con las pistas.
+        let got = pl.contents.items.len();
+        let start = pl.contents.position.max(0) as usize;
+        let want = pl.length.max(0) as usize;
+        if pl.contents.is_truncated || start + got < want {
+            log::warn!(
+                "[playlist] {id}: llegó truncada ({got} elementos desde {start} de {want}, truncated={})",
+                pl.contents.is_truncated
+            );
+        }
+        let meta = meta_from_playlist4(&pl, id);
+        let items = pl
             .contents
             .items
             .iter()
@@ -870,42 +1385,152 @@ impl Client {
                 }),
                 _ => None,
             })
-            .collect())
+            .collect();
+        Ok((items, meta))
     }
 
-    /// Detalles de pistas por id: Web API por lotes de 50 y, si falla (las apps en modo
-    /// desarrollo no tienen /tracks), metadatos internos por lotes; una a una solo si eso falla.
+    /// Detalles de pistas por id: metadatos internos por lotes de 500 (no gastan cuota de la Web
+    /// API). Ya no se prueba antes /tracks: a las apps en modo desarrollo Spotify siempre lo
+    /// rechaza (403), y averiguarlo costaba en cada arranque una lectura de la Web API por hilo
+    /// (con un 429, hasta 25 s de espera) antes de la primera playlist.
     fn tracks_by_ids(&self, ids: &[String]) -> Result<Vec<Track>, String> {
         let mut out = Vec::with_capacity(ids.len());
-        use std::sync::atomic::Ordering;
-        if self.tracks_blocked.load(Ordering::Relaxed) {
-            for chunk in ids.chunks(500) {
-                match self.tracks_via_batch(chunk) {
-                    Ok(t) => out.extend(t),
-                    Err(e) => {
-                        log::warn!("metadatos por lotes: {e}; se piden una a una");
-                        out.extend(self.tracks_via_librespot(chunk)?);
-                    }
+        for chunk in ids.chunks(BATCH_MAX) {
+            match self.tracks_via_batch(chunk) {
+                Ok(t) => out.extend(t),
+                // Una a una solo si son pocas. Con un lote de cientos, el error sube: pedirlas
+                // sueltas agotaba el cupo de librespot y aun así se perdían pistas; quien pidió
+                // conserva lo que tenía y reintenta más tarde.
+                Err(e) if chunk.len() <= SINGLE_GET_MAX => {
+                    log::warn!("metadatos por lotes: {e}; se piden una a una");
+                    out.extend(self.tracks_via_librespot(chunk)?);
                 }
-            }
-            return Ok(out);
-        }
-        for chunk in ids.chunks(50) {
-            if self.tracks_blocked.load(Ordering::Relaxed) {
-                out.extend(self.tracks_by_ids(chunk)?);
-                continue;
-            }
-            let url = format!("{BASE}/tracks?ids={}", chunk.join(","));
-            match self.get_json::<TracksResponse>(&url) {
-                Ok(r) => out.extend(r.tracks.into_iter().flatten().map(slim_track)),
-                Err(e) => {
-                    log::info!("/tracks no disponible ({e}); usando metadatos de librespot");
-                    self.tracks_blocked.store(true, Ordering::Relaxed);
-                    out.extend(self.tracks_by_ids(chunk)?);
-                }
+                Err(e) => return Err(e),
             }
         }
         Ok(out)
+    }
+
+    /// Como tracks_by_ids, pero una entrada por id pedido y en su orden (`None` si Spotify no la
+    /// tiene): una pista puede volver con otro id (Spotify sustituye ediciones) y hay que saber
+    /// de cuál de las pedidas es.
+    fn tracks_aligned(&self, ids: &[String]) -> Result<Vec<Option<Track>>, String> {
+        let kind = librespot_protocol::extension_kind::ExtensionKind::TRACK_V4;
+        let uris: Vec<Option<SpotifyUri>> = ids.iter().map(|id| SpotifyUri::from_uri(&format!("spotify:track:{id}")).ok()).collect();
+        let valid: Vec<SpotifyUri> = uris.iter().flatten().cloned().collect();
+        let metas = match self.metadata_batch::<librespot_metadata::Track>(&valid, kind) {
+            Ok(m) => m,
+            // Una a una solo si son pocas, como en tracks_by_ids.
+            Err(e) if valid.len() <= SINGLE_GET_MAX => {
+                log::warn!("{e}; se piden una a una");
+                let session = self.session()?;
+                let keys: Vec<String> = valid.iter().map(|u| u.to_uri().unwrap_or_default()).collect();
+                let all: Vec<usize> = (0..keys.len()).collect();
+                let got = self.handle.block_on(get_singles::<librespot_metadata::Track>(&session, &keys, &all));
+                if got.iter().all(|(_, m)| m.is_none()) {
+                    return Err(e);
+                }
+                let mut metas = vec![None; keys.len()];
+                for (i, m) in got {
+                    metas[i] = m;
+                }
+                metas
+            }
+            Err(e) => return Err(e),
+        };
+        let mut metas = metas.into_iter();
+        Ok(uris.iter().map(|u| u.as_ref().and_then(|_| metas.next().flatten()).map(track_from_meta)).collect())
+    }
+
+    /// Copia en disco de una playlist, si sirve para reutilizar sus pistas al recargarla. No
+    /// sirve si no la hay o no se puede leer, si sus metadatos tienen LIST_META_TTL o más (o no
+    /// se sabe de cuándo son: copias de antes de guardarlo) o si son de otro país, que cambia
+    /// qué ediciones están disponibles: entonces se piden todas, como antes.
+    fn list_copy(&self, id: &str, country: &str) -> Option<ListCopy> {
+        let text = std::fs::read_to_string(self.lists_dir.join(format!("{id}.json"))).ok()?;
+        let copy = match serde_json::from_str::<ListCopy>(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                log::info!("playlist {id}: copia en disco ilegible ({e}); se piden todas sus pistas");
+                return None;
+            }
+        };
+        let now = crate::cache::now_secs();
+        // Una fecha futura (el reloj iba adelantado al guardarla) tampoco se da por buena.
+        if copy.meta_at == 0 || copy.meta_at > now || now - copy.meta_at >= LIST_META_TTL {
+            log::info!("playlist {id}: metadatos de la copia sin fecha o de hace una semana o más; se piden todos");
+            return None;
+        }
+        if copy.country.as_deref() != Some(country) {
+            log::info!("playlist {id}: la copia es de otro país ({:?}, ahora {country}); se piden todas sus pistas", copy.country);
+            return None;
+        }
+        Some(copy)
+    }
+
+    /// Recarga de una playlist con su copia en disco: solo se piden (en un lote) las pistas que
+    /// la copia no tiene, y la lista se rehace en el orden de `items`, una fila por posición
+    /// (las repetidas también), con quién y cuándo se añadió en esa posición. Antes cada
+    /// recarga volvía a pedir todas: 2.000 pistas, 5 lotes aunque solo hubiera una nueva.
+    /// `None` si faltan tantas que conviene la carga por lotes en paralelo, que además muestra
+    /// las primeras filas antes.
+    fn playlist_from_copy(
+        &self,
+        req: &Req,
+        id: &str,
+        items: &[(String, Option<String>, Option<String>)],
+        copy: ListCopy,
+        country: &str,
+        t0: Instant,
+        ui: &UiTx,
+    ) -> Option<Result<Resp, String>> {
+        // Por id de pista: una repetida es la misma entrada, clonada en cada posición.
+        let mut known: std::collections::HashMap<String, Track> =
+            copy.tracks.into_iter().filter_map(|t| Some((t.id.clone()?, t))).collect();
+        let mut seen = std::collections::HashSet::new();
+        let missing: Vec<String> = items
+            .iter()
+            .map(|(tid, _, _)| tid)
+            .filter(|tid| !known.contains_key(*tid) && seen.insert(*tid))
+            .cloned()
+            .collect();
+        if missing.len() > BATCH_MAX {
+            log::info!("playlist {id}: {} pistas nuevas respecto a la copia; se cargan todas por lotes", missing.len());
+            return None;
+        }
+        if !missing.is_empty() {
+            let fetched = match self.tracks_aligned(&missing) {
+                Ok(f) => f,
+                // Falla la carga: quien pidió conserva lo que tenía y reintenta más tarde.
+                Err(e) => return Some(Err(e)),
+            };
+            for (tid, t) in missing.iter().zip(fetched) {
+                if let Some(t) = t {
+                    known.insert(tid.clone(), t);
+                }
+            }
+        }
+        // Las que Spotify ya no tiene no llegan (como en la carga por lotes): se omiten.
+        let tracks: Vec<Track> = items
+            .iter()
+            .filter_map(|(tid, by, at)| {
+                let mut t = known.get(tid)?.clone();
+                t.added_by = by.clone();
+                t.added_at = at.clone();
+                Some(t)
+            })
+            .collect();
+        log::info!(
+            "[t] PlaylistTracks {id} n={} completa en {} ms (de la copia; {} pedidas)",
+            items.len(),
+            t0.elapsed().as_millis(),
+            missing.len()
+        );
+        // Lo reutilizado conserva su fecha: la copia nueva lleva la de la anterior, y pasado
+        // LIST_META_TTL se piden todas otra vez.
+        let info = Resp::PlaylistCopyInfo { id: id.to_string(), meta_at: copy.meta_at, country: country.to_string() };
+        ui.send(Msg::Api(ApiResult { req: req.clone(), result: Ok(info) }));
+        Some(Ok(Resp::Tracks { key: id.to_string(), tracks, total: items.len() as u32, done: true }))
     }
 
     /// Nombre e imagen de un artista por los metadatos internos.
@@ -913,28 +1538,54 @@ impl Client {
         let session = self.session()?;
         let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}")).map_err(|e| e.to_string())?;
         let a = self
-            .handle
-            .block_on(librespot_metadata::Artist::get(&session, &uri))
+            .block(TIMEOUT_ITEM, librespot_metadata::Artist::get(&session, &uri))
             .map_err(|e| format!("artista: {e}"))?;
+        Ok(self.artist_from_meta(id, &a))
+    }
+
+    /// Artista de los metadatos internos, con los géneros ya conocidos (los externos los
+    /// completa quien llama, sin retrasar la página). Sin seguidores: no vienen ahí.
+    fn artist_from_meta(&self, id: &str, a: &librespot_metadata::Artist) -> Artist {
         let mut images: Vec<Image> = a.portrait_group.iter().map(image_from_meta).collect();
         if images.is_empty() {
             images = a.portraits.iter().map(image_from_meta).collect();
         }
-        Ok(Artist {
+        Artist {
             id: id.to_string(),
             name: a.name.clone(),
             uri: format!("spotify:artist:{id}"),
             images,
-            // Los externos los completa quien llama, sin retrasar la página.
             genres: self.cached_genres(&format!("artist:{id}")).unwrap_or_default(),
             followers: None,
-        })
+        }
+    }
+
+    /// Nombre e imagen de varios artistas por lotes de metadatos internos: una petición por
+    /// cada THUMBS_BATCH en vez de una a la Web API (y una búsqueda de géneros) por artista.
+    /// Lo que el lote no traiga se omite: la tarjeta deja la inicial.
+    fn artist_thumbs(&self, ids: &[String]) -> Result<Vec<Artist>, String> {
+        let wanted: Vec<(&String, SpotifyUri)> = ids
+            .iter()
+            .filter_map(|id| Some((id, SpotifyUri::from_uri(&format!("spotify:artist:{id}")).ok()?)))
+            .collect();
+        let mut out = Vec::with_capacity(wanted.len());
+        for chunk in wanted.chunks(THUMBS_BATCH) {
+            let uris: Vec<SpotifyUri> = chunk.iter().map(|(_, u)| u.clone()).collect();
+            let metas = self.metadata_batch::<librespot_metadata::Artist>(&uris, librespot_protocol::extension_kind::ExtensionKind::ARTIST_V4)?;
+            // Por posición, con el id pedido: la tarjeta lo busca por ese.
+            for ((id, _), m) in chunk.iter().zip(metas) {
+                if let Some(a) = m {
+                    out.push(self.artist_from_meta(id, &a));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// GET sin autorización (fuentes públicas: iTunes, Deezer, MusicBrainz), con tiempo límite corto.
     fn plain_get_json(&self, url: &str) -> Option<Value> {
         let resp = self
-            .agent
+            .ext_agent
             .get(url)
             .header("User-Agent", "Nanofy/1.0.0 (https://github.com/nanofy)")
             .header("Accept", "application/json")
@@ -959,30 +1610,57 @@ impl Client {
         if let Some(g) = self.genres.lock().unwrap().get(key) {
             return Some(g.clone());
         }
-        self.genres_miss.lock().unwrap().contains(key).then(Vec::new)
+        self.genres_miss.lock().unwrap().contains_key(key).then(Vec::new)
     }
 
-    /// Géneros sin retrasar la página: buscarlos cuesta varias consultas externas en serie, así
-    /// que si no están ya en memoria se envía `partial` en seguida y se buscan después (la misma
-    /// respuesta vuelve a llegar, ya con ellos).
-    fn genres_or_send(&self, key: &str, artist: &str, album: Option<&str>, partial: impl FnOnce() -> Resp, req: &Req, ui: &UiTx) -> Vec<String> {
+    /// Géneros sin retrasar la página ni ocupar el hilo: buscarlos cuesta varias consultas
+    /// externas en serie (segundos), así que si no se conocen ya se devuelven vacíos al momento y
+    /// se encargan al carril de enriquecimiento, que los manda aparte (Resp::Genres). Antes se
+    /// buscaban aquí mismo y uno de los dos hilos comunes quedaba ocupado tras dibujar la página.
+    fn genres_or_queue(&self, key: &str, artist: &str, album: Option<&str>) -> Vec<String> {
         if let Some(g) = self.cached_genres(key) {
             return g;
         }
-        ui.send(Msg::Api(ApiResult { req: req.clone(), result: Ok(partial()) }));
-        self.external_genres(key, artist, album)
+        let (lock, cv) = &*self.enrich;
+        let mut q = lock.lock().unwrap();
+        if q.queued.insert(key.to_string()) {
+            q.genres.push_back((key.to_string(), artist.to_string(), album.map(str::to_string)));
+            if q.genres.len() > ENRICH_GENRES_MAX {
+                if let Some((old, _, _)) = q.genres.pop_front() {
+                    q.queued.remove(&old);
+                }
+            }
+            cv.notify_one();
+        }
+        Vec::new()
     }
 
     /// Géneros cacheados o consultados a fuentes externas. `key` = "artist:<id>" o "album:<id>".
     /// Spotify dejó de exponer géneros (Web API y metadatos internos vienen vacíos), así que se
     /// combinan iTunes Search (género principal), Deezer (géneros de álbum) y MusicBrainz (etiquetas).
-    fn external_genres(&self, key: &str, artist: &str, album: Option<&str>) -> Vec<String> {
+    /// Solo desde el carril de enriquecimiento (genres_or_queue); `between` se llama antes de
+    /// cada consulta para atender ahí las letras que esperen.
+    fn external_genres(&self, key: &str, artist: &str, album: Option<&str>, between: &dyn Fn()) -> Vec<String> {
         if let Some(g) = self.genres.lock().unwrap().get(key) {
             return g.clone();
         }
-        if self.genres_miss.lock().unwrap().contains(key) {
+        if self.genres_miss.lock().unwrap().contains_key(key) {
             return Vec::new();
         }
+        // Alguna fuente no contestó (sin red, límite, plazo vencido): un resultado vacío entonces
+        // no dice que no tenga géneros.
+        let failed = std::cell::Cell::new(false);
+        // Deezer avisa de su límite con un 200 y un objeto «error».
+        let get = |url: &str| {
+            // Una búsqueda son hasta tres consultas de varios segundos: las letras de la canción
+            // que suena no esperan a todas, solo a la que esté en curso.
+            between();
+            let v = self.plain_get_json(url);
+            if v.as_ref().map_or(true, |v| v.get("error").is_some()) {
+                failed.set(true);
+            }
+            v
+        };
         let norm = |s: &str| s.trim().to_lowercase();
         let mut out: Vec<String> = Vec::new();
         let push = |g: &str, out: &mut Vec<String>| {
@@ -995,12 +1673,12 @@ impl Client {
             Some(album) => {
                 // Deezer: búsqueda del álbum y géneros del álbum (varios).
                 let q = urlencode(&format!("artist:\"{artist}\" album:\"{album}\""));
-                if let Some(v) = self.plain_get_json(&format!("https://api.deezer.com/search/album?q={q}&limit=1")) {
+                if let Some(v) = get(&format!("https://api.deezer.com/search/album?q={q}&limit=1")) {
                     let hit = v["data"][0].clone();
                     let title = hit["title"].as_str().unwrap_or("");
                     if !title.is_empty() && (norm(title) == norm(album) || norm(title).starts_with(&norm(album)) || norm(album).starts_with(&norm(title))) {
                         if let Some(id) = hit["id"].as_i64() {
-                            if let Some(a) = self.plain_get_json(&format!("https://api.deezer.com/album/{id}")) {
+                            if let Some(a) = get(&format!("https://api.deezer.com/album/{id}")) {
                                 if let Some(gs) = a["genres"]["data"].as_array() {
                                     for g in gs {
                                         if let Some(n) = g["name"].as_str() {
@@ -1014,7 +1692,7 @@ impl Client {
                 }
                 // iTunes: género principal del álbum (si el título coincide).
                 let q = urlencode(&format!("{artist} {album}"));
-                if let Some(v) = self.plain_get_json(&format!("https://itunes.apple.com/search?term={q}&entity=album&limit=3")) {
+                if let Some(v) = get(&format!("https://itunes.apple.com/search?term={q}&entity=album&limit=3")) {
                     if let Some(items) = v["results"].as_array() {
                         for it in items {
                             let name = it["collectionName"].as_str().unwrap_or("");
@@ -1032,7 +1710,7 @@ impl Client {
             None => {
                 // iTunes: género principal del artista.
                 let q = urlencode(artist);
-                if let Some(v) = self.plain_get_json(&format!("https://itunes.apple.com/search?term={q}&entity=musicArtist&limit=3")) {
+                if let Some(v) = get(&format!("https://itunes.apple.com/search?term={q}&entity=musicArtist&limit=3")) {
                     if let Some(items) = v["results"].as_array() {
                         for it in items {
                             if norm(it["artistName"].as_str().unwrap_or("")) == norm(artist) {
@@ -1046,7 +1724,7 @@ impl Client {
                 }
                 // MusicBrainz: etiquetas de la comunidad (las más votadas), si el servidor responde.
                 let q = urlencode(&format!("artist:\"{artist}\""));
-                if let Some(v) = self.plain_get_json(&format!("https://musicbrainz.org/ws/2/artist/?query={q}&fmt=json&limit=1")) {
+                if let Some(v) = get(&format!("https://musicbrainz.org/ws/2/artist/?query={q}&fmt=json&limit=1")) {
                     let hit = v["artists"][0].clone();
                     if hit["score"].as_i64().unwrap_or(0) >= 90 && norm(hit["name"].as_str().unwrap_or("")) == norm(artist) {
                         if let Some(tags) = hit["tags"].as_array() {
@@ -1066,12 +1744,31 @@ impl Client {
         }
         log::info!("[generos] {key} ({artist}{}): {out:?}", album.map(|a| format!(" — {a}")).unwrap_or_default());
         if out.is_empty() {
-            self.genres_miss.lock().unwrap().insert(key.to_string());
+            let text = {
+                let mut miss = self.genres_miss.lock().unwrap();
+                miss.insert(key.to_string(), (!failed.get()).then(crate::cache::now_secs));
+                // Al disco solo las que tienen fecha; se escribe sin el cerrojo, que los hilos
+                // comunes miran en cada álbum o artista.
+                (!failed.get())
+                    .then(|| {
+                        let disk: std::collections::HashMap<&String, u64> = miss.iter().filter_map(|(k, at)| Some((k, (*at)?))).collect();
+                        serde_json::to_string(&disk).ok()
+                    })
+                    .flatten()
+            };
+            if let Some(t) = text {
+                crate::cache::write_atomic(&self.genres_miss_file, &t);
+            }
         } else {
-            let mut map = self.genres.lock().unwrap();
-            map.insert(key.to_string(), out.clone());
-            if let Ok(t) = serde_json::to_string(&*map) {
-                let _ = std::fs::write(&self.genres_file, t);
+            // Igual: fuera del cerrojo, y atómico (un cierre a medio escribir los perdía todos).
+            // Solo escribe este carril, así que no se pisan dos versiones.
+            let text = {
+                let mut map = self.genres.lock().unwrap();
+                map.insert(key.to_string(), out.clone());
+                serde_json::to_string(&*map).ok()
+            };
+            if let Some(t) = text {
+                crate::cache::write_atomic(&self.genres_file, &t);
             }
         }
         out
@@ -1082,8 +1779,7 @@ impl Client {
         let session = self.session()?;
         let uri = SpotifyUri::from_uri(&format!("spotify:album:{id}")).map_err(|e| e.to_string())?;
         let a = self
-            .handle
-            .block_on(librespot_metadata::Album::get(&session, &uri))
+            .block(TIMEOUT_ITEM, librespot_metadata::Album::get(&session, &uri))
             .map_err(|e| format!("álbum: {e}"))?;
         let ids: Vec<String> = a.discs.iter().flat_map(|d| d.tracks.iter()).filter_map(|u| u.to_id().ok()).collect();
         let tracks = self.tracks_by_ids(&ids)?;
@@ -1120,47 +1816,7 @@ impl Client {
 
     /// Metadatos de una playlist por librespot (nombre, descripción, portada, tamaño).
     fn playlist_meta_via_librespot(&self, id: &str) -> Result<Playlist, String> {
-        let session = self.session()?;
-        let uri = SpotifyUri::from_uri(&format!("spotify:playlist:{id}")).map_err(|e| e.to_string())?;
-        let pl = self
-            .handle
-            .block_on(librespot_metadata::Playlist::get(&session, &uri))
-            .map_err(|e| format!("playlist: {e}"))?;
-        let a = &pl.attributes;
-        let images = if a.picture.is_empty() {
-            // Radios y mixes: la portada generada viene en las variantes por tamaño.
-            a.picture_sizes
-                .iter()
-                .max_by_key(|p| match p.target_name.as_str() {
-                    "xlarge" => 4,
-                    "large" => 3,
-                    "default" => 2,
-                    _ => 1,
-                })
-                .filter(|p| !p.url.is_empty())
-                .map(|p| vec![Image { url: p.url.clone(), width: Some(300), height: Some(300) }])
-                .unwrap_or_default()
-        } else {
-            let hex: String = a.picture.iter().map(|b| format!("{b:02x}")).collect();
-            vec![Image { url: format!("https://i.scdn.co/image/{hex}"), width: Some(300), height: Some(300) }]
-        };
-        // Las playlists algorítmicas de Spotify comparten prefijo de id.
-        let spotify_made = id.starts_with("37i9dQZ");
-        Ok(Playlist {
-            id: id.to_string(),
-            name: a.name.clone(),
-            uri: format!("spotify:playlist:{id}"),
-            description: Some(a.description.clone()).filter(|d| !d.is_empty()),
-            images: Some(images),
-            owner: Owner {
-                display_name: spotify_made.then(|| "Spotify".to_string()),
-                id: spotify_made.then(|| "spotify".to_string()),
-            },
-            tracks: Some(TracksRef { total: pl.length.max(0) as u32 }),
-            public: None,
-            collaborative: Some(a.is_collaborative),
-            followers: None,
-        })
+        Ok(meta_from_playlist4(&self.playlist4(id)?, id))
     }
 
     /// Álbumes de varios grupos (discos, sencillos…) a partir de uris internos, en una sola
@@ -1206,15 +1862,31 @@ fn album_ref_from_meta(a: librespot_metadata::Album) -> AlbumRef {
     }
 }
 
+/// Ids de las 10 canciones populares de un artista en el país de la cuenta (o, si no hay lista
+/// para él, en el primero que traiga).
+fn top_track_ids(a: &librespot_metadata::Artist, country: &str) -> Vec<String> {
+    a.top_tracks
+        .iter()
+        .find(|t| t.country == country)
+        .or_else(|| a.top_tracks.first())
+        .map(|t| t.tracks.iter().filter_map(|u| u.to_id().ok()).take(10).collect())
+        .unwrap_or_default()
+}
+
 impl Client {
-    /// Vista completa del artista: biografía, relacionados y discografía por grupos.
-    fn artist_view_via_librespot(&self, id: &str) -> Result<ArtistView, String> {
+    /// Vista completa del artista: biografía, relacionados y discografía por grupos. Las
+    /// populares salen antes, aparte (como Resp::ArtistTop), del mismo Artist::get: antes eran
+    /// otra petición que lo descargaba otra vez y ocupaba un hilo, y así no esperan al lote de
+    /// la discografía.
+    fn artist_view_via_librespot(&self, id: &str, ui: &UiTx) -> Result<ArtistView, String> {
         let session = self.session()?;
         let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}")).map_err(|e| e.to_string())?;
         let a = self
-            .handle
-            .block_on(librespot_metadata::Artist::get(&session, &uri))
+            .block(TIMEOUT_ITEM, librespot_metadata::Artist::get(&session, &uri))
             .map_err(|e| format!("artista: {e}"))?;
+        // Un fallo de las populares llega como el de Req::ArtistTop y no impide la vista.
+        let top = self.tracks_by_ids(&top_track_ids(&a, &session.country()));
+        ui.send(Msg::Api(ApiResult { req: Req::ArtistTop(id.to_string()), result: top.map(Resp::ArtistTop) }));
         let firsts = |groups: &librespot_metadata::artist::AlbumGroups, cap: usize| -> Vec<SpotifyUri> {
             groups.iter().filter_map(|g| g.first().cloned()).take(cap).collect()
         };
@@ -1257,8 +1929,7 @@ impl Client {
         let session = self.session()?;
         let uri = SpotifyUri::from_uri(&format!("spotify:show:{id}")).map_err(|e| e.to_string())?;
         let s = self
-            .handle
-            .block_on(librespot_metadata::Show::get(&session, &uri))
+            .block(TIMEOUT_ITEM, librespot_metadata::Show::get(&session, &uri))
             .map_err(|e| format!("podcast: {e}"))?;
         let ep_uris: Vec<SpotifyUri> = s.episodes.iter().take(50).cloned().collect();
         let fetched = self
@@ -1297,8 +1968,7 @@ impl Client {
         let session = self.session()?;
         let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}")).map_err(|e| e.to_string())?;
         let artist = self
-            .handle
-            .block_on(librespot_metadata::Artist::get(&session, &uri))
+            .block(TIMEOUT_ITEM, librespot_metadata::Artist::get(&session, &uri))
             .map_err(|e| format!("artista: {e}"))?;
         // Cada grupo agrupa versiones del mismo álbum: nos quedamos con la primera.
         let mut uris: Vec<SpotifyUri> = Vec::new();
@@ -1350,62 +2020,25 @@ impl Client {
     /// oficial), en el orden pedido. Pedirlas una a una gasta una petición por elemento: además
     /// de lento, agota el cupo de librespot (300 cada 30 s) y entonces tampoco se pueden cargar
     /// canciones para sonar. Lo que el lote no traiga (pocas: ediciones regionales, retiradas)
-    /// se pide suelto.
+    /// se pide suelto, con tope. Envoltorio síncrono de batch_chunk para quien no carga una
+    /// playlist: lotes uno tras otro, como antes.
     fn metadata_batch<M: librespot_metadata::Metadata + Clone>(
         &self,
         uris: &[SpotifyUri],
         kind: librespot_protocol::extension_kind::ExtensionKind,
     ) -> Result<Vec<Option<M>>, String> {
-        use librespot_protocol::extended_metadata::{BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery};
-        use protobuf::{EnumOrUnknown, Message};
         let session = self.session()?;
         let keys: Vec<String> = uris.iter().map(|u| u.to_uri().unwrap_or_default()).collect();
-        let mut found: std::collections::HashMap<String, M> = std::collections::HashMap::with_capacity(uris.len());
-        for chunk in keys.chunks(500) {
-            let mut req = BatchedEntityRequest::new();
-            let header = req.header.mut_or_insert_default();
-            header.country = session.country();
-            header.catalogue = "premium".to_string();
-            for uri in chunk {
-                let mut q = ExtensionQuery::new();
-                q.extension_kind = EnumOrUnknown::new(kind);
-                let mut e = EntityRequest::new();
-                e.entity_uri = uri.clone();
-                e.query.push(q);
-                req.entity_request.push(e);
+        // El tope de sueltos es por llamada, no por lote.
+        let singles = std::cell::Cell::new(SINGLE_GET_MAX);
+        self.handle.block_on(async {
+            let mut out = Vec::with_capacity(keys.len());
+            for chunk in keys.chunks(BATCH_MAX) {
+                let first = batch_chunk::<M>(&session, chunk, kind, &singles).await;
+                out.extend(batch_retry(&session, chunk, kind, &singles, first).await?);
             }
-            let body = req.write_to_bytes().map_err(|e| e.to_string())?;
-            let resp = self
-                .spclient_pb(http::Method::POST, "/extended-metadata/v0/extended-metadata", Some(&body))
-                .and_then(|b| BatchedExtensionResponse::parse_from_bytes(&b).map_err(|e| e.to_string()));
-            let resp = match resp {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!("metadatos por lotes: {e}; se piden sueltos");
-                    continue;
-                }
-            };
-            for data in resp.extended_metadata.iter().flat_map(|a| a.extension_data.iter()) {
-                let Some(any) = data.extension_data.as_ref() else { continue };
-                let (Ok(msg), Ok(uri)) = (M::Message::parse_from_bytes(&any.value), SpotifyUri::from_uri(&data.entity_uri)) else { continue };
-                if let Ok(m) = M::parse(&msg, &uri) {
-                    found.insert(data.entity_uri.clone(), m);
-                }
-            }
-        }
-        let missing: Vec<usize> = (0..uris.len()).filter(|&i| !found.contains_key(&keys[i])).collect();
-        if !missing.is_empty() {
-            log::info!("metadatos por lotes: {} de {} sin datos; se piden sueltos", missing.len(), uris.len());
-            let fetched = self.handle.block_on(futures::future::join_all(missing.iter().map(|&i| M::get(&session, &uris[i]))));
-            // Puede volver con otro id (Spotify sustituye ediciones): cuenta como la pedida.
-            for (i, r) in missing.into_iter().zip(fetched) {
-                if let Ok(m) = r {
-                    found.insert(keys[i].clone(), m);
-                }
-            }
-        }
-        // `get`, no `remove`: una playlist puede tener la misma canción dos veces.
-        Ok(keys.iter().map(|k| found.get(k).cloned()).collect())
+            Ok::<_, String>(out)
+        })
     }
 
     fn tracks_via_batch(&self, ids: &[String]) -> Result<Vec<Track>, String> {
@@ -1414,36 +2047,60 @@ impl Client {
         Ok(tracks.into_iter().flatten().map(track_from_meta).collect())
     }
 
+    /// Pistas una a una (solo para tandas pequeñas: tracks_by_ids no pasa más de SINGLE_GET_MAX),
+    /// pocas a la vez y en el orden pedido.
     fn tracks_via_librespot(&self, ids: &[String]) -> Result<Vec<Track>, String> {
+        use futures::StreamExt;
         let session = self.session()?;
+        let session = &session;
         let uris: Vec<SpotifyUri> = ids
             .iter()
             .filter_map(|id| SpotifyUri::from_uri(&format!("spotify:track:{id}")).ok())
             .collect();
-        let fetched = self.handle.block_on(async {
-            futures::future::join_all(
-                uris.iter()
-                    .map(|u| librespot_metadata::Track::get(&session, u)),
-            )
-            .await
-        });
-        Ok(fetched
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .map(track_from_meta)
-            .collect())
+        // Plazo por pista, no para todas juntas: una que no contesta no se lleva por delante
+        // las que sí llegaron. Tras la primera que no contesta, las que aún no salieron no se
+        // piden (como en get_singles): la conexión está colgada.
+        let stalled = &std::cell::Cell::new(false);
+        let fetched: Vec<_> = self.handle.block_on(
+            futures::stream::iter(uris.iter().map(|u| async move {
+                if stalled.get() {
+                    return None;
+                }
+                let r = tokio::time::timeout(TIMEOUT_ITEM, librespot_metadata::Track::get(session, u)).await;
+                if r.is_err() {
+                    stalled.set(true);
+                }
+                r.ok()
+            }))
+            .buffered(SINGLE_GET_PARALLEL)
+            .collect(),
+        );
+        let mut out = Vec::with_capacity(fetched.len());
+        let mut first_err = None;
+        for r in fetched {
+            match r {
+                Some(Ok(t)) => out.push(track_from_meta(t)),
+                Some(Err(e)) => {
+                    first_err.get_or_insert(e.to_string());
+                }
+                None => {
+                    first_err.get_or_insert(timeout_message(TIMEOUT_ITEM));
+                }
+            }
+        }
+        // Que no llegue ninguna es un fallo (sin red, el limitador), no una lista vacía: así
+        // quien pidió conserva lo que tenía en vez de quedarse sin pistas.
+        match first_err {
+            Some(e) if out.is_empty() => Err(format!("pistas: {e}")),
+            _ => Ok(out),
+        }
     }
 
-    /// Petición protobuf a un endpoint interno (spclient): cuerpo y respuesta en bytes.
+    /// Petición protobuf a un endpoint interno (spclient): cuerpo y respuesta en bytes. Con el
+    /// plazo de su método (`sp_timeout`).
     fn spclient_pb(&self, method: http::Method, endpoint: &str, body: Option<&[u8]>) -> Result<Vec<u8>, String> {
         let session = self.session()?;
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/x-protobuf"));
-        headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/x-protobuf"));
-        let bytes = self
-            .handle
-            .block_on(session.spclient().request(&method, endpoint, Some(headers), body))
-            .map_err(|e| format!("{e}"))?;
+        let bytes = self.block(sp_timeout(&method), session.spclient().request(&method, endpoint, Some(pb_headers()), body))?;
         Ok(bytes.to_vec())
     }
 
@@ -1452,11 +2109,16 @@ impl Client {
         use protobuf::Message;
         let session = self.session()?;
         let bytes = self
-            .handle
-            .block_on(session.spclient().get_rootlist(0, Some(5000)))
+            .block(TIMEOUT_LIST, session.spclient().get_rootlist(0, Some(5000)))
             .map_err(|e| format!("rootlist: {e}"))?;
         let msg = librespot_protocol::playlist4_external::SelectedListContent::parse_from_bytes(&bytes)
             .map_err(|e| format!("rootlist: {e}"))?;
+        // Más de 5000 entradas no caben en esta lectura: que quede en el registro, en vez de
+        // perder en silencio las carpetas del final (y desplazar los índices de las ediciones).
+        let got = msg.contents.items.len();
+        if msg.contents.truncated() || msg.length().max(0) as usize > got {
+            log::warn!("[rootlist] llegó truncado: {got} de {} entradas", msg.length());
+        }
         let uris = msg.contents.items.iter().map(|i| i.uri().to_string()).collect();
         Ok((msg.revision().to_vec(), uris))
     }
@@ -1491,7 +2153,7 @@ impl Client {
         use protobuf::Message;
         let session = self.session()?;
         let sid = librespot_core::SpotifyId::from_base62(id).map_err(|e| e.to_string())?;
-        let bytes = self.handle.block_on(session.spclient().get_playlist(&sid)).map_err(|e| format!("{e}"))?;
+        let bytes = self.block(TIMEOUT_LIST, session.spclient().get_playlist(&sid))?;
         let msg = librespot_protocol::playlist4_external::SelectedListContent::parse_from_bytes(&bytes).map_err(|e| e.to_string())?;
         Ok(msg.revision().to_vec())
     }
@@ -1581,13 +2243,11 @@ impl Client {
         Ok(format!("https://open.spotify.com/playlist/{playlist}?pi={token}"))
     }
 
-    /// Petición a un endpoint interno de Spotify a través de librespot (spclient).
+    /// Petición a un endpoint interno de Spotify a través de librespot (spclient), con el plazo
+    /// de su método (`sp_timeout`).
     fn spclient(&self, method: http::Method, endpoint: &str) -> Result<String, String> {
         let session = self.session()?;
-        let bytes = self
-            .handle
-            .block_on(session.spclient().request(&method, endpoint, None, None))
-            .map_err(|e| format!("{e}"))?;
+        let bytes = self.block(sp_timeout(&method), session.spclient().request(&method, endpoint, None, None))?;
         String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
     }
 
@@ -1598,26 +2258,48 @@ impl Client {
                 self.all_pages::<Playlist>(&format!("{BASE}/me/playlists?limit=50"), 40)?,
             )),
             Req::PlaylistMeta(id) => {
+                // Las generadas por Spotify (radios, mixes) no están en la Web API para apps
+                // externas: siempre daban 404 y luego se bajaba su playlist4. Directamente esta.
+                if id.starts_with("37i9dQZ") {
+                    return Ok(Resp::PlaylistMetaPartial(self.playlist_meta_via_librespot(id)?));
+                }
                 let url = format!("{BASE}/playlists/{id}?fields=id,name,uri,description,images,owner,tracks.total,public,collaborative,followers");
-                match self.get_json::<Playlist>(&url) {
+                // Solo completa lo que ya trae la carga de pistas (privacidad, seguidores, nombre
+                // del propietario): ante un 429 no espera, falla al momento.
+                match self.get_json_nowait::<Playlist>(&url) {
                     Ok(p) => Ok(Resp::PlaylistMeta(p)),
+                    // Con Spotify limitando no se baja la playlist4 otra vez: la carga de pistas
+                    // ya envía esos mismos metadatos y solo ocuparía un hilo.
+                    Err(e)
+                        if retry_secs(&e).is_some()
+                            || e == NO_APP_HINT
+                            || e.starts_with("Spotify ha agotado la cuota")
+                            || e.starts_with("Spotify está limitando") =>
+                    {
+                        Err(e)
+                    }
                     Err(e) => {
-                        // Las playlists generadas por Spotify (radios, mixes) no están en la Web API
-                        // para apps externas: nombre, portada y tamaño por los metadatos internos.
+                        // La Web API no la sirve: nombre, portada y tamaño por los metadatos internos.
                         log::info!("/playlists/{id} no disponible ({e}); usando metadatos de librespot");
-                        Ok(Resp::PlaylistMeta(self.playlist_meta_via_librespot(id)?))
+                        Ok(Resp::PlaylistMetaPartial(self.playlist_meta_via_librespot(id)?))
                     }
                 }
             }
             Req::PlaylistTracks(id) => {
                 // Spotify no permite /playlists/{id}/tracks a las apps en modo desarrollo:
                 // los uris salen del protocolo interno (librespot) y los detalles por lotes.
-                let items = self.playlist_items(id)?;
-                let added: std::collections::HashMap<String, (Option<String>, Option<String>)> =
-                    items.iter().map(|(i, by, at)| (i.clone(), (by.clone(), at.clone()))).collect();
-                let ids: Vec<String> = items.into_iter().map(|(i, _, _)| i).collect();
-                let total = ids.len() as u32;
-                if ids.is_empty() {
+                let t0 = Instant::now();
+                // En el orden de la playlist, una entrada por posición: quién y cuándo la añadió
+                // va por posición, no por id (por id, cada copia repetida se quedaba con la
+                // fecha de la última).
+                let (items, meta) = self.playlist_items(id)?;
+                // Los metadatos salen de la misma playlist4, antes de la primera fila: la página
+                // tiene nombre y portada sin esperar a /playlists/{id} (que ya no se pide para
+                // las de la biblioteca ni las de Spotify), y la precarga y la restauración dejan
+                // también el nombre del contexto.
+                ui.send(Msg::Api(ApiResult { req: req.clone(), result: Ok(Resp::PlaylistMetaPartial(meta)) }));
+                let total = items.len() as u32;
+                if items.is_empty() {
                     return Ok(Resp::Tracks {
                         key: id.clone(),
                         tracks: Vec::new(),
@@ -1625,35 +2307,101 @@ impl Client {
                         done: true,
                     });
                 }
-                let chunks: Vec<&[String]> = ids.chunks(100).collect();
-                let last = chunks.len() - 1;
-                for (i, chunk) in chunks.iter().enumerate() {
-                    let mut tracks = self.tracks_by_ids(chunk)?;
-                    for t in &mut tracks {
-                        if let Some((by, at)) = t.id.as_ref().and_then(|tid| added.get(tid)) {
-                            t.added_by = by.clone();
-                            t.added_at = at.clone();
-                        }
+                let session = self.session()?;
+                let country = session.country();
+                // Recarga: con una copia en disco reciente solo se piden las pistas que no tiene.
+                if let Some(copy) = self.list_copy(id, &country) {
+                    if let Some(result) = self.playlist_from_copy(req, id, &items, copy, &country, t0, ui) {
+                        return result;
                     }
-                    if i == last {
-                        return Ok(Resp::Tracks {
-                            key: id.clone(),
-                            tracks,
-                            total,
-                            done: true,
-                        });
-                    }
-                    ui.send(Msg::Api(ApiResult {
-                        req: req.clone(),
-                        result: Ok(Resp::Tracks {
-                            key: id.clone(),
-                            tracks,
-                            total,
-                            done: false,
-                        }),
-                    }));
                 }
-                unreachable!()
+                // Todas pedidas ahora: la copia que se guarde lleva esta fecha.
+                let meta_at = crate::cache::now_secs();
+                let keys: Vec<String> = items.iter().map(|(i, _, _)| format!("spotify:track:{i}")).collect();
+                // Un primer lote pequeño para que las primeras filas salgan tan pronto como
+                // antes, y el resto de 500 en 500 con hasta 3 peticiones en vuelo: antes eran
+                // lotes de 100 uno tras otro (2.000 pistas, 20 idas y vueltas en serie).
+                // `buffered` entrega en orden aunque terminen desordenados.
+                let first = keys.len().min(PLAYLIST_FIRST_BATCH);
+                let chunks: Vec<&[String]> = std::iter::once(&keys[..first]).chain(keys[first..].chunks(BATCH_MAX)).collect();
+                let last = chunks.len() - 1;
+                let kind = librespot_protocol::extension_kind::ExtensionKind::TRACK_V4;
+                // Tope de sueltos para toda la carga: con varios lotes en vuelo, el de cada lote
+                // por sí solo permitiría cientos y agotaría el cupo de librespot.
+                let singles = std::cell::Cell::new(SINGLE_GET_LOAD_MAX);
+                let (session, singles, items) = (&session, &singles, &items);
+                self.handle.block_on(async {
+                    use futures::StreamExt;
+                    // El reintento de un lote va dentro de su futuro, no aquí: mientras se espera
+                    // aquí a otra cosa, los lotes en vuelo no avanzan, y su plazo (que corre igual)
+                    // vencería sin que hubieran tenido ocasión de terminar.
+                    let mut batches = futures::stream::iter(chunks.iter().map(|&c| async move {
+                        let first = batch_chunk::<librespot_metadata::Track>(session, c, kind, singles).await;
+                        batch_retry(session, c, kind, singles, first).await
+                    }))
+                    .buffered(PLAYLIST_BATCH_PARALLEL);
+                    let mut offset = 0;
+                    for (ci, &chunk) in chunks.iter().enumerate() {
+                        let Some(fetched) = batches.next().await else { break };
+                        let metas = match fetched {
+                            Ok(m) => m,
+                            // Como en tracks_by_ids: una tanda pequeña (una playlist corta, o lo
+                            // que sobra tras los lotes de 500) se pide una a una; solo falla si
+                            // no llega ninguna.
+                            Err(e) if chunk.len() <= SINGLE_GET_MAX => {
+                                log::warn!("{e}; se piden una a una");
+                                let all: Vec<usize> = (0..chunk.len()).collect();
+                                let got = get_singles::<librespot_metadata::Track>(session, chunk, &all).await;
+                                if got.iter().all(|(_, m)| m.is_none()) {
+                                    return Err(e);
+                                }
+                                let mut metas = vec![None; chunk.len()];
+                                for (i, m) in got {
+                                    metas[i] = m;
+                                }
+                                metas
+                            }
+                            // Falla toda la carga: quien pidió conserva lo que tenía (la copia
+                            // del disco) y reintenta más tarde, en vez de recibir una lista con
+                            // cientos de huecos que acabaría guardada como buena.
+                            Err(e) => return Err(e),
+                        };
+                        let tracks: Vec<Track> = metas
+                            .into_iter()
+                            .zip(&items[offset..])
+                            .filter_map(|(m, (_, by, at))| {
+                                let mut t = track_from_meta(m?);
+                                t.added_by = by.clone();
+                                t.added_at = at.clone();
+                                Some(t)
+                            })
+                            .collect();
+                        offset += chunk.len();
+                        if ci == last {
+                            log::info!("[t] PlaylistTracks {id} n={total} completa en {} ms", t0.elapsed().as_millis());
+                            let info = Resp::PlaylistCopyInfo { id: id.clone(), meta_at, country: country.clone() };
+                            ui.send(Msg::Api(ApiResult { req: req.clone(), result: Ok(info) }));
+                            // El último lo envía run() con lo que devuelve: enviarlo aquí también
+                            // duplicaría filas.
+                            return Ok(Resp::Tracks {
+                                key: id.clone(),
+                                tracks,
+                                total,
+                                done: true,
+                            });
+                        }
+                        ui.send(Msg::Api(ApiResult {
+                            req: req.clone(),
+                            result: Ok(Resp::Tracks {
+                                key: id.clone(),
+                                tracks,
+                                total,
+                                done: false,
+                            }),
+                        }));
+                    }
+                    unreachable!()
+                })
             }
             Req::Liked => self.stream_tracks::<SavedTrack>(
                 req,
@@ -1669,7 +2417,14 @@ impl Client {
                 for _ in 0..2 {
                     let page: Paging<SavedTrack> = self.get_json(&url)?;
                     total = page.total;
-                    tracks.extend(page.items.into_iter().filter_map(|i| i.track).map(slim_track));
+                    // Como en stream_tracks: sin uri no se puede reproducir ni contar como nueva.
+                    tracks.extend(
+                        page.items
+                            .into_iter()
+                            .filter_map(|i| i.track)
+                            .filter(|t| !t.uri.is_empty())
+                            .map(slim_track),
+                    );
                     match page.next {
                         Some(n) => url = n,
                         None => break,
@@ -1682,10 +2437,17 @@ impl Client {
                     done: true,
                 })
             }
+            // /me/albums trae cada álbum con hasta 50 pistas: nada las usa (la página del álbum
+            // pide las suyas) y engordaban la instantánea y cada guardado. Fuera ya aquí, como
+            // hace Resp::AlbumSaved.
             Req::SavedAlbums => Ok(Resp::SavedAlbums(
                 self.all_pages::<SavedAlbum>(&format!("{BASE}/me/albums?limit=50"), 20)?
                     .into_iter()
-                    .map(|s| s.album)
+                    .map(|s| {
+                        let mut a = s.album;
+                        a.tracks = None;
+                        a
+                    })
                     .collect(),
             )),
             Req::FollowedArtists => {
@@ -1731,7 +2493,7 @@ impl Client {
                 if album.genres.is_empty() {
                     let by = album.artists.first().map(|a| a.name.clone()).unwrap_or_default();
                     let name = album.name.clone();
-                    album.genres = self.genres_or_send(&format!("album:{id}"), &by, Some(&name), || Resp::Album(album.clone()), req, ui);
+                    album.genres = self.genres_or_queue(&format!("album:{id}"), &by, Some(&name));
                 }
                 Ok(Resp::Album(album))
             }
@@ -1745,10 +2507,15 @@ impl Client {
                 };
                 if a.genres.is_empty() {
                     let name = a.name.clone();
-                    a.genres = self.genres_or_send(&format!("artist:{id}"), &name, None, || Resp::Artist(a.clone()), req, ui);
+                    a.genres = self.genres_or_queue(&format!("artist:{id}"), &name, None);
                 }
                 Ok(Resp::Artist(a))
             }
+            Req::ArtistThumbs(ids) => Ok(Resp::ArtistThumbs(self.artist_thumbs(ids)?)),
+            Req::Genres { key } => Ok(Resp::Genres {
+                key: key.clone(),
+                genres: self.cached_genres(key).unwrap_or_default(),
+            }),
             Req::ArtistPlaylists { id, name } => {
                 let r: SearchResult = self.get_json(&format!("{BASE}/search?q={}&type=playlist&limit=50", urlencode(name)))?;
                 let want = name.trim().to_lowercase();
@@ -1778,24 +2545,16 @@ impl Client {
                 v.pop().map(Resp::TrackInfo).ok_or_else(|| "pista no encontrada".to_string())
             }
             Req::ArtistTop(id) => {
-                // /artists/{id}/top-tracks está restringido: usamos los metadatos internos.
+                // /artists/{id}/top-tracks está restringido: usamos los metadatos internos. La
+                // página de artista ya no lo pide (salen con Req::ArtistView); queda para el
+                // control y el diagnóstico.
                 let session = self.session()?;
                 let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
                     .map_err(|e| e.to_string())?;
                 let artist = self
-                    .handle
-                    .block_on(librespot_metadata::Artist::get(&session, &uri))
+                    .block(TIMEOUT_ITEM, librespot_metadata::Artist::get(&session, &uri))
                     .map_err(|e| format!("artista: {e}"))?;
-                let country = session.country();
-                let top = artist
-                    .top_tracks
-                    .iter()
-                    .find(|t| t.country == country)
-                    .or_else(|| artist.top_tracks.first());
-                let ids: Vec<String> = top
-                    .map(|t| t.tracks.iter().filter_map(|u| u.to_id().ok()).take(10).collect())
-                    .unwrap_or_default();
-                Ok(Resp::ArtistTop(self.tracks_by_ids(&ids)?))
+                Ok(Resp::ArtistTop(self.tracks_by_ids(&top_track_ids(&artist, &session.country()))?))
             }
             Req::ArtistAlbums(id) => {
                 use std::sync::atomic::Ordering;
@@ -1814,16 +2573,70 @@ impl Client {
                 Ok(Resp::ArtistAlbums(self.artist_albums_via_librespot(id)?))
             }
             Req::Search(q) => {
-                let full = format!(
-                    "{BASE}/search?q={}&type=track,album,artist,playlist,show,episode,audiobook&limit=10&market=from_token",
-                    urlencode(q)
-                );
-                match self.get_json::<SearchResult>(&full) {
-                    Ok(r) => Ok(Resp::Search(r)),
-                    Err(_) => Ok(Resp::Search(self.get_json(&format!(
-                        "{BASE}/search?q={}&type=track,album,artist,playlist,show,episode&limit=10&market=from_token",
-                        urlencode(q)
-                    ))?)),
+                // Primero la búsqueda de los clientes oficiales: una petición de ~1 s que no gasta
+                // cuota de la Web API ni se para con su enfriamiento. Si no responde bien, la de
+                // la Web API, que falla rápido ante un 429.
+                let t0 = Instant::now();
+                // Segundos que pide un 429 de pathfinder, para reintentar solo si no hay Web API.
+                let mut retry: Option<u64> = None;
+                // pathfinder contestó, pero sin nada: se pregunta a la Web API y, si esa no
+                // puede, vale esta respuesta vacía antes que un error.
+                let mut empty: Option<SearchResult> = None;
+                let why = match self.pf.usable(self.web_cooldown_left().is_some()) {
+                    Err((why, secs)) => {
+                        retry = secs;
+                        why
+                    }
+                    Ok(hash) => match self.pf.search(q, &hash) {
+                        Ok(r) => {
+                            self.pf.ok(&hash);
+                            log::info!("[t] búsqueda «{q}» por pathfinder en {} ms", t0.elapsed().as_millis());
+                            return Ok(Resp::Search(r));
+                        }
+                        Err(PfErr::Empty(r)) => {
+                            self.pf.ok(&hash);
+                            empty = Some(r);
+                            "pathfinder no encontró nada".to_string()
+                        }
+                        Err(PfErr::UnknownHash) => {
+                            self.pf.reject(&hash, q);
+                            "hash de searchDesktop rechazado".to_string()
+                        }
+                        Err(PfErr::Down(e)) => {
+                            self.pf.down(&e);
+                            e
+                        }
+                        Err(PfErr::Limited(secs)) => {
+                            self.pf.limited(secs);
+                            retry = Some(secs);
+                            format!("pathfinder limita {secs} s")
+                        }
+                        Err(PfErr::Failed(e)) => e,
+                    },
+                };
+                // Con la cuota de la Web API agotada la búsqueda es solo pathfinder: si limitó,
+                // «reintenta en N s» para que la interfaz la repita sola; si no, su fallo.
+                if let Some(left) = self.web_cooldown_left() {
+                    if let Some(r) = empty {
+                        return Ok(Resp::Search(r));
+                    }
+                    return Err(match retry {
+                        Some(secs) => throttle_message(secs),
+                        None => format!("La búsqueda no respondió ({why}). {}", cooldown_message(left)),
+                    });
+                }
+                match self.search_web(q) {
+                    Ok(r) => {
+                        log::info!("[t] búsqueda «{q}» por la Web API en {} ms ({why})", t0.elapsed().as_millis());
+                        Ok(Resp::Search(r))
+                    }
+                    Err(e) => match empty {
+                        Some(r) => {
+                            log::info!("búsqueda «{q}» sin resultados en pathfinder; la Web API falló ({e})");
+                            Ok(Resp::Search(r))
+                        }
+                        None => Err(e),
+                    },
                 }
             }
             Req::LastPlayback => {
@@ -2185,19 +2998,14 @@ impl Client {
                 Ok(Resp::SavedAudiobooks(items.into_iter().flatten().filter(|a| !a.id.is_empty()).collect()))
             }
             Req::Rootlist => {
-                use protobuf::Message;
-                let session = self.session()?;
-                let bytes = self
-                    .handle
-                    .block_on(session.spclient().get_rootlist(0, None))
-                    .map_err(|e| format!("carpetas: {e}"))?;
-                let msg = librespot_protocol::playlist4_external::SelectedListContent::parse_from_bytes(&bytes)
-                    .map_err(|e| format!("carpetas: {e}"))?;
+                // El rootlist entero, igual que lo leen las ediciones (rootlist_raw). Con el largo
+                // por defecto de librespot (120 entradas), en una biblioteca grande las carpetas
+                // del final faltaban o salían con la mitad de sus playlists.
+                let (_, uris) = self.rootlist_raw()?;
                 // Las carpetas son pares start-group/end-group alrededor de sus playlists.
                 let mut folders: Vec<Folder> = Vec::new();
                 let mut stack: Vec<Folder> = Vec::new();
-                for item in &msg.contents.items {
-                    let uri = item.uri();
+                for uri in &uris {
                     if let Some(rest) = uri.strip_prefix("spotify:start-group:") {
                         let (id, name) = rest.split_once(':').unwrap_or((rest, ""));
                         let name = urldecode(name);
@@ -2298,6 +3106,7 @@ impl Client {
                     "PUT",
                     &format!("{BASE}/playlists/{id}/images"),
                     Some(("image/jpeg", b64.as_bytes())),
+                    true,
                 )?;
                 if !(200..300).contains(&status) {
                     return Err(http_error(status, &text));
@@ -2348,8 +3157,7 @@ impl Client {
                 // que además trae las playlists públicas y si ya lo sigues.
                 let session = self.session()?;
                 let bytes = self
-                    .handle
-                    .block_on(session.spclient().get_user_profile(id, Some(50), Some(0)))
+                    .block(TIMEOUT_ITEM, session.spclient().get_user_profile(id, Some(50), Some(0)))
                     .map_err(|e| format!("perfil: {e}"))?;
                 let v: Value = serde_json::from_slice(&bytes)
                     .map_err(|e| format!("perfil: respuesta inesperada: {e}"))?;
@@ -2392,6 +3200,7 @@ impl Client {
                                     public: Some(true),
                                     collaborative: None,
                                     followers: None,
+                                    snapshot_id: None,
                                 })
                             })
                             .collect()
@@ -2468,13 +3277,16 @@ impl Client {
                     let endpoint = format!(
                         "/color-lyrics/v2/track/{id}?format=json&vocalRemoval=false&market=from_token"
                     );
-                    let result = self.handle.block_on(session.spclient().request(
-                        &http::Method::GET,
-                        &endpoint,
-                        Some(headers),
-                        None,
-                    ));
-                    if let Ok(bytes) = result {
+                    // Con plazo: una llamada colgada pararía el carril de enriquecimiento entero
+                    // (los géneros esperan detrás). Si vence, se prueba LRCLIB.
+                    let result = self.handle.block_on(async {
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            session.spclient().request(&http::Method::GET, &endpoint, Some(headers), None),
+                        )
+                        .await
+                    });
+                    if let Ok(Ok(bytes)) = result {
                         if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                             if let Some(l) = Lyrics::from_json(id, &v) {
                                 return Ok(Resp::Lyrics(Some(l)));
@@ -2527,7 +3339,13 @@ impl Client {
                         }
                         Err(e) => {
                             log::info!("[jam] salida fallida con {method} {ep}: {e}");
+                            // Sin respuesta en el plazo, la conexión está colgada: los demás
+                            // esperarían otro plazo entero cada uno (hasta 2 min con el hilo ocupado).
+                            let stalled = e == timeout_message(TIMEOUT_SP_WRITE);
                             last = e;
+                            if stalled {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2542,7 +3360,7 @@ impl Client {
             }
             Req::ArtistView(id) => Ok(Resp::ArtistView {
                 id: id.clone(),
-                view: self.artist_view_via_librespot(id)?,
+                view: self.artist_view_via_librespot(id, ui)?,
             }),
             Req::Show(id) => {
                 // Web API si está disponible; si no, metadatos internos.
@@ -2563,7 +3381,7 @@ impl Client {
                         // Los temas del podcast solo vienen por los metadatos internos.
                         if let Ok(session) = self.session() {
                             if let Ok(uri) = SpotifyUri::from_uri(&format!("spotify:show:{id}")) {
-                                if let Ok(s) = self.handle.block_on(librespot_metadata::Show::get(&session, &uri)) {
+                                if let Ok(s) = self.block(TIMEOUT_ITEM, librespot_metadata::Show::get(&session, &uri)) {
                                     show.keywords = s.keywords.clone();
                                 }
                             }
@@ -2598,6 +3416,54 @@ impl Client {
 }
 
 pub const NO_APP_HINT: &str = "Spotify limita la Web API del cliente compartido (429). Configura tu Client ID en Ajustes.";
+
+/// Metadatos de una playlist a partir de su playlist4 (la misma descarga que trae las pistas).
+/// Sin nombre visible del propietario, privacidad ni seguidores (solo los da la Web API); el
+/// id del propietario sí, para que «Tu playlist» y el menú de edición funcionen sin ella.
+fn meta_from_playlist4(pl: &librespot_metadata::Playlist, id: &str) -> Playlist {
+    let a = &pl.attributes;
+    let images = if a.picture.is_empty() {
+        // Radios y mixes: la portada generada viene en las variantes por tamaño.
+        a.picture_sizes
+            .iter()
+            .max_by_key(|p| match p.target_name.as_str() {
+                "xlarge" => 4,
+                "large" => 3,
+                "default" => 2,
+                _ => 1,
+            })
+            .filter(|p| !p.url.is_empty())
+            .map(|p| vec![Image { url: p.url.clone(), width: Some(300), height: Some(300) }])
+            .unwrap_or_default()
+    } else {
+        let hex: String = a.picture.iter().map(|b| format!("{b:02x}")).collect();
+        vec![Image { url: format!("https://i.scdn.co/image/{hex}"), width: Some(300), height: Some(300) }]
+    };
+    // Las playlists algorítmicas de Spotify comparten prefijo de id.
+    let spotify_made = id.starts_with("37i9dQZ");
+    // librespot guarda el usuario propietario (owner_username) en el uri de la playlist.
+    let owner_user = match &pl.id {
+        SpotifyUri::Playlist { user: Some(u), .. } if !u.is_empty() => Some(u.clone()),
+        _ => None,
+    };
+    Playlist {
+        id: id.to_string(),
+        name: a.name.clone(),
+        uri: format!("spotify:playlist:{id}"),
+        description: Some(a.description.clone()).filter(|d| !d.is_empty()),
+        images: Some(images),
+        owner: if spotify_made {
+            Owner { display_name: Some("Spotify".to_string()), id: Some("spotify".to_string()) }
+        } else {
+            Owner { display_name: None, id: owner_user }
+        },
+        tracks: Some(TracksRef { total: pl.length.max(0) as u32 }),
+        public: None,
+        collaborative: Some(a.is_collaborative),
+        followers: None,
+        snapshot_id: None,
+    }
+}
 
 fn image_from_meta(im: &librespot_metadata::image::Image) -> Image {
     Image {
@@ -2640,6 +3506,216 @@ fn track_from_meta(t: librespot_metadata::Track) -> Track {
         added_by: None,
         added_at: None,
     }
+}
+
+/// Lo que pide esperar el limitador propio de librespot («rate limited for at least another N
+/// seconds»); cero si el error no lo dice (p. ej. un 429 de Spotify sin Retry-After).
+fn limiter_wait(e: &librespot_core::Error) -> Duration {
+    let secs = e
+        .error
+        .to_string()
+        .strip_prefix("rate limited for at least another ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    Duration::from_secs(secs)
+}
+
+/// Espera una llamada de librespot desde un hilo que no es del runtime, con plazo `d`. Al vencer
+/// se suelta el futuro, y con él la petición y los reintentos y esperas de librespot que llevara
+/// dentro (hasta 10 intentos de spclient, las esperas por 429). Sin plazo, una conexión colgada
+/// tras suspender el equipo o cambiar de wifi bloqueaba el hilo para siempre.
+fn block_timeout<T, E: std::fmt::Display>(
+    handle: &tokio::runtime::Handle,
+    d: Duration,
+    f: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    // El plazo se crea dentro del runtime: tokio::time::timeout llamado fuera de él (en este
+    // hilo, antes del block_on) entra en pánico por no haber temporizador.
+    match handle.block_on(async move { tokio::time::timeout(d, f).await }) {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(_) => Err(timeout_message(d)),
+    }
+}
+
+fn timeout_message(d: Duration) -> String {
+    format!("Spotify no respondió en {} s", d.as_secs())
+}
+
+/// Plazo de una petición a spclient según su método: las escrituras con más margen (ver
+/// TIMEOUT_SP_WRITE).
+fn sp_timeout(method: &http::Method) -> Duration {
+    if *method == http::Method::GET {
+        TIMEOUT_SP_READ
+    } else {
+        TIMEOUT_SP_WRITE
+    }
+}
+
+/// Cabeceras de las peticiones protobuf a spclient.
+fn pb_headers() -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/x-protobuf"));
+    headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/x-protobuf"));
+    headers
+}
+
+/// Cuerpo de una petición extended-metadata: estas entidades (uris), todas del mismo tipo.
+fn build_batch_body(
+    session: &librespot_core::Session,
+    keys: &[String],
+    kind: librespot_protocol::extension_kind::ExtensionKind,
+) -> Result<Vec<u8>, String> {
+    use librespot_protocol::extended_metadata::{BatchedEntityRequest, EntityRequest, ExtensionQuery};
+    use protobuf::{EnumOrUnknown, Message};
+    let mut req = BatchedEntityRequest::new();
+    let header = req.header.mut_or_insert_default();
+    header.country = session.country();
+    header.catalogue = "premium".to_string();
+    for uri in keys {
+        let mut q = ExtensionQuery::new();
+        q.extension_kind = EnumOrUnknown::new(kind);
+        let mut e = EntityRequest::new();
+        e.entity_uri = uri.clone();
+        e.query.push(q);
+        req.entity_request.push(e);
+    }
+    req.write_to_bytes().map_err(|e| e.to_string())
+}
+
+/// Lo que trae una respuesta de extended-metadata, por uri. Lo que no se puede leer se omite
+/// (cuenta como que falta).
+fn parse_batch<M: librespot_metadata::Metadata>(bytes: &[u8]) -> Result<std::collections::HashMap<String, M>, String> {
+    use librespot_protocol::extended_metadata::BatchedExtensionResponse;
+    use protobuf::Message;
+    let resp = BatchedExtensionResponse::parse_from_bytes(bytes).map_err(|e| e.to_string())?;
+    let mut found = std::collections::HashMap::new();
+    for data in resp.extended_metadata.iter().flat_map(|a| a.extension_data.iter()) {
+        let Some(any) = data.extension_data.as_ref() else { continue };
+        let (Ok(msg), Ok(uri)) = (M::Message::parse_from_bytes(&any.value), SpotifyUri::from_uri(&data.entity_uri)) else { continue };
+        if let Ok(m) = M::parse(&msg, &uri) {
+            found.insert(data.entity_uri.clone(), m);
+        }
+    }
+    Ok(found)
+}
+
+/// La petición de un lote, sin bloquear: se espera dentro de un `block_on` que ya está en
+/// marcha. Llamar ahí a spclient_pb (que bloquea) sería un block_on anidado, y tokio aborta.
+async fn fetch_batch(session: &librespot_core::Session, body: &[u8]) -> librespot_core::spclient::SpClientResult {
+    session
+        .spclient()
+        .request(&http::Method::POST, "/extended-metadata/v0/extended-metadata", Some(pb_headers()), Some(body))
+        .await
+}
+
+/// Error de un lote y, si merece otro intento, cuánto esperar antes.
+type BatchErr = (String, Option<Duration>);
+
+/// Un lote de metadatos (hasta 500), en el orden pedido: una petición y, para lo que no traiga
+/// (pocas: ediciones regionales, retiradas), peticiones sueltas con tope por lote y del
+/// presupuesto común `singles`; lo que quede sin pedir se omite, como lo que Spotify no tiene.
+/// Si falla la petición del lote no se pide nada suelto: eso decide batch_retry.
+async fn batch_chunk<M: librespot_metadata::Metadata + Clone>(
+    session: &librespot_core::Session,
+    keys: &[String],
+    kind: librespot_protocol::extension_kind::ExtensionKind,
+    singles: &std::cell::Cell<usize>,
+) -> Result<Vec<Option<M>>, BatchErr> {
+    use librespot_core::error::ErrorKind;
+    let body = build_batch_body(session, keys, kind).map_err(|e| (e, None))?;
+    // Plazo por lote, no para la carga entera: los lotes que ya llegaron se quedan. Al vencer
+    // no se reintenta (ya pasó TIMEOUT_SP_READ con los reintentos de librespot dentro): falla
+    // la carga y quien pidió conserva lo que tenía.
+    let fetched = tokio::time::timeout(TIMEOUT_SP_READ, fetch_batch(session, &body))
+        .await
+        .map_err(|_| (timeout_message(TIMEOUT_SP_READ), None))?;
+    let bytes = fetched.map_err(|e| {
+        let retry = match e.kind {
+            // Caídas y plazos vencidos ya los reintenta librespot (hasta 10 veces): repetirlos
+            // aquí solo alargaría la espera.
+            ErrorKind::Unavailable | ErrorKind::DeadlineExceeded => None,
+            // Su limitador propio dice cuánto falta para poder pedir otra vez.
+            ErrorKind::ResourceExhausted => Some(limiter_wait(&e)),
+            _ => Some(Duration::ZERO),
+        };
+        (e.to_string(), retry)
+    })?;
+    let mut found = parse_batch::<M>(&bytes).map_err(|e| (e, Some(Duration::ZERO)))?;
+    // Una vez por uri: la misma canción dos veces en una playlist es una sola petición.
+    let mut seen = std::collections::HashSet::new();
+    let missing: Vec<usize> = (0..keys.len()).filter(|&i| !found.contains_key(&keys[i]) && seen.insert(&keys[i])).collect();
+    if !missing.is_empty() {
+        // Con tope y pocas a la vez: si faltan muchas, lo que pasa no es una edición regional
+        // suelta, y cientos de peticiones solo agotarían el cupo de librespot.
+        let n = missing.len().min(SINGLE_GET_MAX).min(singles.get());
+        singles.set(singles.get() - n);
+        log::info!("metadatos por lotes: {} de {} sin datos; se piden sueltos {n}", missing.len(), keys.len());
+        // Puede volver con otro id (Spotify sustituye ediciones): cuenta como la pedida.
+        for (i, m) in get_singles::<M>(session, keys, &missing[..n]).await {
+            if let Some(m) = m {
+                found.insert(keys[i].clone(), m);
+            }
+        }
+    }
+    // `get`, no `remove`: una playlist puede tener la misma canción dos veces.
+    Ok(keys.iter().map(|k| found.get(k).cloned()).collect())
+}
+
+/// Un lote fallido se reintenta UNA vez, tras la espera que pida (en una playlist, los lotes ya
+/// en vuelo siguen, pero no salen más de PLAYLIST_BATCH_PARALLEL); si vuelve a fallar, falla
+/// todo. Antes se pedían sueltos sus cientos de elementos a la vez: se agotaba el cupo de
+/// librespot, la canción que suena no cargaba y aun así se perdían pistas.
+async fn batch_retry<M: librespot_metadata::Metadata + Clone>(
+    session: &librespot_core::Session,
+    keys: &[String],
+    kind: librespot_protocol::extension_kind::ExtensionKind,
+    singles: &std::cell::Cell<usize>,
+    first: Result<Vec<Option<M>>, BatchErr>,
+) -> Result<Vec<Option<M>>, String> {
+    match first {
+        Ok(v) => Ok(v),
+        Err((e, Some(wait))) => {
+            let wait = wait.clamp(Duration::from_millis(400), Duration::from_secs(10));
+            log::warn!("metadatos por lotes: {e}; se reintenta en {} ms", wait.as_millis());
+            tokio::time::sleep(wait).await;
+            batch_chunk(session, keys, kind, singles).await.map_err(|(e, _)| format!("metadatos por lotes: {e}"))
+        }
+        Err((e, None)) => Err(format!("metadatos por lotes: {e}")),
+    }
+}
+
+/// Elementos sueltos de `keys` (por posición), pocos a la vez. El índice viaja con cada
+/// resultado porque llegan en cualquier orden; el que falla vuelve como `None`. Plazo por
+/// elemento (TIMEOUT_ITEM), no para todos juntos, para no perder los que sí llegaron.
+async fn get_singles<M: librespot_metadata::Metadata>(
+    session: &librespot_core::Session,
+    keys: &[String],
+    idx: &[usize],
+) -> Vec<(usize, Option<M>)> {
+    use futures::StreamExt;
+    // Si uno no contesta en el plazo, la conexión está colgada: los que aún no salieron no se
+    // piden (cada tanda esperaría otro plazo entero) y vuelven como `None`.
+    let stalled = &std::cell::Cell::new(false);
+    futures::stream::iter(idx.iter().map(|&i| async move {
+        if stalled.get() {
+            return (i, None);
+        }
+        let m = match SpotifyUri::from_uri(&keys[i]) {
+            Ok(uri) => match tokio::time::timeout(TIMEOUT_ITEM, M::get(session, &uri)).await {
+                Ok(r) => r.ok(),
+                Err(_) => {
+                    stalled.set(true);
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        (i, m)
+    }))
+    .buffer_unordered(SINGLE_GET_PARALLEL)
+    .collect()
+    .await
 }
 
 /// Deja solo las imágenes útiles (≤ 300 px) para no retener URLs que nunca se usan.
@@ -2703,6 +3779,24 @@ fn cooldown_message(secs: u64) -> String {
     format!("Spotify ha agotado la cuota de tu app; la Web API vuelve en {when}. La reproducción sigue funcionando.")
 }
 
+/// Lectura limitada con los segundos que faltan; `retry_secs` los vuelve a leer para que la
+/// búsqueda se reintente sola.
+fn throttle_message(secs: u64) -> String {
+    format!("Spotify está limitando las peticiones (reintenta en {secs} s)")
+}
+
+/// Segundos de espera de un error de `throttle_message` (None si el error es de otro tipo).
+pub fn retry_secs(e: &str) -> Option<u64> {
+    let rest = e.split("(reintenta en ").nth(1)?;
+    rest.split(" s)").next()?.trim().parse().ok()
+}
+
+/// Segundos enteros redondeando hacia arriba (mínimo 1): reintentar antes de que pase la espera
+/// solo volvería a fallar.
+fn ceil_secs(d: Duration) -> u64 {
+    (d.as_secs() + u64::from(d.subsec_nanos() > 0)).max(1)
+}
+
 fn http_error(status: u16, text: &str) -> String {
     let msg = serde_json::from_str::<Value>(text)
         .ok()
@@ -2743,22 +3837,21 @@ fn download_track(
 ) -> Result<(), String> {
     use crate::config::Quality;
     use librespot_metadata::audio::AudioFileFormat as F;
+    // Metadatos con plazo largo (el hilo es solo de la descarga): uno colgado ya no deja sin
+    // descargar el resto de la tanda. Abrir el audio no lo lleva: puede tardar de verdad.
     let files: librespot_metadata::audio::AudioFiles = if episode {
         let uri = SpotifyUri::from_uri(&format!("spotify:episode:{id}")).map_err(|e| e.to_string())?;
-        let ep = handle
-            .block_on(librespot_metadata::Episode::get(session, &uri))
+        let ep = block_timeout(handle, TIMEOUT_DOWNLOAD_META, librespot_metadata::Episode::get(session, &uri))
             .map_err(|e| format!("episodio: {e}"))?;
         ep.audio.clone()
     } else {
         let uri = SpotifyUri::from_uri(&format!("spotify:track:{id}")).map_err(|e| e.to_string())?;
-        let mut track = handle
-            .block_on(librespot_metadata::Track::get(session, &uri))
+        let mut track = block_timeout(handle, TIMEOUT_DOWNLOAD_META, librespot_metadata::Track::get(session, &uri))
             .map_err(|e| format!("pista: {e}"))?;
         if track.files.0.is_empty() {
             // Sin archivo en esta región: se prueba la primera alternativa.
             let alt = track.alternatives.first().cloned().ok_or("sin archivo de audio disponible")?;
-            track = handle
-                .block_on(librespot_metadata::Track::get(session, &alt))
+            track = block_timeout(handle, TIMEOUT_DOWNLOAD_META, librespot_metadata::Track::get(session, &alt))
                 .map_err(|e| format!("pista: {e}"))?;
         }
         track.files.clone()

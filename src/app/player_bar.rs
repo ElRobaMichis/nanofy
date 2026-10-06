@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use egui::{pos2, vec2, Align, Color32, CornerRadius, Label, Layout, Rect, RichText, Sense};
+use egui::{pos2, vec2, Align, Color32, CornerRadius, Label, Layout, Rect, RichText, Sense, UiBuilder};
 
 use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
@@ -125,6 +125,14 @@ impl App {
             if self.focus_search {
                 self.focus_search = false;
                 r.request_focus();
+                // La consulta anterior queda seleccionada: lo que ella escriba la sustituye (como
+                // Ctrl+F en un navegador), y con las flechas o un clic sigue pudiendo editarla.
+                let id = egui::Id::new(SEARCH_ID);
+                if let Some(mut state) = egui::TextEdit::load_state(f.ctx(), id) {
+                    let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.search_query.chars().count()));
+                    state.cursor.set_char_range(Some(all));
+                    state.store(f.ctx(), id);
+                }
             }
             if r.lost_focus() && f.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.run_search();
@@ -269,13 +277,11 @@ impl App {
             self.go(Page::Artists);
         }
 
-        // Fijados
-        let pinned: Vec<Playlist> = self
-            .playlists
-            .iter()
-            .filter(|pl| self.settings.pinned.contains(&pl.id))
-            .cloned()
-            .collect();
+        // Fijados. Índices y no copias: este panel se dibuja en todas las páginas, cada fotograma.
+        let pinned: Vec<usize> = {
+            let set: std::collections::HashSet<&str> = self.settings.pinned.iter().map(String::as_str).collect();
+            (0..self.playlists.len()).filter(|&i| set.contains(self.playlists[i].id.as_str())).collect()
+        };
         let r = Self::nav_item(ui, Some(Icon::Pin), "Fijados", false, 0.0);
         Self::chevron(ui, r.rect, self.sidebar_pins_open, p.weak);
         if r.clicked() {
@@ -288,13 +294,15 @@ impl App {
                     ui.label(RichText::new("Fija playlists con el clic derecho").small().color(p.faint));
                 });
             }
-            for pl in &pinned {
-                let sel = page == Page::Playlist(pl.id.clone());
+            for i in pinned {
+                // Copia solo de las fijadas (pocas): el menú contextual necesita `&mut self`.
+                let pl = self.playlists[i].clone();
+                let sel = matches!(&page, Page::Playlist(id) if *id == pl.id);
                 let r = Self::nav_item(ui, Some(Icon::Playlist), &pl.name, sel, 24.0);
                 if r.clicked() {
                     self.go(Page::Playlist(pl.id.clone()));
                 }
-                self.playlist_context_menu(&r, pl);
+                self.playlist_context_menu(&r, &pl);
             }
         }
 
@@ -322,20 +330,31 @@ impl App {
                     Self::loading(ui, "Cargando");
                 });
             }
-            let list: Vec<Playlist> = self.playlists.clone();
             let avail = (ui.available_height() - 9.0 * 36.0 - 60.0).max(80.0);
+            // Solo las filas a la vista: con cientos de playlists, copiarlas y maquetarlas todas
+            // costaba casi un milisegundo por fotograma en cualquier página. nav_item mide 34 px
+            // y show_rows ya suma el espaciado de 2 px entre filas.
             egui::ScrollArea::vertical()
                 .id_salt("sidebar_playlists")
                 .auto_shrink([false, true])
                 .max_height(avail)
-                .show(ui, |ui| {
-                    for pl in &list {
-                        let sel = page == Page::Playlist(pl.id.clone());
-                        let r = Self::nav_item(ui, Some(Icon::Playlist), &pl.name, sel, 24.0);
+                .show_rows(ui, 34.0, self.playlists.len(), |ui, range| {
+                    for i in range {
+                        let Some(pl) = self.playlists.get(i).cloned() else { break };
+                        let sel = matches!(&page, Page::Playlist(id) if *id == pl.id);
+                        // Id de la fila por playlist: nav_item gasta dos ids automáticos y
+                        // show_rows solo salta uno por fila oculta, así que con ids automáticos
+                        // el hover y el menú abierto saltarían de fila al desplazarse.
+                        let key = ui.id().with(("sb_pl", i, &pl.id));
+                        let r = ui
+                            .scope_builder(UiBuilder::new().id(key), |ui| {
+                                Self::nav_item(ui, Some(Icon::Playlist), &pl.name, sel, 24.0)
+                            })
+                            .inner;
                         if r.clicked() {
                             self.go(Page::Playlist(pl.id.clone()));
                         }
-                        self.playlist_context_menu(&r, pl);
+                        self.playlist_context_menu(&r, &pl);
                     }
                 });
         }

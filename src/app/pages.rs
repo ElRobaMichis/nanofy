@@ -6,7 +6,7 @@ use egui::{pos2, vec2, Align, Button, Color32, CornerRadius, Label, Layout, Rect
 
 use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
-use super::widgets::{child_in, uri_to_link, CardInfo, CardKind, RowOpts, Source, CARD_W};
+use super::widgets::{child_in, keyed_child, uri_to_link, CardInfo, CardKind, RowOpts, Source, CARD_H, CARD_W};
 use super::{fmt_thousands, strip_html, Action, App, Auth, FolderDialog, Page, PlayTarget, ERROR_RED, LIKED};
 use crate::api::Req;
 use crate::config::{Quality, Theme};
@@ -295,9 +295,12 @@ impl App {
         ui.allocate_rect(Rect::from_min_size(top, vec2(width, h)), Sense::hover());
     }
 
-    /// Tarjeta de información: portada grande, chips y artistas con avatar.
-    fn info_card(&mut self, ui: &mut egui::Ui, cover: Option<&str>, chips: &[String], artists: &[ArtistRef]) {
+    /// Tarjeta de información: portada grande, chips y artistas con avatar. `ready`: la lista ya
+    /// no cambia (terminó de cargar). Solo entonces se piden las imágenes que falten, todas en
+    /// una petición: mientras llegan lotes, los artistas más presentes aún van cambiando.
+    fn info_card(&mut self, ui: &mut egui::Ui, cover: Option<&str>, chips: &[String], artists: &[ArtistRef], ready: bool) {
         let p = theme::palette(ui.ctx());
+        let mut missing: Vec<String> = Vec::new();
         egui::Frame::new()
             .fill(p.card2)
             .corner_radius(CornerRadius::same(14))
@@ -351,31 +354,67 @@ impl App {
                                 self.actions.push(Action::Go(Page::Artist(id.clone())));
                             }
                         }
-                        // Pide la imagen del artista una sola vez (metadatos ligeros).
                         if let Some(id) = &a.id {
-                            if img.is_none() {
-                                self.request_once(&format!("artistmeta:{id}"), Req::Artist(id.clone()));
+                            if ready && img.is_none() {
+                                missing.push(id.clone());
                             }
                         }
                     }
                 }
             });
+        // Las imágenes que falten, de una vez y una sola vez por artista (metadatos ligeros).
+        if !missing.is_empty() {
+            self.request_artist_thumbs(missing);
+        }
     }
 
     /// Artistas más frecuentes de una lista de pistas.
     fn top_artists(tracks: &[Track], n: usize) -> Vec<ArtistRef> {
-        let mut counts: Vec<(ArtistRef, usize)> = Vec::new();
+        // Cada artista (id y nombre, como antes) lleva a su puesto en `counts`, que conserva el
+        // orden de primera aparición: buscarlo recorriendo `counts` era O(pistas × artistas), y
+        // la ordenación estable deja los empates en el mismo orden que antes.
+        let mut index: std::collections::HashMap<(Option<&str>, &str), usize> = std::collections::HashMap::new();
+        let mut counts: Vec<(&ArtistRef, usize)> = Vec::new();
         for t in tracks {
             for a in &t.artists {
-                if let Some(e) = counts.iter_mut().find(|(x, _)| x.id == a.id && x.name == a.name) {
-                    e.1 += 1;
-                } else {
-                    counts.push((a.clone(), 1));
+                match index.entry((a.id.as_deref(), a.name.as_str())) {
+                    std::collections::hash_map::Entry::Occupied(e) => counts[*e.get()].1 += 1,
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(counts.len());
+                        counts.push((a, 1));
+                    }
                 }
             }
         }
         counts.sort_by(|x, y| y.1.cmp(&x.1));
-        counts.into_iter().take(n).map(|(a, _)| a).collect()
+        counts.into_iter().take(n).map(|(a, _)| a.clone()).collect()
+    }
+
+    /// Resumen de una lista (duración, artistas más presentes, quién añadió canciones), guardado
+    /// por versión: solo se recalcula cuando cambian sus pistas, no en cada fotograma. La lista
+    /// llega aparte porque las páginas la sacan de `lists` mientras se dibujan.
+    fn list_summary(&mut self, key: &str, list: &crate::app::TrackList) -> std::rc::Rc<crate::app::ListSummary> {
+        // La longitud también cuenta, por si algún cambio se quedara sin su versión nueva.
+        if let Some((gen, len, s)) = self.page_cache.get(key) {
+            if *gen == list.gen && *len == list.tracks.len() {
+                return s.clone();
+            }
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let added_by = list
+            .tracks
+            .iter()
+            .filter_map(|t| t.added_by.as_deref())
+            .filter(|b| seen.insert(b))
+            .map(str::to_string)
+            .collect();
+        let s = std::rc::Rc::new(crate::app::ListSummary {
+            total_ms: list.tracks.iter().map(|t| t.duration_ms as u64).sum(),
+            top: Self::top_artists(&list.tracks, 5),
+            added_by,
+        });
+        self.page_cache.insert(key.to_string(), (list.gen, list.tracks.len(), s.clone()));
+        s
     }
 
     // ------------------------------------------------------------------ inicio
@@ -459,6 +498,9 @@ impl App {
             self.settings.home_custom.clone(),
             self.settings.home_custom.iter().map(|p| self.lists.get(p).map(|l| l.tracks.len()).unwrap_or(0)).sum::<usize>(),
             self.settings.home_order.clone(),
+            // Al llegar (o fallar) el listado de esta sesión, las secciones de playlists que aún
+            // no se pidieron miran si su copia sigue al día (ensure_playlist).
+            self.listing_settled(),
         );
         if let Some((k, cached)) = &self.home_cache {
             if *k == key {
@@ -475,9 +517,13 @@ impl App {
         // Playlists de la biblioteca añadidas como sección: sus canciones como tarjetas.
         for pid in self.settings.home_custom.clone() {
             let Some(pl) = self.playlists.iter().find(|p| p.id == pid).cloned() else { continue };
-            // Misma clave que la página de la playlist: una sola carga por playlist.
+            // Misma clave que la página de la playlist: una sola carga por playlist, y ninguna
+            // si su copia en disco sigue al día. Con copia a la vista se espera al listado que se
+            // está pidiendo: si no, al arrancar (antes de que llegue) se pedían siempre.
             self.warm_list(&pid);
-            self.request_once(&format!("pl:{pid}"), Req::PlaylistTracks(pid.clone()));
+            if self.listing_settled() || !self.lists.contains_key(&pid) {
+                self.ensure_playlist(&pid);
+            }
             let items: Vec<HomeItem> = self
                 .lists
                 .get(&pid)
@@ -909,70 +955,128 @@ impl App {
         self.request_once("albums", Req::SavedAlbums);
         self.request_once("artists", Req::FollowedArtists);
 
+        // Índices y no copias: filtrarlos y ordenarlos cuesta microsegundos y, al rehacerse en
+        // cada fotograma, nunca apuntan a otro elemento tras renombrar, fijar o recargar la
+        // biblioteca (una caché por longitudes sí se quedaría desfasada y abriría otra playlist).
         let filter = self.library_filter.trim().to_lowercase();
         let matches = |s: &str| filter.is_empty() || s.to_lowercase().contains(&filter);
-        let mut pls: Vec<Playlist> = self.playlists.iter().filter(|pl| matches(&pl.name)).cloned().collect();
-        let pinned = self.settings.pinned.clone();
+        let mut pls: Vec<usize> = (0..self.playlists.len()).filter(|&i| matches(&self.playlists[i].name)).collect();
+        let mut albums: Vec<usize> = (0..self.saved_albums.len())
+            .filter(|&i| matches(&self.saved_albums[i].name) || matches(&self.saved_albums[i].artists_str()))
+            .collect();
+        let mut artists: Vec<usize> = (0..self.followed_artists.len()).filter(|&i| matches(&self.followed_artists[i].name)).collect();
         if self.library_sort_name {
-            pls.sort_by_key(|pl| pl.name.to_lowercase());
+            pls.sort_by_cached_key(|&i| self.playlists[i].name.to_lowercase());
+            albums.sort_by_cached_key(|&i| self.saved_albums[i].name.to_lowercase());
+            artists.sort_by_cached_key(|&i| self.followed_artists[i].name.to_lowercase());
         }
-        pls.sort_by_key(|pl| !pinned.contains(&pl.id));
-        let mut albums: Vec<Album> = self.saved_albums.iter().filter(|a| matches(&a.name) || matches(&a.artists_str())).cloned().collect();
-        if self.library_sort_name {
-            albums.sort_by_key(|a| a.name.to_lowercase());
+        {
+            // Orden estable: las fijadas suben sin perder el orden elegido entre ellas.
+            let pinned: std::collections::HashSet<&str> = self.settings.pinned.iter().map(String::as_str).collect();
+            pls.sort_by_key(|&i| !pinned.contains(self.playlists[i].id.as_str()));
         }
-        let mut artists: Vec<Artist> = self.followed_artists.iter().filter(|a| matches(&a.name)).cloned().collect();
-        if self.library_sort_name {
-            artists.sort_by_key(|a| a.name.to_lowercase());
-        }
+        let liked = matches("canciones que te gustan");
 
         if self.library_grid {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 8.0);
-                if matches("canciones que te gustan") {
+                if liked {
                     self.liked_card(ui);
                 }
-                for pl in &pls {
-                    self.playlist_card(ui, pl);
+                // Las tarjetas fuera de la vista solo reservan su hueco: así la cuadrícula fluye
+                // igual, pero solo se copian y dibujan (y piden portada) las que se ven.
+                for &i in &pls {
+                    if let Some(mut c) = Self::card_slot(ui, ("lib_pl", i, &self.playlists[i].id)) {
+                        let pl = self.playlists[i].clone();
+                        self.playlist_card(&mut c, &pl);
+                    }
                 }
-                for a in &albums {
-                    let sub = a.artists_str();
-                    self.album_card(ui, &a.id.clone(), a.cover(300), &a.name, &sub, a.total_tracks);
+                for &i in &albums {
+                    if let Some(mut c) = Self::card_slot(ui, ("lib_al", i, &self.saved_albums[i].id)) {
+                        let a = self.saved_albums[i].clone();
+                        let sub = a.artists_str();
+                        self.album_card(&mut c, &a.id, a.cover(300), &a.name, &sub, a.total_tracks);
+                    }
                 }
-                for a in &artists {
-                    self.artist_card(ui, a);
+                for &i in &artists {
+                    if let Some(mut c) = Self::card_slot(ui, ("lib_ar", i, &self.followed_artists[i].id)) {
+                        let a = self.followed_artists[i].clone();
+                        self.artist_card(&mut c, &a);
+                    }
                 }
             });
         } else {
-            let liked_total = self.lists.get(LIKED).map(|l| l.total).unwrap_or(0);
-            if matches("canciones que te gustan") {
-                let r = self.list_entry(ui, None, CardKind::Liked, "Canciones que te gustan", &format!("{liked_total} canciones"));
-                if r.clicked() {
-                    self.actions.push(Action::Go(Page::Liked));
-                }
+            // Solo las filas visibles, como en track_rows: un bloque con la altura de todas y cada
+            // fila a la vista en su sitio. Todas miden 56 px (list_entry reserva exactamente eso) más
+            // el espaciado, así que la posición de cada una se calcula sin dibujar las demás.
+            let lead = liked as usize;
+            let n = lead + pls.len() + albums.len() + artists.len();
+            if n == 0 {
+                return;
             }
-            for pl in &pls {
-                let sub = format!("Playlist · {}", pl.owner_name());
-                let r = self.list_entry(ui, pl.cover(64), CardKind::Playlist, &pl.name, &sub);
-                if r.clicked() {
-                    self.actions.push(Action::OpenPlaylist(pl.clone()));
+            let gap = ui.spacing().item_spacing.y;
+            let pitch = 56.0 + gap;
+            let w = ui.available_width();
+            let (block, _) = ui.allocate_exact_size(vec2(w, n as f32 * pitch - gap), Sense::hover());
+            let clip = ui.clip_rect();
+            let first = ((clip.top() - block.top()) / pitch).floor().max(0.0) as usize;
+            let last = (((clip.bottom() - block.top()) / pitch).ceil().max(0.0) as usize).min(n);
+            for row in first..last {
+                let rect = Rect::from_min_size(pos2(block.min.x, block.min.y + row as f32 * pitch), vec2(w, 56.0));
+                if row < lead {
+                    let liked_total = self.lists.get(LIKED).map(|l| l.total).unwrap_or(0);
+                    let mut c = keyed_child(ui, rect, "lib_liked");
+                    let r = self.list_entry(&mut c, None, CardKind::Liked, "Canciones que te gustan", &format!("{liked_total} canciones"));
+                    if r.clicked() {
+                        self.actions.push(Action::Go(Page::Liked));
+                    }
+                    continue;
                 }
-                self.playlist_row_menu(&r, pl);
-            }
-            for a in &albums {
-                let sub = format!("Álbum · {}", a.artists_str());
-                let r = self.list_entry(ui, a.cover(64), CardKind::Album, &a.name, &sub);
-                if r.clicked() {
-                    self.actions.push(Action::Go(Page::Album(a.id.clone())));
+                // Copia solo de la fila visible: list_entry y el menú necesitan `&mut self`.
+                let k = row - lead;
+                if let Some(&i) = pls.get(k) {
+                    let pl = self.playlists[i].clone();
+                    let sub = format!("Playlist · {}", pl.owner_name());
+                    let mut c = keyed_child(ui, rect, ("lib_pl", i, &pl.id));
+                    let r = self.list_entry(&mut c, pl.cover(64), CardKind::Playlist, &pl.name, &sub);
+                    if r.clicked() {
+                        self.actions.push(Action::OpenPlaylist(pl.clone()));
+                    }
+                    self.playlist_row_menu(&r, &pl);
+                    continue;
                 }
-            }
-            for a in &artists {
-                let r = self.list_entry(ui, a.cover(64), CardKind::Artist, &a.name, "Artista");
-                if r.clicked() {
-                    self.actions.push(Action::Go(Page::Artist(a.id.clone())));
+                let k = k - pls.len();
+                if let Some(&i) = albums.get(k) {
+                    let a = self.saved_albums[i].clone();
+                    let sub = format!("Álbum · {}", a.artists_str());
+                    let mut c = keyed_child(ui, rect, ("lib_al", i, &a.id));
+                    let r = self.list_entry(&mut c, a.cover(64), CardKind::Album, &a.name, &sub);
+                    if r.clicked() {
+                        self.actions.push(Action::Go(Page::Album(a.id.clone())));
+                    }
+                    continue;
+                }
+                let k = k - albums.len();
+                if let Some(&i) = artists.get(k) {
+                    let a = self.followed_artists[i].clone();
+                    let mut c = keyed_child(ui, rect, ("lib_ar", i, &a.id));
+                    let r = self.list_entry(&mut c, a.cover(64), CardKind::Artist, &a.name, "Artista");
+                    if r.clicked() {
+                        self.actions.push(Action::Go(Page::Artist(a.id.clone())));
+                    }
                 }
             }
         }
+    }
+
+    /// Hueco de una tarjeta en la cuadrícula de la biblioteca. Siempre lo reserva (para que el
+    /// flujo de filas no cambie), pero solo devuelve dónde dibujarla si está a la vista.
+    fn card_slot(ui: &mut egui::Ui, key: impl egui::AsIdSalt) -> Option<egui::Ui> {
+        let (_, rect) = ui.allocate_space(vec2(CARD_W, CARD_H));
+        if !ui.is_rect_visible(rect) {
+            return None;
+        }
+        Some(keyed_child(ui, rect, key))
     }
 
     fn playlist_row_menu(&mut self, r: &egui::Response, pl: &Playlist) {
@@ -1078,7 +1182,7 @@ impl App {
         }
         self.collection_bar(ui, "history", &recent, None, None, |_, _| {}, None);
         ui.add_space(8.0);
-        let shown = self.filter_tracks("history", &recent);
+        let shown = self.filter_tracks("history", None, &recent);
         self.track_rows(ui, "history", &shown, RowOpts { header: true, select: true, ..RowOpts::tracks(true, true) });
         ui.add_space(8.0);
         ui.label(
@@ -1101,10 +1205,7 @@ impl App {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
             for (i, label) in FILTERS.iter().enumerate() {
                 if Self::pill(ui, label, self.search_filter == i as u8).clicked() {
-                    self.search_filter = i as u8;
-                    if i == 8 && !self.search_query.trim().is_empty() {
-                        self.api.send(Req::User(self.search_query.trim().to_string()));
-                    }
+                    self.set_search_filter(i as u8);
                 }
             }
         });
@@ -1129,11 +1230,14 @@ impl App {
             }
             return;
         }
-        if self.search_loading {
-            Self::loading(ui, "Buscando");
-            return;
-        }
+        // Una consulta en vuelo sin search_loading (la del diagnóstico) también cuenta; el refresco
+        // detrás de un resultado de la caché no: lo que se ve ya es de esa consulta.
+        let waiting = self.search_loading || self.search_pending.as_ref().is_some_and(|q| !self.search_refreshing.contains(q));
         let Some(result) = self.search_result.take() else {
+            if waiting {
+                Self::loading(ui, "Buscando");
+                return;
+            }
             ui.add_space(20.0);
             ui.label(
                 RichText::new(
@@ -1144,6 +1248,14 @@ impl App {
             );
             return;
         };
+        // Con una búsqueda nueva en vuelo, los resultados anteriores siguen a la vista pero
+        // atenuados, con un aviso pequeño encima, en vez de vaciar la página hasta la respuesta.
+        // No se devuelve el foco a la caja: Espacio, S, R… dejarían de ser atajos.
+        let opacity = ui.opacity();
+        if waiting {
+            Self::loading(ui, "Buscando");
+            ui.multiply_opacity(0.5);
+        }
 
         if let Some(tracks) = &result.tracks {
             if (f == 0 || f == 1) && !tracks.items.is_empty() {
@@ -1233,6 +1345,7 @@ impl App {
                 });
             }
         }
+        ui.set_opacity(opacity);
         self.search_result = Some(result);
     }
 
@@ -1481,26 +1594,30 @@ impl App {
         }
         self.request_once(LIKED, Req::Liked);
         let list = self.lists.remove(LIKED).unwrap_or_default();
-        let total_ms: u64 = list.tracks.iter().map(|t| t.duration_ms as u64).sum();
+        let summary = self.list_summary(LIKED, &list);
+        let total_ms = summary.total_ms;
         let meta = format!("{} canciones · {}", list.total, fmt_total(total_ms));
-        let uris: Vec<String> = list.tracks.iter().map(|t| t.uri.clone()).collect();
-        let top = Self::top_artists(&list.tracks, 5);
         let tracks = list.tracks;
         let loading = list.loading;
         let total = list.total;
+        let gen = list.gen;
+        // Con la lista completa (o la copia entera a la vista mientras se refresca), los artistas
+        // más presentes ya no cambian: es cuando se piden sus imágenes. Un total 0 en carga aún
+        // no se conoce (no es una lista vacía): con él, cada lote pediría otro artista suelto.
+        let thumbs_ready = !loading || (total > 0 && tracks.len() >= total as usize);
 
         self.two_columns(
             ui,
             |app, ui| {
                 Self::page_title(ui, "PLAYLIST", "Canciones que te gustan", &meta);
-                if !uris.is_empty() {
+                if !tracks.is_empty() {
                     app.collection_bar(ui, LIKED, &tracks, None, None, |_, _| {}, None);
                     ui.add_space(8.0);
                 }
                 if loading {
                     Self::loading(ui, &format!("Cargando {} de {}", tracks.len(), total));
                 }
-                let shown = app.filter_tracks(LIKED, &tracks);
+                let shown = app.filter_tracks(LIKED, Some(gen), &tracks);
                 app.track_rows(ui, LIKED, &shown, RowOpts { header: true, select: true, ..RowOpts::tracks(true, true) });
             },
             |app, ui| {
@@ -1516,21 +1633,23 @@ impl App {
                         let _ = Self::pill(ui, &format!("{} canciones", total), false);
                         let _ = Self::pill(ui, &fmt_total(total_ms), false);
                     });
-                    if !top.is_empty() {
+                    if !summary.top.is_empty() {
                         ui.add_space(12.0);
                         ui.label(RichText::new("Artistas más presentes").small().color(p.weak));
                         ui.add_space(4.0);
-                        app.info_card_artists(ui, &top);
+                        app.info_card_artists(ui, &summary.top, thumbs_ready);
                     }
                 });
             },
         );
-        self.lists.insert(LIKED.to_string(), crate::app::TrackList { tracks, total, loading });
+        // Con su versión: si no, el resumen y la búsqueda guardados no valdrían al fotograma siguiente.
+        self.lists.insert(LIKED.to_string(), crate::app::TrackList { tracks, total, loading, gen });
     }
 
-    /// Lista de artistas con avatar (parte de la tarjeta de información).
-    fn info_card_artists(&mut self, ui: &mut egui::Ui, artists: &[ArtistRef]) {
+    /// Lista de artistas con avatar (parte de la tarjeta de información). `ready` como en info_card.
+    fn info_card_artists(&mut self, ui: &mut egui::Ui, artists: &[ArtistRef], ready: bool) {
         let p = theme::palette(ui.ctx());
+        let mut missing: Vec<String> = Vec::new();
         for a in artists.iter().take(6) {
             let img = a
                 .id
@@ -1563,10 +1682,13 @@ impl App {
                 }
             }
             if let Some(id) = &a.id {
-                if img.is_none() {
-                    self.request_once(&format!("artistmeta:{id}"), Req::Artist(id.clone()));
+                if ready && img.is_none() {
+                    missing.push(id.clone());
                 }
             }
+        }
+        if !missing.is_empty() {
+            self.request_artist_thumbs(missing);
         }
     }
 
@@ -1773,18 +1895,56 @@ impl App {
             self.welcome(ui);
             return;
         }
+        // Medida para el registro: desde que se abre la página hasta que se ve su primera fila.
+        // Es una apertura nueva si cambia el id o si el fotograma anterior no la dibujó.
+        let frame = ui.ctx().cumulative_frame_nr();
+        if self.pl_open_mark.as_ref().map_or(true, |(m, last, _)| *m != id || last + 1 < frame) {
+            self.pl_open_mark = Some((id.clone(), frame, Some(Instant::now())));
+        }
         let meta = self
             .playlists
             .iter()
             .find(|pl| pl.id == id)
             .cloned()
             .or_else(|| self.playlist_meta.get(&id).cloned());
-        self.warm_list(&id);
-        self.request_once(&format!("plmeta:{id}"), Req::PlaylistMeta(id.clone()));
-        self.request_once(&format!("pl:{id}"), Req::PlaylistTracks(id.clone()));
+        // Las pistas primero: su carga trae también nombre, portada y descripción (playlist4).
+        // /playlists/{id} solo añade privacidad, seguidores y el nombre del propietario, que de
+        // las de la biblioteca ya se saben; y las de Spotify (37i9) no están en la Web API. Así
+        // abrirlas no gasta una lectura de cuota ni un hilo esperando un 429. Con su copia en
+        // disco al día (mismo snapshot_id que el listado) no se pide nada.
+        self.ensure_playlist(&id);
+        let in_library = self.in_library(&id);
+        // Sin la biblioteca cargada aún (primer arranque, sin instantánea) no se sabe si está en
+        // ella: se espera a saberlo en vez de gastar la lectura en la ráfaga inicial.
+        if self.playlists_loaded && !in_library && !id.starts_with("37i9dQZ") {
+            self.request_once(&format!("plmeta:{id}"), Req::PlaylistMeta(id.clone()));
+        }
         let list = self.lists.remove(&id).unwrap_or_default();
+        if let Some((_, last, opened)) = self.pl_open_mark.as_mut() {
+            *last = frame;
+            if !list.tracks.is_empty() {
+                if let Some(t0) = opened.take() {
+                    log::info!("[t] abrir playlist {id}: primera fila en {} ms", t0.elapsed().as_millis());
+                }
+            }
+        }
 
-        let full_meta = self.playlist_meta.get(&id).cloned().or(meta);
+        // De las de la biblioteca ya no se pide /playlists/{id}: la privacidad buena es la de la
+        // biblioteca (se recarga al conectar y tras editarla), no la de playlist4 (que no la trae)
+        // ni la de una copia en disco antigua. El editor parte de `public` (sin dato, pública):
+        // con una vieja, guardar otro cambio podía deshacer el de privacidad.
+        let full_meta = match (self.playlist_meta.get(&id).cloned(), meta) {
+            (Some(mut m), Some(lib)) if in_library => {
+                if lib.public.is_some() {
+                    m.public = lib.public;
+                }
+                if m.owner.display_name.is_none() && lib.owner.display_name.is_some() {
+                    m.owner = lib.owner;
+                }
+                Some(m)
+            }
+            (m, lib) => m.or(lib),
+        };
         let mine = full_meta.as_ref().map(|pl| self.is_mine(pl)).unwrap_or(false);
         let collaborative = full_meta.as_ref().and_then(|pl| pl.collaborative).unwrap_or(false);
         let (name, owner, owner_id, cover, uri) = match &full_meta {
@@ -1802,7 +1962,8 @@ impl App {
         } else {
             full_meta.as_ref().and_then(|pl| pl.tracks.as_ref()).map(|t| t.total).unwrap_or(0)
         };
-        let total_ms: u64 = list.tracks.iter().map(|t| t.duration_ms as u64).sum();
+        let summary = self.list_summary(&id, &list);
+        let total_ms = summary.total_ms;
         let mut meta_line = String::new();
         if !owner.is_empty() {
             meta_line.push_str(&format!("De {owner} · "));
@@ -1826,20 +1987,16 @@ impl App {
             }
         }
         let description = full_meta.as_ref().and_then(|pl| pl.description.clone()).filter(|d| !d.is_empty()).map(|d| strip_html(&d));
-        let top = Self::top_artists(&list.tracks, 5);
-        let in_library = self.in_library(&id);
         let pinned = self.settings.pinned.contains(&id);
         let tracks = list.tracks;
         let loading = list.loading;
-        // Autores: el propietario y, por orden de aparición, quienes han añadido canciones.
+        let gen = list.gen;
+        // Como en Me gusta: imágenes de artistas solo con la lista completa.
+        let thumbs_ready = !loading || (total > 0 && tracks.len() >= total as usize);
+        // Autores: el propietario y, por orden de aparición, quienes han añadido canciones. El
+        // propietario se pone aquí y no en el resumen: sus datos pueden llegar después.
         let mut contributors: Vec<String> = owner_id.iter().cloned().collect();
-        for t in &tracks {
-            if let Some(b) = &t.added_by {
-                if !contributors.contains(b) {
-                    contributors.push(b.clone());
-                }
-            }
-        }
+        contributors.extend(summary.added_by.iter().filter(|b| owner_id.as_ref() != Some(*b)).cloned());
         // Spotify ya no marca como colaborativas las públicas: si hay varios autores, lo es.
         let collaborative = collaborative || contributors.len() > 1;
         let editable = mine || collaborative;
@@ -1923,7 +2080,6 @@ impl App {
                         ui.close();
                     }
                 }));
-                let all_uris: Vec<String> = tracks.iter().map(|t| t.uri.clone()).collect();
                 app.collection_bar(
                     ui,
                     &id,
@@ -1932,21 +2088,51 @@ impl App {
                     Some(&link),
                     |app, ui| {
                         let p = theme::palette(ui.ctx());
+                        // Los uris solo al pulsar: copiarlos todos en cada fotograma costaba con miles.
                         if icons::button(ui, Icon::PlusSquare, 34.0, p.weak).on_hover_text("Añadir todas a una playlist").clicked() {
-                            app.open_add_dialog(all_uris.clone());
+                            app.open_add_dialog(tracks.iter().map(|t| t.uri.clone()).collect());
                         }
                     },
                     menu,
                 );
                 ui.add_space(8.0);
+                // La carga falló o llegó con huecos: lo que hay y «Reintentar». Texto fijo, no
+                // Self::loading, que repinta 4 veces por segundo mientras espera el reintento.
+                // Vacía cuenta aunque no se sepa el total (falló el primer lote sin metadatos).
+                let partial = app.list_retry.contains_key(&id) && (tracks.is_empty() || tracks.len() < total as usize);
+                let retrying = partial && app.list_retry_busy(&id);
                 if loading {
                     Self::loading(ui, &format!("Cargando {} de {}", tracks.len(), total));
-                } else if tracks.is_empty() && total > 0 {
+                } else if retrying && tracks.is_empty() {
+                    Self::loading(ui, "Cargando");
+                } else if partial {
+                    ui.horizontal(|ui| {
+                        let shown = if tracks.is_empty() {
+                            "No se pudo cargar la playlist".to_string()
+                        } else {
+                            format!("Mostrando {} de {}", tracks.len(), total)
+                        };
+                        ui.label(RichText::new(shown).color(p.weak));
+                        ui.label(RichText::new("·").color(p.faint));
+                        if retrying {
+                            ui.label(RichText::new("reintentando").color(p.weak));
+                        } else {
+                            let r = ui.add(Label::new(RichText::new("Reintentar").color(p.text)).sense(Sense::click()));
+                            if r.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if r.clicked() {
+                                app.actions.push(Action::RetryList(id.clone()));
+                            }
+                        }
+                    });
+                } else if tracks.is_empty() && (total > 0 || app.warming.contains_key(&id)) {
+                    // También mientras se lee su copia en disco (sin total aún): no está vacía.
                     Self::loading(ui, "Cargando");
                 } else if tracks.is_empty() {
                     ui.label(RichText::new("Esta playlist está vacía. Añade canciones con el botón + de cualquier fila.").color(p.weak));
                 }
-                let shown = app.filter_tracks(&id, &tracks);
+                let shown = app.filter_tracks(&id, Some(gen), &tracks);
                 let src = if shown.len() == tracks.len() { Source::Context(&uri) } else { Source::Tracks };
                 // En playlists colaborativas se ve quién añadió cada canción (como en Spotify).
                 app.rows_added_by = collaborative;
@@ -1968,10 +2154,11 @@ impl App {
                 app.rows_added_by = false;
             },
             |app, ui| {
-                app.info_card(ui, cover.as_deref(), &chips, &top);
+                app.info_card(ui, cover.as_deref(), &chips, &summary.top, thumbs_ready);
             },
         );
-        self.lists.insert(id.clone(), crate::app::TrackList { tracks, total, loading });
+        // Con su versión: si no, el resumen y la búsqueda guardados no valdrían al fotograma siguiente.
+        self.lists.insert(id.clone(), crate::app::TrackList { tracks, total, loading, gen });
     }
 
     // ------------------------------------------------------------------- álbum
@@ -2024,7 +2211,7 @@ impl App {
         let uri = album.uri.clone();
         let name = album.name.clone();
         let filter = self.list_query(&id);
-        let filtered = self.filter_tracks(&id, &all);
+        let filtered = self.filter_tracks(&id, None, &all);
         if self.sel_list == id {
             if let Some(mark) = self.sel.iter().find(|s| s.starts_with('#')).cloned() {
                 self.sel.remove(&mark);
@@ -2142,7 +2329,7 @@ impl App {
                 }
             },
             |app, ui| {
-                app.info_card(ui, cover.as_deref(), &chips, &collaborators);
+                app.info_card(ui, cover.as_deref(), &chips, &collaborators, true);
             },
         );
         self.albums.insert(id, album);

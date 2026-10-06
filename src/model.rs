@@ -181,6 +181,10 @@ pub struct Playlist {
     pub collaborative: Option<bool>,
     #[serde(default)]
     pub followers: Option<Followers>,
+    /// Versión de la playlist según la Web API (/me/playlists la trae sin pedirla aparte):
+    /// cambia con cada edición. Comparada con la de su copia en disco dice si hay que bajarla.
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
 }
 
 impl Playlist {

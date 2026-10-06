@@ -485,7 +485,9 @@ impl App {
             },
             "search_filter" => match n(cmd, "n") {
                 Some(f) => {
-                    self.search_filter = f as u8;
+                    // Como el clic en la píldora: Perfiles pide el perfil y, al salir de ahí, se
+                    // busca la consulta que quedó pendiente.
+                    self.set_search_filter(f as u8);
                     ok()
                 }
                 None => err("falta n"),
@@ -963,7 +965,13 @@ impl App {
                 self.api.send(Req::LastPlayback);
                 ok()
             }
-            "playlist_tracks" => need_id(Req::PlaylistTracks(id.clone())),
+            // Por la puerta única: con una carga ya en vuelo, esta sale detrás (dos a la vez
+            // mezclarían sus lotes). Si la lista ya se ve, la nueva la sustituye al terminar.
+            "playlist_tracks" if !id.is_empty() => {
+                self.load_playlist(&id, false, true);
+                ok()
+            }
+            "playlist_tracks" => err("falta id"),
             "playlist_meta" => need_id(Req::PlaylistMeta(id.clone())),
             "album" => need_id(Req::Album(id.clone())),
             "artist" => need_id(Req::Artist(id.clone())),
@@ -1119,7 +1127,7 @@ impl App {
             "artist_views": artist_views,
             "users": users,
             "user_playlists": self.user_playlists.iter().map(|(k, v)| (k.clone(), json!(v.len()))).collect::<serde_json::Map<_, _>>(),
-            "search": {"query": self.search_query, "loading": self.search_loading, "filter": self.search_filter, "result": search},
+            "search": {"query": self.search_query, "loading": self.search_loading, "pending": self.search_pending, "filter": self.search_filter, "result": search, "result_query": self.search_result_for},
             "focus_search": self.focus_search,
             "folders": self.folders.iter().map(|f| json!({"id": f.id, "name": f.name, "playlists": f.playlists})).collect::<Vec<_>>(),
             "settings": serde_json::to_value(&self.settings).unwrap_or(Value::Null),

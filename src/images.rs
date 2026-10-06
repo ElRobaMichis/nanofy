@@ -3,12 +3,15 @@
 //!
 //! Cada textura se guarda una sola vez (en RAM, sin copia en GPU) y al tamaño pedido:
 //! una fila de 36 px no necesita una portada de 300 px.
+//!
+//! Los hilos sirven primero lo que está a la vista y no descargan lo que ya salió de ella.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use egui::load::SizedTexture;
 use egui::{ColorImage, TextureHandle, TextureOptions};
@@ -19,14 +22,38 @@ use crate::bus::{Msg, UiTx};
 const MAX_TEXTURES: usize = 160;
 /// Presupuesto de píxeles residentes (todas las texturas de portadas): 20 MB.
 const MAX_TEXTURE_BYTES: usize = 16 * 1024 * 1024;
-/// Texturas sin usar durante más de estos fotogramas se liberan (≈ 20 s a 1 fps en reposo).
-const IDLE_FRAMES: u64 = 40;
-const WORKERS: usize = 2;
+/// Texturas sin verse durante este tiempo se liberan (otras páginas). Por tiempo y no por
+/// fotogramas: a 144 fps, 40 fotogramas eran 0,3 s y volver atrás en una lista dejaba
+/// cuadros grises mientras se recargaban.
+const IDLE: Duration = Duration::from_secs(15);
+/// Cada cuánto se revisan las texturas sin uso y los fallos que toca reintentar.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
+/// Un fallo pasajero (red, plazo agotado, 5xx) se vuelve a pedir pasado este tiempo si la
+/// portada sigue a la vista: antes, una portada que fallaba una vez quedaba en blanco toda la
+/// sesión.
+const RETRY_FAILED: Duration = Duration::from_secs(30);
+/// Un encargo que lleva estos fotogramas sin pintarse salió de la vista y ya no se descarga.
+/// En fotogramas y no en tiempo: sin repintados (app en reposo) nada caduca, y lo que se ve
+/// se vuelve a pedir en cada fotograma.
+const STALE_FRAMES: u64 = 5;
+/// A la vista y esperando más que esto, un encargo pasa delante de los recién llegados.
+const AGED: Duration = Duration::from_millis(300);
+/// Las descargas van a la CDN de portadas (i.scdn.co) con un agente propio: sin cuota de la
+/// Web API ni el limitador de librespot, y esperan a la red mucho más que a la CPU.
+const WORKERS: usize = 4;
+
+/// Último fotograma en que se pidió una portada que aún no ha llegado. La comparten el hueco
+/// (`Slot::Loading`), que la refresca cada vez que se pinta, y el encargo en cola, que así
+/// sabe si sigue a la vista.
+pub type Wanted = Arc<AtomicU64>;
 
 enum Slot {
-    Loading,
-    Ready { tex: TextureHandle, used: u64, bytes: usize },
-    Failed,
+    Loading { wanted: Wanted },
+    /// `used` (fotograma) decide qué se expulsa al pasar los topes sin tocar lo pintado en el
+    /// último fotograma; `seen` (hora) decide qué lleva tiempo sin verse.
+    Ready { tex: TextureHandle, used: u64, seen: Instant, bytes: usize },
+    /// `retry`: el fallo fue pasajero y se olvida pasado `RETRY_FAILED`.
+    Failed { at: Instant, retry: bool },
 }
 
 /// Tamaño pedido: lado máximo (miniaturas) o encaje exacto con recorte centrado (cabeceras
@@ -37,19 +64,97 @@ pub enum Size {
     Fit(u32, u32),
 }
 
+struct Job {
+    key: String,
+    url: String,
+    size: Size,
+    wanted: Wanted,
+    /// Orden de llegada (creciente).
+    pushed: u64,
+    at: Instant,
+}
+
+/// Encargos de portadas por servir. No es un canal porque los hilos no toman el más antiguo
+/// sino el que más interesa (lo que se ve ahora) y descartan lo que ya no se ve: con la cola
+/// FIFO, tras desplazarse rápido por una lista larga las portadas donde se paraba esperaban
+/// detrás de cientos de filas ya pasadas.
+#[derive(Default)]
+struct Pending {
+    jobs: Vec<Job>,
+    /// La app se cierra: los hilos terminan (como antes al soltar el canal).
+    closed: bool,
+}
+
+impl Pending {
+    /// Saca el encargo que más interesa. Lo que está a la vista (pintado en este fotograma o
+    /// en el anterior) va antes que nada y, de eso, lo más nuevo, que es donde se paró la
+    /// lista; pero lo que lleva `AGED` esperando a la vista pasa delante, del más antiguo al
+    /// más nuevo, para que la portada del reproductor o una cabecera no se queden sin turno
+    /// mientras la lista no para de moverse. Lo que ya no se ve va al final, lo visto más
+    /// recientemente primero (es lo que reaparece al volver atrás). Recorre toda la cola, pero
+    /// son unos pocos miles de encargos como mucho y una comparación por encargo.
+    fn take(&mut self, cur: u64) -> Option<Job> {
+        let now = Instant::now();
+        let rank = |j: &Job| {
+            let wanted = j.wanted.load(Ordering::Relaxed);
+            if wanted + 1 >= cur {
+                if now.saturating_duration_since(j.at) >= AGED {
+                    (3, u64::MAX - j.pushed, 0)
+                } else {
+                    (2, j.pushed, 0)
+                }
+            } else {
+                (1, wanted, j.pushed)
+            }
+        };
+        let best = self.jobs.iter().enumerate().max_by_key(|(_, j)| rank(j))?.0;
+        Some(self.jobs.swap_remove(best))
+    }
+}
+
+type Queue = Arc<(Mutex<Pending>, Condvar)>;
+
+/// Resultado de un encargo.
+enum Loaded {
+    Image(ColorImage),
+    Failed { retry: bool },
+    /// Sin copia en disco y fuera de la vista: no se descargó.
+    Dropped,
+}
+
 pub struct Images {
-    tx: mpsc::Sender<(String, Size)>,
+    queue: Queue,
+    /// `frame`, compartido con los hilos para saber qué encargos dejaron de verse.
+    shared_frame: Arc<AtomicU64>,
+    /// Contador de encargos, para ordenarlos por llegada.
+    pushed: u64,
     slots: HashMap<String, Slot>,
     frame: u64,
+    last_sweep: Instant,
+    /// Para medir lo que tarda en llenarse lo que se ve: hora de la última portada pedida
+    /// mientras alguna a la vista seguía sin llegar.
+    waiting: Option<Instant>,
+    /// Portadas a la vista sin textura en este fotograma.
+    waiting_now: usize,
     /// Color dominante por URL (calculado al cargar miniaturas), para el fondo del reproductor.
     colors: HashMap<String, egui::Color32>,
+}
+
+impl Drop for Images {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.queue;
+        if let Ok(mut q) = lock.lock() {
+            q.closed = true;
+        }
+        cv.notify_all();
+    }
 }
 
 impl Images {
     pub fn start(cache_dir: PathBuf, ui: UiTx) -> Self {
         let _ = std::fs::create_dir_all(&cache_dir);
-        let (tx, rx) = mpsc::channel::<(String, Size)>();
-        let rx = Arc::new(Mutex::new(rx));
+        let queue: Queue = Arc::new((Mutex::new(Pending::default()), Condvar::new()));
+        let shared_frame = Arc::new(AtomicU64::new(0));
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(15)))
             .http_status_as_error(false)
@@ -64,7 +169,8 @@ impl Images {
         prune_cache(cache_dir.clone());
 
         for i in 0..WORKERS {
-            let rx = rx.clone();
+            let queue = queue.clone();
+            let frame = shared_frame.clone();
             let agent = agent.clone();
             let ui = ui.clone();
             let dir = cache_dir.clone();
@@ -73,27 +179,52 @@ impl Images {
                 .stack_size(512 * 1024)
                 .spawn(move || loop {
                     let job = {
-                        let guard = rx.lock().unwrap();
-                        guard.recv()
-                    };
-                    match job {
-                        Ok((url, size)) => {
-                            let image = load(&agent, &dir, &url, size);
-                            ui.send(Msg::Image {
-                                key: key(&url, size),
-                                image,
-                            });
+                        let (lock, cv) = &*queue;
+                        let mut q = lock.lock().unwrap();
+                        loop {
+                            if q.closed {
+                                return;
+                            }
+                            if let Some(job) = q.take(frame.load(Ordering::Relaxed)) {
+                                break job;
+                            }
+                            q = cv.wait(q).unwrap();
                         }
-                        Err(_) => break,
+                    };
+                    // Se mira justo antes de ir a la red y no al sacarlo: si la fila volvió a
+                    // la vista mientras tanto, se descarga.
+                    let stale = || job.wanted.load(Ordering::Relaxed) + STALE_FRAMES < frame.load(Ordering::Relaxed);
+                    match load(&agent, &dir, &job.url, job.size, stale) {
+                        Loaded::Image(img) => ui.send(Msg::Image {
+                            key: job.key,
+                            image: Some(img),
+                            retry: false,
+                        }),
+                        Loaded::Failed { retry } => ui.send(Msg::Image {
+                            key: job.key,
+                            image: None,
+                            retry,
+                        }),
+                        // Nunca como `image: None`: eso deja el hueco en Failed y la portada
+                        // no se volvería a pedir al verla otra vez.
+                        Loaded::Dropped => ui.send(Msg::ImageDropped {
+                            key: job.key,
+                            wanted: job.wanted,
+                        }),
                     }
                 })
                 .expect("no se pudo crear el hilo de imágenes");
         }
 
         Self {
-            tx,
+            queue,
+            shared_frame,
+            pushed: 0,
             slots: HashMap::new(),
             frame: 0,
+            last_sweep: Instant::now(),
+            waiting: None,
+            waiting_now: 0,
             colors: HashMap::new(),
         }
     }
@@ -112,14 +243,35 @@ impl Images {
         let frame = self.frame;
         let k = key(url, size);
         match self.slots.get_mut(&k) {
-            Some(Slot::Ready { tex, used, .. }) => {
+            Some(Slot::Ready { tex, used, seen, .. }) => {
                 *used = frame;
+                *seen = Instant::now();
                 Some(SizedTexture::from_handle(tex))
             }
-            Some(_) => None,
+            Some(Slot::Loading { wanted }) => {
+                // Sigue a la vista: su encargo no caduca y va delante de lo que ya no se ve.
+                wanted.store(frame, Ordering::Relaxed);
+                self.waiting_now += 1;
+                self.waiting.get_or_insert_with(Instant::now);
+                None
+            }
+            Some(Slot::Failed { .. }) => None,
             None => {
-                self.slots.insert(k, Slot::Loading);
-                let _ = self.tx.send((url.to_string(), size));
+                let wanted: Wanted = Arc::new(AtomicU64::new(frame));
+                self.slots.insert(k.clone(), Slot::Loading { wanted: wanted.clone() });
+                self.pushed += 1;
+                let (lock, cv) = &*self.queue;
+                lock.lock().unwrap().jobs.push(Job {
+                    key: k,
+                    url: url.to_string(),
+                    size,
+                    wanted,
+                    pushed: self.pushed,
+                    at: Instant::now(),
+                });
+                cv.notify_one();
+                self.waiting_now += 1;
+                self.waiting = Some(Instant::now());
                 None
             }
         }
@@ -147,7 +299,8 @@ impl Images {
         })
     }
 
-    pub fn loaded(&mut self, ctx: &egui::Context, key: &str, image: Option<ColorImage>) {
+    /// `retry` solo cuenta sin imagen: el fallo fue pasajero y se reintentará.
+    pub fn loaded(&mut self, ctx: &egui::Context, key: &str, image: Option<ColorImage>, retry: bool) {
         let slot = match image {
             Some(img) => {
                 let bytes = img.pixels.len() * 4;
@@ -159,21 +312,54 @@ impl Images {
                 Slot::Ready {
                     tex: ctx.load_texture(key, img, TextureOptions::LINEAR),
                     used: self.frame,
+                    seen: Instant::now(),
                     bytes,
                 }
             }
-            None => Slot::Failed,
+            None => {
+                // Un fallo tardío (de un encargo anterior a `clear()`) no tapa una textura buena.
+                if matches!(self.slots.get(key), Some(Slot::Ready { .. })) {
+                    return;
+                }
+                Slot::Failed { at: Instant::now(), retry }
+            }
         };
         self.slots.insert(key.to_string(), slot);
+    }
+
+    /// Encargo descartado sin descargar porque salió de la vista: se quita su hueco para que
+    /// la portada se pida de nuevo si vuelve a verse. Solo si es el mismo encargo: tras
+    /// `clear()` la clave puede tener ya otro encargo o una textura, que no se tocan.
+    pub fn dropped(&mut self, key: &str, wanted: &Wanted) {
+        if matches!(self.slots.get(key), Some(Slot::Loading { wanted: w }) if Arc::ptr_eq(w, wanted)) {
+            self.slots.remove(key);
+        }
     }
 
     /// Llamar una vez por fotograma: desaloja texturas antiguas si hay demasiadas.
     pub fn end_frame(&mut self) {
         self.frame += 1;
-        // Cada 30 fotogramas: libera las texturas que llevan tiempo sin verse (otras páginas).
-        if self.frame % 30 == 0 {
-            let cur = self.frame;
-            self.slots.retain(|_, s| !matches!(s, Slot::Ready { used, .. } if cur.saturating_sub(*used) > IDLE_FRAMES));
+        self.shared_frame.store(self.frame, Ordering::Relaxed);
+        if self.waiting_now == 0 {
+            if let Some(t0) = self.waiting.take() {
+                // Solo las esperas que se notan: las copias de disco llegan antes.
+                let ms = t0.elapsed().as_millis();
+                if ms >= 100 {
+                    log::info!("[img] visibles listas en {ms} ms");
+                }
+            }
+        }
+        self.waiting_now = 0;
+        // Una vez por segundo: libera las texturas que llevan tiempo sin verse (otras páginas)
+        // y olvida los fallos pasajeros viejos, para que se pidan otra vez si se ven.
+        if self.last_sweep.elapsed() >= SWEEP_EVERY {
+            let now = Instant::now();
+            self.last_sweep = now;
+            self.slots.retain(|_, s| match s {
+                Slot::Ready { seen, .. } => now.saturating_duration_since(*seen) <= IDLE,
+                Slot::Failed { at, retry: true } => now.saturating_duration_since(*at) < RETRY_FAILED,
+                _ => true,
+            });
         }
         let ready = self.resident();
         let bytes = self.resident_bytes();
@@ -227,6 +413,9 @@ impl Images {
 
     pub fn clear(&mut self) {
         self.slots.clear();
+        // Los encargos en cola se quedan sin hueco: lo que se vea se pedirá de nuevo. Los que
+        // ya están en curso terminan y su respuesta se trata como cualquier otra tardía.
+        self.queue.0.lock().unwrap().jobs.clear();
     }
 }
 
@@ -280,21 +469,71 @@ fn cache_name(url: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
-fn load(agent: &ureq::Agent, dir: &PathBuf, url: &str, size: Size) -> Option<ColorImage> {
+/// Escribe una portada en la caché a través de un fichero temporal: un cierre a medias o dos
+/// hilos con la misma URL (tamaños distintos) nunca dejan un fichero truncado con el nombre
+/// definitivo.
+fn write_cache(file: &Path, bytes: &[u8]) {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = file.with_extension(format!("{}-{n}.tmp", std::process::id()));
+    if std::fs::write(&tmp, bytes).is_err() || std::fs::rename(&tmp, file).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// `stale` dice si el encargo ya salió de la vista; se mira antes de ir a la red (y, en las
+/// cabeceras, antes de leer el disco).
+fn load(agent: &ureq::Agent, dir: &Path, url: &str, size: Size, stale: impl Fn() -> bool) -> Loaded {
+    // Salvo las cabeceras (`Fit`): llevan el tamaño exacto en la clave, así que al redimensionar
+    // la ventana se pide una por fotograma y las anteriores no vuelven a pedirse. Decodificar y
+    // escalar cada una a hasta 1280 px cuesta decenas de ms y una textura de varios MB que solo
+    // iría a desalojarse.
+    if matches!(size, Size::Fit(..)) && stale() {
+        return Loaded::Dropped;
+    }
     let file = dir.join(cache_name(url));
-    let bytes = match std::fs::read(&file) {
-        Ok(b) if !b.is_empty() => b,
-        _ => {
-            let mut resp = agent.get(url).call().ok()?;
-            if resp.status().as_u16() != 200 {
-                return None;
+    // Lo que está en disco se decodifica siempre, aunque ya no se vea: es barato y así está
+    // lista si se vuelve atrás.
+    let cached = match std::fs::read(&file) {
+        Ok(b) if !b.is_empty() => match image::load_from_memory(&b) {
+            Ok(img) => Some(img),
+            Err(_) => {
+                // Copia dañada (p. ej. de un cierre a medias): se borra y se descarga otra vez
+                // en vez de fallar con ella en cada sesión.
+                let _ = std::fs::remove_file(&file);
+                None
             }
-            let b = resp.body_mut().read_to_vec().ok()?;
-            let _ = std::fs::write(&file, &b);
-            b
+        },
+        _ => None,
+    };
+    let img = match cached {
+        Some(img) => img,
+        None => {
+            if stale() {
+                return Loaded::Dropped;
+            }
+            let mut resp = match agent.get(url).call() {
+                Ok(r) => r,
+                // Una URL mal formada no se arregla reintentando; lo demás es red o plazo.
+                Err(ureq::Error::BadUri(_) | ureq::Error::Http(_)) => return Loaded::Failed { retry: false },
+                Err(_) => return Loaded::Failed { retry: true },
+            };
+            let status = resp.status().as_u16();
+            if status != 200 {
+                // 429 y 5xx de la CDN son pasajeros; un 404 o un 403 no cambian en la sesión.
+                return Loaded::Failed { retry: status == 429 || status >= 500 };
+            }
+            let Ok(b) = resp.body_mut().read_to_vec() else {
+                return Loaded::Failed { retry: true };
+            };
+            let Ok(img) = image::load_from_memory(&b) else {
+                return Loaded::Failed { retry: false };
+            };
+            // Solo después de decodificarla: lo que no es una imagen no se guarda.
+            write_cache(&file, &b);
+            img
         }
     };
-    let img = image::load_from_memory(&bytes).ok()?;
     let img = match size {
         Size::Max(max_side) => {
             let max_side = max_side.max(16);
@@ -316,7 +555,7 @@ fn load(agent: &ureq::Agent, dir: &PathBuf, url: &str, size: Size) -> Option<Col
     };
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
-    Some(ColorImage::from_rgba_unmultiplied(
+    Loaded::Image(ColorImage::from_rgba_unmultiplied(
         [w as usize, h as usize],
         rgba.as_raw(),
     ))

@@ -2,11 +2,62 @@
 //! los datos de la última sesión y la red solo se usa para refrescarlos en segundo plano.
 
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::*;
+
+type DiskJob = Box<dyn FnOnce() + Send>;
+
+/// Un solo hilo («nanofy-disk») para lo que se lee y escribe fuera de la interfaz: la
+/// instantánea, el registro de reproducciones, lo que suena y las copias de playlists, álbumes
+/// y radios (leerlas al abrirlas, guardarlas y borrarlas). Va en orden: antes cada guardado tenía su propio hilo, y dos
+/// escrituras del mismo fichero (mismo `.json.tmp`) podían pisarse, o una vieja quedar encima
+/// de la última.
+pub struct Disk {
+    tx: Option<mpsc::Sender<DiskJob>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Disk {
+    pub fn start() -> Self {
+        let (tx, rx) = mpsc::channel::<DiskJob>();
+        let thread = std::thread::Builder::new()
+            .name("nanofy-disk".into())
+            .spawn(move || {
+                for job in rx {
+                    job();
+                }
+            })
+            .ok();
+        Self { tx: thread.is_some().then_some(tx), thread }
+    }
+
+    /// Encola un trabajo. Sin hilo (no arrancó o ya se cerró) se hace aquí mismo: mejor un
+    /// tirón que perder lo que había que guardar.
+    pub fn run(&self, job: impl FnOnce() + Send + 'static) {
+        let job: DiskJob = Box::new(job);
+        match &self.tx {
+            Some(tx) => {
+                if let Err(e) = tx.send(job) {
+                    (e.0)();
+                }
+            }
+            None => job(),
+        }
+    }
+
+    /// Espera a que termine todo lo encolado y cierra el hilo. Al salir: lo último guardado es
+    /// lo que queda en disco y el proceso no lo corta a medias.
+    pub fn finish(&mut self) {
+        self.tx = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(default)]
@@ -19,6 +70,18 @@ pub struct Snapshot {
     pub followed_artists: Vec<Artist>,
     pub liked: Vec<Track>,
     pub liked_total: u32,
+    /// Cuándo terminó la última recarga completa de Me gusta (0 = nunca, p. ej. una instantánea
+    /// de una versión anterior). `saved_at` no sirve: cambia con cada guardado.
+    pub liked_synced_at: u64,
+    /// Cuenta cruda de Spotify (`total`, con las no disponibles) en esa recarga, ajustada con los
+    /// Me gusta dados y quitados aquí: la base con la que lo reciente detecta lo quitado fuera.
+    pub liked_server_total: u64,
+    /// Ids con Me gusta dado aquí sin fila en la lista (no había objeto Track a mano). Ya suman
+    /// en `liked_server_total`: sin guardarlos, el próximo arranque los tomaría por nuevos de
+    /// otro dispositivo, la cuenta no cuadraría y saldría una recarga completa.
+    pub liked_extra: Vec<String>,
+    /// Cuándo llegaron por última vez los artistas seguidos.
+    pub artists_synced_at: u64,
 }
 
 pub fn now_secs() -> u64 {
@@ -64,34 +127,17 @@ impl Snapshot {
         serde_json::from_str(&text).ok()
     }
 
-    pub fn age_secs(&self) -> u64 {
-        now_secs().saturating_sub(self.saved_at)
-    }
-
-    /// Escribe ahora mismo (fichero temporal + renombrado). Para el cierre.
+    /// Escribe ahora mismo (fichero temporal + renombrado).
     pub fn save_now(&self, path: &Path) {
         if let Ok(text) = serde_json::to_string(self) {
             write_atomic(path, &text);
         }
     }
 
-    /// Serializa en este hilo (rápido) y escribe en otro para no tocar el fotograma.
-    pub fn save_async(&self, path: PathBuf) {
-        let Ok(text) = serde_json::to_string(self) else {
-            return;
-        };
-        std::thread::Builder::new()
-            .name("nanofy-snapshot".into())
-            .spawn(move || {
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                let tmp = path.with_extension("json.tmp");
-                if std::fs::write(&tmp, text).is_ok() {
-                    let _ = std::fs::rename(&tmp, &path);
-                }
-            })
-            .ok();
+    /// Serializa y escribe en el hilo del disco. Serializar aquí (miles de Me gusta) era un
+    /// tirón del fotograma en cada cambio de canción.
+    pub fn save_async(self, disk: &Disk, path: PathBuf) {
+        disk.run(move || self.save_now(&path));
     }
 }
 
@@ -144,21 +190,9 @@ impl PlayLog {
         }
     }
 
-    pub fn save_async(&self, path: PathBuf) {
-        let Ok(text) = serde_json::to_string(self) else {
-            return;
-        };
-        std::thread::Builder::new()
-            .name("nanofy-playlog".into())
-            .spawn(move || {
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                let tmp = path.with_extension("json.tmp");
-                if std::fs::write(&tmp, text).is_ok() {
-                    let _ = std::fs::rename(&tmp, &path);
-                }
-            })
-            .ok();
+    /// Serializa y escribe en el hilo del disco. Va compartido (Arc): el registro de la interfaz
+    /// solo se copia si se apunta otra canción mientras se escribe, no en cada guardado.
+    pub fn save_async(self: Arc<Self>, disk: &Disk, path: PathBuf) {
+        disk.run(move || self.save_now(&path));
     }
 }

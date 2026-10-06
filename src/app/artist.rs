@@ -23,8 +23,9 @@ impl App {
         if !self.requested.contains(&format!("artist:{id}")) {
             self.requested.insert(format!("artist:{id}"));
             self.requested.insert(format!("artistmeta:{id}"));
+            // Req::Artist trae seguidores y géneros (Web API); las populares llegan con la vista,
+            // que hace un único Artist::get para ambas.
             self.api.send(Req::Artist(id.clone()));
-            self.api.send(Req::ArtistTop(id.clone()));
             self.api.send(Req::ArtistView(id.clone()));
         }
         let page = self.artists.remove(&id).unwrap_or_default();

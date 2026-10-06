@@ -14,6 +14,7 @@ mod media;
 #[cfg(windows)]
 mod taskbar;
 mod model;
+mod pathfinder;
 mod raster;
 mod shell;
 mod update;

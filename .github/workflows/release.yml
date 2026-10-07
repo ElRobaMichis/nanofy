@@ -1,6 +1,15 @@
 # Compila Nanofy para Windows, Linux y macOS y publica los zips en una release de GitHub.
-# Se dispara al subir una etiqueta v* (por ejemplo: git tag v1.0.0 && git push --tags)
+# Se dispara al subir una etiqueta v* (por ejemplo: git tag -a v1.0.0 -m "…" && git push --tags)
 # o a mano desde la pestaña Actions ("Run workflow").
+#
+# La release se publica de una sola vez: cada compilación solo deja su zip como artefacto y el
+# trabajo `publish` los sube todos a un borrador (invisible para /releases/latest, que es lo que
+# consultan las apps), comprueba lo subido y solo entonces lo publica. Así ninguna app ve una
+# versión nueva sin su zip, que en 1.4–1.6 hacía caer el aviso en «Descargar». El mensaje de la
+# etiqueta anotada es la nota de la release, y SHA256SUMS.txt lleva la suma de cada zip.
+#
+# Una etiqueta con guion (v1.7.0-rc.1) sale como pre-release y nunca como la última, así que no
+# llega a ninguna app: sirve para probar una versión antes de publicarla de verdad.
 #
 # Si guardas tu Client ID de Spotify como secreto del repositorio (Settings → Secrets →
 # NANOFY_CLIENT_ID), queda incluido como valor por defecto en los binarios.
@@ -16,8 +25,9 @@ on:
         required: false
         default: ""
 
+# Las compilaciones solo leen el código; únicamente `publish` puede escribir en las releases.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -45,7 +55,11 @@ jobs:
     env:
       NANOFY_CLIENT_ID: ${{ secrets.NANOFY_CLIENT_ID }}
     steps:
+      # Lanzado a mano con una etiqueta se compila esa etiqueta y no la rama desde la que se lanzó:
+      # lo que se publica bajo vX.Y.Z tiene que ser el código de vX.Y.Z.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -111,14 +125,275 @@ jobs:
           EOF
           (cd dist && zip -r Nanofy-${{ matrix.name }}.zip Nanofy.app LEEME.txt LEEME-mac.txt)
 
+      # Aquí ya no se publica nada: el zip solo queda como artefacto para `publish`. Con
+      # `overwrite` relanzar un trabajo fallido sustituye su artefacto en vez de chocar con él.
       - uses: actions/upload-artifact@v4
         with:
           name: Nanofy-${{ matrix.name }}
           path: dist/Nanofy-${{ matrix.name }}.zip
+          if-no-files-found: error
+          overwrite: true
 
-      - name: Publicar en la release
-        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+  publish:
+    needs: build
+    # `!cancelled()`: si falla un macOS se publica igual con Windows y Linux (obligatorios, se
+    # comprueba abajo); con `needs: build` a secas, un solo fallo dejaba a todos sin versión. No
+    # `always()`: ese también corre si se cancela la ejecución, y cancelar debe no publicar nada.
+    if: ${{ !cancelled() && needs.build.result != 'cancelled' && (startsWith(github.ref, 'refs/tags/') || inputs.tag != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    # Dos ejecuciones de la misma etiqueta no se pisan los archivos del borrador.
+    concurrency:
+      group: release-publish-${{ inputs.tag || github.ref_name }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      # actions/checkout puede dejar la etiqueta apuntando al commit y no al objeto de la
+      # etiqueta anotada; sin esto las notas serían el mensaje del commit.
+      - name: Traer la etiqueta anotada
+        run: git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+
+      - name: Comprobar etiqueta y versión
+        id: version
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Etiqueta no válida: $TAG (se espera vX.Y.Z o vX.Y.Z-rc.N)"
+            exit 1
+          fi
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          # v1.7.0-rc.1 prueba la 1.7.0: se compara sin el sufijo de pre-release.
+          if [ "${TAG%%-*}" != "v$VERSION" ]; then
+            echo "::error::La etiqueta $TAG no corresponde a la versión de Cargo.toml ($VERSION)"
+            exit 1
+          fi
+          case "$TAG" in
+            *-*) PRERELEASE=true ;;
+            *) PRERELEASE=false ;;
+          esac
+          if [ "$(git cat-file -t "refs/tags/$TAG")" != tag ]; then
+            echo "::warning::$TAG no es una etiqueta anotada: la nota será el mensaje del commit"
+          fi
+          echo "Etiqueta $TAG, versión $VERSION, pre-release: $PRERELEASE"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Nanofy-*
+          path: dist
+          merge-multiple: true
+
+      - name: Comprobar los zips y calcular SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cd dist
+          ls -l
+          for f in Nanofy-windows-x64.zip Nanofy-linux-x64.zip; do
+            if [ ! -s "$f" ]; then
+              echo "::error::Falta $f (falló su compilación): no se publica nada"
+              exit 1
+            fi
+          done
+          for f in Nanofy-macos-arm64.zip Nanofy-macos-x64.zip; do
+            [ -s "$f" ] || echo "::warning::Falta $f (falló su compilación): la release sale sin él"
+          done
+          # Las apps 1.1–1.6 descargan el PRIMER archivo cuyo nombre contiene su plataforma
+          # (la API los ordena por nombre): no puede subirse nada más que lleve
+          # windows-x64, linux-x64, macos-arm64 o macos-x64 en el nombre.
+          for f in *; do
+            case "$f" in
+              Nanofy-windows-x64.zip | Nanofy-linux-x64.zip | Nanofy-macos-arm64.zip | Nanofy-macos-x64.zip) ;;
+              *)
+                echo "::error::Archivo inesperado en dist: $f"
+                exit 1
+                ;;
+            esac
+          done
+          # El instalador de 1.4–1.6 busca la entrada cuyo último tramo tras «/» es el
+          # ejecutable; si el zip cambiara de forma, esas versiones no podrían actualizarse.
+          entries=$(unzip -Z1 Nanofy-windows-x64.zip)
+          if ! grep -Eq '(^|/)nanofy\.exe$' <<< "$entries"; then
+            echo "::error::Nanofy-windows-x64.zip no contiene nanofy.exe:"
+            echo "$entries"
+            exit 1
+          fi
+          entries=$(unzip -Z1 Nanofy-linux-x64.zip)
+          if ! grep -Eq '(^|/)nanofy$' <<< "$entries"; then
+            echo "::error::Nanofy-linux-x64.zip no contiene nanofy:"
+            echo "$entries"
+            exit 1
+          fi
+          # Sin sufijo de plataforma en el nombre, por lo dicho arriba.
+          sha256sum Nanofy-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # La primera línea la ven las versiones 1.1–1.3, que solo saben abrir el zip en el
+      # navegador; 1.7 en adelante la oculta en su aviso.
+      - name: Notas de la release
+        run: |
+          set -euo pipefail
+          {
+            echo "Si tu aviso solo muestra «Descargar» (Nanofy 1.3 o anterior), descomprime este zip y sustituye tu nanofy.exe una sola vez; desde entonces se actualizará solo."
+            echo
+            # Una etiqueta firmada lleva la firma al final del mensaje: no es parte de la nota.
+            git for-each-ref "refs/tags/$TAG" --format='%(contents)' | sed '/^-----BEGIN [A-Z ]*SIGNATURE-----$/,$d'
+          } > notes.md
+          cat notes.md
+
+      # softprops deja una release existente en el estado que tenía: relanzar una etiqueta ya
+      # publicada borraría y volvería a subir sus zips a la vista de las apps (el hueco sin zip de
+      # Windows que cae en «Descargar»). Se vuelve a borrador antes; mientras tanto
+      # /releases/latest devuelve la anterior, que es segura.
+      - name: Volver a borrador si ya estaba publicada
+        run: |
+          set -euo pipefail
+          # /releases/tags/ no devuelve borradores: 404 si no existe o si ya es borrador.
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id 2>/dev/null || true)
+          case "$id" in
+            '' | *[!0-9]*) echo "$TAG no tiene una release publicada" ;;
+            *)
+              echo "::warning::$TAG ya estaba publicada: vuelve a borrador hasta terminar la subida"
+              gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -F draft=true --jq .html_url
+              ;;
+          esac
+
+      # Borrador: /releases/latest no lo devuelve mientras se suben los archivos.
+      - name: Subir a un borrador
+        id: draft
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          files: dist/Nanofy-${{ matrix.name }}.zip
+          tag_name: ${{ env.TAG }}
+          draft: true
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          body_path: notes.md
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      - name: Comprobar el borrador
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::La acción de la release no devolvió su id"
+            exit 1
+          fi
+          api="repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+          # Si algo la hubiera publicado ya, las apps podrían haber visto archivos a medio subir.
+          if [ "$(gh api "$api" --jq .draft)" != true ]; then
+            echo "::error::La release $TAG no está como borrador antes de comprobarla"
+            exit 1
+          fi
+          body=$(gh api "$api" --jq '.body // ""')
+          if [ -z "$body" ]; then
+            echo "::error::La release quedó sin notas"
+            exit 1
+          fi
+          cd dist
+          # Un zip de una ejecución anterior que esta no ha generado (p. ej. un macOS que ahora
+          # falló) no está en SHA256SUMS.txt: se quita. Cualquier otro archivo ajeno puede
+          # confundir a las apps 1.1–1.6 (ver arriba): mejor no publicar.
+          gh api --paginate "$api/assets" --jq '.[] | "\(.id) \(.name)"' > ../assets.txt
+          while read -r id name; do
+            [ -e "$name" ] && continue
+            case "$name" in
+              Nanofy-windows-x64.zip | Nanofy-linux-x64.zip | Nanofy-macos-arm64.zip | Nanofy-macos-x64.zip)
+                echo "::warning::$name es de una ejecución anterior: se quita del borrador"
+                gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$id"
+                ;;
+              *)
+                echo "::error::La release tiene un archivo que no es de esta compilación: $name. Bórralo a mano y relanza."
+                exit 1
+                ;;
+            esac
+          done < ../assets.txt
+          # Cada archivo tiene que estar subido entero y con la suma de SHA256SUMS.txt.
+          gh api --paginate "$api/assets" --jq '.[] | "\(.name) \(.state) \(.size) \(.digest // "-")"' > ../assets.txt
+          cat ../assets.txt
+          for f in *; do
+            line=$(awk -v n="$f" '$1 == n' ../assets.txt)
+            if [ -z "$line" ]; then
+              echo "::error::$f no aparece en la release"
+              exit 1
+            fi
+            read -r _ state size digest <<< "$line"
+            local_size=$(stat -c %s "$f")
+            local_digest="sha256:$(sha256sum "$f" | cut -d' ' -f1)"
+            if [ "$state" != uploaded ] || [ "$size" != "$local_size" ]; then
+              echo "::error::$f: estado $state y $size bytes en GitHub, $local_size bytes aquí"
+              exit 1
+            fi
+            if [ "$digest" = "-" ] || [ "$digest" = null ]; then
+              echo "::warning::GitHub no da el digest de $f; se comprobó solo el tamaño"
+            elif [ "$digest" != "$local_digest" ]; then
+              echo "::error::$f: $digest en GitHub, $local_digest aquí"
+              exit 1
+            fi
+          done
+
+      # Una sola petición: deja de ser borrador y, si es estable, pasa a ser la última.
+      - name: Publicar
+        id: publish
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          latest=false
+          if [ "$PRERELEASE" != true ]; then
+            latest=true
+            # Relanzar una etiqueta vieja no debe quitarle el puesto a una versión más nueva.
+            # Si aún no hay ninguna, gh falla y deja en la salida el JSON del error: se descarta.
+            current=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
+            case "$current" in
+              v[0-9]*) ;;
+              *) current="" ;;
+            esac
+            if [ -n "$current" ] && [ "$current" != "$TAG" ] &&
+              [ "$(printf '%s\n%s\n' "$current" "$TAG" | sort -V | tail -n1)" = "$current" ]; then
+              echo "::warning::$current es más nueva que $TAG: se publica sin marcarla como la última"
+              latest=false
+            fi
+          fi
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -F prerelease="$PRERELEASE" -f make_latest="$latest" --jq .html_url
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Comprobar /releases/latest
+        env:
+          LATEST: ${{ steps.publish.outputs.latest }}
+        run: |
+          set -euo pipefail
+          now=""
+          for _ in $(seq 1 12); do
+            now=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
+            case "$now" in
+              v[0-9]*) ;;
+              *) now="" ;;
+            esac
+            if [ "$LATEST" = true ] && [ "$now" = "$TAG" ]; then
+              echo "/releases/latest ya es $TAG"
+              exit 0
+            fi
+            if [ "$LATEST" != true ] && [ "$now" != "$TAG" ]; then
+              echo "/releases/latest sigue en ${now:-(ninguna)}: $TAG no llega a las apps"
+              exit 0
+            fi
+            sleep 5
+          done
+          if [ "$LATEST" = true ]; then
+            echo "::error::/releases/latest devuelve ${now:-nada} y debería ser $TAG"
+          else
+            echo "::error::/releases/latest devuelve $TAG, que no debía quedar como la última"
+          fi
+          exit 1

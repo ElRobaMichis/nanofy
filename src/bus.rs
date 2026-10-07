@@ -3,7 +3,7 @@
 use crate::api::ApiResult;
 use crate::backend::Event;
 use crate::control::ControlReq;
-use crate::update::{InstallProgress, UpdateResult};
+use crate::update::{MoveReason, Stage, UpdateResult};
 
 pub enum Msg {
     Backend(Event),
@@ -28,10 +28,19 @@ pub enum Msg {
         list: Option<Box<crate::app::CachedList>>,
     },
     Media(souvlaki::MediaControlEvent),
-    /// Resultado de la comprobación de versiones (`manual` = pedida desde Ajustes).
-    Update { result: UpdateResult, manual: bool },
-    /// Progreso de la instalación automática de una versión nueva.
-    UpdateProgress(InstallProgress),
+    /// Resultado de la comprobación de versiones (`manual` = pedida desde Ajustes). `location`:
+    /// la carpeta del ejecutable y por qué la app no puede actualizarse sola desde ella.
+    /// `staged`: esa versión ya está preparada junto al ejecutable (no se descarga otra vez).
+    Update { result: UpdateResult, manual: bool, location: Option<(std::path::PathBuf, MoveReason)>, staged: Option<std::path::PathBuf> },
+    /// Progreso de la preparación de una versión nueva (descarga, autoprueba) y su final. `turn`
+    /// es el de `update::stage`: solo cuenta el de la última preparación pedida.
+    UpdateStage { turn: u64, stage: Stage },
+    /// Fin de la sustitución del ejecutable: `Ok` con la ruta que hay que abrir al cerrar, o el
+    /// texto del aviso.
+    UpdateApplied(Result<std::path::PathBuf, String>),
+    /// Notas de la versión en uso que guardó la anterior al prepararla (ventana recién
+    /// actualizada), leídas en el hilo del disco.
+    ReleaseNotes(crate::update::UpdateInfo),
     /// Operación del modo de control (`--control`); se responde por su canal.
     Control(ControlReq),
 }

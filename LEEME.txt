@@ -10,7 +10,11 @@ Qué necesitas
 
 Cómo abrirlo
 ------------
-1. Descomprime el zip en cualquier carpeta (por ejemplo, Documentos\Nanofy).
+1. Descomprime el zip en una carpeta tuya que no esté dentro de Archivos de
+   programa ni de OneDrive, por ejemplo %LOCALAPPDATA%\Programs\Nanofy (escribe
+   %LOCALAPPDATA% en la barra de direcciones del Explorador y crea ahí las
+   carpetas Programs y Nanofy si no están). Ahí Nanofy puede actualizarse solo.
+   No lo abras desde dentro del zip sin descomprimirlo.
 2. Abre nanofy.exe.
    Si Windows muestra "Windows protegió tu PC" (el archivo no está firmado):
    pulsa "Más información" y luego "Ejecutar de todas formas". Solo la primera vez.
@@ -25,6 +29,25 @@ puede añadir tu correo de Spotify a su lista de usuarios (hasta 25 personas):
 - Si te lo pasó con su Client ID ya incluido, solo tienes que ir a
   Ajustes → Web API → "Conectar" y aceptar en el navegador.
 - Si no, pega el Client ID que te dé en ese mismo campo y pulsa "Conectar".
+
+Actualizaciones
+---------------
+Nanofy busca versiones nuevas al abrirse y cada seis horas. Con "Actualizar
+automáticamente" (activado de serie, en Ajustes → Acerca de Nanofy) la versión
+nueva se descarga en segundo plano y, cuando está lista, aparece "Reiniciar
+para actualizar" arriba: Nanofy se reabre en un par de segundos y la música
+sigue donde estaba. Si no reinicias, se instala sola la próxima vez que lo
+abras. Con la opción apagada, el aviso ofrece "Instalar" y no se descarga nada
+hasta pulsarlo.
+- Antes de instalarla, Nanofy comprueba que la descarga llegó entera (tamaño y
+  SHA-256 que publica GitHub) y que el ejecutable nuevo arranca.
+- La versión anterior se guarda hasta que la nueva funciona; si la nueva no
+  llega a arrancar, Nanofy vuelve solo a la anterior.
+- Si tu aviso solo muestra "Descargar" (Nanofy 1.3 o anterior), cierra Nanofy y
+  sustituye tu nanofy.exe por el de este zip una sola vez; desde entonces se
+  actualizará solo.
+- Si el aviso dice que Nanofy no puede actualizarse desde su carpeta, muévelo a
+  la carpeta del paso 1 de "Cómo abrirlo".
 
 Dónde guarda sus datos
 ----------------------

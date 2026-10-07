@@ -1,4 +1,4 @@
-# Comprueba que Nanofy compila en Windows en cada push o pull request.
+# Comprueba que Nanofy compila en Windows en cada push o pull request y pasa sus pruebas.
 name: ci
 
 on:
@@ -15,3 +15,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Compilar (release)
         run: cargo build --release
+      # Solo las pruebas del binario nanofy (update.rs y demás). Las de los crates de vendor/
+      # quedan fuera: vendor/librespot-core/tests se conecta a Spotify y depende de la red.
+      - name: Pruebas unitarias
+        run: cargo test --release --bin nanofy

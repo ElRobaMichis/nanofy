@@ -15,7 +15,8 @@ mod widgets;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use egui::{CornerRadius, Frame, Key, Margin, Modifiers};
@@ -30,7 +31,7 @@ use crate::images::Images;
 use crate::media::Media;
 use crate::model::*;
 use crate::shell::{NativeHandles, FPS_CAP_KEY, FRAME_MS_KEY, FRAME_PHASES_KEY};
-use crate::update::{InstallProgress, UpdateInfo, UpdateResult};
+use crate::update::{FailKind, MoveReason, Stage, UpdateInfo, UpdateResult};
 use crate::webauth::WebAuth;
 
 pub use theme::GREEN;
@@ -299,6 +300,20 @@ const PREFETCH_STALE: Duration = Duration::from_secs(60);
 /// pedir nada si tiene menos de esto (24 h): pasado, se recarga igualmente (barata: la API
 /// reutiliza sus pistas), por si algún cambio no hubiera movido el snapshot_id.
 const LIST_UNCHANGED_SECS: u64 = 24 * 3600;
+/// Tras reiniciar para actualizar, la copia local de la reproducción manda sin esperar a Spotify
+/// si tiene menos de esto: es la que guardó la ventana anterior al cerrarse.
+const UPDATE_RESTORE_FRESH_SECS: u64 = 120;
+/// Lo que dura a la vista el aviso de después de actualizar (más mientras el ratón esté encima).
+pub const UPDATED_TOAST_FOR: Duration = Duration::from_secs(8);
+
+/// Aviso breve de después de actualizar: «Nanofy se actualizó a la {version}».
+pub struct UpdatedToast {
+    pub version: String,
+    /// Desde cuándo cuenta: desde que se vio por primera vez (no desde que se creó la app, que
+    /// puede ser antes de que la ventana se vea) y otra vez cada vez que el ratón pasa por encima.
+    pub since: Option<Instant>,
+}
+
 /// Tiempo durante el que el listado de playlists de esta sesión decide si una copia en disco
 /// sigue al día (ver `App::listing_fresh`).
 const LISTING_TRUST: Duration = Duration::from_secs(10 * 60);
@@ -498,12 +513,61 @@ pub struct App {
     /// Comprobación en curso y último resultado en texto (para Ajustes; `true` = error).
     pub update_busy: bool,
     pub update_note: Option<(String, bool)>,
-    /// Instalación automática en curso (o su error).
-    pub update_progress: Option<InstallProgress>,
-    /// Al cerrar, volver a abrir el ejecutable (ya sustituido por la versión nueva).
-    pub restart_after_exit: bool,
-    /// Próxima comprobación automática (al arrancar y cada 6 h).
+    /// Instalación de la versión nueva: disponible, descargando, preparando, lista o su error.
+    pub update_stage: Stage,
+    /// Para la preparación en curso (`Cancelar`, o porque empieza otra).
+    update_cancel: Option<Arc<AtomicBool>>,
+    /// Turno de la preparación en curso (`update::stage`): los mensajes de una anterior se
+    /// ignoran.
+    update_turn: u64,
+    /// La preparación en curso la empezó la app sola («Actualizar automáticamente»), no el
+    /// usuario con «Instalar»: no se enseña el aviso hasta que esté lista o haga falta él.
+    update_silent: bool,
+    /// Reintentos automáticos seguidos tras un fallo de red al preparar sola la versión nueva.
+    update_retry: u8,
+    /// «Reiniciar» pulsado durante una Jam: el aviso pide confirmarlo antes (se sale de ella).
+    pub update_confirm_jam: bool,
+    /// El estado lo puso `update_fake_stage` (capturas): «Reiniciar» no instala nada de verdad.
+    update_fake: bool,
+    /// Al cerrar, abrir este ejecutable: la versión nueva ya ocupa su sitio. La ruta se toma
+    /// antes de renombrar nada (en Linux `current_exe` sigue al archivo apartado).
+    pub restart_after_exit: Option<PathBuf>,
+    /// Al cerrar para actualizar sonaba música: la versión nueva la retoma (`--resume-playing`).
+    restart_resume: bool,
+    /// Sustitución del ejecutable en marcha (en un hilo, con la ventana abierta).
+    update_applying: bool,
+    /// Esta ventana es la de una versión recién instalada (`--updated-from <versión anterior>`).
+    pub updated_from: Option<String>,
+    /// Abierta por «Reiniciar» mientras sonaba música (`--resume-playing`): al restaurar la copia
+    /// local, que es de hace segundos, sigue sonando. Solo esa vez; cualquier otro arranque se
+    /// restaura en pausa.
+    resume_after_update: bool,
+    /// Modo de control activo (`--control`): la app no se actualiza sola salvo contra un
+    /// servidor de releases local (ver `update::auto_update_allowed`).
+    control_mode: bool,
+    /// Cuándo dar por buena la versión en uso (primer fotograma + 20 s) y si ya se hizo.
+    health_at: Option<Instant>,
+    health_marked: bool,
+    /// Próxima comprobación automática (al arrancar y cada 6 h; 10 min si la release aún no
+    /// trae zip para esta plataforma).
     update_check_at: Option<Instant>,
+    /// Consultas seguidas cuya release más nueva aún no traía zip para esta plataforma.
+    update_pending: u8,
+    /// La versión nueva no llegó a arrancar y se volvió a esta (`--update-failed`, o falló al
+    /// instalarla al abrir): el motivo, hasta que el usuario pulse «Reintentar», y si su aviso
+    /// rojo sigue a la vista.
+    update_failed: Option<String>,
+    pub update_failed_banner: bool,
+    /// «Reintentar» tras una actualización fallida: la consulta que va a llegar instala la
+    /// versión nueva en cuanto la encuentre (la que no arrancaba no se prepara sola).
+    update_install_after_check: bool,
+    /// Diálogo «Novedades de Nanofy {v}» abierto, con las notas completas de esa versión.
+    pub notes_dialog: Option<UpdateInfo>,
+    /// Notas de la versión en uso, si esta ventana es la recién instalada y la anterior las
+    /// guardó al prepararla («Ver novedades» del aviso de después de actualizar).
+    current_notes: Option<UpdateInfo>,
+    /// Aviso breve de después de actualizar («Nanofy se actualizó a la …»).
+    pub updated_toast: Option<UpdatedToast>,
 
     pub playlists: Vec<Playlist>,
     pub playlists_loaded: bool,
@@ -929,9 +993,29 @@ impl App {
             update_banner: false,
             update_busy: false,
             update_note: None,
-            update_progress: None,
-            restart_after_exit: false,
+            update_stage: Stage::Idle,
+            update_cancel: None,
+            update_turn: 0,
+            update_silent: false,
+            update_retry: 0,
+            update_confirm_jam: false,
+            update_fake: false,
+            restart_after_exit: None,
+            restart_resume: false,
+            update_applying: false,
+            updated_from: None,
+            resume_after_update: false,
+            control_mode: false,
+            health_at: None,
+            health_marked: false,
             update_check_at,
+            update_pending: 0,
+            update_failed: None,
+            update_failed_banner: false,
+            update_install_after_check: false,
+            notes_dialog: None,
+            current_notes: None,
+            updated_toast: None,
             playlists: Vec::new(),
             playlists_loaded: false,
             playlists_fresh: None,
@@ -1742,19 +1826,93 @@ impl App {
         crate::update::check(self.ui_tx.clone(), manual);
     }
 
-    fn on_update(&mut self, result: UpdateResult, manual: bool) {
+    fn on_update(&mut self, result: UpdateResult, manual: bool, location: Option<(PathBuf, MoveReason)>, staged: Option<PathBuf>) {
         self.update_busy = false;
+        // Tras «Reintentar» la consulta cuenta como pedida por el usuario aunque fuera la
+        // automática que ya estaba en marcha.
+        let install_after = std::mem::take(&mut self.update_install_after_check);
+        self.on_update_result(result, manual || install_after, location, staged, install_after);
+        // «Reintentar» del aviso rojo: si al final no hay nada que instalar, el porqué (al día,
+        // aún publicándose, sin conexión) no puede quedarse solo en Ajustes.
+        if install_after && !self.update_banner && !self.update_stage.busy() {
+            match self.update_note.clone() {
+                Some((text, true)) => {
+                    self.update_failed = Some(text);
+                    self.update_failed_banner = true;
+                }
+                Some((text, false)) => self.status(text),
+                None => {}
+            }
+        }
+    }
+
+    fn on_update_result(&mut self, result: UpdateResult, manual: bool, location: Option<(PathBuf, MoveReason)>, staged: Option<PathBuf>, install_after: bool) {
+        // Instalando o a punto de reiniciar: ya nada cambia la versión que se instala.
+        if self.update_applying || self.restart_after_exit.is_some() {
+            log::info!("[update] consulta ignorada: se está instalando la versión nueva");
+            return;
+        }
+        // Con una preparación en marcha, una consulta que llega a la vez (la de 6 h o el botón de
+        // Ajustes) no la cambia ni la quita: su aviso y Ajustes enseñan el progreso.
+        if matches!(self.update_stage, Stage::Downloading { .. } | Stage::Preparing) {
+            log::info!("[update] consulta ignorada: hay una instalación en marcha");
+            // La consulta manual borró la nota y Ajustes enseña el progreso debajo de ella.
+            if let (true, Some(u)) = (manual, &self.update) {
+                self.update_note = Some((format!("Hay una versión nueva: {}", u.version), false));
+            }
+            return;
+        }
+        // Lista para «Reiniciar»: solo la cambia una versión aún más nueva (y no omitida, salvo
+        // que el usuario la busque a mano). Cualquier otra respuesta (la misma versión, un fallo
+        // de red) la deja como está.
+        let replaces_ready = match (&self.update_stage, &result) {
+            (Stage::Ready { version, .. }, UpdateResult::Available(info)) => {
+                crate::update::is_newer(&info.version, version) && (manual || !self.update_is_skipped(&info.version))
+            }
+            _ => false,
+        };
+        if let Stage::Ready { version, .. } = &self.update_stage {
+            if !replaces_ready {
+                if manual {
+                    self.update_note = Some((format!("Nanofy {version} está lista"), false));
+                    self.update_banner = true;
+                }
+                return;
+            }
+            log::info!("[update] la {version} estaba lista, pero ya hay otra más nueva");
+        }
         match result {
             UpdateResult::Available(info) => {
-                // La versión omitida no vuelve a saltar sola, pero sí si el usuario la pide.
-                let skipped = !manual && self.settings.update_skipped == info.version;
-                self.update_note = Some((format!("Hay una versión nueva: {}", info.version), false));
-                self.update_banner = !skipped;
-                self.update = Some(info);
+                self.update_pending = 0;
+                // Una consulta nueva parte de cero: el error del intento anterior (o el «sin
+                // descarga para tu sistema» de una release a medio publicar) ya no vale.
+                let staging = self.offer_update(info, manual, location, staged);
+                // Si la nueva no se prepara sola, la vieja no debe instalarse al abrir Nanofy.
+                // Si se prepara, ella misma empieza quitando la marca de lista de la vieja.
+                if replaces_ready && !staging {
+                    crate::update::discard_staged_async();
+                }
+                // «Reintentar» tras una versión que no arrancaba: lo pidió el usuario, así que se
+                // instala aunque sea esa misma (sola no se volvería a preparar).
+                if install_after && !staging && self.update_stage == Stage::Available {
+                    self.install_update();
+                }
+                // Con «Actualizar automáticamente» se empezó a preparar en segundo plano, sin
+                // aviso: tras pulsar «Reintentar» (que cerró el aviso rojo) el usuario no vería
+                // nada hasta que estuviera lista. La pidió él: a la vista y como si fuera
+                // «Instalar» (apagar la opción ya no la descarta).
+                if install_after && staging && self.update_silent && matches!(self.update_stage, Stage::Downloading { .. } | Stage::Preparing) {
+                    self.update_silent = false;
+                    self.update_banner = true;
+                }
             }
+            UpdateResult::Pending(info) => self.on_update_pending(info, manual),
             UpdateResult::UpToDate => {
+                self.update_pending = 0;
+                self.update_retry = 0;
                 self.update = None;
                 self.update_banner = false;
+                self.update_stage = Stage::Idle;
                 self.update_note = Some((format!("Estás al día ({})", crate::update::current_version()), false));
             }
             UpdateResult::Failed(e) => {
@@ -1763,8 +1921,96 @@ impl App {
                 if manual {
                     self.update_note = Some((e, true));
                 }
+                // Era el reintento de una preparación automática que se quedó sin red y sigue sin
+                // ella: toca el intento siguiente o, agotados, el aviso (una vez: sin red, la
+                // consulta de cada 6 h no debe volver a sacarlo).
+                let retrying = self.update_silent && matches!(self.update_stage, Stage::Failed { kind: FailKind::Network, .. });
+                if !manual && retrying && !self.schedule_auto_retry() && self.update_retry as usize == crate::update::AUTO_RETRY.len() {
+                    self.update_retry += 1;
+                    self.update_banner = self.update.is_some();
+                }
             }
         }
+    }
+
+    /// La versión omitida, o una que ya se instaló aquí y no llegaba a arrancar (se volvió a
+    /// esta): no salta sola ni se prepara sola.
+    fn update_is_skipped(&self, version: &str) -> bool {
+        self.settings.update_skipped == version || crate::update::is_bad_version(version)
+    }
+
+    /// Hay una versión nueva con zip para este sistema. Con «Actualizar automáticamente» se
+    /// prepara sola en segundo plano, sin aviso hasta que esté lista para «Reiniciar»; si no, se
+    /// avisa y se instala con «Instalar». La omitida (o la que no arrancaba) solo se ofrece si el
+    /// usuario la busca a mano, y aun así instalarla es cosa suya. Devuelve si empezó a prepararla.
+    fn offer_update(&mut self, info: UpdateInfo, manual: bool, location: Option<(PathBuf, MoveReason)>, staged: Option<PathBuf>) -> bool {
+        let skipped = self.update_is_skipped(&info.version);
+        self.update_note = Some((format!("Hay una versión nueva: {}", info.version), false));
+        self.update = Some(info);
+        self.update_stage = Stage::Available;
+        if skipped && !manual {
+            self.update_banner = false;
+            return false;
+        }
+        // Desde esta carpeta no puede sustituirse (en ningún modo): el aviso dice qué hacer.
+        if let Some((dir, reason)) = location {
+            self.update_stage = Stage::NeedsMove { dir, reason };
+            self.update_banner = true;
+            return false;
+        }
+        // Ya preparada y probada en una sesión anterior (al abrir no se pudo sustituir el
+        // ejecutable): queda lista para «Reiniciar» sin descargarla otra vez. No cuenta como
+        // preparada sola: apagar «Actualizar automáticamente» no la descarta (quizá la pidió el
+        // usuario con «Instalar»), y de todos modos se instala al abrir Nanofy.
+        if let Some(staged) = staged {
+            let version = self.update.as_ref().map(|u| u.version.clone()).unwrap_or_default();
+            log::info!("[update] la {version} ya estaba preparada");
+            self.update_note = Some((format!("Nanofy {version} está lista"), false));
+            self.update_silent = false;
+            self.update_fake = false;
+            self.update_confirm_jam = false;
+            self.update_retry = 0;
+            self.remember_release_notes(&version);
+            self.update_stage = Stage::Ready { version, staged };
+            self.update_banner = true;
+            return true;
+        }
+        if !skipped && self.auto_update_on() {
+            self.start_stage(true);
+            return true;
+        }
+        self.update_banner = true;
+        false
+    }
+
+    /// Guarda la versión nueva y saca su aviso (salvo que sea la omitida y no la haya pedido el
+    /// usuario: la omitida no vuelve a saltar sola). Tampoco salta sola una versión que ya se
+    /// instaló aquí y no llegaba a arrancar (se volvió a esta): solo si la pide el usuario.
+    fn show_update(&mut self, info: UpdateInfo, manual: bool) {
+        let skipped = !manual && self.update_is_skipped(&info.version);
+        self.update_note = Some((format!("Hay una versión nueva: {}", info.version), false));
+        self.update_banner = !skipped;
+        self.update = Some(info);
+    }
+
+    /// La release más nueva aún no trae zip para esta plataforma: CI lo está subiendo o falló esa
+    /// compilación. Un aviso ahora solo podría mandar al navegador, así que se calla y se vuelve
+    /// a mirar en 10 min; si tras varias consultas sigue sin zip, se avisa de que esa versión no
+    /// tiene descarga para este sistema.
+    fn on_update_pending(&mut self, info: UpdateInfo, manual: bool) {
+        self.update_pending = self.update_pending.saturating_add(1);
+        if self.update_pending < crate::update::PENDING_MAX {
+            // Solo si el aviso automático está activo: si no, `tick` seguiría consultando cada 6 h.
+            if self.settings.update_check {
+                self.update_check_at = Some(Instant::now() + crate::update::PENDING_RECHECK);
+            }
+            if manual {
+                self.update_note = Some((format!("Hay una versión nueva ({}), pero aún se está publicando; vuelve a mirar en unos minutos", info.version), false));
+            }
+            return;
+        }
+        self.update_stage = Stage::Failed { kind: FailKind::NoAsset, detail: crate::update::NO_ASSET_TEXT.to_string() };
+        self.show_update(info, manual);
     }
 
     /// Activa o desactiva el aviso automático; se guarda al instante.
@@ -1774,6 +2020,73 @@ impl App {
         self.update_check_at = on.then(|| Instant::now() + Duration::from_secs(6 * 3600));
         if !self.ephemeral {
             self.settings.save(&self.paths);
+        }
+        // Sin consulta automática tampoco hay actualización automática (ver `auto_update_on`).
+        if !on {
+            self.stop_silent_update();
+        }
+    }
+
+    /// Esta copia puede prepararse sola las versiones nuevas: no es una compilación de
+    /// desarrollo, ni una sesión de capturas, ni el modo de control de las pruebas (salvo contra
+    /// un servidor de releases local). Ver `update::auto_update_allowed`.
+    pub fn auto_update_allowed(&self) -> bool {
+        let exe = crate::update::target_exe();
+        crate::update::auto_update_allowed(&crate::update::AutoGuard {
+            debug: cfg!(debug_assertions),
+            ephemeral: self.ephemeral,
+            control: self.control_mode,
+            test_server: crate::update::test_server_configured(),
+            exe: exe.as_deref(),
+        })
+    }
+
+    /// «Actualizar automáticamente» está en vigor: activado, con la consulta automática activa
+    /// (sin ella la opción ni se puede tocar), en un sistema donde la app se sustituye sola y en
+    /// una copia que puede hacerlo (`auto_update_allowed`).
+    pub fn auto_update_on(&self) -> bool {
+        self.settings.update_check && self.settings.update_auto && crate::update::can_self_install() && self.auto_update_allowed()
+    }
+
+    /// Activa o desactiva «Actualizar automáticamente»; se guarda al instante.
+    pub fn set_update_auto(&mut self, on: bool) {
+        self.settings.update_auto = on;
+        self.draft.update_auto = on;
+        if !self.ephemeral {
+            self.settings.save(&self.paths);
+        }
+        if !on {
+            self.stop_silent_update();
+            return;
+        }
+        // Había una versión nueva esperando a «Instalar»: se prepara ya.
+        let waiting = self.update_stage == Stage::Available
+            && self.update.as_ref().is_some_and(|u| u.asset.is_some() && !self.update_is_skipped(&u.version));
+        if waiting && !self.update_applying && self.restart_after_exit.is_none() && self.auto_update_on() {
+            self.start_stage(true);
+        }
+    }
+
+    /// Se apagó la actualización automática: lo que la app empezó a preparar sola ya no debe
+    /// instalarse sin que el usuario lo pida (lo preparado se instalaría al abrir Nanofy), así que
+    /// se para o se descarta y queda el aviso de siempre, con «Instalar».
+    fn stop_silent_update(&mut self) {
+        if !self.update_silent || self.update_applying || self.restart_after_exit.is_some() {
+            return;
+        }
+        match self.update_stage {
+            Stage::Downloading { .. } | Stage::Preparing => {
+                self.cancel_update();
+                self.update_banner = true;
+            }
+            Stage::Ready { .. } => {
+                crate::update::discard_staged_async();
+                self.update_silent = false;
+                self.update_confirm_jam = false;
+                self.update_stage = Stage::Available;
+                self.update_banner = true;
+            }
+            _ => {}
         }
     }
 
@@ -1789,53 +2102,289 @@ impl App {
         self.update_banner = false;
     }
 
-    /// Instalación automática: descarga, sustituye el ejecutable y reinicia.
+    /// Carpeta de las descargas de la actualización: la de estado, no junto al ejecutable, para
+    /// que si este vive en una carpeta de OneDrive no se suba ni se bloquee a medias.
+    fn update_work_dir(&self) -> PathBuf {
+        self.paths.state_dir.join("update")
+    }
+
+    /// «Instalar» (y «Reintentar» tras un fallo, que empieza de cero): prepara la versión nueva
+    /// en segundo plano con su aviso a la vista. Al terminar queda lista para «Reiniciar».
     pub fn install_update(&mut self) {
+        let Some(u) = self.update.as_ref() else {
+            return;
+        };
+        if self.update_applying || self.restart_after_exit.is_some() || self.update_stage.busy() {
+            return;
+        }
+        if u.asset.is_none() {
+            self.update_stage = Stage::Failed { kind: FailKind::NoAsset, detail: crate::update::NO_ASSET_TEXT.to_string() };
+            return;
+        }
+        if !crate::update::can_self_install() {
+            self.update_stage = Stage::Failed { kind: FailKind::NoAsset, detail: "En este sistema la actualización se instala a mano: descarga el zip".to_string() };
+            return;
+        }
+        self.update_retry = 0;
+        self.start_stage(false);
+    }
+
+    /// Empieza a preparar `self.update` en un hilo (descarga comprobada y autoprueba). `silent`:
+    /// la empezó la app sola, sin aviso hasta que esté lista. Si había otra en marcha, se para:
+    /// solo cuenta la última (sus mensajes llevan su turno).
+    fn start_stage(&mut self, silent: bool) {
         let Some(u) = self.update.clone() else {
             return;
         };
-        if matches!(self.update_progress, Some(InstallProgress::Downloading { .. } | InstallProgress::Extracting | InstallProgress::Ready(_))) {
-            return;
+        if let Some(old) = self.update_cancel.take() {
+            old.store(true, Ordering::Relaxed);
         }
-        if !crate::update::can_self_install() || u.asset_url.is_none() {
-            self.update_progress = Some(InstallProgress::Failed("En este sistema la actualización se instala a mano: descarga el zip".to_string()));
-            return;
-        }
-        self.update_banner = true;
-        self.update_progress = Some(InstallProgress::Downloading { done: 0, total: None });
-        crate::update::install(self.ui_tx.clone(), u);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.update_cancel = Some(cancel.clone());
+        self.update_fake = false;
+        self.update_silent = silent;
+        self.update_confirm_jam = false;
+        self.update_banner = !silent;
+        self.update_stage = Stage::Downloading { done: 0, total: None };
+        log::info!("[update] preparando la {}{}", u.version, if silent { " en segundo plano" } else { "" });
+        self.update_turn = crate::update::stage(self.ui_tx.clone(), u, self.update_work_dir(), cancel);
     }
 
-    fn on_update_progress(&mut self, ctx: &egui::Context, p: InstallProgress) {
-        if let InstallProgress::Ready(new_exe) = &p {
-            // Windows no deja sobrescribir un ejecutable en uso, pero sí renombrarlo: el actual
-            // pasa a .old.exe (se borra en el siguiente arranque) y el nuevo ocupa su sitio.
-            let swap = (|| -> Result<(), String> {
-                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-                let old = crate::update::old_exe_path().ok_or("sin ruta")?;
-                let _ = std::fs::remove_file(&old);
-                std::fs::rename(&exe, &old).map_err(|e| format!("No se pudo apartar el ejecutable actual: {e}"))?;
-                if let Err(e) = std::fs::rename(new_exe, &exe) {
-                    let _ = std::fs::rename(&old, &exe);
-                    return Err(format!("No se pudo colocar el ejecutable nuevo: {e}"));
-                }
-                Ok(())
-            })();
-            match swap {
-                Ok(()) => {
-                    log::info!("[update] ejecutable sustituido; reiniciando");
-                    self.update_progress = Some(p);
-                    self.restart_after_exit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(new_exe);
-                    self.update_progress = Some(InstallProgress::Failed(format!("{e}. Descarga el zip y sustituye el ejecutable a mano.")));
-                }
-            }
+    /// «Cancelar» la descarga o la preparación: para el hilo, borra la descarga a medias y la
+    /// versión nueva vuelve a estar solo disponible (se puede instalar otra vez).
+    pub fn cancel_update(&mut self) {
+        if !matches!(self.update_stage, Stage::Downloading { .. } | Stage::Preparing) {
             return;
         }
-        self.update_progress = Some(p);
+        if let Some(cancel) = self.update_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        // El hilo la borra en cuanto ve la cancelación, pero una descarga atascada puede tardar
+        // en devolverle el control.
+        if let Some(u) = &self.update {
+            crate::update::remove_attempt_downloads(&self.update_work_dir(), &u.version, self.update_turn);
+        }
+        self.update_silent = false;
+        self.update_stage = Stage::Available;
+        log::info!("[update] preparación cancelada");
+    }
+
+    fn on_update_stage(&mut self, turn: u64, stage: Stage) {
+        // De una preparación cancelada o sustituida por otra (sus últimos mensajes pueden llegar
+        // después): ya no dice nada de la actual.
+        if turn != self.update_turn || !matches!(self.update_stage, Stage::Downloading { .. } | Stage::Preparing) {
+            // La de este turno terminó justo cuando se cancelaba («Cancelar», o se apagó
+            // «Actualizar automáticamente») y su hilo ya no lo vio: lo que dejó listo no debe
+            // instalarse al abrir Nanofy. Una de otro turno no: si hay otra después, es suya. Con
+            // un estado de prueba (`update_fake_stage`, que la paró) ninguna real debe quedar.
+            let shown_ready = matches!(self.update_stage, Stage::Ready { .. });
+            let cancelled = turn != 0 && (self.update_fake || (turn == self.update_turn && !shown_ready));
+            if cancelled && matches!(stage, Stage::Ready { .. }) && !self.update_applying && self.restart_after_exit.is_none() {
+                log::info!("[update] la versión preparada llegó tras cancelar: se descarta");
+                crate::update::discard_staged_async();
+                return;
+            }
+            log::debug!("[update] estado de una preparación anterior ignorado: {}", stage.name());
+            return;
+        }
+        match &stage {
+            Stage::Ready { version, .. } => {
+                self.update_cancel = None;
+                self.update_retry = 0;
+                self.update_note = Some((format!("Nanofy {version} está lista"), false));
+                // Lista y probada, pero no se instala sin que el usuario lo diga («Reiniciar»), o
+                // sola al abrir Nanofy la próxima vez. El aviso sale también si se preparó sola:
+                // es lo único que queda por hacer.
+                self.update_banner = true;
+                self.remember_release_notes(version);
+            }
+            Stage::Failed { kind, .. } => {
+                self.update_cancel = None;
+                // Preparándola sola, un corte de red no merece aviso: se vuelve a intentar.
+                if !(self.update_silent && *kind == FailKind::Network && self.schedule_auto_retry()) {
+                    self.update_banner = true;
+                }
+            }
+            Stage::NeedsMove { .. } => {
+                self.update_cancel = None;
+                self.update_banner = true;
+            }
+            Stage::Idle | Stage::Available | Stage::Downloading { .. } | Stage::Preparing => {}
+        }
+        self.update_stage = stage;
+    }
+
+    /// Tras quedarse sin red preparando sola la versión nueva, programa otra consulta (que vuelve
+    /// a prepararla) en 5 min y luego en 30. Agotados, devuelve `false`: se avisa y queda la
+    /// consulta normal de cada 6 h.
+    fn schedule_auto_retry(&mut self) -> bool {
+        let Some(wait) = crate::update::AUTO_RETRY.get(self.update_retry as usize).copied() else {
+            return false;
+        };
+        if !self.settings.update_check {
+            return false;
+        }
+        self.update_retry += 1;
+        self.update_check_at = Some(Instant::now() + wait);
+        log::info!("[update] sin red para la versión nueva; otro intento en {} min", wait.as_secs() / 60);
+        true
+    }
+
+    /// «Reiniciar»: sustituye el ejecutable por la versión preparada y, si sale bien, cierra para
+    /// abrir la nueva, que retoma la música si sonaba. La sustitución va en un hilo con la
+    /// ventana aún abierta, nunca al cerrar: el vigilante de salida de 3 s podría cortarla entre
+    /// los dos renombrados y dejar al usuario sin nanofy.exe. Si no se puede, la versión
+    /// preparada se instala al abrir Nanofy la próxima vez. En una Jam se sale de ella al
+    /// reiniciar: sin `confirm_jam`, el aviso pide confirmarlo primero.
+    pub fn restart_to_update(&mut self, confirm_jam: bool) {
+        if self.update_applying || self.restart_after_exit.is_some() {
+            return;
+        }
+        if !matches!(self.update_stage, Stage::Ready { .. }) {
+            return;
+        }
+        if self.jam.is_some() && !confirm_jam {
+            self.update_confirm_jam = true;
+            self.update_banner = true;
+            return;
+        }
+        self.update_confirm_jam = false;
+        if self.update_fake {
+            // Un «lista» de mentira para capturas: lo que hubiera preparado de verdad junto al
+            // ejecutable (la compilación con la que se trabaja) no debe instalarse por él.
+            self.update_stage = Stage::Failed { kind: FailKind::Swap, detail: "Estado de prueba: no hay ninguna versión preparada".to_string() };
+            return;
+        }
+        let Some(target) = crate::update::target_exe() else {
+            self.update_stage = Stage::Failed { kind: FailKind::Swap, detail: "No se encuentra el ejecutable actual".to_string() };
+            self.update_banner = true;
+            return;
+        };
+        if let Stage::Ready { version, staged } = &self.update_stage {
+            log::info!("[update] instalando la {version} ({} → {})", staged.display(), target.display());
+        }
+        self.update_applying = true;
+        let ui = self.ui_tx.clone();
+        let spawn = std::thread::Builder::new().name("nanofy-update-apply".to_string()).spawn(move || {
+            let result = crate::update::apply_pending(&target).map(|()| target.clone()).map_err(|e| crate::update::swap_failure_text(&target, &e));
+            ui.send(Msg::UpdateApplied(result));
+        });
+        if let Err(e) = spawn {
+            self.update_applying = false;
+            self.update_stage = Stage::Failed { kind: FailKind::Swap, detail: format!("No se pudo instalar la versión nueva ({e})") };
+            self.update_banner = true;
+        }
+    }
+
+    fn on_update_applied(&mut self, ctx: &egui::Context, result: Result<PathBuf, String>) {
+        self.update_applying = false;
+        match result {
+            Ok(target) => {
+                // Se decide ahora, con la ventana a punto de cerrarse: si suena aquí (no en otro
+                // dispositivo por Connect), la versión nueva sigue en el mismo segundo.
+                self.restart_resume = self.player.remote.is_none() && matches!(self.player.state, PlayState::Playing | PlayState::Loading);
+                log::info!("[update] ejecutable sustituido; reiniciando ({})", if self.restart_resume { "la música seguirá" } else { "sin música que retomar" });
+                self.restart_after_exit = Some(target);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                // El motivo real: el aviso ya ofrece «Reintentar» y «Descargar a mano».
+                log::warn!("[update] {e}");
+                self.update_stage = Stage::Failed { kind: FailKind::Swap, detail: e };
+                self.update_banner = true;
+            }
+        }
+    }
+
+    /// `--updated-from <versión>` y `--resume-playing`: esta ventana es la versión recién
+    /// instalada (por «Reiniciar» o al abrir) y, si sonaba música al reiniciar, la retoma.
+    pub fn apply_update_flags(&mut self, updated_from: Option<String>, resume: bool) {
+        if let Some(v) = &updated_from {
+            log::info!("[update] actualizada desde la {v}{}", if resume { "; se retomará la música" } else { "" });
+        }
+        // Sin --updated-from no viene de un reinicio para actualizar: nunca suena sola.
+        self.resume_after_update = resume && updated_from.is_some();
+        if updated_from.is_some() {
+            let version = crate::update::current_version();
+            self.updated_toast = Some(UpdatedToast { version: version.clone(), since: None });
+            // Las notas de esta versión las guardó la anterior al prepararla; para esta ya no hay
+            // versión nueva que las traiga. En el hilo del disco: la ventana no espera por ellas.
+            let (dir, ui) = (self.update_work_dir(), self.ui_tx.clone());
+            self.disk.run(move || {
+                if let Some(info) = crate::update::load_notes(&dir, &version) {
+                    ui.send(Msg::ReleaseNotes(info));
+                }
+            });
+        }
+        self.updated_from = updated_from;
+    }
+
+    /// «Ver novedades»: el diálogo con las notas completas de `info` o, si la release no trae
+    /// notas (las anteriores a 1.7 no las tienen), su página de GitHub.
+    pub fn open_release_notes(&mut self, ctx: &egui::Context, info: Option<UpdateInfo>) {
+        let Some(info) = info else {
+            return;
+        };
+        if crate::update::note_lines(&info.notes).is_empty() {
+            ctx.open_url(egui::OpenUrl::new_tab(info.page_url.clone()));
+            self.status("Se han abierto las novedades en el navegador");
+        } else {
+            self.notes_dialog = Some(info);
+        }
+    }
+
+    /// Notas de la versión en uso para «Ver novedades» del aviso de después de actualizar: las
+    /// guardadas o, si no hay, solo la página de su release.
+    pub fn current_release_notes(&self) -> UpdateInfo {
+        let version = crate::update::current_version();
+        self.current_notes.clone().filter(|n| n.version == version).unwrap_or_else(|| UpdateInfo {
+            page_url: format!("{}/tag/v{version}", crate::update::RELEASES_URL),
+            notes: String::new(),
+            asset: None,
+            version,
+        })
+    }
+
+    /// La versión nueva quedó lista: sus notas se guardan para la ventana que se abrirá con ella.
+    fn remember_release_notes(&self, version: &str) {
+        if let Some(info) = self.update.clone().filter(|u| u.version == version) {
+            let dir = self.update_work_dir();
+            self.disk.run(move || crate::update::save_notes(&dir, &info));
+        }
+    }
+
+    /// Página actual como valor de `--page` (lo que entiende `apply_start_flags`), para que la
+    /// versión nueva se abra donde estaba el usuario. En el inicio no hace falta.
+    fn restart_page(&self) -> Option<String> {
+        let spec = control::page_spec(self.page());
+        let plain = matches!(
+            spec.as_str(),
+            "library" | "search" | "liked" | "albums" | "artists" | "settings" | "history" | "saves" | "shows" | "audiobooks" | "folders"
+        );
+        let with_id = ["playlist:", "album:", "artist:", "show:"].iter().any(|p| spec.starts_with(p));
+        (plain || with_id).then_some(spec)
+    }
+
+    /// Se abrió con `--update-failed`, o la versión nueva no arrancó al instalarla al abrir: se
+    /// sigue con esta y se dice por qué.
+    pub fn show_update_failed(&mut self, msg: &str) {
+        log::warn!("[update] {msg}");
+        self.update_note = Some((msg.to_string(), true));
+        self.update_failed = Some(msg.to_string());
+        self.update_failed_banner = true;
+    }
+
+    /// «Reintentar» del aviso rojo (o de Ajustes, con un error de consulta): vuelve a mirar y, si
+    /// era una actualización que no arrancó, instala la versión nueva en cuanto llegue.
+    pub fn retry_failed_update(&mut self) {
+        self.update_failed_banner = false;
+        if self.update_failed.take().is_some() {
+            self.update_install_after_check = true;
+            // Si ya había una consulta en marcha, su resultado no debe tomar el aviso viejo
+            // como el error de este intento.
+            self.update_note = None;
+        }
+        self.check_updates(true);
     }
 
     /// Abre en el navegador el zip de esta plataforma (`download`) o la página de la release.
@@ -1843,8 +2392,8 @@ impl App {
         let Some(u) = &self.update else {
             return;
         };
-        let url = match (&u.asset_url, download) {
-            (Some(asset), true) => asset.clone(),
+        let url = match (&u.asset, download) {
+            (Some(asset), true) => asset.url.clone(),
             _ => u.page_url.clone(),
         };
         ctx.open_url(egui::OpenUrl::new_tab(url));
@@ -2422,8 +2971,10 @@ impl App {
                     ui_phase("tecla multimedia", || format!("{ev:?}"));
                     self.on_media(ev)
                 }
-                Msg::Update { result, manual } => self.on_update(result, manual),
-                Msg::UpdateProgress(p) => self.on_update_progress(ctx, p),
+                Msg::Update { result, manual, location, staged } => self.on_update(result, manual, location, staged),
+                Msg::UpdateStage { turn, stage } => self.on_update_stage(turn, stage),
+                Msg::UpdateApplied(result) => self.on_update_applied(ctx, result),
+                Msg::ReleaseNotes(info) => self.current_notes = Some(info),
                 Msg::Control(req) => {
                     ui_phase("orden de control", || short(req.cmd.to_string()));
                     let reply = self.control_exec(ctx, &req.cmd);
@@ -2521,13 +3072,24 @@ impl App {
                 if self.status.as_ref().is_some_and(|(t, _, err)| !err && t.starts_with("Conectando")) {
                     self.status = None;
                 }
+                // Recién reiniciada para actualizar: la copia local la guardó la ventana anterior al
+                // cerrarse hace unos segundos, así que manda sin esperar al estado de Spotify (que
+                // aún diría lo de esa ventana). Solo aquí, ya conectada: antes, restaurar no puede
+                // activar este dispositivo.
+                let fresh_update = self.updated_from.is_some()
+                    && self.restore_pending.as_ref().is_some_and(|s| crate::cache::now_secs().saturating_sub(s.saved_at) < UPDATE_RESTORE_FRESH_SECS);
+                if !fresh_update && std::mem::take(&mut self.resume_after_update) {
+                    // Sin esa copia reciente no se sabe qué sonaba: como en cualquier arranque,
+                    // se restaura en pausa.
+                    log::info!("[update] sin copia reciente de la reproducción: se restaura en pausa");
+                }
                 if self.restore_pending.is_some() || self.restore_wanted {
                     // La decisión (copia local, clúster de Connect, recently-played) se toma en
                     // try_decide_restore; el clúster inicial llega justo después de conectar.
                     if self.restore_deadline.is_none() {
                         self.restore_deadline = Some(Instant::now() + Duration::from_millis(2500));
                     }
-                    self.try_decide_restore(false);
+                    self.try_decide_restore(fresh_update);
                 }
                 self.refresh_from_network(false);
                 if let Some(k) = user_key {
@@ -4217,6 +4779,21 @@ impl App {
                 ctx.request_repaint_after(at - now);
             }
         }
+        // A los 20 s del primer fotograma la versión en uso funciona: si es una recién instalada
+        // deja de estar a prueba, y se borran el ejecutable anterior y los restos de 1.4–1.6.
+        // Antes no: el anterior es la vuelta atrás si la nueva no llega a arrancar. Con una
+        // sustitución en marcha desde esta ventana se espera, porque el registro ya describe la
+        // versión que se está instalando, no esta.
+        if !self.health_marked {
+            let now = Instant::now();
+            let at = *self.health_at.get_or_insert(now + crate::update::HEALTHY_AFTER);
+            if now < at {
+                ctx.request_repaint_after(at - now);
+            } else if !self.update_applying && self.restart_after_exit.is_none() {
+                self.health_marked = true;
+                crate::update::mark_healthy();
+            }
+        }
         self.flush_volume(ctx);
         self.poll_restore_queue(ctx);
         // Búsqueda limitada por Spotify (429 corto): se repite sola al pasar la espera, solo si
@@ -4406,7 +4983,6 @@ impl App {
             // arrancar (inicialización de DLLs, descompresión de fuentes…).
             if !self.ws_trimmed && self.taskbar_at.elapsed() > Duration::from_secs(4) {
                 self.ws_trimmed = true;
-                crate::update::cleanup_old_exe();
                 let atlas = ctx.fonts(|f| f.font_image_size());
                 log::info!(
                     "[mem] atlas de fuentes {}x{} ({:.1} MB en f32), portadas {:.1} MB en {} texturas, me gusta {} pistas, feed {} secciones, historial local {} entradas",
@@ -5399,6 +5975,15 @@ impl App {
             // La cola manual se vuelve a añadir cuando el dispositivo ya está activo.
             self.pending_queue = Some((Instant::now() + Duration::from_millis(2500), Some(pos), saved.queued.clone()));
         }
+        // «Reiniciar» para actualizar con música sonando: se carga en pausa en el mismo segundo y
+        // el evento de pausa la reanuda, como tras una reconexión. Solo esta vez: la regla de que
+        // al abrir nunca suena sola vale para cualquier otro arranque.
+        if std::mem::take(&mut self.resume_after_update) {
+            self.pause_after_restore = false;
+            self.play_after_restore = true;
+            self.player.state = PlayState::Loading;
+            log::info!("[update] se retoma la música tras actualizar");
+        }
         log::info!("[restore] {} en {} ms", saved.now.name, pos);
     }
 
@@ -6140,6 +6725,7 @@ impl App {
                 self.show_shortcuts = false;
                 self.jam_open = false;
                 self.editor = None;
+                self.notes_dialog = None;
             }
         }
     }
@@ -6278,11 +6864,38 @@ impl crate::shell::UiApp for App {
     }
 
     fn on_exit(&mut self) {
+        // Lo primero: desde aquí ninguna sustitución del ejecutable empieza a renombrar (si hay
+        // una en curso, se espera a que termine el renombrado, milisegundos). El proceso termina
+        // enseguida y no debe quedarse entre apartar el actual y poner el nuevo.
+        crate::update::close_swap_gate();
+        // Cerrar con normalidad tras pintar la ventana: si esta versión está a prueba, arranca.
+        if !self.update_applying && self.restart_after_exit.is_none() && crate::FIRST_FRAME_MS.get().is_some() {
+            crate::update::confirm_on_exit();
+        }
         self.save_playback();
         if !self.ephemeral {
             self.settings.volume = vol_raw_to_pct(self.player.volume).round() as u8;
             self.settings.lyrics_open = self.side == Some(SideTab::Lyrics);
             self.settings.save(&self.paths);
+        }
+        // La versión nueva ya ocupa su sitio: se abre ya, antes de la despedida a Spotify y de
+        // esperar al disco, para que el vigilante de salida de 3 s (shell.rs) no pueda cortar el
+        // cierre antes de abrirla. Con --wait-pid espera a que este proceso termine antes de leer
+        // nada (ajustes, la copia de la reproducción que save_playback acaba de encolar) o de
+        // conectarse a Spotify. Mismos argumentos (p. ej. --control) para que arranque igual, en la
+        // página en la que estaba el usuario y, si sonaba música, retomándola. Si no arranca, el
+        // acceso directo del usuario ya abre la nueva la próxima vez. Con una versión lista y sin
+        // «Reiniciar» no se hace nada aquí: se instala al abrir.
+        if let Some(target) = self.restart_after_exit.take() {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let args = crate::update::restart_args(&args, self.restart_page().as_deref());
+            let mut extra = vec!["--updated-from".to_string(), crate::update::current_version()];
+            if self.restart_resume {
+                extra.push("--resume-playing".to_string());
+            }
+            if let Err(e) = crate::update::spawn_target(&target, &args, &extra) {
+                log::error!("[update] no se pudo abrir {}: {e}", target.display());
+            }
         }
         // El backend empieza a desconectar (avisa a Spotify de la pausa y del dispositivo
         // inactivo) mientras se escriben los ficheros. Van al hilo del disco detrás de lo que
@@ -6301,16 +6914,6 @@ impl crate::shell::UiApp for App {
         // Un margen corto para que salga el aviso de desconexión; si Spotify tarda más, se
         // cierra igual: la copia local de la reproducción ya está guardada y el servidor
         // detecta la desconexión por sí mismo.
-        if self.restart_after_exit {
-            // Mismos argumentos (p. ej. --control) para que la versión nueva arranque igual.
-            if let Ok(exe) = std::env::current_exe() {
-                let args: Vec<String> = std::env::args().skip(1).collect();
-                match std::process::Command::new(&exe).args(&args).spawn() {
-                    Ok(_) => log::info!("[update] versión nueva lanzada: {}", exe.display()),
-                    Err(e) => log::error!("[update] no se pudo relanzar {}: {e}", exe.display()),
-                }
-            }
-        }
         let t = Instant::now();
         while !self.shutdown_done && t.elapsed() < Duration::from_millis(30) {
             while let Ok(msg) = self.rx.try_recv() {

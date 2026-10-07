@@ -8,6 +8,7 @@ use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
 use super::widgets::{child_in, keyed_child, uri_to_link, CardInfo, CardKind, RowOpts, Source, CARD_H, CARD_W};
 use super::{fmt_thousands, strip_html, Action, App, Auth, FolderDialog, Page, PlayTarget, ERROR_RED, LIKED};
+use super::panels::{about_view, Tone};
 use crate::api::Req;
 use crate::config::{Quality, Theme};
 use crate::model::*;
@@ -2690,32 +2691,75 @@ impl App {
                 let _ = Self::pill(ui, "Rust · egui · librespot", false);
             });
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if Self::secondary_button(ui, "Buscar actualizaciones", !self.update_busy).clicked() {
-                    self.check_updates(true);
+            let applying = self.update_applying || self.restart_after_exit.is_some();
+            if Self::secondary_button(ui, "Buscar actualizaciones", !self.update_busy && !applying).clicked() {
+                self.check_updates(true);
+            }
+            // El estado va en su propia fila, con el motivo debajo: con la interfaz ampliada no
+            // cabe al lado del botón.
+            let current = crate::update::current_version();
+            let row = about_view(&self.update_stage, self.update.as_ref(), self.update_note.as_ref(), self.update_busy, applying, crate::update::can_self_install(), &current);
+            if let Some(row) = row {
+                ui.add_space(6.0);
+                if row.waiting {
+                    Self::loading(ui, &row.text);
+                } else {
+                    let color = match row.tone {
+                        Tone::Text => p.text,
+                        Tone::Weak => weak,
+                        Tone::Error => ERROR_RED,
+                    };
+                    ui.add(Label::new(RichText::new(&row.text).color(color)).wrap());
                 }
-                if self.update_busy {
-                    Self::loading(ui, "Consultando GitHub");
-                } else if let Some((text, err)) = self.update_note.clone() {
-                    ui.label(RichText::new(text).small().color(if err { ERROR_RED } else { weak }));
-                    if let Some(pr) = self.update_progress.clone() {
-                        ui.label(RichText::new(pr.label()).small().color(weak));
-                    } else if self.update.is_some() {
-                        let install = crate::update::can_self_install() && self.update.as_ref().and_then(|u| u.asset_url.as_ref()).is_some();
-                        if Self::primary_button(ui, if install { "Instalar" } else { "Descargar" }, true).clicked() {
-                            if install {
-                                self.install_update();
-                            } else {
-                                self.open_update(&ctx, true);
+                if let Some(detail) = &row.detail {
+                    ui.add(Label::new(RichText::new(detail).small().color(weak)).wrap());
+                }
+                if row.primary.is_some() || row.secondary.is_some() || row.link.is_some() {
+                    ui.add_space(4.0);
+                    let mut action = None;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if let Some((label, a)) = row.primary {
+                            if Self::primary_button(ui, label, true).clicked() {
+                                action = Some(a);
                             }
                         }
+                        if let Some((label, a)) = row.secondary {
+                            if Self::secondary_button(ui, label, true).clicked() {
+                                action = Some(a);
+                            }
+                        }
+                        if let Some((label, a)) = row.link {
+                            if Self::small_link(ui, label).clicked() {
+                                action = Some(a);
+                            }
+                        }
+                    });
+                    if let Some(a) = action {
+                        self.run_update_action(&ctx, a);
                     }
                 }
-            });
+            }
+            ui.add_space(6.0);
             let mut v = self.settings.update_check;
-            if Self::toggle_pad(ui, &mut v, "Avisar al arrancar cuando haya una versión nueva", 0.0) {
+            if Self::toggle_pad(ui, &mut v, "Buscar versiones nuevas automáticamente", 0.0) {
                 self.set_update_check(v);
+            }
+            // Donde la app no se sustituye sola (macOS) no hay nada que pueda hacer sola.
+            if crate::update::can_self_install() {
+                // Sin consulta automática no hay nada que preparar solo: la opción queda apagada a la vista.
+                let check_on = self.settings.update_check;
+                let mut auto = self.settings.update_auto && check_on;
+                let changed = ui.add_enabled_ui(check_on, |ui| Self::toggle_pad(ui, &mut auto, "Actualizar automáticamente", 0.0)).inner;
+                if changed && check_on {
+                    self.set_update_auto(auto);
+                }
+                ui.label(RichText::new("Descarga las versiones nuevas en segundo plano; solo tendrás que pulsar Reiniciar.").small().color(weak));
+                // Activada pero sin efecto en esta copia (`auto_update_allowed`): que no parezca
+                // que falla.
+                if check_on && self.settings.update_auto && !self.auto_update_allowed() {
+                    ui.label(RichText::new("En esta copia (de desarrollo o de pruebas) no se aplica: las versiones nuevas se avisan con «Instalar».").small().color(weak));
+                }
             }
             if let Some(m) = mem {
                 ui.label(RichText::new(format!("Memoria en uso {m:.0} MB · {n_img} portadas en memoria ({img_mb:.1} MB) · último fotograma {frame_ms:.1} ms")).small().color(weak));

@@ -65,6 +65,16 @@ impl std::io::Write for LogSink {
 }
 
 fn main() {
+    // `--self-test`: la actualización arranca así la versión nueva antes de instalarla, para
+    // saber que Windows o el antivirus la dejan abrir. Va lo primero: sin registro (no rota
+    // nanofy.log), sin leer ajustes y sin ventana.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--self-test") {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "nanofy {}", env!("CARGO_PKG_VERSION"));
+        let _ = out.flush();
+        std::process::exit(0);
+    }
     let paths = config::Paths::new();
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,nanofy=info"),
@@ -76,11 +86,17 @@ fn main() {
     let t0 = std::time::Instant::now();
     let _ = START.set(t0);
     log::info!("[t] main {}", env!("CARGO_PKG_VERSION"));
+    // Actualizaciones, antes que nada más (ajustes, ventana): esperar a la ventana que se cerró
+    // para actualizar, volver a la versión anterior si esta no llega a arrancar e instalar la que
+    // quedó preparada. Si con eso ya se abrió otra versión, esta termina aquí.
+    let update_notice = match update::on_launch() {
+        update::Launch::Exit => std::process::exit(0),
+        update::Launch::Continue { notice } => notice,
+    };
     // Identidad estable en la barra de tareas: sin ella, al anclar el .exe suelto Windows no
     // asocia el botón con el acceso directo anclado y este se queda sin icono.
     #[cfg(windows)]
     set_app_user_model_id();
-    update::cleanup_old_exe();
     let settings = config::Settings::load(&paths);
     tmark("ajustes cargados");
     // `--diag`: prueba automática de letras, dispositivos, cola y reproducción (10 s), y sale.
@@ -93,6 +109,12 @@ fn main() {
     let start_page = flag("--page");
     let start_side = flag("--side");
     let start_jam = args.iter().any(|a| a == "--jam");
+    // `--update-failed <texto>`: la versión nueva no arrancaba y se volvió a esta.
+    let update_failed = update_notice.or_else(|| flag("--update-failed"));
+    // `--updated-from <versión>`: la abrió la anterior al instalarse esta; `--resume-playing`:
+    // sonaba música al pulsar «Reiniciar» y debe seguir sonando.
+    let updated_from = flag("--updated-from");
+    let resume_playing = args.iter().any(|a| a == "--resume-playing");
     // `--control <puerto>`: modo de control local para las pruebas automatizadas (carpeta qa/).
     let control_port = flag("--control").and_then(|p| p.parse::<u16>().ok());
     // `--tab <página>` (repetible): abre pestañas adicionales en segundo plano.
@@ -117,6 +139,10 @@ fn main() {
         log::info!("[t] app creada a los {} ms", t0.elapsed().as_millis());
         app.diag = diag;
         app.apply_start_flags(start_page.as_deref(), start_side.as_deref(), start_jam);
+        app.apply_update_flags(updated_from.clone(), resume_playing);
+        if let Some(msg) = &update_failed {
+            app.show_update_failed(msg);
+        }
         for t in &extra_tabs {
             app.open_tab_from_flag(t);
         }

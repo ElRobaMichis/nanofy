@@ -120,9 +120,17 @@ pub struct Settings {
     pub home_recs: bool,
     /// Consultar GitHub al arrancar (y cada pocas horas) y avisar si hay una versión nueva.
     pub update_check: bool,
+    /// Descargar y preparar la versión nueva en segundo plano sin preguntar: solo queda pulsar
+    /// «Reiniciar» (o se instala sola al abrir Nanofy la próxima vez). Sin esto, se avisa y se
+    /// instala con «Instalar». Los settings.json de antes no lo traen: toman `UPDATE_AUTO_DEFAULT`.
+    pub update_auto: bool,
     /// Versión que el usuario pidió omitir (no se vuelve a avisar de ella).
     pub update_skipped: String,
 }
+
+/// Valor de «Actualizar automáticamente» para instalaciones nuevas y para los ajustes guardados
+/// por versiones que aún no lo tenían. En un solo sitio para poder cambiarlo.
+pub const UPDATE_AUTO_DEFAULT: bool = true;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -152,6 +160,7 @@ impl Default for Settings {
             home_custom: Vec::new(),
             home_recs: true,
             update_check: true,
+            update_auto: UPDATE_AUTO_DEFAULT,
             update_skipped: String::new(),
         }
     }
@@ -256,4 +265,25 @@ fn random_hex() -> String {
     }
     out.truncate(40);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Un settings.json de una versión anterior (sin `update_auto`) se lee entero: el campo nuevo
+    /// toma su valor por defecto y lo demás, incluido el device_id, se conserva.
+    #[test]
+    fn ajustes_antiguos_sin_update_auto() {
+        let old = r#"{"device_name":"Salón","device_id":"abc123","update_check":false,"update_skipped":"1.5.0"}"#;
+        let s: Settings = serde_json::from_str(old).expect("settings.json de 1.6 válido");
+        assert_eq!(s.update_auto, UPDATE_AUTO_DEFAULT);
+        assert_eq!(s.device_name, "Salón");
+        assert_eq!(s.device_id, "abc123");
+        assert!(!s.update_check);
+        assert_eq!(s.update_skipped, "1.5.0");
+        let off: Settings = serde_json::from_str(r#"{"device_id":"abc123","update_auto":false}"#).unwrap();
+        assert!(!off.update_auto);
+        assert_eq!(Settings::default().update_auto, UPDATE_AUTO_DEFAULT);
+    }
 }

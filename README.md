@@ -33,13 +33,33 @@ Los ejecutables listos para usar están en la pestaña **Releases** del reposito
 `Nanofy-macos-x64.zip`), descomprímelo y abre Nanofy. El `LEEME.txt` incluido explica el
 primer arranque. Cada release la compila GitHub Actions a partir del código de este repositorio.
 
-**Actualización con un clic.** Al arrancar (y cada seis horas) Nanofy consulta la última release
-de este repositorio con una sola petición anónima a la API de GitHub. Si hay una versión más
-reciente aparece un aviso arriba a la derecha con «Instalar», «Ver novedades» y «Omitir esta
-versión». «Instalar» descarga el zip de tu sistema, sustituye el ejecutable y Nanofy se reabre
-ya actualizado (Windows y Linux; en macOS el botón es «Descargar»). En Ajustes → Acerca de
-Nanofy está el botón «Buscar actualizaciones» y el interruptor para desactivar el aviso. Nada se
-descarga sin pulsar el botón.
+**Actualizaciones automáticas.** Al arrancar (y cada seis horas) Nanofy consulta la última
+release de este repositorio con una sola petición anónima a la API de GitHub. Con «Actualizar
+automáticamente», activado de serie, la versión nueva se descarga en segundo plano mientras
+escuchas y, cuando está lista, aparece «Reiniciar para actualizar» en la barra superior: un clic y
+Nanofy se reabre en un par de segundos ya actualizado, con la música en el mismo segundo (o en
+pausa, si estaba en pausa). Si no lo pulsas, se instala sola la próxima vez que abras Nanofy;
+nunca al cerrarlo, para que un cierre a medias no te deje sin ejecutable.
+
+Antes de instalar nada, Nanofy comprueba que la descarga es justo la que publica la release (su
+tamaño y su SHA-256) y arranca el ejecutable nuevo una vez en modo de prueba, por si Windows o el
+antivirus no lo dejan abrir. La versión anterior se guarda hasta que la nueva lleva un rato
+funcionando: si la nueva no llega a arrancar, Nanofy vuelve solo a la anterior y no la reinstala
+sin que se lo pidas. Si algo falla, el aviso dice qué ha pasado y ofrece «Reintentar»; el zip en el
+navegador queda como último recurso.
+
+Con «Actualizar automáticamente» apagado, el aviso de arriba a la derecha ofrece «Instalar», «Ver
+novedades» y «Omitir esta versión», y no se descarga nada hasta pulsar «Instalar». Las dos
+opciones («Buscar versiones nuevas automáticamente» y «Actualizar automáticamente») y el botón
+«Buscar actualizaciones» están en Ajustes → Acerca de Nanofy. Se actualiza solo en Windows y Linux;
+en macOS el aviso ofrece «Descargar». Si Nanofy está en una carpeta donde no puede escribir (como
+Archivos de programa) o lo abres desde dentro del zip, el aviso te dice cómo moverlo.
+
+Desde una versión anterior a la 1.7: la 1.3 o anteriores solo saben abrir el zip en el navegador,
+así que basta con sustituir `nanofy.exe` por el de la última release una vez; desde ahí se
+actualiza solo. De la 1.4–1.6 a la 1.7 el salto lo hace aún su instalador de un clic, que
+reinicia en cuanto termina la descarga y no retoma la música; en Linux esas versiones se reabren
+con el ejecutable anterior, así que hay que cerrar y abrir Nanofy una vez.
 
 ## Interfaz
 
@@ -202,6 +222,11 @@ archivo de audio de la canción en curso (10 MB a 320 kbps, hasta 40 MB sin pér
   compila en GitHub Actions al subir una etiqueta `v*` (Windows, Linux, macOS Intel y Apple
   Silicon) y publica los zips en una release. Los binarios no van firmados: en Mac hay que
   abrir la app con clic derecho → Abrir la primera vez.
+- **Publicar una versión**: sube `version` en `Cargo.toml` y crea una etiqueta anotada
+  `vX.Y.Z` con esa versión; su mensaje es la nota de la release. La release aparece de una
+  vez, cuando ya están subidos todos los zips y `SHA256SUMS.txt` con sus sumas; si falla una
+  compilación de macOS sale igual, sin ese zip. Una etiqueta con guion (`v1.7.0-rc.1`) se
+  publica como pre-release y no llega a las apps: sirve para probar antes de publicar.
 - Todo el mundo necesita Spotify Premium (requisito de Spotify para apps externas).
 
 ## Qué hace

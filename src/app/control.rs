@@ -12,7 +12,7 @@ use super::{Action, ActiveTab, App, Auth, Page, PlayState, PlayTarget, PlaylistE
 use crate::api::Req;
 use crate::backend::Cmd;
 use crate::config::vol_pct_to_raw;
-use crate::update::InstallProgress;
+use crate::update::{Asset, FailKind, MoveReason, Stage, UpdateInfo};
 
 fn s<'a>(cmd: &'a Value, key: &str) -> Option<&'a str> {
     cmd.get(key).and_then(|v| v.as_str())
@@ -60,7 +60,7 @@ pub fn parse_page(spec: &str) -> Option<Page> {
     })
 }
 
-fn page_spec(p: &Page) -> String {
+pub(super) fn page_spec(p: &Page) -> String {
     match p {
         Page::Home => "home".into(),
         Page::Library => "library".into(),
@@ -120,7 +120,9 @@ impl App {
         matches!(self.auth, Auth::LoggedIn { .. } | Auth::Connecting { .. })
     }
 
-    pub fn control_start(&self, port: u16) {
+    pub fn control_start(&mut self, port: u16) {
+        // Con el modo de control la app no se actualiza sola (ver `auto_update_allowed`).
+        self.control_mode = true;
         crate::control::start(port, self.ui_tx.clone());
     }
 
@@ -130,7 +132,9 @@ impl App {
         log::debug!("[control] {cmd}");
         match op {
             "state" => json!({"ok": true, "state": self.control_state()}),
-            "ping" => json!({"ok": true, "version": crate::update::current_version()}),
+            // El pid deja al runner seguir a la versión que abre una actualización (al reiniciar o
+            // al instalarse al abrir): es otro proceso, no un hijo suyo, en el mismo puerto.
+            "ping" => json!({"ok": true, "version": crate::update::current_version(), "pid": std::process::id()}),
 
             // ------------------------------------------------------------ navegación
             "go" => match s(cmd, "page").and_then(parse_page) {
@@ -835,8 +839,10 @@ impl App {
                 self.backend.send(Cmd::Stalled);
                 ok()
             }
+            // Como «Buscar actualizaciones» de Ajustes; con `manual: false`, como la consulta
+            // automática (la de los 5 s y la de cada 6 h), que se calla la versión omitida.
             "check_updates" => {
-                self.check_updates(true);
+                self.check_updates(b(cmd, "manual", true));
                 ok()
             }
             "update_install" => {
@@ -849,6 +855,55 @@ impl App {
             }
             "update_banner" => {
                 self.update_banner = b(cmd, "on", true) && self.update.is_some();
+                ok()
+            }
+            // «Reiniciar» del aviso. En una Jam, sin `confirm` solo pide confirmación (como el
+            // botón); con `confirm: true` es «Reiniciar igualmente».
+            "update_restart" => {
+                if !matches!(self.update_stage, Stage::Ready { .. }) {
+                    return err(format!("no hay ninguna versión lista (estado {})", self.update_stage.name()));
+                }
+                self.restart_to_update(b(cmd, "confirm", false));
+                json!({"ok": true, "confirm_jam": self.update_confirm_jam, "applying": self.update_applying})
+            }
+            "update_cancel" => {
+                self.cancel_update();
+                ok()
+            }
+            "update_auto" => {
+                self.set_update_auto(b(cmd, "on", true));
+                json!({"ok": true, "auto": self.settings.update_auto, "auto_allowed": self.auto_update_allowed()})
+            }
+            "update_fake_stage" => self.control_fake_update_stage(cmd),
+            // Capturas de lo que rodea a la actualización: el diálogo de novedades (de la versión
+            // nueva, o de la en uso si no hay), el aviso de después de actualizar y el rojo de
+            // una que no arrancó. `on: false` los quita.
+            "update_notes" => {
+                if !b(cmd, "on", true) {
+                    self.notes_dialog = None;
+                    return ok();
+                }
+                let mut info = self.update.clone().unwrap_or_else(|| self.current_release_notes());
+                if let Some(notes) = s(cmd, "notes") {
+                    info.notes = notes.to_string();
+                }
+                self.notes_dialog = Some(info);
+                ok()
+            }
+            "update_toast" => {
+                self.updated_toast = b(cmd, "on", true).then(|| super::UpdatedToast {
+                    version: s(cmd, "version").map(str::to_string).unwrap_or_else(crate::update::current_version),
+                    since: None,
+                });
+                ok()
+            }
+            "update_failed_notice" => {
+                if b(cmd, "on", true) {
+                    let text = s(cmd, "text").map(str::to_string).unwrap_or_else(|| format!("La versión 9.9.9 no arrancaba; se volvió a la {}", crate::update::current_version()));
+                    self.show_update_failed(&text);
+                } else {
+                    self.update_failed_banner = false;
+                }
                 ok()
             }
             "frame_reset" => {
@@ -1000,6 +1055,91 @@ impl App {
         }
     }
 
+    /// Lo que enseña ahora el aviso de actualización: título, botones y mensaje, sacados de
+    /// `banner_view` como al pintarlo. Así una prueba comprueba lo que vería el usuario (que tras
+    /// un fallo se ofrece «Reintentar» y no el navegador, por ejemplo) sin capturas. `null` si
+    /// el aviso no está a la vista.
+    fn control_update_view(&self) -> Value {
+        let Some(info) = self.update.as_ref().filter(|_| self.update_banner) else {
+            return Value::Null;
+        };
+        let applying = self.update_applying || self.restart_after_exit.is_some();
+        let in_jam = self.jam.is_some() || self.update_confirm_jam;
+        let v = super::panels::banner_view(&self.update_stage, info, &crate::update::current_version(), crate::update::can_self_install(), in_jam, applying);
+        json!({
+            "title": v.title,
+            "primary": v.primary.map(|(label, _)| label),
+            "secondary": v.secondary.map(|(label, _)| label),
+            "link": v.link.map(|(label, _)| label),
+            "message": v.message.map(|(text, _)| text),
+            "skip": v.skip,
+        })
+    }
+
+    /// `update_fake_stage`: pone el aviso de actualización en un estado cualquiera sin descargar
+    /// nada, para las capturas de cada estado. `stage`: idle | available | downloading |
+    /// preparing | ready | needs_move | failed; opcionales `version`, `notes`, `done`, `total`,
+    /// `kind` (network | corrupt | disk | blocked | swap | no_asset), `reason` (read_only |
+    /// running_from_zip), `detail`, `confirm_jam`, `silent` y `banner` (por defecto a la vista).
+    fn control_fake_update_stage(&mut self, cmd: &Value) -> Value {
+        if self.update_applying || self.restart_after_exit.is_some() {
+            return err("se está instalando una versión de verdad");
+        }
+        let version = s(cmd, "version")
+            .map(str::to_string)
+            .or_else(|| self.update.as_ref().map(|u| u.version.clone()))
+            .unwrap_or_else(|| "9.9.9".to_string());
+        let exe = crate::update::target_exe();
+        let stage = match s(cmd, "stage").unwrap_or("available") {
+            "idle" => Stage::Idle,
+            "available" => Stage::Available,
+            "downloading" => Stage::Downloading { done: n(cmd, "done").unwrap_or(0).max(0) as u64, total: n(cmd, "total").map(|t| t.max(0) as u64) },
+            "preparing" => Stage::Preparing,
+            "ready" => Stage::Ready { version: version.clone(), staged: exe.as_deref().map(crate::update::staged_exe_path).unwrap_or_default() },
+            "needs_move" => Stage::NeedsMove {
+                dir: exe.as_deref().and_then(|e| e.parent()).map(|d| d.to_path_buf()).unwrap_or_default(),
+                reason: match s(cmd, "reason") {
+                    Some("running_from_zip" | "zip") => MoveReason::RunningFromZip,
+                    _ => MoveReason::ReadOnly,
+                },
+            },
+            "failed" => {
+                let current = crate::update::current_version();
+                let (kind, text) = match s(cmd, "kind").unwrap_or("network") {
+                    "corrupt" => (FailKind::Corrupt, "La descarga llegó dañada y se descartó.".to_string()),
+                    "disk" => (FailKind::Disk, "No hay espacio suficiente en el disco.".to_string()),
+                    "blocked" => (FailKind::Blocked, format!("Windows o tu antivirus bloqueó la versión nueva. Sigues usando la {current}.")),
+                    "swap" => (FailKind::Swap, "No se pudo sustituir nanofy.exe (prueba). Se intentará de nuevo al abrir Nanofy.".to_string()),
+                    "no_asset" => (FailKind::NoAsset, crate::update::NO_ASSET_TEXT.to_string()),
+                    "network" => (FailKind::Network, "No se pudo descargar la actualización. Revisa tu conexión.".to_string()),
+                    other => return err(format!("tipo de fallo desconocido: {other}")),
+                };
+                Stage::Failed { kind, detail: s(cmd, "detail").map(str::to_string).unwrap_or(text) }
+            }
+            other => return err(format!("estado desconocido: {other}")),
+        };
+        // El aviso necesita una versión nueva: una release de mentira si no es la que hay.
+        if self.update.as_ref().is_none_or(|u| u.version != version) {
+            self.update = Some(UpdateInfo {
+                page_url: format!("{}/tag/v{version}", crate::update::RELEASES_URL),
+                notes: s(cmd, "notes").unwrap_or("").to_string(),
+                asset: Some(Asset { name: format!("Nanofy-{}.zip", crate::update::platform_suffix()), url: String::new(), size: 0, sha256: None }),
+                version,
+            });
+        }
+        // Una preparación de verdad en marcha deja de contar: sus mensajes ya no se aceptan.
+        if let Some(cancel) = self.update_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.update_turn = 0;
+        self.update_fake = true;
+        self.update_silent = b(cmd, "silent", false);
+        self.update_confirm_jam = b(cmd, "confirm_jam", false);
+        self.update_stage = stage;
+        self.update_banner = b(cmd, "banner", true);
+        json!({"ok": true, "stage": self.update_stage.name()})
+    }
+
     /// Fotografía del estado de la app (solo datos; nada de egui).
     pub fn control_state(&self) -> Value {
         let auth = match &self.auth {
@@ -1092,6 +1232,13 @@ impl App {
         });
         let phases_n = self.frame_hist.len().max(1) as f32;
         let phases_avg = json!({"ui": self.frame_phases[0] / phases_n, "tessellate": self.frame_phases[1] / phases_n, "raster": self.frame_phases[2] / phases_n, "present": self.frame_phases[3] / phases_n});
+        // Aparte: dentro del objeto grande pasaría del límite de recursión de `json!`.
+        let mut update = json!({"available": self.update.as_ref().map(|u| u.version.clone()), "asset": self.update.as_ref().and_then(|u| u.asset.as_ref()).map(|a| json!({"name": a.name, "size": a.size, "sha256": a.sha256.is_some()})), "banner": self.update_banner, "busy": self.update_busy, "note": self.update_note, "stage": self.update_stage.name(), "progress": (!matches!(self.update_stage, Stage::Idle | Stage::Available)).then(|| self.update_stage.label()), "failed": matches!(self.update_stage, Stage::Failed { .. }), "fail_kind": match &self.update_stage { Stage::Failed { kind, .. } => Some(format!("{kind:?}")), _ => None }, "move_reason": match &self.update_stage { Stage::NeedsMove { reason, .. } => Some(format!("{reason:?}")), _ => None }, "pending": self.update_pending, "pct": match &self.update_stage { Stage::Downloading { done, total: Some(t) } if *t > 0 => Some((done * 100 / t).min(100)), _ => None }, "staged_version": match &self.update_stage { Stage::Ready { version, .. } => Some(version.clone()), _ => None }, "auto": self.settings.update_auto, "auto_allowed": self.auto_update_allowed(), "auto_on": self.auto_update_on(), "silent": self.update_silent, "fake": self.update_fake, "location_problem": match &self.update_stage { Stage::NeedsMove { reason, .. } => Some(format!("{reason:?}")), _ => None }, "confirm_jam": self.update_confirm_jam, "applying": self.update_applying, "restarting": self.restart_after_exit.is_some(), "retry": self.update_retry, "updated_from": self.updated_from, "resume_after_update": self.resume_after_update, "toast": self.updated_toast.as_ref().map(|t| t.version.clone()), "notes_open": self.notes_dialog.as_ref().map(|n| n.version.clone()), "failed_notice": self.update_failed.clone().filter(|_| self.update_failed_banner)});
+        // También aparte: lo que enseña el aviso ahora mismo (título y botones, del mismo
+        // `banner_view` que lo pinta) y si la versión en uso ya se dio por buena, que es cuando
+        // se borran el ejecutable anterior y los restos de 1.4–1.6.
+        update["view"] = self.control_update_view();
+        update["health_marked"] = json!(self.health_marked);
         json!({
             "version": crate::update::current_version(),
             "auth": auth,
@@ -1149,7 +1296,7 @@ impl App {
             "downloaded": self.downloaded,
             "downloading": self.downloading,
             "sleep": sleep,
-            "update": {"available": self.update.as_ref().map(|u| u.version.clone()), "banner": self.update_banner, "busy": self.update_busy, "note": self.update_note, "progress": self.update_progress.as_ref().map(|p| p.label()), "failed": matches!(self.update_progress, Some(InstallProgress::Failed(_)))},
+            "update": update,
             "invite_links": self.invite_links,
             "members": self.members.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>(),
             "home_feed": self.home_feed.iter().map(|s| json!({"id": s.id, "title": s.title, "items": s.items.len(), "first": s.items.first().map(|i| json!({"uri": i.uri, "title": i.title, "context": i.context}))})).collect::<Vec<_>>(),

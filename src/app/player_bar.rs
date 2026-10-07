@@ -42,8 +42,14 @@ impl App {
             }
         }
 
-        // Derecha: ajustes y perfil
-        let right_w = 110.0;
+        // Derecha: ajustes y perfil y, con una versión nueva lista, «Reiniciar para actualizar».
+        // Sigue a la vista aunque se cierre el aviso: es lo único que queda por hacer.
+        let ready = match &self.update_stage {
+            crate::update::Stage::Ready { version, .. } => Some(version.clone()),
+            _ => None,
+        };
+        let pill_text_w = ready.as_ref().map(|_| ui.painter().layout_no_wrap(UPDATE_PILL_TEXT.to_string(), theme::bold(13.0), Color32::BLACK).size().x);
+        let (right_w, pill) = top_right_layout(full.width(), pill_text_w);
         let right = Rect::from_min_max(pos2(full.max.x - right_w, full.min.y), full.max);
         {
             let mut r = child_in(ui, right.shrink2(vec2(10.0, 0.0)), Layout::right_to_left(Align::Center));
@@ -95,6 +101,12 @@ impl App {
                 self.draft = self.settings.clone();
                 self.go(Page::Settings);
             }
+            if let (Some(version), Some(pill)) = (ready, pill) {
+                if self.update_pill(&mut r, &version, pill).clicked() {
+                    // En una Jam, el aviso pide confirmarlo antes (se sale de ella).
+                    self.restart_to_update(false);
+                }
+            }
         }
 
         // Pestañas pegadas a la izquierda de la zona de contenido: Inicio, Buscar (que se
@@ -102,6 +114,8 @@ impl App {
         let center = Rect::from_min_max(pos2(left.max.x, full.min.y), pos2(right.min.x, full.max.y));
         let searching = page == Page::Search;
         let mut c = child_in(ui, center, Layout::left_to_right(Align::Center));
+        // Con muchas pestañas abiertas no se pintan encima de lo de la derecha.
+        c.set_clip_rect(center.intersect(c.clip_rect()));
         c.spacing_mut().item_spacing.x = 6.0;
         c.add_space(4.0);
         if Self::top_tab(&mut c, Icon::Home, "Inicio", self.active == super::ActiveTab::Home, 0.0, false).clicked() {
@@ -197,6 +211,38 @@ impl App {
             self.forward();
         }
         ui.allocate_rect(full, Sense::hover());
+    }
+
+    /// Píldora verde «Reiniciar para actualizar» de la barra superior (o solo su icono si no cabe).
+    /// Mientras se sustituye el ejecutable no se puede pulsar.
+    fn update_pill(&self, ui: &mut egui::Ui, version: &str, pill: UpdatePill) -> egui::Response {
+        let applying = self.update_applying || self.restart_after_exit.is_some();
+        let w = match pill {
+            UpdatePill::Full(w) => w,
+            UpdatePill::Icon => PILL_H,
+        };
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, PILL_H), if applying { Sense::hover() } else { Sense::click() });
+        let fill = if resp.hovered() && !applying { GREEN.lerp_to_gamma(Color32::WHITE, 0.12) } else { GREEN };
+        ui.painter().rect_filled(rect, CornerRadius::same((PILL_H / 2.0) as u8), fill);
+        match pill {
+            UpdatePill::Full(_) => {
+                let icon = Rect::from_center_size(pos2(rect.min.x + PILL_PAD + 9.0, rect.center().y), vec2(18.0, 18.0));
+                icons::paint(ui.painter(), icon, Color32::BLACK, Icon::Download);
+                ui.painter().text(pos2(icon.max.x + 6.0, rect.center().y), egui::Align2::LEFT_CENTER, UPDATE_PILL_TEXT, theme::bold(13.0), Color32::BLACK);
+            }
+            UpdatePill::Icon => icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), Color32::BLACK, Icon::Download),
+        }
+        if resp.hovered() && !applying {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let tip = if applying {
+            "Instalando la versión nueva…".to_string()
+        } else {
+            let tip = format!("Nanofy {version} está lista. La música seguirá donde estaba.");
+            // Solo el icono: el texto de la píldora pasa al globo.
+            if pill == UpdatePill::Icon { format!("{UPDATE_PILL_TEXT}. {tip}") } else { tip }
+        };
+        resp.on_hover_text(tip)
     }
 
     fn top_tab(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool, width: f32, closable: bool) -> egui::Response {
@@ -874,5 +920,67 @@ impl App {
                 Auth::LoggedIn { username } | Auth::Connecting { username } => username.clone(),
                 _ => String::new(),
             })
+    }
+}
+
+// ------------------------------------------------------------ píldora de actualización
+
+/// Texto de la píldora de la barra superior cuando hay una versión nueva lista.
+const UPDATE_PILL_TEXT: &str = "Reiniciar para actualizar";
+/// Alto de la píldora (el ancho de solo el icono) y margen a cada lado del contenido.
+const PILL_H: f32 = 32.0;
+const PILL_PAD: f32 = 14.0;
+/// Ancho de la zona de la derecha sin la píldora (ajustes y perfil).
+const TOP_RIGHT_W: f32 = 110.0;
+/// Lo que se deja como mínimo a las pestañas (Inicio, Buscar, atrás y adelante) antes de
+/// encoger la píldora a solo el icono.
+const TOP_TABS_MIN_W: f32 = 320.0;
+
+/// Cómo cabe la píldora: entera (con este ancho) o solo el icono.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UpdatePill {
+    Full(f32),
+    Icon,
+}
+
+/// Ancho de la zona de la derecha de la barra superior y cómo cabe en ella la píldora de
+/// «Reiniciar para actualizar». `full_w`: ancho de la barra; `pill_text_w`: ancho del texto de
+/// la píldora (`None`: no hay versión lista). Con la ventana estrecha o la interfaz ampliada
+/// queda solo el icono, para no quitarles el sitio a las pestañas ni montarse sobre el perfil.
+fn top_right_layout(full_w: f32, pill_text_w: Option<f32>) -> (f32, Option<UpdatePill>) {
+    let Some(text_w) = pill_text_w else {
+        return (TOP_RIGHT_W, None);
+    };
+    // Separación con el botón de ajustes (la de la fila).
+    let gap = 6.0;
+    let full = (PILL_PAD + 18.0 + 6.0 + text_w + PILL_PAD).ceil();
+    let tabs = full_w - SIDEBAR_W - (TOP_RIGHT_W + gap + full);
+    if tabs >= TOP_TABS_MIN_W {
+        (TOP_RIGHT_W + gap + full, Some(UpdatePill::Full(full)))
+    } else {
+        (TOP_RIGHT_W + gap + PILL_H, Some(UpdatePill::Icon))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pildora_de_actualizacion() {
+        // Sin versión lista, la zona de siempre.
+        assert_eq!(top_right_layout(1120.0, None), (TOP_RIGHT_W, None));
+        // Ventana normal: entera, y la zona crece justo lo que ocupa.
+        let (w, pill) = top_right_layout(1120.0, Some(160.0));
+        let Some(UpdatePill::Full(pw)) = pill else { panic!("{pill:?}") };
+        assert_eq!(w, TOP_RIGHT_W + 6.0 + pw);
+        assert!(pw >= 160.0 + 18.0 + 2.0 * PILL_PAD);
+        assert!(1120.0 - SIDEBAR_W - w >= TOP_TABS_MIN_W);
+        // Interfaz al 200 % (560 puntos de ancho) o la ventana mínima: solo el icono.
+        for full in [560.0, 760.0] {
+            let (w, pill) = top_right_layout(full, Some(160.0));
+            assert_eq!(pill, Some(UpdatePill::Icon), "{full}");
+            assert_eq!(w, TOP_RIGHT_W + 6.0 + PILL_H);
+        }
     }
 }

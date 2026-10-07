@@ -2689,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "nanofy"
-version = "1.6.0"
+version = "1.7.0"
 dependencies = [
  "base64 0.22.1",
  "directories",
@@ -2713,6 +2713,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sha2",
  "softbuffer",
  "souvlaki",
  "sysinfo 0.37.2",

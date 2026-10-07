@@ -32,7 +32,7 @@ impl App {
             let rect = Rect::from_min_max(pos2(x0 + 18.0, cy - 18.0), pos2(x0 + SIDEBAR_W - 20.0, cy + 18.0));
             let resp = ui.interact(rect, ui.id().with("top_library"), Sense::click());
             let color = st.color(page == Page::Library, resp.hovered());
-            icons::paint(ui.painter(), Rect::from_center_size(pos2(x0 + 41.5, cy), vec2(27.0, 27.0)), st.icon_of(color), Icon::Library);
+            icons::paint_side(ui.painter(), pos2(x0 + 41.5, cy), 27.0, st.icon_of(color), Icon::Library);
             let g = ui.painter().layout_no_wrap("Tu biblioteca".into(), theme::regular(TOP_FONT), color);
             text_on_baseline(ui.painter(), pos2(x0 + 72.0, cy + 6.0), g, color);
             if resp.hovered() {
@@ -343,12 +343,13 @@ impl App {
             let set: std::collections::HashSet<&str> = self.settings.pinned.iter().map(String::as_str).collect();
             (0..self.playlists.len()).filter(|&i| set.contains(self.playlists[i].id.as_str())).collect()
         };
-        let r = Self::side_row(ui, Icon::Pin, "Fijados", false, &st);
-        Self::side_chevron(ui, r.rect, self.sidebar_pins_open, st.icon_of(st.color(false, r.hovered())));
+        let r = Self::side_row(ui, Icon::Pin, "Fijados", false, self.sidebar_pins_open, &st);
+        Self::side_chevron(ui, r.rect, self.sidebar_pins_open, if r.hovered() { st.hover } else { st.icon });
         if r.clicked() {
             self.sidebar_pins_open = !self.sidebar_pins_open;
         }
         if self.sidebar_pins_open {
+            ui.add_space(SIDE_CHILD_BEFORE);
             if pinned.is_empty() {
                 let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), SIDE_CHILD_H), Sense::hover());
                 let g = ui.painter().layout_no_wrap("Fija playlists con el clic derecho".into(), theme::regular(12.5), p.faint);
@@ -364,11 +365,12 @@ impl App {
                 }
                 self.playlist_context_menu(&r, &pl);
             }
+            ui.add_space(SIDE_CHILD_AFTER);
         }
 
         // Playlists, con «+» (nueva playlist) al pasar el ratón.
-        let r = Self::side_row(ui, Icon::Playlist, "Playlists", false, &st);
-        Self::side_chevron(ui, r.rect, self.sidebar_playlists_open, st.icon_of(st.color(false, r.hovered())));
+        let r = Self::side_row(ui, Icon::Playlist, "Playlists", false, self.sidebar_playlists_open, &st);
+        Self::side_chevron(ui, r.rect, self.sidebar_playlists_open, if r.hovered() { st.hover } else { st.icon });
         {
             let plus = Rect::from_center_size(pos2(r.rect.min.x + 214.0, r.rect.center().y), vec2(26.0, 26.0));
             let pr = ui.interact(plus, ui.id().with("new_pl"), Sense::click());
@@ -383,13 +385,14 @@ impl App {
             pr.on_hover_text("Nueva playlist (Ctrl+N)");
         }
         if self.sidebar_playlists_open {
+            ui.add_space(SIDE_CHILD_BEFORE);
             // Sin copia (primer arranque): el hueco de las filas mientras llega el rootlist. Con
             // copia no hace falta aviso: se ve la lista y se sustituye al llegar.
             if self.signed_in() && !self.playlists_loaded && self.playlists.is_empty() {
-                Self::skeleton_rows(ui, 6, SIDE_CHILD_H, 18.0, 28.0);
+                Self::skeleton_rows(ui, 6, SIDE_CHILD_H, 16.0, 22.0);
             }
             // Debajo quedan 8 filas (Me gusta… Historial) y el aviso de estado.
-            let avail = (ui.available_height() - 8.0 * SIDE_ROW_H - 40.0).max(SIDE_CHILD_H * 2.0);
+            let avail = (ui.available_height() - 8.0 * SIDE_ROW_H - SIDE_CHILD_AFTER - 40.0).max(SIDE_CHILD_H * 2.0);
             // Solo las filas a la vista: con cientos de playlists, copiarlas y maquetarlas todas
             // costaba casi un milisegundo por fotograma en cualquier página.
             egui::ScrollArea::vertical()
@@ -411,6 +414,7 @@ impl App {
                         self.playlist_context_menu(&r, &pl);
                     }
                 });
+            ui.add_space(SIDE_CHILD_AFTER);
         }
 
         let items = [
@@ -424,7 +428,7 @@ impl App {
             (Icon::History, "Historial", Page::History),
         ];
         for (icon, label, pg) in items {
-            if Self::side_row(ui, icon, label, page == pg, &st).clicked() {
+            if Self::side_row(ui, icon, label, page == pg, false, &st).clicked() {
                 self.go(pg);
             }
         }
@@ -452,15 +456,16 @@ impl App {
         }
     }
 
-    /// Fila principal de la barra lateral: icono de 28 px centrado a 37 px del borde y el texto a
-    /// 67 px, con la línea base 7 px por debajo del centro.
-    fn side_row(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool, st: &TopStyle) -> egui::Response {
+    /// Fila principal de la barra lateral: icono de 28 px (la copia exacta de la referencia)
+    /// centrado a 37 px del borde y el texto a 67 px, con la línea base 7 px por debajo del
+    /// centro. `open`: sección desplegada (el texto se aclara; el icono no).
+    fn side_row(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool, open: bool, st: &TopStyle) -> egui::Response {
         let w = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(vec2(w, SIDE_ROW_H), Sense::click());
         let color = st.color(selected, resp.hovered());
+        let (color, icon_color) = if open && color == st.text { (st.open, st.icon) } else { (color, st.icon_of(color)) };
         let c = rect.center().y;
-        let (side, dx, dy) = side_icon_fit(icon);
-        icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.min.x + 37.0 + dx, c + dy), vec2(side, side)), st.icon_of(color), icon);
+        icons::paint_side(ui.painter(), pos2(rect.min.x + 37.0, c), SIDE_ICON, icon_color, icon);
         let g = galley_truncated(ui.painter(), text, theme::regular(SIDE_FONT), color, (w - 67.0 - 44.0).max(20.0));
         text_on_baseline(ui.painter(), pos2(rect.min.x + 67.0, c + 7.0), g, color);
         if resp.hovered() {
@@ -469,14 +474,16 @@ impl App {
         resp
     }
 
-    /// Playlist dentro de Fijados o Playlists desplegados: fila de 40 px, más metida.
+    /// Playlist dentro de Fijados o Playlists desplegados (como en la referencia): fila de 34 px,
+    /// icono de 16 px a 38,5 del borde y el texto, algo más apagado, a 59.
     fn side_child(ui: &mut egui::Ui, text: &str, selected: bool, st: &TopStyle) -> egui::Response {
         let w = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(vec2(w, SIDE_CHILD_H), Sense::click());
-        let color = st.color(selected, resp.hovered());
+        let color = if selected || resp.hovered() { st.color(selected, resp.hovered()) } else { st.child };
+        let icon_color = if color == st.child { st.icon } else { color };
         let c = rect.center().y;
-        icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.min.x + 60.0, c), vec2(22.0, 22.0)), st.icon_of(color), Icon::PlaylistItem);
-        let g = galley_truncated(ui.painter(), text, theme::regular(SIDE_CHILD_FONT), color, (w - SIDE_CHILD_TEXT_X - 24.0).max(20.0));
+        icons::paint_side(ui.painter(), pos2(rect.min.x + 38.5, c - 1.0), 16.0, icon_color, Icon::PlaylistItem);
+        let g = galley_truncated(ui.painter(), text, theme::regular(SIDE_FONT), color, (w - SIDE_CHILD_TEXT_X - 24.0).max(20.0));
         text_on_baseline(ui.painter(), pos2(rect.min.x + SIDE_CHILD_TEXT_X, c + 5.0), g, color);
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -484,15 +491,11 @@ impl App {
         resp
     }
 
-    /// «›» (plegado) o «⌄» (desplegado) a 245,5 px del borde, de 9 × 14 px.
+    /// «›» (plegado) o «⌄» (desplegado) a 245,5 px del borde, copiados de la referencia.
     fn side_chevron(ui: &mut egui::Ui, rect: Rect, open: bool, color: Color32) {
         let c = pos2(rect.min.x + 245.5, rect.center().y + 1.0);
-        let pts = if open {
-            vec![pos2(c.x - 6.5, c.y - 3.0), pos2(c.x, c.y + 3.5), pos2(c.x + 6.5, c.y - 3.0)]
-        } else {
-            vec![pos2(c.x - 3.0, c.y - 6.5), pos2(c.x + 3.5, c.y), pos2(c.x - 3.0, c.y + 6.5)]
-        };
-        ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(2.0, color)));
+        let icon = if open { Icon::ChevronDown } else { Icon::ChevronRight };
+        icons::paint_side(ui.painter(), c, 16.0, color, icon);
     }
 
     fn playlist_context_menu(&mut self, r: &egui::Response, pl: &Playlist) {
@@ -1487,22 +1490,13 @@ const SIDE_FIRST_CENTER: f32 = 30.0;
 const SIDE_ROW_H: f32 = 51.5;
 const SIDE_ICON: f32 = 28.0;
 const SIDE_FONT: f32 = 14.5;
-/// Filas de las playlists desplegadas: alto, texto y dónde empieza.
-const SIDE_CHILD_H: f32 = 40.0;
-const SIDE_CHILD_FONT: f32 = 14.0;
-const SIDE_CHILD_TEXT_X: f32 = 80.0;
-
-/// Lado y desplazamiento (x, y) de cada icono de la barra lateral para que su tinta caiga donde
-/// en la referencia (sus dibujos no ocupan el cuadro igual).
-fn side_icon_fit(icon: Icon) -> (f32, f32, f32) {
-    match icon {
-        Icon::Pin => (30.0, 0.0, 1.5),
-        Icon::Heart => (SIDE_ICON, 0.5, 2.0),
-        Icon::Album => (SIDE_ICON, -1.0, 0.5),
-        Icon::Podcast => (30.0, 1.0, -0.5),
-        _ => (SIDE_ICON, 0.0, 0.0),
-    }
-}
+/// Filas de las playlists desplegadas (2.png): alto, dónde empieza el texto y el hueco antes de
+/// la primera y después de la última (la primera, 47 px bajo el centro de su sección; la fila
+/// siguiente, 53,5 bajo la última).
+const SIDE_CHILD_H: f32 = 34.0;
+const SIDE_CHILD_TEXT_X: f32 = 59.0;
+const SIDE_CHILD_BEFORE: f32 = 47.0 - SIDE_ROW_H / 2.0 - SIDE_CHILD_H / 2.0;
+const SIDE_CHILD_AFTER: f32 = 53.5 - SIDE_ROW_H / 2.0 - SIDE_CHILD_H / 2.0;
 
 /// Colores de la barra superior y la lateral: iconos y texto grises, más claros al pasar el
 /// ratón, y blancos en la página abierta.
@@ -1511,14 +1505,24 @@ struct TopStyle {
     text: Color32,
     hover: Color32,
     active: Color32,
+    /// Texto de una sección desplegada y de las playlists de su lista.
+    open: Color32,
+    child: Color32,
 }
 
 impl TopStyle {
     fn new(p: &theme::Palette) -> Self {
         if p.dark {
-            Self { icon: Color32::from_gray(143), text: Color32::from_gray(130), hover: Color32::from_gray(205), active: p.text }
+            Self {
+                icon: Color32::from_gray(143),
+                text: Color32::from_gray(130),
+                hover: Color32::from_gray(205),
+                active: p.text,
+                open: Color32::from_gray(189),
+                child: Color32::from_gray(118),
+            }
         } else {
-            Self { icon: p.weak, text: p.weak, hover: p.text, active: p.text }
+            Self { icon: p.weak, text: p.weak, hover: p.text, active: p.text, open: p.text, child: p.weak }
         }
     }
 

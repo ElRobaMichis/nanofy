@@ -835,6 +835,12 @@ impl App {
                 }
                 ok()
             }
+            // Desplegar o plegar Fijados y Playlists en la barra lateral.
+            "sidebar_sections" => {
+                self.sidebar_pins_open = b(cmd, "pins", self.sidebar_pins_open);
+                self.sidebar_playlists_open = b(cmd, "playlists", self.sidebar_playlists_open);
+                ok()
+            }
             "miniplayer" => {
                 let want = b(cmd, "on", !self.miniplayer);
                 if want != self.miniplayer {

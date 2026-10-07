@@ -9,6 +9,8 @@ use std::f32::consts::PI;
 
 use egui::{pos2, vec2, Color32, ColorImage, Pos2, Rect, Sense, TextureHandle, TextureOptions, Vec2};
 
+use super::icon_masks::{self, Mask};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Icon {
     Home,
@@ -94,6 +96,9 @@ pub enum Icon {
     Trash,
     Edit,
     Keyboard,
+    /// «›» y «⌄» de las secciones plegables de la barra lateral.
+    ChevronRight,
+    ChevronDown,
 }
 
 /// Grosor del trazo en unidades de la rejilla de 24.
@@ -343,9 +348,16 @@ fn build(icon: Icon, d: &mut Draw) {
             d.line(needle[0], needle[1]);
         }
         Icon::Playlist => {
-            d.rrect((3.5, 3.5), (20.5, 20.5), 4.5);
-            d.line((4.0, 7.8), (20.0, 7.8));
-            d.note(13.0, 10.6, 15.6);
+            // Copiado de la referencia (rejilla de 28): la tarjeta de atrás asoma por arriba y la de
+            // delante lleva una nota de trazo fino.
+            d.grid = BAR_GRID;
+            d.sw = 2.0;
+            d.stroke(rounded_each(&[(7.0, 5.2), (7.0, 2.6), (21.4, 2.6), (21.4, 5.2)], &[0.0, 1.5, 1.5, 0.0], false));
+            d.rrect((4.0, 6.0), (24.0, 25.6), 3.0);
+            d.sw = 1.4;
+            d.line((14.5, 10.6), (14.5, 18.9));
+            d.line((14.5, 10.6), (16.8, 10.9));
+            d.ring((12.9, 18.9), 1.6);
         }
         Icon::PlaylistItem => {
             d.rrect((4.0, 4.0), (20.0, 20.0), 4.5);
@@ -718,6 +730,8 @@ fn build(icon: Icon, d: &mut Draw) {
             }
             d.line((8.0, 14.4), (16.0, 14.4));
         }
+        Icon::ChevronRight => d.poly(&[(9.5, 5.5), (15.0, 12.0), (9.5, 18.5)]),
+        Icon::ChevronDown => d.poly(&[(5.5, 9.5), (12.0, 15.0), (18.5, 9.5)]),
         Icon::Hourglass => {
             d.line((6.0, 3.5), (18.0, 3.5));
             d.line((6.0, 20.5), (18.0, 20.5));
@@ -834,6 +848,96 @@ fn texture(ctx: &egui::Context, icon: Icon, px: u16) -> egui::TextureId {
     id
 }
 
+// ------------------------------------------------------------ copias exactas de la referencia
+
+/// Máscara copiada de la referencia de diseño para un icono de la barra lateral, si la hay.
+fn side_mask(icon: Icon) -> Option<&'static Mask> {
+    Some(match icon {
+        Icon::Pin => &icon_masks::PIN,
+        Icon::Playlist => &icon_masks::PLAYLIST,
+        Icon::PlaylistItem => &icon_masks::PLAYLIST_ITEM,
+        Icon::Heart => &icon_masks::HEART,
+        Icon::Bookmark => &icon_masks::BOOKMARK,
+        Icon::Album => &icon_masks::ALBUM,
+        Icon::Folder => &icon_masks::FOLDER,
+        Icon::Podcast => &icon_masks::PODCAST,
+        Icon::Book => &icon_masks::BOOK,
+        Icon::Artist => &icon_masks::ARTIST,
+        Icon::Library => &icon_masks::LIBRARY,
+        Icon::ChevronRight => &icon_masks::CHEVRON_RIGHT,
+        Icon::ChevronDown => &icon_masks::CHEVRON_DOWN,
+        _ => return None,
+    })
+}
+
+thread_local! {
+    /// Máscaras ya pasadas a textura, por icono y ancho en píxeles.
+    static MASKS: RefCell<HashMap<(Icon, u16), TextureHandle>> = RefCell::new(HashMap::new());
+}
+
+/// Textura de la máscara de `icon` a `w`×`h` píxeles: tal cual a su tamaño; reescalada (bilineal)
+/// si la interfaz está ampliada o reducida.
+fn mask_texture(ctx: &egui::Context, icon: Icon, m: &Mask, w: usize, h: usize) -> egui::TextureId {
+    if let Some(id) = MASKS.with(|c| c.borrow().get(&(icon, w as u16)).map(TextureHandle::id)) {
+        return id;
+    }
+    let at = |x: isize, y: isize| -> f32 {
+        if x < 0 || y < 0 || x >= m.w as isize || y >= m.h as isize {
+            0.0
+        } else {
+            m.alpha[y as usize * m.w + x as usize] as f32
+        }
+    };
+    let (kx, ky) = (w as f32 / m.w as f32, h as f32 / m.h as f32);
+    let mut pixels = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let a = if w == m.w && h == m.h {
+                m.alpha[y * m.w + x] as f32
+            } else {
+                let sx = (x as f32 + 0.5) / kx - 0.5;
+                let sy = (y as f32 + 0.5) / ky - 0.5;
+                let (x0, y0) = (sx.floor(), sy.floor());
+                let (fx, fy) = (sx - x0, sy - y0);
+                let (x0, y0) = (x0 as isize, y0 as isize);
+                let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+                let bottom = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+                top * (1.0 - fy) + bottom * fy
+            };
+            pixels.push(Color32::from_white_alpha(a.round().clamp(0.0, 255.0) as u8));
+        }
+    }
+    let tex = ctx.load_texture(format!("icono-ref-{icon:?}-{w}"), ColorImage::new([w, h], pixels), TextureOptions::NEAREST);
+    let id = tex.id();
+    MASKS.with(|c| {
+        c.borrow_mut().insert((icon, w as u16), tex);
+    });
+    id
+}
+
+/// Icono de la barra lateral en su cuadro de `side` puntos centrado en `c`: la copia exacta de la
+/// referencia de diseño (píxel a píxel a escala 1) si la hay; si no, o con la interfaz muy
+/// ampliada o reducida, el dibujo vectorial.
+pub fn paint_side(painter: &egui::Painter, c: Pos2, side: f32, color: Color32, icon: Icon) {
+    let ppp = painter.pixels_per_point();
+    let px = (side * ppp).round();
+    let Some(m) = side_mask(icon).filter(|m| (0.74..=2.6).contains(&(px / m.native))) else {
+        return paint(painter, Rect::from_center_size(c, Vec2::splat(side)), color, icon);
+    };
+    if color.a() == 0 {
+        return;
+    }
+    let k = px / m.native;
+    // La esquina del cuadro, como en `paint`: así la máscara cae donde se recortó.
+    let bx = (c.x * ppp - px / 2.0).round();
+    let by = (c.y * ppp - px / 2.0).round();
+    let pad = (m.pad * k).round();
+    let (w, h) = ((m.w as f32 * k).round() as usize, (m.h as f32 * k).round() as usize);
+    let tex = mask_texture(painter.ctx(), icon, m, w, h);
+    let r = Rect::from_min_size(pos2((bx - pad) / ppp, (by - pad) / ppp), vec2(w as f32 / ppp, h as f32 / ppp));
+    painter.image(tex, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), color);
+}
+
 /// Dibuja el icono dentro de `rect` (se usa el cuadrado inscrito), del color `color`.
 pub fn paint(painter: &egui::Painter, rect: Rect, color: Color32, icon: Icon) {
     let side = rect.width().min(rect.height());
@@ -907,7 +1011,8 @@ mod tests {
         Icon::People, Icon::Share, Icon::Hourglass, Icon::Download, Icon::Minus, Icon::PlusCircle,
         Icon::Bookmark, Icon::BookmarkFilled, Icon::Sort, Icon::Filter, Icon::Episode, Icon::Sliders, Icon::Eye,
         Icon::EyeOff, Icon::DragHandle, Icon::Folder, Icon::Book, Icon::Radio, Icon::Clock, Icon::Fullscreen,
-        Icon::Miniplayer, Icon::NewTab, Icon::Trash, Icon::Edit, Icon::Keyboard,
+        Icon::Miniplayer, Icon::NewTab, Icon::Trash, Icon::Edit, Icon::Keyboard, Icon::ChevronRight,
+        Icon::ChevronDown,
     ];
 
     /// Todos se ven (tienen tinta) y caben en su cuadro: el marco exterior queda casi vacío, así

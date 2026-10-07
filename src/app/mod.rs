@@ -6,6 +6,7 @@
 
 mod artist;
 pub mod control;
+mod icon_masks;
 mod icons;
 mod pages;
 mod panels;

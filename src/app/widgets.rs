@@ -389,7 +389,7 @@ impl App {
         let color = if selected { p.text } else { p.weak.lerp_to_gamma(p.text, 0.45) };
         let mut x = rect.min.x + 12.0 + indent;
         if let Some(icon) = icon {
-            let icon_rect = Rect::from_center_size(pos2(x + 9.0, rect.center().y), vec2(18.0, 18.0));
+            let icon_rect = Rect::from_center_size(pos2(x + 10.0, rect.center().y), vec2(20.0, 20.0));
             icons::paint(ui.painter(), icon_rect, color, icon);
             x = icon_rect.max.x + 12.0;
         }
@@ -623,7 +623,7 @@ impl App {
                 self.actions.push(Action::Play(target(true)));
             }
             extra(self, ui);
-            if icons::button(ui, Icon::Queue, 34.0, p.weak).on_hover_text("Añadir a la cola").clicked() {
+            if icons::button(ui, Icon::AddToQueue, 34.0, p.weak).on_hover_text("Añadir a la cola").clicked() {
                 for t in all {
                     self.actions.push(Action::AddToQueue(t.uri.clone()));
                 }

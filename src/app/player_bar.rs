@@ -27,7 +27,7 @@ impl App {
             let mut l = child_in(ui, left.shrink2(vec2(14.0, 0.0)), Layout::left_to_right(Align::Center));
             let r = l.allocate_response(vec2(l.available_width(), 34.0), Sense::click());
             let color = if page == Page::Library { p.text } else { p.weak.lerp_to_gamma(p.text, 0.5) };
-            icons::paint(l.painter(), Rect::from_center_size(pos2(r.rect.min.x + 12.0, r.rect.center().y), vec2(18.0, 18.0)), color, Icon::Library);
+            icons::paint(l.painter(), Rect::from_center_size(pos2(r.rect.min.x + 12.0, r.rect.center().y), vec2(20.0, 20.0)), color, Icon::Library);
             l.painter().text(
                 pos2(r.rect.min.x + 32.0, r.rect.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -279,12 +279,12 @@ impl App {
             Page::Liked => (Icon::Heart, "Canciones que te gustan".into()),
             Page::Albums => (Icon::Album, "Álbumes".into()),
             Page::Saves => (Icon::Bookmark, "Guardados".into()),
-            Page::Shows => (Icon::Lyrics, "Podcasts".into()),
+            Page::Shows => (Icon::Podcast, "Podcasts".into()),
             Page::Audiobooks => (Icon::Book, "Audiolibros".into()),
             Page::Folders => (Icon::Folder, "Carpetas".into()),
             Page::Artists => (Icon::Artist, "Artistas".into()),
             Page::Settings => (Icon::Settings, "Ajustes".into()),
-            Page::Show(id) => (Icon::Lyrics, self.shows.get(id).map(|s| s.0.name.clone()).unwrap_or_else(|| "Podcast".into())),
+            Page::Show(id) => (Icon::Podcast, self.shows.get(id).map(|s| s.0.name.clone()).unwrap_or_else(|| "Podcast".into())),
             Page::Playlist(id) => (
                 Icon::Playlist,
                 self.playlists
@@ -306,7 +306,7 @@ impl App {
                     .unwrap_or_else(|| "Artista".into()),
             ),
             Page::User(id) => (
-                Icon::Artist,
+                Icon::Person,
                 self.users.get(id).map(|u| u.name().to_string()).unwrap_or_else(|| "Perfil".into()),
             ),
         }
@@ -345,7 +345,7 @@ impl App {
                 // Copia solo de las fijadas (pocas): el menú contextual necesita `&mut self`.
                 let pl = self.playlists[i].clone();
                 let sel = matches!(&page, Page::Playlist(id) if *id == pl.id);
-                let r = Self::nav_item(ui, Some(Icon::Playlist), &pl.name, sel, 24.0);
+                let r = Self::nav_item(ui, Some(Icon::PlaylistItem), &pl.name, sel, 24.0);
                 if r.clicked() {
                     self.go(Page::Playlist(pl.id.clone()));
                 }
@@ -394,7 +394,7 @@ impl App {
                         let key = ui.id().with(("sb_pl", i, &pl.id));
                         let r = ui
                             .scope_builder(UiBuilder::new().id(key), |ui| {
-                                Self::nav_item(ui, Some(Icon::Playlist), &pl.name, sel, 24.0)
+                                Self::nav_item(ui, Some(Icon::PlaylistItem), &pl.name, sel, 24.0)
                             })
                             .inner;
                         if r.clicked() {
@@ -411,7 +411,7 @@ impl App {
             (Icon::Bookmark, "Guardados", Page::Saves),
             (Icon::Album, "Álbumes", Page::Albums),
             (Icon::Folder, "Carpetas", Page::Folders),
-            (Icon::Lyrics, "Podcasts", Page::Shows),
+            (Icon::Podcast, "Podcasts", Page::Shows),
             (Icon::Book, "Audiolibros", Page::Audiobooks),
             (Icon::History, "Historial", Page::History),
         ];
@@ -501,125 +501,160 @@ impl App {
 
     // -------------------------------------------------------------- reproductor
 
+    /// Reproductor de abajo, copia de la referencia de diseño (barra de 1491 × 80 px): a la
+    /// izquierda los mandos, el tiempo, el progreso y el altavoz; en medio la portada con título,
+    /// artista y álbum; a la derecha corazón, playlist, letra, dispositivos, más | Jam y cola.
+    /// Todo va en posiciones fijas medidas desde los bordes (`bar_layout`); solo el progreso y el
+    /// texto cambian de ancho con la ventana.
     pub fn player_bar(&mut self, ui: &mut egui::Ui) {
-        let p = theme::palette(ui.ctx());
         let full = ui.available_rect_before_wrap();
-        // Fondo dinámico: color de la portada al reproducir, gris en pausa (con transición).
-        let playing = self.player.state == PlayState::Playing;
-        let target = if playing {
-            self.player
-                .now
-                .as_ref()
-                .and_then(|n| n.cover_url.as_deref())
-                .and_then(|u| self.images.color(u, p.dark))
-                .unwrap_or(p.card)
+        let st = BarStyle::new(ui);
+        ui.painter().rect_filled(full, CornerRadius::same(BAR_RADIUS), st.bg);
+        let lay = bar_layout(full.width());
+        // Centro vertical de los mandos: un píxel por debajo del centro de la barra.
+        let cy = full.center().y + 1.0;
+        let x0 = full.min.x;
+        let xr = full.max.x;
+        // Cajas de 28 px de los iconos: esquina superior izquierda (la de la referencia).
+        let boxed = |x: f32, dy: f32| Rect::from_min_size(pos2(x, cy - 14.0 + dy), vec2(BOX, BOX));
+
+        // ---- transporte
+        self.play_button(ui, pos2(x0 + 40.0, cy), &st);
+        if lay.shuffle_repeat {
+            let episode = self.player.now.as_ref().is_some_and(|n| n.uri.starts_with("spotify:episode:"));
+            if self.bar_icon(ui, boxed(x0 + 69.0, 0.0), Icon::Prev, st.icon, "Anterior (Ctrl+←)").clicked() {
+                self.prev();
+            }
+            if self.bar_icon(ui, boxed(x0 + 111.0, 0.0), Icon::Next, st.icon, "Siguiente (Ctrl+→)").clicked() {
+                self.next();
+            }
+            if episode {
+                // En un episodio, como en Spotify: 15 s atrás y adelante en lugar de aleatorio y repetir.
+                if self.bar_icon(ui, boxed(x0 + 154.0, 0.0), Icon::Replay15, st.icon, "Retroceder 15 s").clicked() {
+                    self.seek_by(-15_000);
+                }
+                if self.bar_icon(ui, boxed(x0 + 197.0, 0.0), Icon::Forward15, st.icon, "Avanzar 15 s").clicked() {
+                    self.seek_by(15_000);
+                }
+            } else {
+                let shuffle = if self.player.shuffle { GREEN } else { st.icon };
+                if self.bar_icon(ui, boxed(x0 + 154.0, 0.0), Icon::Shuffle, shuffle, "Aleatorio (S)").clicked() {
+                    self.toggle_shuffle();
+                }
+                let (rep_icon, rep_color) = match self.player.repeat {
+                    Repeat::Off => (Icon::Repeat, st.icon),
+                    Repeat::Context => (Icon::Repeat, GREEN),
+                    Repeat::Track => (Icon::RepeatOne, GREEN),
+                };
+                if self.bar_icon(ui, boxed(x0 + 197.0, 1.0), rep_icon, rep_color, "Repetir (R)").clicked() {
+                    self.cycle_repeat();
+                }
+            }
         } else {
-            p.card2
-        };
-        let anim = |ui: &egui::Ui, k: u8, v: u8| ui.ctx().animate_value_with_time(egui::Id::new(("player_bg", k)), v as f32, 0.6);
-        let bg = Color32::from_rgb(anim(ui, 0, target.r()) as u8, anim(ui, 1, target.g()) as u8, anim(ui, 2, target.b()) as u8);
-        ui.painter().rect_filled(full, CornerRadius::same(14), bg);
-        ui.painter().rect_stroke(full, CornerRadius::same(14), egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
-        let inner = full.shrink2(vec2(14.0, 8.0));
-        let w = inner.width();
-        let wide = w >= 1100.0;
+            if self.bar_icon(ui, boxed(x0 + 69.0, 0.0), Icon::Prev, st.icon, "Anterior (Ctrl+←)").clicked() {
+                self.prev();
+            }
+            if self.bar_icon(ui, boxed(x0 + 111.0, 0.0), Icon::Next, st.icon, "Siguiente (Ctrl+→)").clicked() {
+                self.next();
+            }
+        }
 
-        // Etiqueta de calidad: solo con la canción sonando aquí (no en otro dispositivo).
-        let badge_w = match self.player.local_audio() {
-            Some(a) => ui.painter().layout_no_wrap(a.badge(), theme::regular(BADGE_FONT), p.weak).size().x + 2.0 * BADGE_PAD + 4.0,
-            None => 0.0,
-        };
-        let BarWidths { vol_zone, transport_w, times_w, vol_w, text_w, actions_w, wave_w, badge } = bar_widths(w, badge_w);
-        let now_w = 46.0 + 10.0 + text_w;
+        // ---- tiempo y progreso
+        let px0 = x0 + lay.prog_x;
+        let px1 = px0 + lay.prog_w;
+        let dur = self.player.now.as_ref().map(|n| n.duration_ms).unwrap_or(0);
+        let pos = self.seek_drag.unwrap_or_else(|| self.player.position());
+        let painter = ui.painter().clone();
+        let time = theme::regular(TIME_FONT);
+        let left = painter.layout_no_wrap(fmt_ms(pos), time.clone(), st.dim);
+        let lw = left.size().x;
+        text_on_baseline(&painter, pos2(px0 - 8.0 - lw, cy + 5.0), left, st.dim);
+        if lay.tail {
+            let right = painter.layout_no_wrap(fmt_ms(dur), time, st.dim);
+            text_on_baseline(&painter, pos2(px1 + 9.0, cy + 5.0), right, st.dim);
+        }
+        self.progress_line(ui, Rect::from_min_max(pos2(px0, cy - 10.0), pos2(px1, cy + 8.0)), cy - 0.75, dur, pos, &st);
 
-        let h = inner.height();
-        let seg = |x0: f32, width: f32| Rect::from_min_size(pos2(x0, inner.min.y), vec2(width, h));
-        let mut x = inner.min.x;
-        let transport = seg(x, transport_w);
-        x += transport_w;
-        let times_wave = seg(x, times_w + wave_w);
-        x += times_w + wave_w;
-        let vol = seg(x, vol_w);
-        x += vol_w + 12.0;
-        let now = seg(x, now_w);
-        let actions = Rect::from_min_max(pos2(inner.max.x - actions_w, inner.min.y), inner.max);
+        // ---- volumen: el altavoz; la línea de volumen sale al pasar por encima
+        if lay.tail {
+            self.volume_button(ui, boxed(px1 + 54.0, 0.0), &st);
+        }
 
-        let mut t = child_in(ui, transport, Layout::left_to_right(Align::Center));
-        self.transport_widget(&mut t);
-        let mut tw = child_in(ui, times_wave, Layout::left_to_right(Align::Center));
-        self.progress_widget(&mut tw, wave_w);
-        let mut v = child_in(ui, vol, Layout::left_to_right(Align::Center));
-        self.volume_widget(&mut v, vol_zone);
-        let mut n = child_in(ui, now, Layout::left_to_right(Align::Center));
-        self.now_playing_widget(&mut n, text_w, wide);
-        let mut a = child_in(ui, actions, Layout::right_to_left(Align::Center));
-        self.player_actions_widget(&mut a, actions_w, badge);
+        // ---- portada, título, artista y álbum
+        if lay.cover {
+            let cover_x = x0 + lay.cover_x();
+            let text_x = x0 + lay.text_x();
+            let text_w = (xr - lay.right_w - 12.0 - text_x).max(40.0);
+            self.now_playing_block(ui, Rect::from_min_size(pos2(cover_x, cy - 26.0), vec2(COVER, COVER)), text_x, text_w, cy, &st);
+        }
+
+        // ---- derecha
+        self.bar_actions(ui, xr, cy, &lay, &st);
         ui.allocate_rect(full, Sense::hover());
     }
 
-    fn transport_widget(&mut self, ui: &mut egui::Ui) {
-        let p = theme::palette(ui.ctx());
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let (icon, fill) = match self.player.state {
-            PlayState::Playing => (Icon::Pause, GREEN),
-            PlayState::Loading => (Icon::Hourglass, p.card2),
-            _ => (Icon::Play, GREEN),
-        };
-        let fg = if self.player.state == PlayState::Loading { p.weak } else { Color32::BLACK };
-        if icons::round_button(ui, icon, 38.0, fill, fg).on_hover_text("Reproducir / pausar (Espacio)").clicked() {
+    /// Botón verde de reproducir / pausar (círculo de 39 px con un aro oscuro).
+    fn play_button(&mut self, ui: &mut egui::Ui, c: egui::Pos2, st: &BarStyle) {
+        let rect = Rect::from_center_size(c, vec2(42.0, 42.0));
+        let resp = ui.interact(rect, ui.id().with("bar_play"), Sense::click()).on_hover_text("Reproducir / pausar (Espacio)");
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let loading = self.player.state == PlayState::Loading;
+        let fill = if loading { st.loading } else { GREEN };
+        let fill = if resp.hovered() { fill.lerp_to_gamma(Color32::WHITE, 0.12) } else { fill };
+        let painter = ui.painter();
+        // Aro oscuro, más grueso arriba (sombra), y un brillo claro por dentro abajo.
+        painter.circle_filled(c, 20.8, st.play_ring);
+        painter.circle_filled(pos2(c.x, c.y - 0.8), 20.6, st.play_ring);
+        painter.circle_filled(pos2(c.x, c.y + 0.6), 19.4, fill.lerp_to_gamma(Color32::WHITE, 0.35));
+        painter.circle_filled(c, 19.3, fill);
+        match self.player.state {
+            PlayState::Playing => {
+                for dx in [-3.5, 3.5] {
+                    let bar = Rect::from_center_size(pos2(c.x + dx, c.y - 0.3), vec2(2.6, 11.6));
+                    painter.rect_filled(bar, CornerRadius::same(1), Color32::BLACK);
+                }
+            }
+            PlayState::Loading => icons::paint(painter, Rect::from_center_size(c, vec2(18.0, 18.0)), st.icon, Icon::Hourglass),
+            _ => icons::paint(painter, Rect::from_center_size(pos2(c.x + 1.0, c.y), vec2(20.0, 20.0)), Color32::BLACK, Icon::Play),
+        }
+        if resp.clicked() {
             self.play_pause();
         }
-        if icons::button(ui, Icon::Prev, 30.0, p.text).on_hover_text("Anterior (Ctrl+←)").clicked() {
-            self.prev();
-        }
-        if icons::button(ui, Icon::Next, 30.0, p.text).on_hover_text("Siguiente (Ctrl+→)").clicked() {
-            self.next();
-        }
-        let shuffle_color = if self.player.shuffle { GREEN } else { p.weak };
-        if icons::button(ui, Icon::Shuffle, 30.0, shuffle_color).on_hover_text("Aleatorio (S)").clicked() {
-            self.toggle_shuffle();
-        }
-        let (rep_icon, rep_color) = match self.player.repeat {
-            Repeat::Off => (Icon::Repeat, p.weak),
-            Repeat::Context => (Icon::Repeat, GREEN),
-            Repeat::Track => (Icon::RepeatOne, GREEN),
+    }
+
+    /// Icono del reproductor en su caja de 28 px; al pasar el ratón se aclara.
+    fn bar_icon(&mut self, ui: &mut egui::Ui, rect: Rect, icon: Icon, color: Color32, tip: &str) -> egui::Response {
+        let resp = ui.interact(rect, ui.id().with(("bar_icon", rect.min.x as i32, icon)), Sense::click()).on_hover_text(tip);
+        let color = if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            color.lerp_to_gamma(Color32::WHITE, 0.45)
+        } else {
+            color
         };
-        if icons::button(ui, rep_icon, 30.0, rep_color).on_hover_text("Repetir (R)").clicked() {
-            self.cycle_repeat();
-        }
+        icons::paint(ui.painter(), rect, color, icon);
+        resp
     }
 
-    /// Tiempo transcurrido, forma de onda con la posición y duración total.
-    fn progress_widget(&mut self, ui: &mut egui::Ui, wave_w: f32) {
-        let p = theme::palette(ui.ctx());
-        ui.spacing_mut().item_spacing.x = 0.0;
-        let dur = self.player.now.as_ref().map(|n| n.duration_ms).unwrap_or(0);
-        let pos = self.seek_drag.unwrap_or_else(|| self.player.position());
-        let (lr, _) = ui.allocate_exact_size(vec2(42.0, 24.0), Sense::hover());
-        ui.painter().text(pos2(lr.max.x - 6.0, lr.center().y), egui::Align2::RIGHT_CENTER, fmt_ms(pos), theme::regular(12.0), p.weak);
-        let (wr, _) = ui.allocate_exact_size(vec2(wave_w, 30.0), Sense::hover());
-        self.progress_line(ui, wr, dur, pos);
-        let (rr, _) = ui.allocate_exact_size(vec2(42.0, 24.0), Sense::hover());
-        ui.painter().text(pos2(rr.min.x + 6.0, rr.center().y), egui::Align2::LEFT_CENTER, fmt_ms(dur), theme::regular(12.0), p.weak);
-    }
-
-    /// Línea de progreso: gris con lo reproducido en blanco; al acercar el ratón aparece la
-    /// bolita. Clic o arrastre para saltar.
-    fn progress_line(&mut self, ui: &mut egui::Ui, rect: Rect, dur: u32, pos: u32) {
-        let p = theme::palette(ui.ctx());
-        let resp = ui.interact(rect, ui.id().with("progress"), Sense::click_and_drag());
+    /// Línea de progreso: lo pendiente en gris oscuro, lo reproducido claro con una sombra
+    /// debajo; al acercar el ratón aparece la bolita. Clic o arrastre para saltar.
+    fn progress_line(&mut self, ui: &mut egui::Ui, zone: Rect, y: f32, dur: u32, pos: u32, st: &BarStyle) {
+        let resp = ui.interact(zone, ui.id().with("progress"), Sense::click_and_drag());
         let near = resp.hovered() || resp.dragged() || resp.is_pointer_button_down_on();
         let frac = if dur > 0 { (pos as f32 / dur as f32).clamp(0.0, 1.0) } else { 0.0 };
-        let y = rect.center().y;
-        let x0 = rect.min.x + 6.0;
-        let x1 = rect.max.x - 6.0;
+        let (x0, x1) = (zone.min.x, zone.max.x);
         let xp = x0 + (x1 - x0) * frac;
         let painter = ui.painter();
-        painter.line_segment([pos2(x0, y), pos2(x1, y)], egui::Stroke::new(3.0, p.weak.gamma_multiply(0.45)));
-        painter.line_segment([pos2(x0, y), pos2(xp, y)], egui::Stroke::new(3.0, p.text));
+        let h = PROGRESS_H / 2.0;
+        painter.rect_filled(Rect::from_min_max(pos2(x0, y - h), pos2(x1, y + h)), CornerRadius::same(2), st.track);
+        if xp > x0 {
+            painter.rect_filled(Rect::from_min_max(pos2(x0 + 1.0, y + h), pos2(xp, y + h + 2.0)), CornerRadius::same(1), st.shadow);
+            painter.rect_filled(Rect::from_min_max(pos2(x0, y - h), pos2(xp.max(x0 + PROGRESS_H), y + h)), CornerRadius::same(2), st.fill);
+        }
         let knob = ui.ctx().animate_bool_with_time(ui.id().with("knob"), near, 0.12);
         if knob > 0.0 {
-            painter.circle_filled(pos2(xp, y), 6.0 * knob, p.text);
+            painter.circle_filled(pos2(xp, y), 6.0 * knob, st.fill);
         }
         if let Some(hp) = resp.hover_pos() {
             if dur > 0 && !resp.dragged() {
@@ -639,37 +674,54 @@ impl App {
         }
     }
 
-    /// Icono de silencio y línea de volumen (mismo estilo que la de progreso).
-    fn volume_widget(&mut self, ui: &mut egui::Ui, zone_w: f32) {
-        let p = theme::palette(ui.ctx());
-        ui.spacing_mut().item_spacing.x = 0.0;
+    /// Altavoz: clic para silenciar, rueda para subir o bajar. Al pasar por encima sale arriba
+    /// la línea de volumen, que se queda mientras el ratón esté en ella.
+    fn volume_button(&mut self, ui: &mut egui::Ui, rect: Rect, st: &BarStyle) {
         let icon = if self.player.volume == 0 { Icon::Mute } else { Icon::Volume };
-        if icons::button(ui, icon, 28.0, p.weak).on_hover_text("Silenciar (M)").clicked() {
+        let resp = self.bar_icon(ui, rect, icon, st.icon, "Volumen · clic para silenciar (M)");
+        if resp.clicked() {
             self.toggle_mute();
         }
-        if zone_w <= 0.0 {
+        if resp.hovered() {
+            self.volume_wheel_from(ui);
+        }
+        let id = egui::Id::new("volume_popup");
+        let popup_rect = Rect::from_center_size(pos2(rect.center().x, rect.min.y - 30.0), vec2(150.0, 32.0));
+        let was_open = ui.ctx().data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+        let pointer_in = ui.ctx().pointer_hover_pos().is_some_and(|p| popup_rect.expand(6.0).contains(p) || rect.contains(p));
+        let open = resp.hovered() || self.volume_drag.is_some() || (was_open && pointer_in);
+        ui.ctx().data_mut(|d| d.insert_temp(id, open));
+        if !open {
             return;
         }
-        let (zone, _) = ui.allocate_exact_size(vec2(zone_w, 28.0), Sense::hover());
-        let resp = ui.interact(zone, ui.id().with("volume"), Sense::click_and_drag());
-        let near = resp.hovered() || resp.dragged() || resp.is_pointer_button_down_on();
+        egui::Area::new(id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(popup_rect.min)
+            .show(ui.ctx(), |ui| {
+                let (area, _) = ui.allocate_exact_size(popup_rect.size(), Sense::hover());
+                ui.painter().rect_filled(area, CornerRadius::same(16), st.bg.lerp_to_gamma(Color32::BLACK, 0.25));
+                self.volume_line(ui, area.shrink2(vec2(14.0, 2.0)), st);
+            });
+    }
+
+    /// Línea de volumen (misma forma que la de progreso), en dB, con la rueda y el arrastre.
+    fn volume_line(&mut self, ui: &mut egui::Ui, zone: Rect, st: &BarStyle) {
+        let resp = ui.interact(zone, egui::Id::new("volume_line"), Sense::click_and_drag());
         let raw_now = self.volume_drag.unwrap_or(self.player.volume);
         let pct = vol_raw_to_pct(raw_now);
         let y = zone.center().y;
-        let x0 = zone.min.x + 8.0;
-        let x1 = zone.max.x - 8.0;
+        let (x0, x1) = (zone.min.x, zone.max.x);
         let xp = x0 + (x1 - x0) * (pct / 100.0).clamp(0.0, 1.0);
         let painter = ui.painter();
-        painter.line_segment([pos2(x0, y), pos2(x1, y)], egui::Stroke::new(3.0, p.weak.gamma_multiply(0.45)));
-        painter.line_segment([pos2(x0, y), pos2(xp, y)], egui::Stroke::new(3.0, p.text));
-        let knob = ui.ctx().animate_bool_with_time(ui.id().with("vol_knob"), near, 0.12);
-        if knob > 0.0 {
-            painter.circle_filled(pos2(xp, y), 6.0 * knob, p.text);
-        }
+        let h = PROGRESS_H / 2.0;
+        painter.rect_filled(Rect::from_min_max(pos2(x0, y - h), pos2(x1, y + h)), CornerRadius::same(2), st.track);
+        painter.rect_filled(Rect::from_min_max(pos2(x0, y - h), pos2(xp.max(x0 + PROGRESS_H), y + h)), CornerRadius::same(2), st.fill);
+        painter.circle_filled(pos2(xp, y), 6.0, st.fill);
         let db = vol_raw_db(raw_now);
         let tip = if db.is_finite() { format!("{pct:.0} %  ({db:+.1} dB)") } else { "Silencio".to_string() };
         if resp.hovered() {
             resp.clone().on_hover_text(tip);
+            self.volume_wheel_from(ui);
         }
         if resp.dragged() || resp.is_pointer_button_down_on() {
             if let Some(hp) = resp.interact_pointer_pos() {
@@ -686,43 +738,53 @@ impl App {
         } else if let Some(raw) = self.volume_drag.take() {
             self.set_volume(raw);
         }
-        if resp.hovered() {
-            // Scroll sin suavizar: el suavizado de egui reparte cada muesca en varios
-            // fotogramas y generaba una orden por fotograma (a tirones y con cola).
-            let scroll: f32 = ui.input(|i| {
-                i.raw
-                    .events
-                    .iter()
-                    .filter_map(|e| match e {
-                        egui::Event::MouseWheel { unit, delta, .. } => Some(match unit {
-                            egui::MouseWheelUnit::Point => delta.y,
-                            egui::MouseWheelUnit::Line => delta.y * 50.0,
-                            egui::MouseWheelUnit::Page => delta.y * 400.0,
-                        }),
-                        _ => None,
-                    })
-                    .sum()
-            });
-            if scroll != 0.0 {
-                self.volume_wheel(scroll);
-            }
+    }
+
+    /// La rueda del ratón sube o baja el volumen. Sin suavizar: el suavizado de egui reparte cada
+    /// muesca en varios fotogramas y generaba una orden por fotograma (a tirones y con cola).
+    fn volume_wheel_from(&mut self, ui: &egui::Ui) {
+        let scroll: f32 = ui.input(|i| {
+            i.raw
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::MouseWheel { unit, delta, .. } => Some(match unit {
+                        egui::MouseWheelUnit::Point => delta.y,
+                        egui::MouseWheelUnit::Line => delta.y * 50.0,
+                        egui::MouseWheelUnit::Page => delta.y * 400.0,
+                    }),
+                    _ => None,
+                })
+                .sum()
+        });
+        if scroll != 0.0 {
+            self.volume_wheel(scroll);
         }
     }
 
-    fn now_playing_widget(&mut self, ui: &mut egui::Ui, text_w: f32, show_album: bool) {
-        let p = theme::palette(ui.ctx());
-        ui.spacing_mut().item_spacing.x = 10.0;
+    /// Portada en `cover` y, a su derecha, título, artista y álbum en líneas de base fijas.
+    fn now_playing_block(&mut self, ui: &mut egui::Ui, cover: Rect, text_x: f32, text_w: f32, cy: f32, st: &BarStyle) {
+        let painter = ui.painter().clone();
         let Some(np) = self.player.now.clone() else {
-            ui.label(RichText::new("Nada en reproducción").color(p.faint));
+            let g = painter.layout_no_wrap("Nada en reproducción".into(), theme::regular(ARTIST_FONT), st.dim);
+            text_on_baseline(&painter, pos2(cover.min.x, cy + 5.0), g, st.dim);
             return;
         };
-        let r = ui
-            .scope(|ui| self.cover(ui, np.cover_url.as_deref(), 46.0, false))
-            .response
-            .interact(Sense::click());
+        self.cover_in(ui, np.cover_url.as_deref(), cover, COVER_RADIUS);
+        let r = ui.interact(cover, ui.id().with("np_cover"), Sense::click());
         if r.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
+        // Lo que suena de verdad (formato, salida, normalización): en el globo de la portada.
+        let r = match self.player.local_audio() {
+            Some(info) if r.hovered() => {
+                let tip = info
+                    .tooltip(crate::backend::audio_output(), self.settings.loudness.label(), self.settings.quality.kbps())
+                    .join("\n");
+                r.on_hover_text(format!("{}\n{tip}", info.badge()))
+            }
+            _ => r,
+        };
         if r.clicked() {
             if let Some(id) = &np.album_id {
                 self.actions.push(Action::Go(Page::Album(id.clone())));
@@ -732,31 +794,23 @@ impl App {
             let t = super::track_from_now(&np);
             self.song_menu(ui, &t, MenuKind::NowPlaying, &RowOpts::tracks(false, false));
         });
-        // Tres líneas en posiciones fijas dentro de la altura de la portada (46 px), sin depender
-        // de la altura de la fuente (los caracteres japoneses usan una fuente de respaldo más alta).
-        let (col, _) = ui.allocate_exact_size(vec2(text_w, 46.0), Sense::hover());
-        let painter = ui.painter().clone();
         // Tarda en cargar (`watchdog::SLOW_AFTER`): la tercera línea lo dice, en lugar del álbum.
         let slow = self.player.state == PlayState::Loading
             && self.player.remote.is_none()
             && self.load_watch.as_ref().is_some_and(|w| w.is_slow());
-        let lines: Vec<(String, egui::FontId, Color32, f32, f32)> = {
-            let names = np.artists.iter().map(|a| a.0.as_str()).collect::<Vec<_>>().join(", ");
-            let mut v = vec![
-                (np.name.clone(), theme::regular(14.0), p.text, 0.0, 18.0),
-                (names, theme::regular(12.0), p.weak, 17.0, 14.0),
-            ];
-            if slow {
-                v.push((SLOW_TEXT.to_string(), theme::regular(12.0), p.warn, 32.0, 14.0));
-            } else if show_album && !np.album.is_empty() {
-                v.push((np.album.clone(), theme::regular(12.0), p.faint, 32.0, 14.0));
-            }
-            v
-        };
-        for (i, (text, font, color, y, h)) in lines.iter().enumerate() {
-            let galley = galley_truncated(&painter, text, font.clone(), *color, text_w);
-            let rect = Rect::from_min_size(pos2(col.min.x, col.min.y + y), vec2(galley.size().x.min(text_w), *h));
-            painter.galley(pos2(rect.min.x, rect.center().y - galley.size().y / 2.0), galley, *color);
+        let names = np.artists.iter().map(|a| a.0.as_str()).collect::<Vec<_>>().join(", ");
+        let mut lines: Vec<(String, f32, Color32, f32)> = vec![
+            (np.name.clone(), TITLE_FONT, st.title, cy - 13.0),
+            (names, ARTIST_FONT, st.dim, cy + 5.0),
+        ];
+        if slow {
+            lines.push((SLOW_TEXT.to_string(), ARTIST_FONT, theme::palette(ui.ctx()).warn, cy + 24.0));
+        } else if !np.album.is_empty() {
+            lines.push((np.album.clone(), ARTIST_FONT, st.dim, cy + 24.0));
+        }
+        for (i, (text, size, color, base)) in lines.iter().enumerate() {
+            let galley = galley_truncated(&painter, text, theme::regular(*size), *color, text_w);
+            let rect = text_on_baseline(&painter, pos2(text_x, *base), galley, *color);
             // El título y el aviso de carga lenta no llevan a ninguna parte.
             if i == 0 || (slow && i == 2) {
                 continue;
@@ -792,95 +846,92 @@ impl App {
         }
     }
 
-    /// De izquierda a derecha: calidad, corazón, playlist, letra, dispositivos, más | cola.
-    fn player_actions_widget(&mut self, ui: &mut egui::Ui, width: f32, badge: bool) {
-        let p = theme::palette(ui.ctx());
-        ui.spacing_mut().item_spacing.x = 2.0;
-        let compact = width < 200.0;
-
-        let q_color = if self.side == Some(SideTab::Queue) { GREEN } else { p.weak };
-        if icons::button(ui, Icon::Queue, 30.0, q_color).on_hover_text("Cola (Q)").clicked() {
-            self.toggle_side(SideTab::Queue);
-        }
-        // Separador vertical
-        let (sr, _) = ui.allocate_exact_size(vec2(20.0, 30.0), Sense::hover());
-        ui.painter().line_segment([pos2(sr.center().x, sr.min.y + 4.0), pos2(sr.center().x, sr.max.y - 4.0)], egui::Stroke::new(1.0, p.border));
-
-        // Más opciones
-        let more = icons::button(ui, Icon::More, 30.0, p.weak).on_hover_text("Más");
-        egui::Popup::menu(&more).show(|ui| self.player_more_menu(ui));
-
-        // Dispositivos
-        let dev_color = if self.player.remote.is_some() { theme::BLUE } else { p.weak };
-        let r = icons::button(ui, Icon::Devices, 30.0, dev_color).on_hover_text(match &self.player.remote {
-            Some(d) => format!("Sonando en {}", d.name),
-            None => "Dispositivos".to_string(),
-        });
-        if r.clicked() {
-            self.api.send(Req::Devices);
-        }
-        egui::Popup::menu(&r).width(280.0).show(|ui| self.devices_menu(ui));
-
-        if !compact {
-            let lyr_color = if self.side == Some(SideTab::Lyrics) { GREEN } else { p.weak };
-            if icons::button(ui, Icon::Lyrics, 30.0, lyr_color).on_hover_text("Letra (L)").clicked() {
-                self.toggle_side(SideTab::Lyrics);
-            }
-        }
-        if let Some(np) = self.player.now.clone() {
-            if !compact {
-                if icons::button(ui, Icon::PlusSquare, 30.0, p.weak).on_hover_text("Añadir a playlist").clicked() {
-                    self.open_add_dialog(vec![np.uri.clone()]);
-                }
-            }
-            if let Some(id) = &np.id {
+    /// Derecha de la barra: corazón, añadir a playlist, letra, dispositivos y más; separador,
+    /// Jam y cola. Cada cosa a su distancia del borde derecho (`bar_layout`).
+    fn bar_actions(&mut self, ui: &mut egui::Ui, xr: f32, cy: f32, lay: &BarLayout, st: &BarStyle) {
+        let boxed = |from_right: f32, dy: f32| Rect::from_min_size(pos2(xr - from_right, cy - 14.0 + dy), vec2(BOX, BOX));
+        let np = self.player.now.clone();
+        if let Some(np) = &np {
+            if let (Some(id), Some(x)) = (&np.id, lay.heart) {
                 let liked = self.player.liked.unwrap_or(false);
-                let (icon, color) = if liked { (Icon::HeartFilled, GREEN) } else { (Icon::Heart, p.weak) };
-                if icons::button(ui, icon, 30.0, color)
-                    .on_hover_text(if liked { "Quitar de Me gusta" } else { "Guardar en Me gusta" })
-                    .clicked()
-                {
+                let (icon, color) = if liked { (Icon::HeartFilled, GREEN) } else { (Icon::Heart, st.icon) };
+                let tip = if liked { "Quitar de Me gusta" } else { "Guardar en Me gusta" };
+                if self.bar_icon(ui, boxed(x, 1.0), icon, color, tip).clicked() {
                     self.actions.push(Action::Like(id.clone(), !liked));
                 }
             }
+            if let Some(x) = lay.add {
+                if self.bar_icon(ui, boxed(x, 0.0), Icon::PlusSquare, st.icon, "Añadir a playlist").clicked() {
+                    self.open_add_dialog(vec![np.uri.clone()]);
+                }
+            }
         }
-        // La última en un diseño de derecha a izquierda: queda a la izquierda del todo.
-        if badge && !compact {
-            self.quality_badge(ui);
+        if let Some(x) = lay.lyrics {
+            let color = if self.side == Some(SideTab::Lyrics) { GREEN } else { st.icon };
+            if self.bar_icon(ui, boxed(x, 0.0), Icon::Lyrics, color, "Letra (L)").clicked() {
+                self.toggle_side(SideTab::Lyrics);
+            }
+        }
+        let dev_color = if self.player.remote.is_some() { theme::BLUE } else { st.icon };
+        let dev_tip = match &self.player.remote {
+            Some(d) => format!("Sonando en {}", d.name),
+            None => "Dispositivos".to_string(),
+        };
+        if lay.devices != lay.more {
+            let r = self.bar_icon(ui, boxed(lay.devices, 0.0), Icon::Devices, dev_color, &dev_tip);
+            if r.clicked() {
+                self.api.send(Req::Devices);
+            }
+            egui::Popup::menu(&r).width(280.0).show(|ui| self.devices_menu(ui));
+        }
+        let more = self.bar_icon(ui, boxed(lay.more, 0.0), Icon::More, st.icon, "Más");
+        egui::Popup::menu(&more).show(|ui| self.player_more_menu(ui));
+        if let Some(x) = lay.separator {
+            let sx = xr - x;
+            ui.painter().line_segment([pos2(sx, cy - 19.0), pos2(sx, cy + 18.0)], egui::Stroke::new(1.3, st.separator));
+        }
+        if let Some(x) = lay.jam {
+            self.jam_orb(ui, pos2(xr - x, cy - 1.5));
+        }
+        let q_color = if self.side == Some(SideTab::Queue) { GREEN } else { st.icon };
+        if self.bar_icon(ui, boxed(lay.queue, 0.0), Icon::Queue, q_color, "Cola (Q)").clicked() {
+            self.toggle_side(SideTab::Queue);
         }
     }
 
-    /// Etiqueta «320 kbps» con lo que suena de verdad: formato, salida y normalización en el
-    /// globo; en ámbar si la canción suena por debajo de la calidad pedida. Abre los ajustes.
-    fn quality_badge(&mut self, ui: &mut egui::Ui) {
-        let Some(info) = self.player.local_audio() else { return };
-        let p = theme::palette(ui.ctx());
-        let color = if info.below_requested() { p.warn } else { p.weak };
-        let galley = ui.painter().layout_no_wrap(info.badge(), theme::regular(BADGE_FONT), color);
-        let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 2.0 * BADGE_PAD, 20.0), Sense::click());
-        let radius = CornerRadius::same(10);
-        if resp.hovered() {
-            ui.painter().rect_filled(rect, radius, p.hover);
+    /// Botón de Jam: un orbe azul con un aro cian irregular. Abre la ventana de Jam.
+    fn jam_orb(&mut self, ui: &mut egui::Ui, c: egui::Pos2) {
+        let rect = Rect::from_center_size(c, vec2(36.0, 36.0));
+        let resp = ui.interact(rect, ui.id().with("jam_orb"), Sense::click()).on_hover_text("Jam (Ctrl+J)");
+        let hover = resp.hovered();
+        if hover {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        ui.painter().rect_stroke(rect, radius, egui::Stroke::new(1.0, color.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-        let text_pos = pos2(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0);
-        ui.painter().galley(text_pos, galley, color);
-        // El globo solo se arma al pasar por encima (la barra se pinta en cada fotograma).
-        let resp = if resp.hovered() {
-            let tip = info
-                .tooltip(crate::backend::audio_output(), self.settings.loudness.label(), self.settings.quality.kbps())
-                .join("\n");
-            resp.on_hover_text(tip)
-        } else {
-            resp
-        };
+        let painter = ui.painter();
+        let blue = Color32::from_rgb(9, 90, 180);
+        let blue = if hover { blue.lerp_to_gamma(Color32::WHITE, 0.1) } else { blue };
+        // Borde difuminado como en la referencia: sólido hasta el radio 15 y de ahí al 19 con
+        // opacidad 0,89 → 0,65 → 0,32 → 0,09 (cada corona suma su alfa a las de fuera).
+        for (r, a) in [(19.0, 0.09), (18.0, 0.253), (17.0, 0.485), (16.0, 0.686)] {
+            painter.circle_filled(c, r, blue.gamma_multiply(a));
+        }
+        painter.circle_filled(c, 15.0, blue);
+        // Anillo cian irregular, con un bulto arriba a la derecha y un halo azul oscuro.
+        let ring: Vec<egui::Pos2> = (0..96)
+            .map(|i| {
+                let a = std::f32::consts::TAU * i as f32 / 96.0;
+                let bump = {
+                    let d = (a - 5.55 + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+                    1.5 * (-(d * d) / 0.1).exp()
+                };
+                let r = 7.9 + 0.8 * (2.0 * a + 0.6).sin() + 0.35 * (3.0 * a + 2.1).sin() + bump;
+                pos2(c.x - 0.6 + r * a.cos(), c.y + 0.9 + r * a.sin())
+            })
+            .collect();
+        painter.add(egui::Shape::closed_line(ring.clone(), egui::Stroke::new(3.6, Color32::from_rgb(0, 72, 150))));
+        painter.add(egui::Shape::closed_line(ring, egui::Stroke::new(1.9, Color32::from_rgb(84, 208, 232))));
         if resp.clicked() {
-            // Si ya se está en Ajustes, no se tiran los cambios sin guardar.
-            if !matches!(self.page(), Page::Settings) {
-                self.draft = self.settings.clone();
-            }
-            self.go(Page::Settings);
+            self.jam_open = !self.jam_open;
         }
     }
 
@@ -933,11 +984,9 @@ impl App {
             } else {
                 d.name.clone()
             };
-            let color = if d.is_active { GREEN } else { ui.visuals().text_color() };
-            if ui
-                .add(egui::Button::new(RichText::new(name).color(color)).frame(false))
-                .clicked()
-            {
+            let icon = if is_self { Icon::Headphones } else { Icon::Devices };
+            let label = if d.is_active { format!("{name} · sonando") } else { name };
+            if Self::menu_item(ui, Some(icon), &label, false).clicked() {
                 self.select_device(d, is_self);
                 ui.close();
             }
@@ -951,16 +1000,13 @@ impl App {
                 volume_percent: None,
             };
             let text = format!("{} (este equipo)", me.name);
-            if ui.add(egui::Button::new(text).frame(false)).clicked() {
+            if Self::menu_item(ui, Some(Icon::Headphones), &text, false).clicked() {
                 self.select_device(me, true);
                 ui.close();
             }
         }
         ui.separator();
-        if ui
-            .add(egui::Button::new(RichText::new("Actualizar lista").small()).frame(false))
-            .clicked()
-        {
+        if Self::menu_item(ui, Some(Icon::Refresh), "Actualizar lista", false).clicked() {
             self.api.send(Req::Devices);
         }
     }
@@ -986,8 +1032,8 @@ impl App {
         let mut action: Option<BannerAction> = None;
         egui::Area::new(egui::Id::new("playback_error_banner"))
             .order(egui::Order::Foreground)
-            // Justo encima de la barra del reproductor (96 px) y centrado.
-            .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -(96.0 + 8.0)))
+            // Justo encima de la barra del reproductor y centrado.
+            .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -(super::PLAYER_PANEL_H + 8.0)))
             .show(ctx, |ui| {
                 Self::dialog_frame(ctx)
                     .inner_margin(egui::Margin::symmetric(14, 10))
@@ -1194,56 +1240,185 @@ pub const NOT_PREMIUM_TEXT: &str = "Spotify solo permite reproducir en apps exte
 /// Lo que dice la barra mientras una canción tarda en cargar (`watchdog::SLOW_AFTER`).
 pub const SLOW_TEXT: &str = "Cargando… la conexión va lenta";
 
-// ------------------------------------------------------------ anchos de la barra
+// ------------------------------------------------------------ medidas del reproductor
 
-/// Tamaño de letra y margen a cada lado del texto de la etiqueta de calidad.
-const BADGE_FONT: f32 = 11.5;
-const BADGE_PAD: f32 = 8.0;
-/// Onda más estrecha que se acepta para hacer sitio a la etiqueta de calidad (más estrecha ya no
-/// sirve para buscar con precisión). Por debajo, la etiqueta le quita sitio al texto.
-const BADGE_MIN_WAVE_W: f32 = 100.0;
-/// Texto de la canción más estrecho que se acepta para hacer sitio a la etiqueta.
-const BADGE_MIN_TEXT_W: f32 = 140.0;
+/// Caja de los iconos del reproductor (su rejilla: cada unidad, un píxel).
+const BOX: f32 = 28.0;
+const BAR_RADIUS: u8 = 10;
+const COVER: f32 = 51.0;
+const COVER_RADIUS: u8 = 4;
+const TITLE_FONT: f32 = 15.0;
+const ARTIST_FONT: f32 = 14.0;
+const TIME_FONT: f32 = 14.0;
+/// Grosor de las líneas de progreso y de volumen.
+const PROGRESS_H: f32 = 3.0;
+/// Progreso más corto que se acepta antes de quitarle sitio al texto de la canción.
+const PROG_MIN: f32 = 160.0;
+/// Texto de la canción: el ancho de la referencia y el mínimo antes de pasar a una barra más
+/// sencilla (sin Jam; después sin letra ni playlist).
+const TEXT_MAX: f32 = 357.0;
+const TEXT_MIN: f32 = 180.0;
 
-/// Anchos de la barra del reproductor: transporte | tiempo | ONDA | tiempo | volumen |
-/// portada+texto | acciones.
-#[derive(Debug, PartialEq)]
-struct BarWidths {
-    vol_zone: f32,
-    transport_w: f32,
-    times_w: f32,
-    vol_w: f32,
-    text_w: f32,
-    actions_w: f32,
-    wave_w: f32,
-    /// Cabe la etiqueta de calidad (ya sumada a `actions_w`).
-    badge: bool,
+/// Colores del reproductor: en tema oscuro, los de la referencia de diseño; en claro, los de la
+/// paleta.
+struct BarStyle {
+    bg: Color32,
+    icon: Color32,
+    title: Color32,
+    dim: Color32,
+    track: Color32,
+    fill: Color32,
+    shadow: Color32,
+    separator: Color32,
+    play_ring: Color32,
+    loading: Color32,
 }
 
-/// Reparte el ancho `w` de la barra. `badge_w`: lo que ocupa la etiqueta de calidad (0 si no
-/// hay nada que enseñar). La etiqueta solo entra en la barra ancha y si cabe sin estropear lo
-/// demás: primero estrecha la onda (hasta `BADGE_MIN_WAVE_W`) y después el texto de la canción
-/// (hasta `BADGE_MIN_TEXT_W`); si ni así, no se enseña y la barra queda como sin ella.
-fn bar_widths(w: f32, badge_w: f32) -> BarWidths {
-    let vol_zone = if w >= 900.0 { 100.0 } else { 0.0 };
-    let transport_w = 38.0 + 4.0 * 30.0 + 5.0 * 4.0 + 8.0;
-    let times_w = 2.0 * 42.0;
-    let vol_w = 28.0 + vol_zone + 8.0;
-    let mut actions_w = if w >= 900.0 { 6.0 * 32.0 + 24.0 + 16.0 } else { 4.0 * 32.0 + 24.0 };
-    let mut text_w = (w * 0.20).clamp(140.0, 300.0);
-    let free = |text_w: f32, actions_w: f32| w - transport_w - times_w - vol_w - (46.0 + 10.0 + text_w) - actions_w - 3.0 * 12.0;
-    let mut badge = false;
-    if w >= 900.0 && badge_w > 0.0 {
-        let from_wave = (free(text_w, actions_w) - BADGE_MIN_WAVE_W).clamp(0.0, badge_w);
-        let from_text = badge_w - from_wave;
-        if text_w - from_text >= BADGE_MIN_TEXT_W {
-            text_w -= from_text;
-            actions_w += badge_w;
-            badge = true;
+impl BarStyle {
+    fn new(ui: &egui::Ui) -> Self {
+        let p = theme::palette(ui.ctx());
+        if ui.visuals().dark_mode {
+            BarStyle {
+                bg: Color32::from_rgb(50, 56, 66),
+                icon: Color32::from_rgb(136, 141, 147),
+                title: Color32::from_rgb(212, 218, 228),
+                dim: Color32::from_rgb(126, 132, 142),
+                track: Color32::from_rgb(70, 76, 86),
+                fill: Color32::from_rgb(220, 224, 231),
+                shadow: Color32::from_rgb(34, 40, 50),
+                separator: Color32::from_rgb(70, 76, 86),
+                play_ring: Color32::from_rgb(2, 44, 20),
+                loading: Color32::from_rgb(70, 76, 86),
+            }
+        } else {
+            BarStyle {
+                bg: p.card2,
+                icon: p.weak,
+                title: p.text,
+                dim: p.weak,
+                track: p.weak.gamma_multiply(0.35),
+                fill: p.text,
+                shadow: Color32::TRANSPARENT,
+                separator: p.border,
+                play_ring: GREEN.gamma_multiply(0.5),
+                loading: p.card,
+            }
         }
     }
-    let wave_w = free(text_w, actions_w).max(80.0);
-    BarWidths { vol_zone, transport_w, times_w, vol_w, text_w, actions_w, wave_w, badge }
+}
+
+/// Dónde va cada cosa en una barra de ancho `w`. A la izquierda, desde el borde: el progreso
+/// (`prog_x`, `prog_w`). A la derecha, la distancia desde el borde derecho a la esquina
+/// izquierda de cada caja de 28 px (o al centro del separador y del orbe); `None`: no cabe.
+/// `right_w`: lo que ocupa la derecha.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarLayout {
+    shuffle_repeat: bool,
+    /// Duración a la derecha del progreso y altavoz (sin ellos, la portada va pegada al progreso).
+    tail: bool,
+    /// Portada y texto de la canción (sin ellos, el progreso llega hasta lo de la derecha).
+    cover: bool,
+    prog_x: f32,
+    prog_w: f32,
+    heart: Option<f32>,
+    add: Option<f32>,
+    lyrics: Option<f32>,
+    devices: f32,
+    more: f32,
+    separator: Option<f32>,
+    jam: Option<f32>,
+    queue: f32,
+    right_w: f32,
+}
+
+impl BarLayout {
+    /// Desde el final del progreso hasta la portada: duración y altavoz (o solo un margen).
+    fn to_cover(&self) -> f32 {
+        if self.tail {
+            114.0
+        } else {
+            12.0
+        }
+    }
+
+    /// Desde el final del progreso hasta el texto (la portada y su margen).
+    fn after_progress(&self) -> f32 {
+        if self.cover {
+            self.to_cover() + 60.0
+        } else {
+            0.0
+        }
+    }
+
+    fn cover_x(&self) -> f32 {
+        self.prog_x + self.prog_w + self.to_cover()
+    }
+
+    fn text_x(&self) -> f32 {
+        self.cover_x() + 60.0
+    }
+}
+
+/// Reparte el ancho `w` de la barra. Con la referencia (1491 px) sale exactamente lo de la
+/// referencia; más ancha, solo crece el progreso; más estrecha, se quitan primero el orbe de Jam
+/// y el separador, después la letra y añadir a playlist y, al final, aleatorio y repetir.
+fn bar_layout(w: f32) -> BarLayout {
+    let full = BarLayout {
+        shuffle_repeat: true,
+        tail: true,
+        cover: true,
+        prog_x: 268.0,
+        prog_w: 0.0,
+        heart: Some(360.0),
+        add: Some(315.0),
+        lyrics: Some(268.0),
+        devices: 222.0,
+        more: 176.0,
+        separator: Some(127.5),
+        jam: Some(88.5),
+        queue: 52.0,
+        right_w: 360.0,
+    };
+    let no_jam = BarLayout { heart: Some(282.0), add: Some(236.0), lyrics: Some(190.0), devices: 144.0, more: 98.0, separator: None, jam: None, right_w: 282.0, ..full };
+    let compact = BarLayout { heart: Some(190.0), add: None, lyrics: None, right_w: 190.0, ..no_jam };
+    let tiny = BarLayout { shuffle_repeat: false, prog_x: 182.0, ..compact };
+    // La más estrecha (ventana mínima con la interfaz ampliada): sin duración a la derecha ni
+    // altavoz, y a la derecha solo más y cola (el corazón y la letra siguen en «Más» y con L).
+    let micro = BarLayout { tail: false, heart: None, devices: 98.0, more: 98.0, queue: 52.0, right_w: 98.0, ..tiny };
+    let avail = |l: &BarLayout| w - l.prog_x - l.after_progress() - l.right_w - 12.0;
+    for l in [full, no_jam, compact] {
+        let a = avail(&l);
+        if a >= PROG_MIN + TEXT_MIN {
+            let text = (a - PROG_MIN).min(TEXT_MAX);
+            return BarLayout { prog_w: a - text, ..l };
+        }
+    }
+    let a = avail(&tiny);
+    if a >= 60.0 + 120.0 {
+        return BarLayout { prog_w: (a * 0.4).max(60.0), ..tiny };
+    }
+    let a = avail(&micro);
+    if a >= 60.0 + 60.0 {
+        return BarLayout { prog_w: (a * 0.45).max(60.0), ..micro };
+    }
+    // Interfaz muy ampliada en la ventana mínima: sin portada ni texto (siguen en el aviso de
+    // «Reproduciendo ahora» del sistema y en la cola).
+    let nano = BarLayout { cover: false, ..micro };
+    BarLayout { prog_w: avail(&nano).max(60.0), ..nano }
+}
+
+/// Pinta `galley` con su borde izquierdo en `at.x` y la línea base en `at.y` (en un píxel
+/// entero); devuelve dónde quedó.
+fn text_on_baseline(painter: &egui::Painter, at: egui::Pos2, galley: std::sync::Arc<egui::Galley>, color: Color32) -> Rect {
+    let base = galley
+        .rows
+        .first()
+        .and_then(|r| r.row.glyphs.first().map(|g| r.pos.y + g.pos.y))
+        .unwrap_or(galley.size().y * 0.8);
+    let min = pos2(at.x.round(), (at.y - base).round());
+    let rect = Rect::from_min_size(min, galley.size());
+    painter.galley(min, galley, color);
+    rect
 }
 
 // ------------------------------------------------------------ píldora de actualización
@@ -1289,48 +1464,56 @@ fn top_right_layout(full_w: f32, pill_text_w: Option<f32>) -> (f32, Option<Updat
 mod tests {
     use super::*;
 
-    /// Lo que ocupan juntas las partes de la barra (con la onda que quede).
-    fn total(b: &BarWidths) -> f32 {
-        b.transport_w + b.times_w + b.wave_w + b.vol_w + 12.0 + 46.0 + 10.0 + b.text_w + b.actions_w + 2.0 * 12.0
+    /// Con el ancho de la referencia (1491 px) todo queda donde en la referencia.
+    #[test]
+    fn reproductor_como_la_referencia() {
+        let l = bar_layout(1491.0);
+        assert!(l.shuffle_repeat);
+        assert_eq!((l.prog_x, l.prog_w), (268.0, 320.0));
+        assert_eq!(l.text_x(), 762.0);
+        assert_eq!((l.heart, l.add, l.lyrics), (Some(360.0), Some(315.0), Some(268.0)));
+        assert_eq!((l.devices, l.more, l.separator, l.jam, l.queue), (222.0, 176.0, Some(127.5), Some(88.5), 52.0));
     }
 
-    /// La etiqueta de calidad no cambia nada si no hay qué enseñar, entra en la ventana por
-    /// defecto (quitando sitio primero a la onda y luego al texto) y nunca hace que la barra se
-    /// salga de su ancho más de lo que ya se salía sin ella.
+    /// A cualquier ancho nada se monta: el texto acaba antes de lo de la derecha, el progreso
+    /// nunca baja de 60 px y lo que se quita va en orden (Jam, después letra y playlist).
     #[test]
-    fn anchos_de_la_barra_con_etiqueta_de_calidad() {
-        let badge = 64.0;
-        for w in [700.0, 899.0, 900.0, 960.0, 1030.0, 1076.0, 1200.0, 1500.0, 1876.0, 2500.0] {
-            let sin = bar_widths(w, 0.0);
-            assert!(!sin.badge, "{w}");
-            let con = bar_widths(w, badge);
-            if !con.badge {
-                // No cabe: la barra queda exactamente como sin etiqueta.
-                assert_eq!(con, sin, "{w}");
-                continue;
+    fn reproductor_a_cualquier_ancho() {
+        let mut prev: Option<BarLayout> = None;
+        let widths: Vec<f32> = (360..=2600).step_by(10).map(|w| w as f32).collect();
+        for &w in widths.iter().rev() {
+            let l = bar_layout(w);
+            assert!(l.prog_w >= 60.0, "{w}: {l:?}");
+            if l.cover {
+                let text_w = w - l.right_w - 12.0 - l.text_x();
+                assert!(text_w >= 40.0, "{w}: texto {text_w}");
+            } else {
+                assert!(l.prog_x + l.prog_w <= w - l.right_w - 12.0 + 0.01, "{w}: {l:?}");
             }
-            assert!(w >= 900.0, "{w}");
-            assert_eq!(con.actions_w, sin.actions_w + badge, "{w}");
-            assert!(con.text_w >= BADGE_MIN_TEXT_W, "{w}");
-            assert!(con.text_w <= sin.text_w, "{w}");
-            // La onda solo baja de BADGE_MIN_WAVE_W si ya estaba por debajo sin la etiqueta.
-            assert!(con.wave_w >= BADGE_MIN_WAVE_W.min(sin.wave_w), "{w}: {} {}", con.wave_w, sin.wave_w);
-            // Nada se sale más de lo que ya se salía.
-            assert!(total(&con) <= total(&sin).max(w) + 0.01, "{w}: {} {}", total(&con), total(&sin));
+            assert!(l.prog_w <= w, "{w}");
+            if l.jam.is_some() {
+                assert!(l.lyrics.is_some() && l.add.is_some() && l.separator.is_some(), "{w}");
+            }
+            if !l.tail {
+                assert!(l.heart.is_none() && l.lyrics.is_none(), "{w}");
+            }
+            if !l.cover {
+                assert!(!l.tail, "{w}");
+            }
+            if let Some(p) = prev {
+                // Al estrechar, nada que se había quitado vuelve.
+                assert!(!(!p.tail && l.tail), "{w}");
+                assert!(!(!p.cover && l.cover), "{w}");
+                assert!(!(p.jam.is_none() && l.jam.is_some()), "{w}");
+                assert!(!(p.lyrics.is_none() && l.lyrics.is_some()), "{w}");
+                assert!(!(!p.shuffle_repeat && l.shuffle_repeat), "{w}");
+            }
+            prev = Some(l);
         }
-        // Barra estrecha (modo compacto): nunca.
-        assert!(!bar_widths(899.0, badge).badge);
-        // Ventana por defecto (1120 px, barra de ~1076): cabe, quitando un poco al texto.
-        let def = bar_widths(1076.0, badge);
-        assert!(def.badge);
-        assert!(def.text_w < bar_widths(1076.0, 0.0).text_w);
-        // Pantalla grande: sale de la onda y el texto no cambia.
-        let big = bar_widths(1876.0, badge);
-        assert!(big.badge);
-        assert_eq!(big.text_w, bar_widths(1876.0, 0.0).text_w);
-        assert_eq!(big.wave_w, bar_widths(1876.0, 0.0).wave_w - badge);
-        // Justo por encima de 900 ya no queda sitio ni en la onda ni en el texto.
-        assert!(!bar_widths(960.0, badge).badge);
+        // Más ancha que la referencia: solo crece el progreso.
+        let big = bar_layout(1900.0);
+        assert_eq!(big.prog_w, 320.0 + 409.0);
+        assert_eq!(1900.0 - big.right_w - 12.0 - big.text_x(), TEXT_MAX);
     }
 
     /// Dos reintentos automáticos (15 s y 60 s) y después el aviso con botones.

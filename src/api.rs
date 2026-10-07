@@ -2411,6 +2411,37 @@ impl Client {
         Ok(())
     }
 
+    /// Pone (arriba del todo) o quita una playlist del rootlist: lo mismo que seguirla o dejar de
+    /// seguirla, sin la Web API. Si ya está (o ya no está), no hace nada.
+    fn rootlist_set_playlist(&self, id: &str, follow: bool) -> Result<(), String> {
+        use librespot_protocol::playlist4_external::{op, Add, Item, Op, Rem};
+        use protobuf::MessageField;
+        let (rev, list) = self.rootlist_raw()?;
+        let uri = format!("spotify:playlist:{id}");
+        let at = list.iter().position(|u| u == &uri);
+        let mut op = Op::new();
+        match (follow, at) {
+            (true, None) => {
+                let mut it = Item::new();
+                it.set_uri(uri);
+                let mut add = Add::new();
+                add.set_from_index(0);
+                add.items.push(it);
+                op.set_kind(op::Kind::ADD);
+                op.add = MessageField::some(add);
+            }
+            (false, Some(idx)) => {
+                let mut rem = Rem::new();
+                rem.set_from_index(idx as i32);
+                rem.set_length(1);
+                op.set_kind(op::Kind::REM);
+                op.rem = MessageField::some(rem);
+            }
+            _ => return Ok(()),
+        }
+        self.rootlist_changes(rev, vec![op])
+    }
+
     /// Revisión actual de una playlist (para playlist4 «changes»).
     fn playlist_revision(&self, id: &str) -> Result<Vec<u8>, String> {
         use protobuf::Message;
@@ -3714,12 +3745,20 @@ impl Client {
                 }
                 Ok(Resp::PlaylistChanged(id.clone()))
             }
+            // Con la Web API limitada (o sin cuota), por el rootlist, como añadir y quitar canciones:
+            // guardar o quitar una playlist de la biblioteca no se queda sin hacer.
             Req::FollowPlaylist(id) => {
-                self.send_json("PUT", &format!("{BASE}/playlists/{id}/followers"), None)?;
+                if let Err(e) = self.send_json("PUT", &format!("{BASE}/playlists/{id}/followers"), None) {
+                    log::info!("FollowPlaylist por Web API falló ({e}); probando el rootlist");
+                    self.rootlist_set_playlist(id, true)?;
+                }
                 Ok(Resp::PlaylistChanged(id.clone()))
             }
             Req::UnfollowPlaylist(id) => {
-                self.send_json("DELETE", &format!("{BASE}/playlists/{id}/followers"), None)?;
+                if let Err(e) = self.send_json("DELETE", &format!("{BASE}/playlists/{id}/followers"), None) {
+                    log::info!("UnfollowPlaylist por Web API falló ({e}); probando el rootlist");
+                    self.rootlist_set_playlist(id, false)?;
+                }
                 Ok(Resp::PlaylistChanged(id.clone()))
             }
             Req::User(id) => {

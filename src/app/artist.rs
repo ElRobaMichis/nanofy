@@ -76,7 +76,7 @@ impl App {
                 }
             });
             if !top_uris.is_empty() {
-                if icons::button(&mut a, Icon::Queue, 34.0, p.text).on_hover_text("Añadir populares a la cola").clicked() {
+                if icons::button(&mut a, Icon::AddToQueue, 34.0, p.text).on_hover_text("Añadir populares a la cola").clicked() {
                     for u in &top_uris {
                         self.actions.push(Action::AddToQueue(u.clone()));
                     }
@@ -517,7 +517,7 @@ impl App {
                             }
                         }
                     });
-                    if icons::button(ui, Icon::Queue, 34.0, p.weak).on_hover_text("Añadir a la cola").clicked() {
+                    if icons::button(ui, Icon::AddToQueue, 34.0, p.weak).on_hover_text("Añadir a la cola").clicked() {
                         for u in &tracks {
                             app.actions.push(Action::AddToQueue(u.clone()));
                         }

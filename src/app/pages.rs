@@ -779,7 +779,7 @@ impl App {
                 }));
             }
             r.context_menu(|ui| {
-                if Self::menu_item(ui, Some(Icon::Queue), "Añadir a la cola", false).clicked() {
+                if Self::menu_item(ui, Some(Icon::AddToQueue), "Añadir a la cola", false).clicked() {
                     self.actions.push(Action::AddToQueue(uri.clone()));
                     ui.close();
                 }
@@ -1600,7 +1600,7 @@ impl App {
             let more = icons::button(ui, Icon::More, 30.0, p.weak).on_hover_text("Más");
             egui::Popup::menu(&more).show(|ui| {
                 ui.set_min_width(180.0);
-                if Self::menu_item(ui, Some(Icon::Queue), "Añadir a la cola", false).clicked() {
+                if Self::menu_item(ui, Some(Icon::AddToQueue), "Añadir a la cola", false).clicked() {
                     self.actions.push(Action::AddToQueue(e.uri.clone()));
                     ui.close();
                 }
@@ -2101,7 +2101,7 @@ impl App {
                             app.actions.push(Action::OpenEditor(meta_m.clone()));
                             ui.close();
                         }
-                        if Self::menu_item(ui, Some(Icon::Image), "Cambiar imagen…", false).clicked() {
+                        if Self::menu_item(ui, Some(Icon::Camera), "Cambiar imagen…", false).clicked() {
                             app.actions.push(Action::PickPlaylistImage(id_m.clone()));
                             ui.close();
                         }
@@ -2319,7 +2319,7 @@ impl App {
                     |app, ui| {
                         let p = theme::palette(ui.ctx());
                         let (icon, color, tip) = if saved {
-                            (Icon::Check, GREEN, "Quitar de tu biblioteca")
+                            (Icon::CheckCircle, GREEN, "Quitar de tu biblioteca")
                         } else {
                             (Icon::PlusCircle, p.weak, "Guardar en tu biblioteca")
                         };

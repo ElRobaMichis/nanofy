@@ -40,6 +40,8 @@ pub use theme::GREEN;
 pub const ERROR_RED: egui::Color32 = theme::RED;
 pub const ROW_H: f32 = 56.0;
 pub const SIDEBAR_W: f32 = 236.0;
+/// Alto del panel del reproductor: barra de 80 px, 4 por encima y 10 por debajo.
+pub const PLAYER_PANEL_H: f32 = 94.0;
 pub const LIKED: &str = "liked";
 pub const SEARCH_ID: &str = "nanofy_search_box";
 
@@ -8068,10 +8070,10 @@ impl crate::shell::UiApp for App {
 
         // Reproductor flotante abajo.
         egui::Panel::bottom("player")
-            .exact_size(96.0)
+            .exact_size(PLAYER_PANEL_H)
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::new().fill(bg).inner_margin(Margin { left: 8, right: 8, top: 4, bottom: 8 }))
+            .frame(Frame::new().fill(bg).inner_margin(Margin { left: 7, right: 7, top: 4, bottom: 10 }))
             .show(ui, |ui| self.player_bar(ui));
 
         if self.settings.sidebar_visible {

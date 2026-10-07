@@ -405,6 +405,14 @@ impl App {
                 }
                 None => err("falta points"),
             },
+            // Tamaño interior de la ventana, en puntos (para capturas a un ancho exacto).
+            "window_size" => match (n(cmd, "w"), n(cmd, "h")) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w as f32, h as f32)));
+                    ok()
+                }
+                _ => err("faltan w y h"),
+            },
             "minimize" => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(b(cmd, "on", true)));
                 ok()

@@ -136,8 +136,6 @@ pub struct Images {
     waiting: Option<Instant>,
     /// Portadas a la vista sin textura en este fotograma.
     waiting_now: usize,
-    /// Color dominante por URL (calculado al cargar miniaturas), para el fondo del reproductor.
-    colors: HashMap<String, egui::Color32>,
 }
 
 impl Drop for Images {
@@ -225,7 +223,6 @@ impl Images {
             last_sweep: Instant::now(),
             waiting: None,
             waiting_now: 0,
-            colors: HashMap::new(),
         }
     }
 
@@ -277,38 +274,11 @@ impl Images {
         }
     }
 
-    /// Color de fondo derivado de una portada ya cargada: oscuro para el tema oscuro y un
-    /// tinte claro (mezclado con blanco) para el tema claro, para que el texto siga legible.
-    pub fn color(&self, url: &str, dark: bool) -> Option<egui::Color32> {
-        let raw = self.colors.get(url).copied()?;
-        let (r, g, b) = (raw.r() as f64, raw.g() as f64, raw.b() as f64);
-        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        Some(if dark {
-            let target = 52.0;
-            let k = if lum > 1.0 { (target / lum).min(1.4) } else { 1.0 };
-            let c = |v: f64| ((v * k).clamp(0.0, 255.0)) as u8;
-            egui::Color32::from_rgb(c(r), c(g), c(b))
-        } else {
-            // Tinte: 78 % blanco + 22 % color, y nunca más oscuro que ~215 de luminancia.
-            let mix = |v: f64| 255.0 * 0.78 + v * 0.22;
-            let (mr, mg, mb) = (mix(r), mix(g), mix(b));
-            let l2 = 0.2126 * mr + 0.7152 * mg + 0.0722 * mb;
-            let k = if l2 < 215.0 { 215.0 / l2 } else { 1.0 };
-            let c = |v: f64| ((v * k).clamp(0.0, 255.0)) as u8;
-            egui::Color32::from_rgb(c(mr), c(mg), c(mb))
-        })
-    }
-
     /// `retry` solo cuenta sin imagen: el fallo fue pasajero y se reintentará.
     pub fn loaded(&mut self, ctx: &egui::Context, key: &str, image: Option<ColorImage>, retry: bool) {
         let slot = match image {
             Some(img) => {
                 let bytes = img.pixels.len() * 4;
-                if img.size[0] <= 200 && img.size[1] <= 200 {
-                    if let Some(url) = key.split_once('|').map(|(_, u)| u.to_string()) {
-                        self.colors.entry(url).or_insert_with(|| dominant_color(&img));
-                    }
-                }
                 Slot::Ready {
                     tex: ctx.load_texture(key, img, TextureOptions::LINEAR),
                     used: self.frame,
@@ -561,25 +531,3 @@ fn load(agent: &ureq::Agent, dir: &Path, url: &str, size: Size, stale: impl Fn()
     ))
 }
 
-/// Media de los píxeles ponderada por saturación (los colores vivos mandan).
-fn dominant_color(img: &ColorImage) -> egui::Color32 {
-    let (mut r, mut g, mut b, mut wsum) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    let step = (img.pixels.len() / 4096).max(1);
-    for px in img.pixels.iter().step_by(step) {
-        let (pr, pg, pb) = (px.r() as f64, px.g() as f64, px.b() as f64);
-        let max = pr.max(pg).max(pb);
-        let min = pr.min(pg).min(pb);
-        let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
-        let light = max / 255.0;
-        let w = sat * sat * light + 0.02;
-        r += pr * w;
-        g += pg * w;
-        b += pb * w;
-        wsum += w;
-    }
-    if wsum <= 0.0 {
-        return egui::Color32::from_rgb(128, 128, 128);
-    }
-    // Se guarda el color medio sin ajustar; `color()` lo adapta al tema.
-    egui::Color32::from_rgb((r / wsum) as u8, (g / wsum) as u8, (b / wsum) as u8)
-}

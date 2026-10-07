@@ -56,8 +56,9 @@ hasta pulsarlo.
 Dónde guarda sus datos
 ----------------------
 - Ajustes:   %APPDATA%\nanofy\config\settings.json
-- Sesión y caché: %LOCALAPPDATA%\nanofy\  (bórrala para "desinstalar" por completo;
-  el programa en sí es solo nanofy.exe)
+- Sesión y caché: %LOCALAPPDATA%\nanofy\
+Para desinstalar del todo, cierra Nanofy y borra su carpeta (el programa es
+solo nanofy.exe) y las carpetas %APPDATA%\nanofy y %LOCALAPPDATA%\nanofy.
 
 Atajos
 ------

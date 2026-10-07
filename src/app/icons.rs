@@ -38,6 +38,9 @@ pub enum Icon {
     Queue,
     /// Añadir a la cola (dos notas con un «+»).
     AddToQueue,
+    /// Añadir una lista entera a la cola (líneas con un «+»), en la fila de botones de una
+    /// playlist o un álbum.
+    QueueList,
     /// Letra: líneas de texto y una nota.
     Lyrics,
     #[allow(dead_code)]
@@ -306,11 +309,17 @@ fn rotated(pts: &[(f32, f32)], deg: f32) -> Vec<(f32, f32)> {
 
 fn build(icon: Icon, d: &mut Draw) {
     match icon {
-        Icon::Home => d.rpoly(
-            &[(4.2, 10.4), (12.0, 4.2), (19.8, 10.4), (19.8, 20.0), (14.6, 20.0), (14.6, 14.6), (9.4, 14.6), (9.4, 20.0), (4.2, 20.0)],
-            0.7,
-            true,
-        ),
+        Icon::Home => {
+            // Tejado a dos aguas y la puerta como un hueco en la base, copiada de la referencia
+            // (rejilla de 28: a 28 px, 1 unidad = 1 px).
+            d.grid = BAR_GRID;
+            d.sw = 2.2;
+            d.stroke(rounded_each(
+                &[(9.1, 22.4), (4.0, 22.4), (4.0, 11.8), (13.7, 4.6), (23.3, 11.8), (23.3, 22.4), (19.1, 22.4)],
+                &[0.0, 1.6, 1.2, 0.9, 1.2, 1.6, 0.0],
+                false,
+            ));
+        }
         Icon::Search => {
             d.ring((10.6, 10.6), 6.4);
             d.line((15.4, 15.4), (20.4, 20.4));
@@ -349,11 +358,15 @@ fn build(icon: Icon, d: &mut Draw) {
             d.note(19.4, 13.4, 19.0);
         }
         Icon::Artist => {
-            d.ring((9.5, 7.6), 3.6);
-            d.cubic((3.6, 19.8), (3.6, 15.6), (6.8, 14.0), (10.2, 14.0));
-            d.line((10.2, 14.0), (12.4, 14.3));
-            d.line((3.6, 19.8), (12.4, 19.8));
-            d.note(19.2, 12.6, 18.6);
+            // Busto (cabeza y hombro) y una nota de cabeza hueca, de la referencia (rejilla de 28).
+            d.grid = BAR_GRID;
+            d.sw = 2.0;
+            d.ring((14.0, 7.4), 3.2);
+            let mut body = cubic_pts(pos2(11.0, 14.3), pos2(8.2, 14.8), pos2(6.0, 16.6), pos2(6.0, 19.2));
+            body.extend(rounded(&[(6.0, 19.2), (6.0, 22.6), (13.6, 22.6)], 1.2, false).into_iter().skip(1));
+            d.stroke(body);
+            d.line((21.9, 7.3), (21.9, 17.6));
+            d.ring((19.7, 17.6), 2.2);
         }
         Icon::History => {
             d.arc((12.8, 12.0), 7.8, 196.0, 506.0);
@@ -362,9 +375,9 @@ fn build(icon: Icon, d: &mut Draw) {
         }
         Icon::Library => {
             // Dos lomos y un libro con la esquina de arriba cortada, en línea.
-            d.line((5.2, 4.0), (5.2, 20.0));
-            d.line((9.6, 4.0), (9.6, 20.0));
-            d.rpoly(&[(13.8, 4.2), (19.6, 6.9), (19.6, 20.0), (13.8, 20.0)], 0.6, true);
+            d.line((4.0, 3.8), (4.0, 19.2));
+            d.line((9.3, 3.8), (9.3, 19.2));
+            d.rpoly(&[(13.8, 3.8), (19.4, 7.4), (19.4, 19.2), (13.8, 19.2)], 0.6, true);
         }
         Icon::Play => d.fill(&[(8.0, 4.8), (19.6, 12.0), (8.0, 19.2)], 1.8),
         Icon::Pause => {
@@ -431,6 +444,17 @@ fn build(icon: Icon, d: &mut Draw) {
             d.rpoly(&[(10.4, 17.6), (10.4, 5.4), (19.2, 5.4), (19.2, 17.6)], 0.5, false);
             d.ring((8.45, 18.2), 1.95);
             d.ring((17.25, 18.2), 1.95);
+        }
+        Icon::QueueList => {
+            // Copiado de la referencia (rejilla de 28): una «C» con un «+» a su derecha y dos
+            // líneas largas debajo.
+            d.grid = BAR_GRID;
+            d.sw = 2.2;
+            d.stroke(rounded_each(&[(13.0, 6.0), (5.0, 6.0), (5.0, 11.0), (13.0, 11.0)], &[0.0, 2.5, 2.5, 0.0], false));
+            d.line((19.0, 4.9), (19.0, 11.1));
+            d.line((15.8, 8.0), (22.2, 8.0));
+            d.line((6.0, 17.0), (21.2, 17.0));
+            d.line((6.0, 22.4), (21.2, 22.4));
         }
         Icon::Lyrics => {
             d.bar();
@@ -577,23 +601,26 @@ fn build(icon: Icon, d: &mut Draw) {
             d.line((21.0, 17.6), (21.0, 19.5));
         }
         Icon::Share => {
-            d.line((12.0, 3.6), (12.0, 14.2));
-            d.poly(&[(8.4, 7.2), (12.0, 3.6), (15.6, 7.2)]);
-            d.rpoly(&[(9.0, 9.8), (5.5, 9.8), (5.5, 20.2), (18.5, 20.2), (18.5, 9.8), (15.0, 9.8)], 2.4, false);
+            // Bandeja abierta y la flecha que sale hacia arriba (referencia, rejilla de 28).
+            d.grid = BAR_GRID;
+            d.sw = 2.1;
+            d.line((14.3, 4.8), (14.3, 16.2));
+            d.poly(&[(9.8, 9.4), (14.3, 4.8), (18.8, 9.4)]);
+            d.stroke(rounded_each(&[(6.5, 13.6), (6.5, 21.1), (22.0, 21.1), (22.0, 13.6)], &[0.0, 2.8, 2.8, 0.0], false));
         }
         Icon::Download => {
             d.ring((12.0, 12.0), 8.6);
-            d.line((12.0, 7.4), (12.0, 16.2));
-            d.poly(&[(8.6, 12.8), (12.0, 16.2), (15.4, 12.8)]);
+            d.line((12.0, 6.6), (12.0, 17.2));
+            d.poly(&[(7.9, 12.9), (12.0, 17.2), (16.1, 12.9)]);
         }
         Icon::Minus => d.line((5.0, 12.0), (19.0, 12.0)),
         Icon::PlusCircle => {
             d.ring((12.0, 12.0), 8.8);
-            d.line((12.0, 8.2), (12.0, 15.8));
-            d.line((8.2, 12.0), (15.8, 12.0));
+            d.line((12.0, 7.9), (12.0, 16.1));
+            d.line((7.9, 12.0), (16.1, 12.0));
         }
         Icon::Bookmark | Icon::BookmarkFilled => {
-            let pts = [(6.0, 3.8), (18.0, 3.8), (18.0, 20.3), (12.0, 16.2), (6.0, 20.3)];
+            let pts = [(5.3, 3.8), (19.5, 3.8), (19.5, 21.0), (12.4, 16.6), (5.3, 21.0)];
             if icon == Icon::BookmarkFilled {
                 d.fill(&pts, 1.8);
             }
@@ -641,11 +668,11 @@ fn build(icon: Icon, d: &mut Draw) {
                 d.dot((x, y), 1.5);
             }
         }
-        Icon::Folder => d.rpoly(&[(3.0, 5.5), (9.6, 5.5), (11.6, 7.6), (21.0, 7.6), (21.0, 18.5), (3.0, 18.5)], 2.0, true),
+        Icon::Folder => d.rpoly(&[(3.0, 3.2), (9.6, 3.2), (11.6, 5.3), (21.0, 5.3), (21.0, 18.5), (3.0, 18.5)], 2.0, true),
         Icon::Book => {
             // Libro abierto: dos páginas que se juntan en el lomo.
-            d.rpoly(&[(12.0, 6.6), (8.0, 5.2), (3.0, 5.6), (3.0, 18.6), (8.0, 18.2), (12.0, 19.6)], 1.6, true);
-            d.rpoly(&[(12.0, 6.6), (16.0, 5.2), (21.0, 5.6), (21.0, 18.6), (16.0, 18.2), (12.0, 19.6)], 1.6, true);
+            d.rpoly(&[(12.0, 5.2), (8.0, 3.8), (3.8, 4.2), (3.8, 19.2), (8.0, 18.8), (12.0, 20.2)], 1.6, true);
+            d.rpoly(&[(12.0, 5.2), (16.0, 3.8), (20.2, 4.2), (20.2, 19.2), (16.0, 18.8), (12.0, 20.2)], 1.6, true);
         }
         Icon::Radio => {
             d.dot((12.0, 12.0), 1.9);
@@ -873,7 +900,7 @@ mod tests {
         Icon::Home, Icon::Search, Icon::Heart, Icon::HeartFilled, Icon::Pin, Icon::PinFilled, Icon::Playlist,
         Icon::PlaylistItem, Icon::Album, Icon::Artist, Icon::History, Icon::Library, Icon::Play, Icon::Pause,
         Icon::Prev, Icon::Next, Icon::Shuffle, Icon::Repeat, Icon::RepeatOne, Icon::Volume, Icon::Mute,
-        Icon::Queue, Icon::AddToQueue, Icon::Lyrics, Icon::Mic, Icon::Podcast, Icon::Devices, Icon::Headphones,
+        Icon::Queue, Icon::AddToQueue, Icon::QueueList, Icon::Lyrics, Icon::Mic, Icon::Podcast, Icon::Devices, Icon::Headphones,
         Icon::ThumbsUp, Icon::Camera, Icon::Refresh, Icon::Replay15, Icon::Forward15, Icon::CheckCircle, Icon::Person,
         Icon::Plus, Icon::PlusSquare, Icon::More,
         Icon::Settings, Icon::Grid, Icon::List, Icon::Back, Icon::Forward, Icon::Close, Icon::Check,

@@ -39,9 +39,42 @@ use crate::webauth::WebAuth;
 pub use theme::GREEN;
 pub const ERROR_RED: egui::Color32 = theme::RED;
 pub const ROW_H: f32 = 56.0;
-pub const SIDEBAR_W: f32 = 236.0;
-/// Alto del panel del reproductor: barra de 80 px, 4 por encima y 10 por debajo.
-pub const PLAYER_PANEL_H: f32 = 94.0;
+pub const SIDEBAR_W: f32 = 272.0;
+/// Alto del panel del reproductor: barra de 80 px, 5 por encima y 10 por debajo.
+pub const PLAYER_PANEL_H: f32 = 95.0;
+/// Alto de la barra superior.
+pub const TOPBAR_H: f32 = 59.0;
+/// Márgenes del contenido dentro de su panel (los de la referencia: el título a 36 px del borde
+/// izquierdo, la portada de la derecha a 49 del derecho y 22 por arriba).
+pub const CONTENT_PAD_LEFT: f32 = 36.0;
+pub const CONTENT_PAD_RIGHT: f32 = 49.0;
+pub const CONTENT_PAD_TOP: f32 = 22.0;
+
+/// Fondo del panel de contenido: sin `tint`, del color `card`; con él, el degradado de la
+/// referencia (plano 26 px y de ahí lineal hasta `bottom` 8 px antes del borde de abajo).
+fn paint_content_panel(painter: &egui::Painter, panel: egui::Rect, tint: Option<egui::Color32>, card: egui::Color32, bottom: egui::Color32) {
+    let r = egui::CornerRadius::same(8);
+    let Some(top) = tint else {
+        painter.rect_filled(panel, r, card);
+        return;
+    };
+    painter.rect_filled(panel, r, bottom);
+    let flat_end = panel.min.y + 26.0;
+    let grad_end = (panel.max.y - 8.0).max(flat_end + 1.0);
+    painter.rect_filled(
+        egui::Rect::from_min_max(panel.min, egui::pos2(panel.max.x, flat_end + 1.0)),
+        egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 },
+        top,
+    );
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.colored_vertex(egui::pos2(panel.min.x, flat_end), top);
+    mesh.colored_vertex(egui::pos2(panel.max.x, flat_end), top);
+    mesh.colored_vertex(egui::pos2(panel.max.x, grad_end), bottom);
+    mesh.colored_vertex(egui::pos2(panel.min.x, grad_end), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
+}
 pub const LIKED: &str = "liked";
 pub const SEARCH_ID: &str = "nanofy_search_box";
 
@@ -1309,8 +1342,8 @@ impl App {
             jam_error: None,
             editor: None,
             show_shortcuts: false,
-            sidebar_pins_open: true,
-            sidebar_playlists_open: true,
+            sidebar_pins_open: false,
+            sidebar_playlists_open: false,
             library_grid: settings_library_grid,
             library_sort_name: false,
             library_filter: String::new(),
@@ -1848,6 +1881,23 @@ impl App {
 
     pub fn in_library(&self, playlist_id: &str) -> bool {
         self.playlists.iter().any(|p| p.id == playlist_id)
+    }
+
+    /// Tono del degradado de la página actual: el de la portada de la playlist o el álbum
+    /// abiertos, cuando ya está cargada.
+    fn page_tint(&self) -> Option<egui::Color32> {
+        let url = match self.page() {
+            Page::Playlist(id) => self
+                .playlists
+                .iter()
+                .find(|pl| &pl.id == id)
+                .and_then(|pl| pl.cover(300))
+                .or_else(|| self.playlist_meta.get(id).and_then(|pl| pl.cover(300)))
+                .map(str::to_string),
+            Page::Album(id) => self.albums.get(id).and_then(|a| a.cover(300)).map(str::to_string),
+            _ => None,
+        }?;
+        self.images.tint(&url)
     }
 
     pub fn page(&self) -> &Page {
@@ -8047,7 +8097,6 @@ impl crate::shell::UiApp for App {
 
         let p = theme::palette(&ctx);
         let bg = p.bg;
-        let margin = 8.0;
 
         if self.miniplayer {
             egui::CentralPanel::default()
@@ -8060,30 +8109,36 @@ impl crate::shell::UiApp for App {
             return;
         }
 
-        // Barra superior a todo el ancho.
+        // Barra superior a todo el ancho (59 px, como en la referencia de diseño).
         egui::Panel::top("topbar")
-            .exact_size(52.0)
+            .exact_size(TOPBAR_H)
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::new().fill(bg).inner_margin(Margin { left: 0, right: 0, top: 6, bottom: 0 }))
+            .frame(Frame::new().fill(bg).inner_margin(Margin::ZERO))
             .show(ui, |ui| self.top_bar(ui));
 
-        // Reproductor flotante abajo.
-        egui::Panel::bottom("player")
-            .exact_size(PLAYER_PANEL_H)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(Frame::new().fill(bg).inner_margin(Margin { left: 7, right: 7, top: 4, bottom: 10 }))
-            .show(ui, |ui| self.player_bar(ui));
-
+        // Biblioteca a la izquierda, de arriba abajo: el reproductor va solo bajo el contenido.
         if self.settings.sidebar_visible {
             egui::Panel::left("sidebar")
                 .exact_size(SIDEBAR_W)
                 .resizable(false)
                 .show_separator_line(false)
-                .frame(Frame::new().fill(bg).inner_margin(Margin { left: 10, right: 6, top: 4, bottom: 4 }))
+                .frame(Frame::new().fill(bg).inner_margin(Margin::ZERO))
                 .show(ui, |ui| self.sidebar(ui));
         }
+
+        // Reproductor bajo el contenido: 5 px por encima, 6 a la derecha y 10 por debajo.
+        egui::Panel::bottom("player")
+            .exact_size(PLAYER_PANEL_H)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(Frame::new().fill(bg).inner_margin(Margin {
+                left: if self.settings.sidebar_visible { 0 } else { 6 },
+                right: 6,
+                top: 5,
+                bottom: 10,
+            }))
+            .show(ui, |ui| self.player_bar(ui));
 
         if let Some(tab) = self.side {
             egui::Panel::right("side")
@@ -8105,28 +8160,31 @@ impl crate::shell::UiApp for App {
         }
 
         let page_key = format!("{:?}", self.page());
+        let tint = if p.dark { self.page_tint() } else { None };
         egui::CentralPanel::default()
             .frame(Frame::new().fill(bg).inner_margin(Margin {
-                left: if self.settings.sidebar_visible { 0 } else { margin as i8 },
-                right: margin as i8,
+                left: if self.settings.sidebar_visible { 0 } else { 6 },
+                right: 6,
                 top: 0,
                 bottom: 0,
             }))
             .show(ui, |ui| {
-                Frame::new()
-                    .fill(p.card)
-                    .corner_radius(CornerRadius::same(14))
-                    .stroke(egui::Stroke::new(1.0, p.border))
-                    .inner_margin(Margin { left: 22, right: 22, top: 18, bottom: 0 })
-                    .show(ui, |ui| {
-                        ui.set_min_size(ui.available_size());
-                        egui::ScrollArea::vertical()
-                            .id_salt(page_key)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                self.page_ui(ui);
-                                ui.add_space(24.0);
-                            });
+                // Panel de contenido con esquinas de 8 px. En playlists y álbumes, degradado del
+                // tono de la portada (plano los primeros 26 px) hasta el fondo de la ventana.
+                let panel = ui.max_rect();
+                paint_content_panel(ui.painter(), panel, tint, p.card, bg);
+                let inner = egui::Rect::from_min_max(
+                    egui::pos2(panel.min.x + CONTENT_PAD_LEFT, panel.min.y + CONTENT_PAD_TOP),
+                    egui::pos2(panel.max.x - CONTENT_PAD_RIGHT, panel.max.y),
+                );
+                let mut c = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+                c.set_clip_rect(panel.shrink(1.0));
+                egui::ScrollArea::vertical()
+                    .id_salt(page_key)
+                    .auto_shrink([false, false])
+                    .show(&mut c, |ui| {
+                        self.page_ui(ui);
+                        ui.add_space(24.0);
                     });
             });
 

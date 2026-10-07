@@ -36,7 +36,7 @@ impl Palette {
         if dark {
             Self {
                 dark,
-                bg: Color32::from_rgb(9, 9, 9),
+                bg: Color32::from_rgb(6, 6, 6),
                 card: Color32::from_rgb(20, 20, 20),
                 card2: Color32::from_rgb(30, 30, 30),
                 hover: Color32::from_rgb(38, 38, 38),
@@ -66,6 +66,41 @@ impl Palette {
 
 pub fn palette(ctx: &egui::Context) -> Palette {
     Palette::new(ctx.theme() == egui::Theme::Dark)
+}
+
+/// Tinta sobre el panel de contenido de playlists y álbumes: en oscuro, blanco con transparencia,
+/// que deja ver el degradado de la portada (como en la referencia de diseño).
+#[derive(Clone, Copy)]
+pub struct Ink {
+    /// Títulos y nombres de canción.
+    pub strong: Color32,
+    /// Metadatos, columnas, números e iconos.
+    pub dim: Color32,
+    /// Separador bajo la cabecera de la tabla.
+    pub line: Color32,
+    /// Borde de los chips y su texto.
+    pub chip: Color32,
+    pub chip_text: Color32,
+    /// Nombres de los artistas de la columna derecha.
+    pub name: Color32,
+    /// Fondo de una fila bajo el ratón o elegida.
+    pub hover: Color32,
+}
+
+pub fn ink(p: &Palette) -> Ink {
+    if p.dark {
+        Ink {
+            strong: Color32::from_white_alpha(225),
+            dim: Color32::from_white_alpha(115),
+            line: Color32::from_white_alpha(16),
+            chip: Color32::from_white_alpha(29),
+            chip_text: Color32::from_white_alpha(122),
+            name: Color32::from_white_alpha(128),
+            hover: Color32::from_white_alpha(10),
+        }
+    } else {
+        Ink { strong: p.text, dim: p.weak, line: p.border, chip: p.border, chip_text: p.weak, name: p.text, hover: p.hover }
+    }
 }
 
 pub fn bold(size: f32) -> FontId {

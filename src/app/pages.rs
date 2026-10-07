@@ -6,15 +6,20 @@ use egui::{pos2, vec2, Align, Button, Color32, CornerRadius, Label, Layout, Rect
 
 use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
-use super::widgets::{child_in, keyed_child, uri_to_link, CardInfo, CardKind, RowOpts, Source, CARD_H, CARD_W};
-use super::{fmt_thousands, strip_html, Action, App, Auth, FolderDialog, Page, PlayTarget, ERROR_RED, LIKED, ROW_H};
+use super::widgets::{child_in, galley_truncated, keyed_child, text_on_baseline, uri_to_link, CardInfo, CardKind, RowOpts, Source, CARD_H, CARD_W, HEADER_H, TABLE_HEAD_H, TABLE_ROW_H};
+use super::{fmt_thousands, strip_html, Action, App, Auth, FolderDialog, Page, PlayTarget, ERROR_RED, LIKED};
 use super::panels::{about_view, Tone};
 use crate::api::Req;
 use crate::config::{Loudness, Quality, Theme};
 use crate::model::*;
 
-/// Ancho de la columna derecha de información en playlists y álbumes.
-const INFO_W: f32 = 300.0;
+/// Columna derecha de información en playlists y álbumes y su separación de la izquierda (de
+/// la referencia de diseño: portada de 320 px a 46 px de la tabla).
+const INFO_W: f32 = 320.0;
+const INFO_GAP: f32 = 46.0;
+/// Título de las páginas y su línea de metadatos.
+const TITLE_FONT: f32 = 35.5;
+const META_FONT: f32 = 14.5;
 
 impl App {
     pub fn page_ui(&mut self, ui: &mut egui::Ui) {
@@ -278,10 +283,64 @@ impl App {
         if !kind.is_empty() {
             ui.label(RichText::new(kind).small().strong().color(p.weak));
         }
-        ui.add(Label::new(RichText::new(title).font(theme::bold(30.0))).truncate());
+        ui.add(Label::new(RichText::new(title).font(theme::bold(TITLE_FONT))).truncate());
         ui.add_space(2.0);
-        ui.add(Label::new(RichText::new(meta).small().color(p.weak)).truncate());
+        ui.add(Label::new(RichText::new(meta).font(theme::regular(META_FONT)).color(p.weak)).truncate());
         ui.add_space(10.0);
+    }
+
+    /// Cabecera de una playlist, un álbum o Me gusta, copia de la referencia de diseño: el título
+    /// en negrita y debajo «De <autores> • <partes>», con los autores en blanco y en negrita
+    /// (enlaces a su página). Ocupa `HEADER_H`: la fila de botones va justo debajo. `tip`: globo
+    /// del título (la descripción de la playlist).
+    fn collection_header(&mut self, ui: &mut egui::Ui, title: &str, tip: Option<&str>, by: &[(String, Option<Page>)], parts: &[String]) {
+        let p = theme::palette(ui.ctx());
+        let ink = theme::ink(&p);
+        let w = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(vec2(w, HEADER_H), Sense::hover());
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        let x = rect.min.x;
+        let g = galley_truncated(&painter, title, theme::bold(TITLE_FONT), ink.strong, w);
+        let tr = text_on_baseline(&painter, pos2(x, rect.min.y + 40.0), g, ink.strong);
+        if let Some(tip) = tip {
+            ui.interact(tr, ui.id().with("header_title"), Sense::hover()).on_hover_text(tip);
+        }
+        let base = rect.min.y + 84.0;
+        let font = theme::regular(META_FONT);
+        let mut cx = x;
+        if !by.is_empty() {
+            let g = painter.layout_no_wrap("De ".into(), font.clone(), ink.dim);
+            cx = text_on_baseline(&painter, pos2(cx, base), g, ink.dim).max.x;
+            for (i, (name, page)) in by.iter().enumerate() {
+                if i > 0 {
+                    let g = painter.layout_no_wrap(", ".into(), font.clone(), ink.dim);
+                    cx = text_on_baseline(&painter, pos2(cx, base), g, ink.dim).max.x;
+                }
+                let g = painter.layout_no_wrap(name.clone(), theme::bold(META_FONT), ink.strong);
+                let r = text_on_baseline(&painter, pos2(cx, base), g, ink.strong);
+                if let Some(page) = page {
+                    let resp = ui.interact(r, ui.id().with(("header_by", i)), Sense::click());
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        painter.line_segment([pos2(r.min.x, base + 2.0), pos2(r.max.x, base + 2.0)], egui::Stroke::new(1.0, ink.strong));
+                    }
+                    if resp.clicked() {
+                        self.actions.push(Action::Go(page.clone()));
+                    }
+                }
+                cx = r.max.x;
+            }
+        }
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 || !by.is_empty() {
+                // Punto de 7 px entre partes, a media altura de las minúsculas.
+                let dot = pos2(cx + 10.5, base - 5.5);
+                painter.circle_filled(dot, 3.0, ink.dim);
+                cx = dot.x + 9.5;
+            }
+            let g = painter.layout_no_wrap(part.clone(), font.clone(), ink.dim);
+            cx = text_on_baseline(&painter, pos2(cx, base), g, ink.dim).max.x;
+        }
     }
 
     /// Dos columnas cuando hay sitio: contenido a la izquierda, tarjeta de información a la derecha.
@@ -297,9 +356,9 @@ impl App {
             return;
         }
         let top = ui.cursor().min;
-        let left_w = width - INFO_W - 24.0;
+        let left_w = width - INFO_W - INFO_GAP;
         let left_rect = Rect::from_min_size(top, vec2(left_w, f32::INFINITY));
-        let right_rect = Rect::from_min_size(pos2(top.x + left_w + 24.0, top.y), vec2(INFO_W, f32::INFINITY));
+        let right_rect = Rect::from_min_size(pos2(top.x + left_w + INFO_GAP, top.y), vec2(INFO_W, f32::INFINITY));
         let mut l = child_in(ui, left_rect, Layout::top_down(Align::Min));
         l.set_width(left_w);
         left(self, &mut l);
@@ -315,68 +374,89 @@ impl App {
     /// una petición: mientras llegan lotes, los artistas más presentes aún van cambiando.
     fn info_card(&mut self, ui: &mut egui::Ui, cover: Option<&str>, chips: &[String], artists: &[ArtistRef], ready: bool) {
         let p = theme::palette(ui.ctx());
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        let side = ui.available_width().min(INFO_W);
+        let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
+        self.cover_in(ui, cover, rect, 6);
+        if cover.is_none() {
+            icons::paint(ui.painter(), rect.shrink(side * 0.3), p.faint, Icon::Album);
+        }
+        self.info_chips_and_artists(ui, chips, artists, ready);
+    }
+
+    /// Debajo de la portada de la columna derecha (referencia de diseño): chips de contorno de
+    /// 39 px a 30 px de la portada y los artistas con su foto redonda de 60 px, uno cada 76 px.
+    fn info_chips_and_artists(&mut self, ui: &mut egui::Ui, chips: &[String], artists: &[ArtistRef], ready: bool) {
+        let p = theme::palette(ui.ctx());
+        let ink = theme::ink(&p);
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        let w = ui.available_width();
+        if !chips.is_empty() {
+            ui.add_space(30.0);
+            let font = theme::regular(15.5);
+            let galleys: Vec<_> = chips.iter().map(|c| ui.painter().layout_no_wrap(c.clone(), font.clone(), ink.chip_text)).collect();
+            // Posiciones por filas: 10 px entre chips y entre filas.
+            let mut placed = Vec::with_capacity(galleys.len());
+            let (mut x, mut row) = (0.0f32, 0usize);
+            for g in &galleys {
+                let cw = (g.size().x + 37.0).round().min(w);
+                if x > 0.0 && x + cw > w {
+                    x = 0.0;
+                    row += 1;
+                }
+                placed.push((x, row, cw));
+                x += cw + 10.0;
+            }
+            let rows = row + 1;
+            let (area, _) = ui.allocate_exact_size(vec2(w, rows as f32 * 49.0 - 10.0), Sense::hover());
+            for ((x, row, cw), g) in placed.into_iter().zip(galleys) {
+                let chip = Rect::from_min_size(pos2(area.min.x + x, area.min.y + row as f32 * 49.0), vec2(cw, 39.0));
+                ui.painter().rect_stroke(chip, CornerRadius::same(20), egui::Stroke::new(1.6, ink.chip), egui::StrokeKind::Inside);
+                text_on_baseline(ui.painter(), pos2(chip.min.x + 19.0, chip.min.y + 25.0), g, ink.chip_text);
+            }
+        }
+        if artists.is_empty() {
+            return;
+        }
+        ui.add_space(if chips.is_empty() { 30.0 } else { 31.0 });
         let mut missing: Vec<String> = Vec::new();
-        egui::Frame::new()
-            .fill(p.card2)
-            .corner_radius(CornerRadius::same(14))
-            .inner_margin(14)
-            .show(ui, |ui| {
-                ui.set_width(INFO_W - 28.0);
-                let side = INFO_W - 28.0;
-                let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
-                self.cover_in(ui, cover, rect, 10);
-                if cover.is_none() {
-                    icons::paint(ui.painter(), rect.shrink(side * 0.3), p.faint, Icon::Album);
+        for (i, a) in artists.iter().take(10).enumerate() {
+            if i > 0 {
+                ui.add_space(16.0);
+            }
+            let img = a
+                .id
+                .as_ref()
+                .and_then(|id| self.artists.get(id))
+                .and_then(|pg| pg.artist.as_ref())
+                .and_then(|ar| ar.cover(64).map(|s| s.to_string()));
+            let (row, r) = ui.allocate_exact_size(vec2(w, 60.0), Sense::click());
+            let avatar = Rect::from_min_size(row.min, vec2(60.0, 60.0));
+            match &img {
+                Some(u) => self.cover_in(ui, Some(u), avatar, 30),
+                None => {
+                    ui.painter().circle_filled(avatar.center(), 30.0, p.hover);
+                    let initial = a.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                    ui.painter().text(avatar.center(), egui::Align2::CENTER_CENTER, initial, theme::regular(22.0), ink.strong);
                 }
-                if !chips.is_empty() {
-                    ui.add_space(12.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for c in chips {
-                            let _ = Self::pill(ui, c, false);
-                        }
-                    });
+            }
+            let color = if r.hovered() && a.id.is_some() { ink.strong } else { ink.name };
+            let g = galley_truncated(ui.painter(), &a.name, theme::regular(17.0), color, (w - 80.0).max(20.0));
+            text_on_baseline(ui.painter(), pos2(row.min.x + 80.0, avatar.center().y + 5.5), g, color);
+            if r.hovered() && a.id.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if r.clicked() {
+                if let Some(id) = &a.id {
+                    self.actions.push(Action::Go(Page::Artist(id.clone())));
                 }
-                if !artists.is_empty() {
-                    ui.add_space(12.0);
-                    for a in artists.iter().take(24) {
-                        let img = a
-                            .id
-                            .as_ref()
-                            .and_then(|id| self.artists.get(id))
-                            .and_then(|pg| pg.artist.as_ref())
-                            .and_then(|ar| ar.cover(64).map(|s| s.to_string()));
-                        let r = ui
-                            .horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 10.0;
-                                let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
-                                match &img {
-                                    Some(u) => self.cover_in(ui, Some(u), rect, 18),
-                                    None => {
-                                        ui.painter().circle_filled(rect.center(), 18.0, p.hover);
-                                        let initial = a.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-                                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, initial, theme::regular(14.0), p.text);
-                                    }
-                                }
-                                ui.add(Label::new(RichText::new(&a.name).color(p.text)).truncate());
-                            })
-                            .response
-                            .interact(Sense::click());
-                        if r.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        if r.clicked() {
-                            if let Some(id) = &a.id {
-                                self.actions.push(Action::Go(Page::Artist(id.clone())));
-                            }
-                        }
-                        if let Some(id) = &a.id {
-                            if ready && img.is_none() {
-                                missing.push(id.clone());
-                            }
-                        }
-                    }
+            }
+            if let Some(id) = &a.id {
+                if ready && img.is_none() {
+                    missing.push(id.clone());
                 }
-            });
+            }
+        }
         // Las imágenes que falten, de una vez y una sola vez por artista (metadatos ligeros).
         if !missing.is_empty() {
             self.request_artist_thumbs(missing);
@@ -1211,7 +1291,7 @@ impl App {
             Self::loading(ui, "Cargando");
             return;
         }
-        self.collection_bar(ui, "history", &recent, None, None, |_, _| {}, None);
+        self.collection_bar(ui, "history", &recent, None, None, |_, _, _| false, None);
         ui.add_space(8.0);
         let shown = self.filter_tracks("history", None, &recent);
         self.track_rows(ui, "history", &shown, RowOpts { header: true, select: true, ..RowOpts::tracks(true, true) });
@@ -1627,7 +1707,6 @@ impl App {
         let list = self.lists.remove(LIKED).unwrap_or_default();
         let summary = self.list_summary(LIKED, &list);
         let total_ms = summary.total_ms;
-        let meta = format!("{} canciones · {}", list.total, fmt_total(total_ms));
         let tracks = list.tracks;
         let loading = list.loading;
         let total = list.total;
@@ -1637,93 +1716,44 @@ impl App {
         // no se conoce (no es una lista vacía): con él, cada lote pediría otro artista suelto.
         let thumbs_ready = !loading || (total > 0 && tracks.len() >= total as usize);
 
+        let me = self.display_name();
+        let by: Vec<(String, Option<Page>)> = if me.is_empty() { Vec::new() } else { vec![(me, self.my_id().map(|id| Page::User(id.to_string())))] };
+        let mut parts = vec![format!("{total} canciones")];
+        if !tracks.is_empty() {
+            parts.push(fmt_total(total_ms));
+        }
+
         self.two_columns(
             ui,
             |app, ui| {
-                Self::page_title(ui, "PLAYLIST", "Canciones que te gustan", &meta);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                app.collection_header(ui, "Canciones que te gustan", None, &by, &parts);
                 if !tracks.is_empty() {
-                    app.collection_bar(ui, LIKED, &tracks, None, None, |_, _| {}, None);
-                    ui.add_space(8.0);
+                    app.collection_bar(ui, LIKED, &tracks, None, None, |_, _, _| false, None);
                 }
                 if loading && tracks.is_empty() {
                     // Primer arranque sin copia: el hueco de las filas mientras llegan.
-                    Self::skeleton_rows(ui, 8, ROW_H, 40.0, 42.0);
+                    ui.add_space(TABLE_HEAD_H);
+                    Self::skeleton_rows(ui, 8, TABLE_ROW_H, 50.0, 43.0);
                 } else if loading {
+                    ui.add_space(8.0);
                     Self::loading(ui, &format!("Cargando {} de {}", tracks.len(), total));
                 }
                 let shown = app.filter_tracks(LIKED, Some(gen), &tracks);
                 app.track_rows(ui, LIKED, &shown, RowOpts { header: true, select: true, ..RowOpts::tracks(true, true) });
             },
             |app, ui| {
-                let p = theme::palette(ui.ctx());
-                egui::Frame::new().fill(p.card2).corner_radius(CornerRadius::same(14)).inner_margin(14).show(ui, |ui| {
-                    ui.set_width(INFO_W - 28.0);
-                    let side = INFO_W - 28.0;
-                    let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
-                    ui.painter().rect_filled(rect, CornerRadius::same(10), theme::GREEN_DARK);
-                    icons::paint(ui.painter(), rect.shrink(side * 0.28), GREEN, Icon::HeartFilled);
-                    ui.add_space(12.0);
-                    ui.horizontal_wrapped(|ui| {
-                        let _ = Self::pill(ui, &format!("{} canciones", total), false);
-                        let _ = Self::pill(ui, &fmt_total(total_ms), false);
-                    });
-                    if !summary.top.is_empty() {
-                        ui.add_space(12.0);
-                        ui.label(RichText::new("Artistas más presentes").small().color(p.weak));
-                        ui.add_space(4.0);
-                        app.info_card_artists(ui, &summary.top, thumbs_ready);
-                    }
-                });
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                let side = ui.available_width().min(INFO_W);
+                let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
+                ui.painter().rect_filled(rect, CornerRadius::same(6), theme::GREEN_DARK);
+                icons::paint(ui.painter(), rect.shrink(side * 0.28), GREEN, Icon::HeartFilled);
+                let chips = [format!("{total} canciones"), fmt_total(total_ms)];
+                app.info_chips_and_artists(ui, &chips, &summary.top, thumbs_ready);
             },
         );
         // Con su versión: si no, el resumen y la búsqueda guardados no valdrían al fotograma siguiente.
         self.lists.insert(LIKED.to_string(), crate::app::TrackList { tracks, total, loading, gen });
-    }
-
-    /// Lista de artistas con avatar (parte de la tarjeta de información). `ready` como en info_card.
-    fn info_card_artists(&mut self, ui: &mut egui::Ui, artists: &[ArtistRef], ready: bool) {
-        let p = theme::palette(ui.ctx());
-        let mut missing: Vec<String> = Vec::new();
-        for a in artists.iter().take(6) {
-            let img = a
-                .id
-                .as_ref()
-                .and_then(|id| self.artists.get(id))
-                .and_then(|pg| pg.artist.as_ref())
-                .and_then(|ar| ar.cover(64).map(|s| s.to_string()));
-            let r = ui
-                .horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
-                    match &img {
-                        Some(u) => self.cover_in(ui, Some(u), rect, 18),
-                        None => {
-                            ui.painter().circle_filled(rect.center(), 18.0, p.hover);
-                            let initial = a.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, initial, theme::regular(14.0), p.text);
-                        }
-                    }
-                    ui.add(Label::new(RichText::new(&a.name).color(p.text)).truncate());
-                })
-                .response
-                .interact(Sense::click());
-            if r.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if r.clicked() {
-                if let Some(id) = &a.id {
-                    self.actions.push(Action::Go(Page::Artist(id.clone())));
-                }
-            }
-            if let Some(id) = &a.id {
-                if ready && img.is_none() {
-                    missing.push(id.clone());
-                }
-            }
-        }
-        if !missing.is_empty() {
-            self.request_artist_thumbs(missing);
-        }
     }
 
     // ----------------------------------------------------------------- álbumes
@@ -2002,13 +2032,9 @@ impl App {
         };
         let summary = self.list_summary(&id, &list);
         let total_ms = summary.total_ms;
-        let mut meta_line = String::new();
-        if !owner.is_empty() {
-            meta_line.push_str(&format!("De {owner} · "));
-        }
-        meta_line.push_str(&format!("{total} canciones"));
+        let mut parts = vec![format!("{total} canciones")];
         if !list.tracks.is_empty() {
-            meta_line.push_str(&format!(" · {}", fmt_total(total_ms)));
+            parts.push(fmt_total(total_ms));
         }
         let mut chips = vec![if mine { "Tu playlist".to_string() } else { "Playlist".to_string() }];
         if let Some(pl) = &full_meta {
@@ -2038,6 +2064,15 @@ impl App {
         // Spotify ya no marca como colaborativas las públicas: si hay varios autores, lo es.
         let collaborative = collaborative || contributors.len() > 1;
         let editable = mine || collaborative;
+        // «De …»: el propietario o, si varias personas han añadido canciones, todas (enlaces a su
+        // perfil, como en Spotify).
+        let by: Vec<(String, Option<Page>)> = if contributors.len() > 1 {
+            contributors.iter().map(|u| (self.user_display(u), Some(Page::User(u.clone())))).collect()
+        } else if !owner.is_empty() {
+            vec![(owner.clone(), owner_id.clone().map(Page::User))]
+        } else {
+            Vec::new()
+        };
         let id2 = id.clone();
         let uri2 = uri.clone();
         let full_meta2 = full_meta.clone();
@@ -2046,48 +2081,8 @@ impl App {
             ui,
             |app, ui| {
                 let p = theme::palette(ui.ctx());
-                Self::page_title(ui, "", &name, &meta_line);
-                if let Some(d) = &description {
-                    ui.add(Label::new(RichText::new(d).small().color(p.weak)).wrap());
-                    ui.add_space(8.0);
-                }
-                if contributors.len() > 1 {
-                    // Varias personas han añadido canciones: se listan como en Spotify.
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(RichText::new("Por").small().color(p.weak));
-                        for (i, user) in contributors.iter().enumerate() {
-                            if i > 0 {
-                                ui.label(RichText::new("·").small().color(p.faint));
-                            }
-                            let img = app.users.get(user).and_then(|u| u.cover(64).map(|s| s.to_string()));
-                            let name = app.user_display(user);
-                            let r = ui
-                                .horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 5.0;
-                                    app.cover(ui, img.as_deref(), 20.0, true);
-                                    ui.label(RichText::new(name).small().color(p.text));
-                                })
-                                .response
-                                .interact(Sense::click());
-                            if r.hovered() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            }
-                            if r.clicked() {
-                                app.actions.push(Action::Go(Page::User(user.clone())));
-                            }
-                        }
-                    });
-                    ui.add_space(6.0);
-                } else if let Some(oid) = &owner_id {
-                    if !owner.is_empty() {
-                        let r = ui.add(Label::new(RichText::new(format!("Ver perfil de {owner}")).small().color(GREEN)).sense(Sense::click()));
-                        if r.clicked() {
-                            app.actions.push(Action::Go(Page::User(oid.clone())));
-                        }
-                        ui.add_space(6.0);
-                    }
-                }
+                ui.spacing_mut().item_spacing.y = 0.0;
+                app.collection_header(ui, &name, description.as_deref(), &by, &parts);
                 let link = uri_to_link(&uri2);
                 let id_m = id2.clone();
                 let meta_m = full_meta2.clone();
@@ -2124,16 +2119,17 @@ impl App {
                     &tracks,
                     Some(&uri2),
                     Some(&link),
-                    |app, ui| {
-                        let p = theme::palette(ui.ctx());
+                    |app, ui, at| {
+                        let ink = theme::ink(&theme::palette(ui.ctx()));
                         // Los uris solo al pulsar: copiarlos todos en cada fotograma costaba con miles.
-                        if icons::button(ui, Icon::PlusSquare, 34.0, p.weak).on_hover_text("Añadir todas a una playlist").clicked() {
+                        let r = Self::slot_button(ui, ui.id().with("add_all"), at, Icon::PlusCircle, 24.0, ink.dim);
+                        if r.on_hover_text("Añadir todas a una playlist").clicked() {
                             app.open_add_dialog(tracks.iter().map(|t| t.uri.clone()).collect());
                         }
+                        true
                     },
                     menu,
                 );
-                ui.add_space(8.0);
                 // La carga falló o llegó con huecos: lo que hay y «Reintentar». Texto fijo, no
                 // Self::loading, que repinta 4 veces por segundo mientras espera el reintento.
                 // Vacía cuenta aunque no se sepa el total (falló el primer lote sin metadatos).
@@ -2141,10 +2137,13 @@ impl App {
                 let retrying = partial && app.list_retry_busy(&id);
                 // Sin ninguna fila aún (ni copia): el hueco de las filas, no un «Cargando».
                 if (loading || retrying) && tracks.is_empty() {
-                    Self::skeleton_rows(ui, 8, ROW_H, 40.0, 42.0);
+                    ui.add_space(TABLE_HEAD_H);
+                    Self::skeleton_rows(ui, 8, TABLE_ROW_H, 50.0, 43.0);
                 } else if loading {
+                    ui.add_space(8.0);
                     Self::loading(ui, &format!("Cargando {} de {}", tracks.len(), total));
                 } else if partial {
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let shown = if tracks.is_empty() {
                             "No se pudo cargar la playlist".to_string()
@@ -2167,8 +2166,10 @@ impl App {
                     });
                 } else if tracks.is_empty() && (total > 0 || app.warming.contains_key(&id)) {
                     // También mientras se lee su copia en disco (sin total aún): no está vacía.
-                    Self::skeleton_rows(ui, 8, ROW_H, 40.0, 42.0);
+                    ui.add_space(TABLE_HEAD_H);
+                    Self::skeleton_rows(ui, 8, TABLE_ROW_H, 50.0, 43.0);
                 } else if tracks.is_empty() {
+                    ui.add_space(24.0);
                     ui.label(RichText::new("Esta playlist está vacía. Añade canciones con el botón + de cualquier fila.").color(p.weak));
                 }
                 let shown = app.filter_tracks(&id, Some(gen), &tracks);
@@ -2220,7 +2221,7 @@ impl App {
             Some("compilation") => "Recopilatorio",
             _ => "Álbum",
         };
-        let meta = format!("{}  •  {} canciones  •  {}", album.year(), all.len(), fmt_total(total_ms));
+        let parts = vec![album.year().to_string(), format!("{} canciones", all.len()), fmt_total(total_ms)];
         // Chips: géneros del álbum (metadatos internos) y, si faltan, los de sus artistas.
         let mut chips: Vec<String> = album.genres.iter().take(5).cloned().collect();
         for a in &album.artists {
@@ -2260,52 +2261,14 @@ impl App {
             }
         }
         let saved = self.saved_albums.iter().any(|a| a.id == id);
+        let by: Vec<(String, Option<Page>)> = artists.iter().map(|a| (a.name.clone(), a.id.clone().map(Page::Artist))).collect();
 
         self.two_columns(
             ui,
             |app, ui| {
                 let p = theme::palette(ui.ctx());
-                ui.add(Label::new(RichText::new(&name).font(theme::bold(30.0))).truncate());
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let (ir, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                    icons::paint(ui.painter(), ir, p.weak, Icon::Artist);
-                    // Artistas en una sola línea truncada (con menú si son varios) y los metadatos detrás.
-                    let meta_text = format!(" •  {meta}");
-                    let meta_w = ui.painter().layout_no_wrap(meta_text.clone(), theme::regular(12.0), p.weak).size().x;
-                    let avail = (ui.available_width() - meta_w - 24.0).max(80.0);
-                    let names = artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
-                    let l = ui
-                        .scope(|ui| {
-                            ui.set_max_width(avail);
-                            ui.add(Label::new(RichText::new(names).font(theme::regular(13.0)).color(p.text)).truncate().sense(Sense::click()))
-                        })
-                        .inner;
-                    if l.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    if artists.len() == 1 {
-                        if l.clicked() {
-                            if let Some(aid) = &artists[0].id {
-                                app.actions.push(Action::Go(Page::Artist(aid.clone())));
-                            }
-                        }
-                    } else {
-                        egui::Popup::menu(&l).show(|ui| {
-                            for a in &artists {
-                                if let Some(aid) = &a.id {
-                                    if Self::menu_item(ui, Some(Icon::Artist), a.name.as_str(), false).clicked() {
-                                        app.actions.push(Action::Go(Page::Artist(aid.clone())));
-                                        ui.close();
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    ui.label(RichText::new(meta_text).small().color(p.weak));
-                });
-                ui.add_space(10.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                app.collection_header(ui, &name, None, &by, &parts);
                 let link = uri_to_link(&uri);
                 let id_m = id.clone();
                 let uri_m = uri.clone();
@@ -2316,16 +2279,17 @@ impl App {
                     &all,
                     Some(&uri),
                     Some(&link),
-                    |app, ui| {
-                        let p = theme::palette(ui.ctx());
+                    |app, ui, at| {
+                        let ink = theme::ink(&theme::palette(ui.ctx()));
                         let (icon, color, tip) = if saved {
                             (Icon::CheckCircle, GREEN, "Quitar de tu biblioteca")
                         } else {
-                            (Icon::PlusCircle, p.weak, "Guardar en tu biblioteca")
+                            (Icon::PlusCircle, ink.dim, "Guardar en tu biblioteca")
                         };
-                        if icons::button(ui, icon, 34.0, color).on_hover_text(tip).clicked() {
+                        if Self::slot_button(ui, ui.id().with("save_album"), at, icon, 24.0, color).on_hover_text(tip).clicked() {
                             app.actions.push(Action::SaveAlbum(id.clone(), !saved));
                         }
+                        true
                     },
                     Some(Box::new(move |app: &mut Self, ui: &mut egui::Ui| {
                         if Self::menu_item(ui, Some(Icon::NewTab), "Abrir en una nueva pestaña", false).clicked() {
@@ -2346,7 +2310,6 @@ impl App {
                         }
                     })),
                 );
-                ui.add_space(8.0);
                 let src = if filter.is_empty() { Source::Context(&uri) } else { Source::Tracks };
                 app.track_rows(
                     ui,

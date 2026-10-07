@@ -378,30 +378,6 @@ impl App {
         resp
     }
 
-    /// Elemento de la barra lateral: icono + texto, con píldora al pasar el ratón.
-    pub fn nav_item(ui: &mut egui::Ui, icon: Option<Icon>, text: &str, selected: bool, indent: f32) -> egui::Response {
-        let p = theme::palette(ui.ctx());
-        let w = ui.available_width();
-        let (rect, resp) = ui.allocate_exact_size(vec2(w, 34.0), Sense::click());
-        if selected || resp.hovered() {
-            ui.painter().rect_filled(rect, CornerRadius::same(10), p.hover);
-        }
-        let color = if selected { p.text } else { p.weak.lerp_to_gamma(p.text, 0.45) };
-        let mut x = rect.min.x + 12.0 + indent;
-        if let Some(icon) = icon {
-            let icon_rect = Rect::from_center_size(pos2(x + 10.0, rect.center().y), vec2(20.0, 20.0));
-            icons::paint(ui.painter(), icon_rect, color, icon);
-            x = icon_rect.max.x + 12.0;
-        }
-        let text_rect = Rect::from_min_max(pos2(x, rect.min.y), pos2(rect.max.x - 8.0, rect.max.y));
-        let mut c = child_in(ui, text_rect, Layout::left_to_right(Align::Center));
-        c.add(Label::new(RichText::new(text).color(color)).truncate());
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        resp
-    }
-
     /// Tarjeta de biblioteca. La forma distingue el tipo: playlist con "pila" arriba, álbum
     /// cuadrado, artista redondo, Me gusta verde. Pin y contador opcionales.
     pub fn card(&mut self, ui: &mut egui::Ui, info: CardInfo) -> egui::Response {
@@ -578,10 +554,11 @@ impl App {
         Shown::Filtered(found)
     }
 
-    /// Barra de acciones de una colección de pistas. Con selección activa se convierte en la
-    /// barra verde de selección. `context` es el uri a reproducir como contexto (si no, las
-    /// pistas sueltas); `extra` añade botones propios de la página tras Aleatorio; `menu`
-    /// rellena el menú «Más».
+    /// Barra de acciones de una colección de pistas, copia de la referencia de diseño: el play
+    /// verde de 44 px y, cada 54,5 px, aleatorio, `extra` (si la página pone un botón propio:
+    /// devuelve si lo puso), añadir a la cola, descargar, compartir y «Más»; la lupa a la
+    /// derecha. Con selección activa se convierte en la barra verde de selección. `context` es el
+    /// uri a reproducir como contexto (si no, las pistas sueltas); `menu` rellena «Más».
     #[allow(clippy::too_many_arguments)]
     pub fn collection_bar(
         &mut self,
@@ -590,7 +567,7 @@ impl App {
         all: &[Track],
         context: Option<&str>,
         link: Option<&str>,
-        extra: impl FnOnce(&mut Self, &mut egui::Ui),
+        extra: impl FnOnce(&mut Self, &mut egui::Ui, egui::Pos2) -> bool,
         menu: Option<Box<dyn FnOnce(&mut Self, &mut egui::Ui) + '_>>,
     ) {
         if self.list_search_id != list_id {
@@ -603,6 +580,7 @@ impl App {
             return;
         }
         let p = theme::palette(ui.ctx());
+        let ink = theme::ink(&p);
         // Ids y uris se recorren o se copian solo al usarse: copiarlos en cada fotograma costaba
         // con listas de miles de pistas.
         let ids = || all.iter().filter_map(|t| t.id.as_ref());
@@ -614,72 +592,96 @@ impl App {
                 shuffle,
             },
         };
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            if icons::round_button(ui, Icon::Play, 44.0, GREEN, Color32::BLACK).on_hover_text("Reproducir").clicked() && !all.is_empty() {
-                self.actions.push(Action::Play(target(false)));
+        let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), BAR_BUTTONS_H), Sense::hover());
+        let cy = bar.center().y;
+        let id = ui.id().with(("collection_bar", list_id));
+        let play = Rect::from_center_size(pos2(bar.min.x + 21.0, cy), vec2(44.0, 44.0));
+        let mut c = child_in(ui, play, Layout::left_to_right(Align::Center));
+        if icons::round_button(&mut c, Icon::Play, 44.0, GREEN, Color32::BLACK).on_hover_text("Reproducir").clicked() && !all.is_empty() {
+            self.actions.push(Action::Play(target(false)));
+        }
+        // Huecos de los botones, de izquierda a derecha.
+        let slot = |k: usize| pos2(bar.min.x + 75.5 + 54.5 * k as f32, cy);
+        if Self::slot_button(ui, id.with("shuffle"), slot(0) - vec2(0.5, 0.0), Icon::Shuffle, 30.0, ink.dim).on_hover_text("Aleatorio").clicked() && !all.is_empty() {
+            self.actions.push(Action::Play(target(true)));
+        }
+        let mut k = if extra(self, ui, slot(1)) { 2 } else { 1 };
+        let mut next = || {
+            k += 1;
+            slot(k - 1)
+        };
+        if Self::slot_button(ui, id.with("queue"), next(), Icon::QueueList, 28.0, ink.dim).on_hover_text("Añadir a la cola").clicked() {
+            for t in all {
+                self.actions.push(Action::AddToQueue(t.uri.clone()));
             }
-            if icons::button(ui, Icon::Shuffle, 34.0, p.weak).on_hover_text("Aleatorio").clicked() && !all.is_empty() {
-                self.actions.push(Action::Play(target(true)));
-            }
-            extra(self, ui);
-            if icons::button(ui, Icon::AddToQueue, 34.0, p.weak).on_hover_text("Añadir a la cola").clicked() {
-                for t in all {
-                    self.actions.push(Action::AddToQueue(t.uri.clone()));
-                }
-            }
-            // Sin guardar: lo descargado cambia por su cuenta, aparte de la lista.
-            let all_dl = ids().next().is_some() && ids().all(|i| self.downloaded.contains(i));
-            let busy = !self.downloading.is_empty() && ids().any(|i| self.downloading.contains(i));
-            let (icon, color, tip) = if all_dl {
-                (Icon::Download, GREEN, "Descargado (en la caché de audio)")
-            } else if busy {
-                (Icon::Hourglass, p.weak, "Descargando…")
+        }
+        // Sin guardar: lo descargado cambia por su cuenta, aparte de la lista.
+        let all_dl = ids().next().is_some() && ids().all(|i| self.downloaded.contains(i));
+        let busy = !self.downloading.is_empty() && ids().any(|i| self.downloading.contains(i));
+        let (icon, color, tip) = if all_dl {
+            (Icon::Download, GREEN, "Descargado (en la caché de audio)")
+        } else if busy {
+            (Icon::Hourglass, ink.dim, "Descargando…")
+        } else {
+            (Icon::Download, ink.dim, "Descargar")
+        };
+        if Self::slot_button(ui, id.with("download"), next(), icon, 24.0, color).on_hover_text(tip).clicked() && !all_dl && !busy {
+            let ids: Vec<String> = ids().cloned().collect();
+            if all.first().and_then(|t| t.kind.as_deref()) == Some("episode") {
+                self.actions.push(Action::DownloadEpisodes(ids));
             } else {
-                (Icon::Download, p.weak, "Descargar")
-            };
-            if icons::button(ui, icon, 34.0, color).on_hover_text(tip).clicked() && !all_dl && !busy {
-                let ids: Vec<String> = ids().cloned().collect();
-                if all.first().and_then(|t| t.kind.as_deref()) == Some("episode") {
-                    self.actions.push(Action::DownloadEpisodes(ids));
-                } else {
-                    self.actions.push(Action::Download(ids));
-                }
+                self.actions.push(Action::Download(ids));
             }
-            if let Some(link) = link {
-                if icons::button(ui, Icon::Share, 34.0, p.weak).on_hover_text("Copiar enlace").clicked() {
-                    self.actions.push(Action::CopyText(link.to_string(), "Enlace"));
-                }
+        }
+        if let Some(link) = link {
+            if Self::slot_button(ui, id.with("share"), next(), Icon::Share, 29.0, ink.dim).on_hover_text("Copiar enlace").clicked() {
+                self.actions.push(Action::CopyText(link.to_string(), "Enlace"));
             }
-            if let Some(menu) = menu {
-                let more = icons::button(ui, Icon::More, 34.0, p.weak).on_hover_text("Más");
-                egui::Popup::menu(&more).show(|ui| {
-                    ui.set_min_width(200.0);
-                    menu(self, ui);
-                });
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let color = if self.album_search_open { GREEN } else { p.weak };
-                if icons::button(ui, Icon::Search, 34.0, color).on_hover_text("Buscar en esta lista").clicked() {
-                    self.album_search_open = !self.album_search_open;
-                    self.album_search_focus = self.album_search_open;
-                    if !self.album_search_open {
-                        self.album_search.clear();
-                    }
-                }
-                if self.album_search_open {
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.album_search).hint_text("Buscar en esta lista").desired_width(200.0));
-                    if self.album_search_focus {
-                        self.album_search_focus = false;
-                        r.request_focus();
-                    }
-                    if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        self.album_search_open = false;
-                        self.album_search.clear();
-                    }
-                }
+        }
+        if let Some(menu) = menu {
+            let more = Self::slot_button(ui, id.with("more"), next() - vec2(1.0, 0.0), Icon::More, 29.0, ink.dim).on_hover_text("Más");
+            egui::Popup::menu(&more).show(|ui| {
+                ui.set_min_width(200.0);
+                menu(self, ui);
             });
-        });
+        }
+        // Lupa a la derecha; el campo de búsqueda se abre a su izquierda.
+        let lupa = pos2(bar.max.x - 23.0, cy - 2.0);
+        let color = if self.album_search_open { GREEN } else { ink.dim };
+        if Self::slot_button(ui, id.with("search"), lupa, Icon::Search, 31.0, color).on_hover_text("Buscar en esta lista").clicked() {
+            self.album_search_open = !self.album_search_open;
+            self.album_search_focus = self.album_search_open;
+            if !self.album_search_open {
+                self.album_search.clear();
+            }
+        }
+        if self.album_search_open {
+            let field = Rect::from_min_max(pos2((lupa.x - 250.0).max(bar.min.x + 360.0), cy - 15.0), pos2(lupa.x - 24.0, cy + 15.0));
+            let mut f = child_in(ui, field, Layout::right_to_left(Align::Center));
+            let r = f.add(egui::TextEdit::singleline(&mut self.album_search).hint_text("Buscar en esta lista").desired_width(field.width()));
+            if self.album_search_focus {
+                self.album_search_focus = false;
+                r.request_focus();
+            }
+            if r.has_focus() && f.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.album_search_open = false;
+                self.album_search.clear();
+            }
+        }
+    }
+
+    /// Botón de icono en un sitio fijo: el icono de `px` píxeles centrado en `c` (sin fondo,
+    /// como en la referencia) y una zona de clic de 40 px. Al pasar el ratón se aclara.
+    pub fn slot_button(ui: &mut egui::Ui, id: egui::Id, c: egui::Pos2, icon: Icon, px: f32, color: Color32) -> egui::Response {
+        let resp = ui.interact(Rect::from_center_size(c, vec2(40.0, 40.0)), id, Sense::click());
+        let color = if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            ui.visuals().strong_text_color().lerp_to_gamma(color, 0.15)
+        } else {
+            color
+        };
+        icons::paint(ui.painter(), Rect::from_center_size(c, vec2(px, px)), color, icon);
+        resp
     }
 
     /// Barra de acciones sobre la selección múltiple (sustituye a la fila de reproducir).
@@ -983,6 +985,11 @@ impl App {
     pub fn track_rows(&mut self, ui: &mut egui::Ui, list_id: &str, tracks: &[Track], opts: RowOpts) {
         let n = tracks.len();
         if n == 0 {
+            return;
+        }
+        // Playlists, álbumes y Me gusta: la tabla grande de la referencia.
+        if opts.header && opts.selectable {
+            self.track_table(ui, list_id, tracks, opts);
             return;
         }
         let p = theme::palette(ui.ctx());
@@ -1366,6 +1373,368 @@ impl App {
     }
 }
 
+impl App {
+    /// Tabla de canciones de playlists, álbumes y Me gusta, copia de la referencia de diseño:
+    /// cabecera con separador y filas de 72 px con número, portada de 50 px, título y artistas,
+    /// álbum, duración y corazón. Al pasar el ratón, el número pasa a ser «reproducir» y salen
+    /// añadir a playlist, descargar, «Más» y el círculo de selección.
+    fn track_table(&mut self, ui: &mut egui::Ui, list_id: &str, tracks: &[Track], opts: RowOpts) {
+        let n = tracks.len();
+        let p = theme::palette(ui.ctx());
+        let ink = theme::ink(&p);
+        let w = ui.available_width();
+        let left = ui.cursor().min.x;
+        let cols = table_cols(w, opts.show_cover, opts.show_album, self.rows_added_by);
+        let small = theme::regular(TABLE_SMALL_FONT);
+
+        // Cabecera: textos con la línea base a 44 px y el separador a 59.
+        let (head, _) = ui.allocate_exact_size(vec2(w, TABLE_HEAD_H), Sense::hover());
+        {
+            let base = head.min.y + 44.0;
+            let painter = ui.painter();
+            let g = painter.layout_no_wrap("#".into(), small.clone(), ink.dim);
+            let gx = left + cols.num_c - g.size().x / 2.0;
+            text_on_baseline(painter, pos2(gx, base), g, ink.dim);
+            let put = |x: f32, text: &str| {
+                let g = painter.layout_no_wrap(text.into(), small.clone(), ink.dim);
+                text_on_baseline(painter, pos2(left + x, base), g, ink.dim);
+            };
+            put(TABLE_COVER_X, "Título");
+            if let Some(x) = cols.album_x {
+                put(x, "Álbum");
+            }
+            if let Some(x) = cols.by_x {
+                put(x, "Añadida por");
+            }
+            if let Some(x) = cols.date_x {
+                put(x, "Fecha");
+            }
+            put(cols.dur_x, "Duración");
+            let y = head.min.y + 59.3;
+            painter.line_segment([pos2(left - 1.0, y), pos2(left + w, y)], Stroke::new(2.2, ink.line));
+        }
+
+        let (rect, _) = ui.allocate_exact_size(vec2(w, n as f32 * TABLE_ROW_H), Sense::hover());
+        let clip = ui.clip_rect();
+        let first = ((clip.top() - rect.top()) / TABLE_ROW_H).floor().max(0.0) as usize;
+        let last = (((clip.bottom() - rect.top()) / TABLE_ROW_H).ceil().max(0.0) as usize).min(n);
+        if first >= last {
+            return;
+        }
+        let now_uri = self.player.now.as_ref().map(|n| n.uri.clone());
+        let shuffle = self.player.shuffle;
+        let title_font = theme::regular(TABLE_TITLE_FONT);
+        let num_font = theme::regular(TABLE_NUM_FONT);
+
+        for i in first..last {
+            let t = &tracks[i];
+            let y = rect.min.y + i as f32 * TABLE_ROW_H;
+            let row = Rect::from_min_size(pos2(left, y), vec2(w, TABLE_ROW_H));
+            let id = ui.id().with((list_id, i));
+            let resp = ui.interact(row, id, Sense::click());
+            let selected = self.selected.as_ref().is_some_and(|s| s.0 == list_id && s.1 == i);
+            // Como en `track_rows`: los botones de la fila y su menú abierto la mantienen «en hover».
+            let more_id = ui.id().with(("more", list_id, i));
+            let hov = resp.hovered() || resp.contains_pointer() || egui::Popup::is_id_open(ui.ctx(), more_id);
+            if selected || hov {
+                ui.painter().rect_filled(row.expand2(vec2(8.0, 0.0)).shrink2(vec2(0.0, 2.0)), CornerRadius::same(6), ink.hover);
+            }
+            let is_now = now_uri.as_deref() == Some(t.uri.as_str());
+            let cy = y + TABLE_ROW_H / 2.0;
+            let mut pressing = false;
+
+            // Número, o reproducir al pasar el ratón (verde: la que suena)
+            let num_c = pos2(left + cols.num_c, cy);
+            if is_now || hov {
+                let color = if is_now { GREEN } else { ink.strong };
+                icons::paint(ui.painter(), Rect::from_center_size(num_c, vec2(16.0, 16.0)), color, Icon::Play);
+                if hov {
+                    let pr = ui.interact(Rect::from_center_size(num_c, vec2(30.0, 30.0)), id.with("play"), Sense::click());
+                    if pr.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    pressing = pr.is_pointer_button_down_on();
+                    if pr.clicked() {
+                        self.actions.push(Action::Play(opts.target(i, tracks, shuffle)));
+                    }
+                }
+            } else {
+                let num = if opts.numbered { t.track_number.unwrap_or(i as u32 + 1) } else { i as u32 + 1 };
+                let g = ui.painter().layout_no_wrap(num.to_string(), num_font.clone(), ink.dim);
+                let gx = num_c.x - g.size().x / 2.0;
+                text_on_baseline(ui.painter(), pos2(gx, y + 42.0), g, ink.dim);
+            }
+
+            if opts.show_cover {
+                let r = Rect::from_min_size(pos2(left + TABLE_COVER_X, y + 11.0), vec2(TABLE_COVER, TABLE_COVER));
+                let url = t.cover(64).map(|s| s.to_string());
+                self.cover_in(ui, url.as_deref(), r, 4);
+            }
+
+            // Título y, debajo, «E» si es explícita y los artistas (enlaces).
+            {
+                let hidden = t.id.as_ref().is_some_and(|i| self.hidden_tracks.contains(i));
+                // Una que seguro no puede sonar se ve apagada (como una oculta), pero se puede
+                // pulsar igual: es solo un aviso, quien decide es el reproductor.
+                let unplayable = t.is_playable == Some(false);
+                let color = if is_now { GREEN } else if hidden || unplayable { ink.dim } else { ink.strong };
+                let x = left + cols.title_x;
+                let g = galley_truncated(ui.painter(), &t.name, title_font.clone(), color, cols.title_w);
+                text_on_baseline(ui.painter(), pos2(x, y + 30.0), g, color);
+                let mut ax = x;
+                if t.explicit {
+                    let badge = Rect::from_min_size(pos2(x + 1.0, y + 43.0), vec2(15.0, 15.0));
+                    ui.painter().rect_filled(badge, CornerRadius::same(2), ink.dim);
+                    let g = ui.painter().layout_no_wrap("E".into(), theme::bold(10.5), Color32::BLACK);
+                    ui.painter().galley(badge.center() - g.size() / 2.0, g, Color32::BLACK);
+                    ax = badge.max.x + 6.0;
+                }
+                let artists: Vec<(&str, Option<&str>)> = t.artists.iter().map(|a| (a.name.as_str(), a.id.as_deref())).collect();
+                self.links_on_baseline(ui, id.with("artists"), &artists, pos2(ax, y + 54.5), x + cols.title_w, small.clone(), ink.dim, ink.strong, Page::Artist);
+            }
+
+            if let (Some(ax), Some(a)) = (cols.album_x, &t.album) {
+                let link = [(a.name.as_str(), a.id.as_deref())];
+                self.links_on_baseline(ui, id.with("album"), &link, pos2(left + ax, y + 42.0), left + ax + cols.album_w, small.clone(), ink.dim, ink.strong, Page::Album);
+            }
+            if let (Some(bx), Some(user)) = (cols.by_x, t.added_by.clone()) {
+                // Añadida por (nombre visible, clic → perfil).
+                let name = self.user_display(&user);
+                let link = [(name.as_str(), Some(user.as_str()))];
+                self.links_on_baseline(ui, id.with("by"), &link, pos2(left + bx, y + 42.0), left + bx + cols.by_w, small.clone(), ink.dim, ink.strong, Page::User);
+            }
+            if let (Some(dx), Some(d)) = (cols.date_x, &t.added_at) {
+                let g = galley_truncated(ui.painter(), &fmt_date(d), small.clone(), ink.dim, cols.date_w);
+                text_on_baseline(ui.painter(), pos2(left + dx, y + 42.0), g, ink.dim);
+            }
+
+            let g = ui.painter().layout_no_wrap(fmt_ms(t.duration_ms), num_font.clone(), ink.dim);
+            text_on_baseline(ui.painter(), pos2(left + cols.dur_x, y + 42.0), g, ink.dim);
+
+            let uri = t.uri.clone();
+            if let Some(tid) = &t.id {
+                // El corazón se ve siempre: verde relleno con Me gusta, solo contorno si no.
+                let liked = self.liked_set.contains(tid);
+                let (icon, color) = if liked { (Icon::HeartFilled, GREEN) } else { (Icon::Heart, ink.dim) };
+                let tip = if liked { "Quitar de Me gusta" } else { "Me gusta" };
+                // El dibujo del corazón queda algo alto en su cuadro: en la referencia va centrado.
+                if Self::slot_button(ui, id.with("like"), pos2(left + cols.heart_c - 1.0, cy + 1.5), icon, TABLE_HEART, color).on_hover_text(tip).clicked() {
+                    self.actions.push(Action::Like(tid.clone(), !liked));
+                }
+                if hov {
+                    // Detrás del corazón, lo que quepa antes del círculo de selección.
+                    let room = left + w - 36.0;
+                    let at = |k: f32| pos2(left + cols.heart_c + 46.0 * k, cy);
+                    let fits = |k: f32| at(k).x + 16.0 <= room;
+                    let n_fit = (1..=3).take_while(|&k| fits(k as f32)).count();
+                    let mut k = 1.0;
+                    if n_fit >= 1 {
+                        if Self::slot_button(ui, id.with("add"), at(k), Icon::PlusCircle, 24.0, ink.dim).on_hover_text("Añadir a playlist").clicked() {
+                            self.open_add_dialog(vec![uri.clone()]);
+                        }
+                        k += 1.0;
+                    }
+                    if n_fit >= 3 {
+                        let dl = self.downloaded.contains(tid);
+                        let busy = self.downloading.contains(tid);
+                        let (icon, color, tip) = if dl {
+                            (Icon::Download, GREEN, "Descargada (en la caché de audio)")
+                        } else if busy {
+                            (Icon::Hourglass, ink.dim, "Descargando…")
+                        } else {
+                            (Icon::Download, ink.dim, "Descargar")
+                        };
+                        if Self::slot_button(ui, id.with("dl"), at(k), icon, 24.0, color).on_hover_text(tip).clicked() && !dl && !busy {
+                            if t.kind.as_deref() == Some("episode") {
+                                self.actions.push(Action::DownloadEpisodes(vec![tid.clone()]));
+                            } else {
+                                self.actions.push(Action::Download(vec![tid.clone()]));
+                            }
+                        }
+                        k += 1.0;
+                    }
+                    if n_fit >= 2 {
+                        let more = Self::slot_button(ui, more_id.with("btn"), at(k), Icon::More, 30.0, ink.dim).on_hover_text("Más");
+                        // El destino solo con el menú abierto: sin contexto copia todos los uris
+                        // de la lista, y la fila bajo el ratón lo hacía en cada fotograma.
+                        egui::Popup::menu(&more).id(more_id).show(|ui| {
+                            let target = opts.target(i, tracks, shuffle);
+                            self.track_menu(ui, t, target, &opts)
+                        });
+                    }
+                }
+            }
+
+            // Círculo de selección múltiple en el extremo derecho.
+            let is_sel = self.sel_list == list_id && self.sel.contains(&uri);
+            if opts.select && (hov || is_sel) {
+                let circle = Rect::from_center_size(pos2(left + w - 16.0, cy), vec2(28.0, 28.0));
+                let cr = ui.interact(circle, id.with("sel"), Sense::click());
+                if is_sel {
+                    ui.painter().circle_filled(circle.center(), 9.0, GREEN);
+                    icons::paint(ui.painter(), Rect::from_center_size(circle.center(), vec2(11.0, 11.0)), Color32::BLACK, Icon::Check);
+                } else {
+                    let col = if cr.hovered() { ink.strong } else { ink.dim };
+                    ui.painter().circle_stroke(circle.center(), 9.0, Stroke::new(1.5, col));
+                }
+                if cr.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if cr.clicked() {
+                    if self.sel_list != list_id {
+                        self.sel.clear();
+                        self.sel_list = list_id.to_string();
+                    }
+                    if is_sel {
+                        self.sel.remove(&uri);
+                    } else {
+                        self.sel.insert(uri.clone());
+                    }
+                }
+            }
+
+            if hov {
+                self.report_row_hover(&t.uri, pressing);
+            }
+            let resp = if t.is_playable == Some(false) { resp.on_hover_text(UNPLAYABLE_HINT) } else { resp };
+            if resp.double_clicked() {
+                self.actions.push(Action::Play(opts.target(i, tracks, shuffle)));
+            } else if resp.clicked() {
+                self.selected = Some((list_id.to_string(), i));
+            }
+            resp.context_menu(|ui| {
+                let target = opts.target(i, tracks, shuffle);
+                self.track_menu(ui, t, target, &opts);
+            });
+        }
+    }
+
+    /// Nombres separados por comas desde `at` (línea base), recortados en `max_x`; los que tienen
+    /// id son enlaces a `page` (se aclaran y subrayan al pasar el ratón).
+    #[allow(clippy::too_many_arguments)]
+    fn links_on_baseline(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        items: &[(&str, Option<&str>)],
+        at: egui::Pos2,
+        max_x: f32,
+        font: egui::FontId,
+        color: Color32,
+        hover: Color32,
+        page: fn(String) -> Page,
+    ) {
+        let mut x = at.x;
+        for (i, (name, link)) in items.iter().enumerate() {
+            let last = i + 1 == items.len();
+            let text = if last { name.to_string() } else { format!("{name},") };
+            let room = max_x - x;
+            if room < 12.0 {
+                break;
+            }
+            let g = galley_truncated(ui.painter(), &text, font.clone(), color, room);
+            let cut = g.size().x >= room - 0.5 || g.text() != text;
+            let rect = Rect::from_min_size(pos2(x, at.y - font.size), vec2(g.size().x, font.size * 1.3));
+            let resp = link.map(|_| ui.interact(rect, id.with(i), Sense::click()));
+            let hovered = resp.as_ref().is_some_and(|r| r.hovered());
+            let c = if hovered { hover } else { color };
+            let drawn = text_on_baseline(ui.painter(), pos2(x, at.y), g, c);
+            if hovered {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                let uy = at.y + 2.0;
+                ui.painter().line_segment([pos2(drawn.min.x, uy), pos2(drawn.max.x - if last { 0.0 } else { 4.0 }, uy)], Stroke::new(1.0, c));
+            }
+            if resp.is_some_and(|r| r.clicked()) {
+                if let Some(link) = link {
+                    self.actions.push(Action::Go(page(link.to_string())));
+                }
+            }
+            x = drawn.max.x + 4.0;
+            if cut {
+                break;
+            }
+        }
+    }
+}
+
+/// Medidas de la cabecera de playlists y álbumes (referencia de diseño): bloque de título y
+/// metadatos y fila de botones.
+pub const HEADER_H: f32 = 106.0;
+pub const BAR_BUTTONS_H: f32 = 44.0;
+/// Tabla de canciones: cabecera (con el separador), filas, portada y corazón.
+pub const TABLE_HEAD_H: f32 = 77.0;
+pub const TABLE_ROW_H: f32 = 72.0;
+const TABLE_COVER: f32 = 50.0;
+const TABLE_COVER_X: f32 = 51.0;
+const TABLE_HEART: f32 = 30.0;
+/// Título de la canción; artistas, álbum y cabecera; número y duración.
+const TABLE_TITLE_FONT: f32 = 17.5;
+const TABLE_SMALL_FONT: f32 = 14.5;
+const TABLE_NUM_FONT: f32 = 16.0;
+
+/// Columnas de la tabla (x desde su borde izquierdo). `album_x`, `by_x` y `date_x` faltan si
+/// la columna no se ve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TableCols {
+    num_c: f32,
+    title_x: f32,
+    title_w: f32,
+    album_x: Option<f32>,
+    album_w: f32,
+    by_x: Option<f32>,
+    by_w: f32,
+    date_x: Option<f32>,
+    date_w: f32,
+    dur_x: f32,
+    heart_c: f32,
+}
+
+/// Columnas para un ancho `w`: las de la referencia (1039 px: álbum en 360, duración en 670 y
+/// el corazón en 771), proporcionales al ancho. En playlists de varios autores (`contrib`),
+/// «Añadida por» y «Fecha» entre el álbum y la duración si hay sitio.
+fn table_cols(w: f32, cover: bool, album: bool, contrib: bool) -> TableCols {
+    let title_x = if cover { 111.0 } else { TABLE_COVER_X };
+    let dur_x = (w * 0.645).round().min(w - 150.0).max(title_x + 100.0);
+    let gap = 16.0;
+    let (album_x, by_x, date_x) = if album && contrib && w >= 900.0 {
+        (Some((w * 0.28).round()), Some((w * 0.43).round()), Some((w * 0.55).round()))
+    } else if album && w >= 620.0 {
+        (Some((w * 0.3465).round()), None, None)
+    } else {
+        (None, None, None)
+    };
+    let title_end = album_x.unwrap_or(dur_x);
+    let album_end = by_x.unwrap_or(dur_x);
+    let by_end = date_x.unwrap_or(dur_x);
+    TableCols {
+        num_c: 20.5,
+        title_x,
+        title_w: (title_end - gap - title_x).max(40.0),
+        album_x,
+        album_w: album_x.map_or(0.0, |x| album_end - gap - x),
+        by_x,
+        by_w: by_x.map_or(0.0, |x| by_end - gap - x),
+        date_x,
+        date_w: date_x.map_or(0.0, |x| dur_x - gap - x),
+        dur_x,
+        heart_c: dur_x + 101.0,
+    }
+}
+
+/// Pinta `galley` con su borde izquierdo en `at.x` y la línea base en `at.y` (en un píxel
+/// entero); devuelve dónde quedó.
+pub fn text_on_baseline(painter: &egui::Painter, at: egui::Pos2, galley: std::sync::Arc<egui::Galley>, color: Color32) -> Rect {
+    let base = galley
+        .rows
+        .first()
+        .and_then(|r| r.row.glyphs.first().map(|g| r.pos.y + g.pos.y))
+        .unwrap_or(galley.size().y * 0.8);
+    let min = pos2(at.x.round(), (at.y - base).round());
+    let rect = Rect::from_min_size(min, galley.size());
+    painter.galley(min, galley, color);
+    rect
+}
+
 /// Texto en una línea recortado con puntos suspensivos para caber en `max_w`.
 pub fn galley_truncated(painter: &egui::Painter, text: &str, font: egui::FontId, color: Color32, max_w: f32) -> std::sync::Arc<egui::Galley> {
     let mut label = text.to_string();
@@ -1384,5 +1753,38 @@ pub fn uri_to_link(uri: &str) -> String {
         format!("https://open.spotify.com/{}/{}", parts[1], parts[2])
     } else {
         uri.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Con el ancho de la referencia (tabla de 1039 px) cada columna cae donde en ella.
+    #[test]
+    fn tabla_como_la_referencia() {
+        let c = table_cols(1039.0, true, true, false);
+        assert_eq!((c.num_c, c.title_x, c.album_x, c.dur_x, c.heart_c), (20.5, 111.0, Some(360.0), 670.0, 771.0));
+        assert_eq!((c.by_x, c.date_x), (None, None));
+        assert_eq!(c.title_w, 360.0 - 16.0 - 111.0);
+    }
+
+    /// A cualquier ancho las columnas van en orden, sin solaparse, y el corazón cabe.
+    #[test]
+    fn tabla_a_cualquier_ancho() {
+        for w in (380..=2400).step_by(7).map(|w| w as f32) {
+            for (cover, album, contrib) in [(true, true, false), (true, true, true), (false, false, false), (true, false, false)] {
+                let c = table_cols(w, cover, album, contrib);
+                let mut xs = vec![c.title_x];
+                xs.extend(c.album_x);
+                xs.extend(c.by_x);
+                xs.extend(c.date_x);
+                xs.push(c.dur_x);
+                assert!(xs.windows(2).all(|p| p[1] - p[0] >= 56.0), "{w} {xs:?}");
+                assert!(c.title_w >= 40.0 && c.heart_c + 16.0 <= w, "{w} {c:?}");
+                assert_eq!(c.album_x.is_some(), album && w >= 620.0, "{w}");
+                assert_eq!(c.by_x.is_some(), album && contrib && w >= 900.0, "{w}");
+            }
+        }
     }
 }

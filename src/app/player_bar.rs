@@ -7,7 +7,7 @@ use librespot_playback::player::LoadFailure;
 
 use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
-use super::widgets::{child_in, galley_truncated, MenuKind, RowOpts};
+use super::widgets::{child_in, galley_truncated, text_on_baseline, MenuKind, RowOpts};
 use super::{Action, App, Auth, Page, PlayState, PlayTarget, Repeat, SideTab, SEARCH_ID, SIDEBAR_W};
 use crate::api::Req;
 use crate::config::{vol_pct_to_raw, vol_raw_db, vol_raw_to_pct};
@@ -16,150 +16,87 @@ use crate::model::*;
 impl App {
     // ------------------------------------------------------------ barra superior
 
+    /// Barra superior, copia de la referencia de diseño: «Tu biblioteca» sobre la barra lateral;
+    /// Inicio y Buscar (icono y texto, sin fondo) y, detrás, una pestaña por página abierta; a la
+    /// derecha, ajustes y la foto del perfil. Posiciones fijas medidas desde los bordes.
     pub fn top_bar(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui.ctx());
         let full = ui.available_rect_before_wrap();
         let page = self.page().clone();
+        let st = TopStyle::new(&p);
+        let cy = full.min.y + 29.0;
+        let x0 = full.min.x;
 
-        // Izquierda: "Tu biblioteca"
-        let left = Rect::from_min_max(full.min, pos2(full.min.x + SIDEBAR_W, full.max.y));
+        // «Tu biblioteca»
         {
-            let mut l = child_in(ui, left.shrink2(vec2(14.0, 0.0)), Layout::left_to_right(Align::Center));
-            let r = l.allocate_response(vec2(l.available_width(), 34.0), Sense::click());
-            let color = if page == Page::Library { p.text } else { p.weak.lerp_to_gamma(p.text, 0.5) };
-            icons::paint(l.painter(), Rect::from_center_size(pos2(r.rect.min.x + 12.0, r.rect.center().y), vec2(20.0, 20.0)), color, Icon::Library);
-            l.painter().text(
-                pos2(r.rect.min.x + 32.0, r.rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                "Tu biblioteca",
-                theme::regular(14.0),
-                color,
-            );
-            if r.hovered() {
+            let rect = Rect::from_min_max(pos2(x0 + 18.0, cy - 18.0), pos2(x0 + SIDEBAR_W - 20.0, cy + 18.0));
+            let resp = ui.interact(rect, ui.id().with("top_library"), Sense::click());
+            let color = st.color(page == Page::Library, resp.hovered());
+            icons::paint(ui.painter(), Rect::from_center_size(pos2(x0 + 41.5, cy), vec2(27.0, 27.0)), st.icon_of(color), Icon::Library);
+            let g = ui.painter().layout_no_wrap("Tu biblioteca".into(), theme::regular(TOP_FONT), color);
+            text_on_baseline(ui.painter(), pos2(x0 + 72.0, cy + 6.0), g, color);
+            if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if r.clicked() {
+            if resp.clicked() {
                 self.go(Page::Library);
             }
         }
 
-        // Derecha: ajustes y perfil y, con una versión nueva lista, «Reiniciar para actualizar».
-        // Sigue a la vista aunque se cierre el aviso: es lo único que queda por hacer.
+        // Derecha: foto del perfil, ajustes y, con una versión nueva lista, «Reiniciar para
+        // actualizar» a su izquierda.
+        let xr = full.max.x;
+        let avatar = Rect::from_center_size(pos2(xr - 25.0, cy), vec2(34.0, 34.0));
+        self.top_avatar(ui, avatar, &p);
+        let gear = Rect::from_center_size(pos2(xr - 74.0, cy), vec2(30.0, 30.0));
+        let gr = ui.interact(gear.expand(4.0), ui.id().with("top_gear"), Sense::click()).on_hover_text("Ajustes (Ctrl+,)");
+        let gear_color = st.color(page == Page::Settings, gr.hovered());
+        icons::paint(ui.painter(), gear, st.icon_of(gear_color), Icon::Settings);
+        if gr.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if gr.clicked() {
+            self.draft = self.settings.clone();
+            self.go(Page::Settings);
+        }
+        let mut tabs_end = gear.min.x - 24.0;
         let ready = match &self.update_stage {
             crate::update::Stage::Ready { version, .. } => Some(version.clone()),
             _ => None,
         };
-        let pill_text_w = ready.as_ref().map(|_| ui.painter().layout_no_wrap(UPDATE_PILL_TEXT.to_string(), theme::bold(13.0), Color32::BLACK).size().x);
-        let (right_w, pill) = top_right_layout(full.width(), pill_text_w);
-        let right = Rect::from_min_max(pos2(full.max.x - right_w, full.min.y), full.max);
-        {
-            let mut r = child_in(ui, right.shrink2(vec2(10.0, 0.0)), Layout::right_to_left(Align::Center));
-            r.spacing_mut().item_spacing.x = 6.0;
-            // Avatar
-            let (arect, aresp) = r.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
-            // Foto del perfil interno si ya llegó; si no, la que da /me (viene en la instantánea).
-            let login_name = match &self.auth {
-                Auth::LoggedIn { username } | Auth::Connecting { username } => Some(username.clone()),
-                _ => None,
-            };
-            let img = self
-                .my_id()
-                .map(|s| s.to_string())
-                .or(login_name)
-                .and_then(|id| self.users.get(&id))
-                .and_then(|u| u.cover(64).map(|s| s.to_string()))
-                .or_else(|| self.user.as_ref().and_then(|u| u.cover(64).map(|s| s.to_string())));
-            match img {
-                Some(url) => self.cover_in(&mut r, Some(&url), arect, 16),
-                None => {
-                    r.painter().circle_filled(arect.center(), 16.0, p.card2);
-                    let initial = self
-                        .user
-                        .as_ref()
-                        .and_then(|u| u.display_name.clone())
-                        .and_then(|n| n.chars().next())
-                        .map(|c| c.to_uppercase().to_string())
-                        .unwrap_or_else(|| "·".to_string());
-                    r.painter().text(arect.center(), egui::Align2::CENTER_CENTER, initial, theme::bold(14.0), p.text);
-                }
-            }
-            if aresp.hovered() {
-                r.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            let logged = self.logged_in();
-            if aresp.clicked() {
-                if let Some(id) = self.my_id().map(|s| s.to_string()) {
-                    self.go(Page::User(id));
-                } else if !logged {
-                    self.login();
-                }
-            }
-            aresp.on_hover_text(if logged { "Tu perfil" } else { "Iniciar sesión" });
-            if icons::button(&mut r, Icon::Settings, 32.0, p.weak)
-                .on_hover_text("Ajustes (Ctrl+,)")
-                .clicked()
-            {
-                self.draft = self.settings.clone();
-                self.go(Page::Settings);
-            }
-            if let (Some(version), Some(pill)) = (ready, pill) {
-                if self.update_pill(&mut r, &version, pill).clicked() {
+        if let Some(version) = ready {
+            let text_w = ui.painter().layout_no_wrap(UPDATE_PILL_TEXT.to_string(), theme::bold(13.0), Color32::BLACK).size().x;
+            let (_, pill) = top_right_layout(full.width(), Some(text_w));
+            if let Some(pill) = pill {
+                let w = match pill {
+                    UpdatePill::Full(w) => w,
+                    UpdatePill::Icon => PILL_H,
+                };
+                let rect = Rect::from_min_size(pos2(gear.min.x - 16.0 - w, cy - PILL_H / 2.0), vec2(w, PILL_H));
+                let mut c = child_in(ui, rect, Layout::left_to_right(Align::Center));
+                if self.update_pill(&mut c, &version, pill).clicked() {
                     // En una Jam, el aviso pide confirmarlo antes (se sale de ella).
                     self.restart_to_update(false);
                 }
+                tabs_end = rect.min.x - 16.0;
             }
         }
 
-        // Pestañas pegadas a la izquierda de la zona de contenido: Inicio, Buscar (que se
-        // expande como campo solo al hacer clic) y una pestaña por página abierta.
-        let center = Rect::from_min_max(pos2(left.max.x, full.min.y), pos2(right.min.x, full.max.y));
-        let searching = page == Page::Search;
-        let mut c = child_in(ui, center, Layout::left_to_right(Align::Center));
-        // Con muchas pestañas abiertas no se pintan encima de lo de la derecha.
-        c.set_clip_rect(center.intersect(c.clip_rect()));
-        c.spacing_mut().item_spacing.x = 6.0;
-        c.add_space(4.0);
-        if Self::top_tab(&mut c, Icon::Home, "Inicio", self.active == super::ActiveTab::Home, 0.0, false).clicked() {
+        // Inicio y Buscar en las posiciones de la referencia (con la ventana estrecha, Buscar se
+        // acerca a Inicio); Buscar se vuelve un campo de texto en su página.
+        let home_c = pos2(x0 + 303.0, cy);
+        if self.top_item(ui, home_c, Icon::Home, 28.0, "Inicio", self.active == super::ActiveTab::Home, &st).clicked() {
             self.go(Page::Home);
         }
-        let expanded = searching;
-        if expanded {
-            let search_w = 320.0f32.min(center.width() * 0.4);
-            let (rect, resp) = c.allocate_exact_size(vec2(search_w, 36.0), Sense::click());
-            c.painter().rect_filled(rect, CornerRadius::same(18), if searching { p.card2 } else { p.hover.gamma_multiply(0.7) });
-            icons::paint(c.painter(), Rect::from_center_size(pos2(rect.min.x + 20.0, rect.center().y), vec2(18.0, 18.0)), p.weak, Icon::Search);
-            let field = Rect::from_min_max(pos2(rect.min.x + 36.0, rect.min.y + 4.0), pos2(rect.max.x - 10.0, rect.max.y - 4.0));
-            let mut f = child_in(&mut c, field, Layout::left_to_right(Align::Center));
-            let edit = egui::TextEdit::singleline(&mut self.search_query)
-                .id(egui::Id::new(SEARCH_ID))
-                .frame(egui::Frame::NONE)
-                .hint_text("Buscar…")
-                .desired_width(field.width());
-            let r = f.add(edit);
-            let _ = resp;
-            if self.focus_search {
-                self.focus_search = false;
-                r.request_focus();
-                // La consulta anterior queda seleccionada: lo que ella escriba la sustituye (como
-                // Ctrl+F en un navegador), y con las flechas o un clic sigue pudiendo editarla.
-                let id = egui::Id::new(SEARCH_ID);
-                if let Some(mut state) = egui::TextEdit::load_state(f.ctx(), id) {
-                    let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.search_query.chars().count()));
-                    state.cursor.set_char_range(Some(all));
-                    state.store(f.ctx(), id);
-                }
-            }
-            if r.lost_focus() && f.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.run_search();
-            }
-        } else {
-            let r = Self::top_tab(&mut c, Icon::Search, "Buscar", false, 0.0, false);
-            if r.clicked() {
-                self.focus_search = true;
-                self.go(Page::Search);
-            }
+        let search_c = pos2((x0 + 722.5).min(tabs_end - 90.0).max(home_c.x + 130.0), cy);
+        if page == Page::Search {
+            self.search_field(ui, search_c, &st, &p);
+        } else if self.top_item(ui, search_c, Icon::Search, 29.0, "Buscar", false, &st).clicked() {
+            self.focus_search = true;
+            self.go(Page::Search);
         }
-        // Pestañas de contenido
+
+        // Una pestaña por página abierta, cada 210 px detrás de Buscar (más juntas si no caben).
         let tabs: Vec<(usize, Icon, String)> = self
             .tabs
             .iter()
@@ -169,15 +106,23 @@ impl App {
                 (i, icon, title)
             })
             .collect();
-        for (i, icon, title) in tabs {
+        let first = search_c.x + TAB_PITCH;
+        let room = (tabs_end - (first - 16.0)).max(0.0);
+        let pitch = if tabs.is_empty() { TAB_PITCH } else { (room / tabs.len() as f32).clamp(56.0, TAB_PITCH) };
+        for (k, (i, icon, title)) in tabs.into_iter().enumerate() {
+            let c = pos2(first + k as f32 * pitch, cy);
+            if c.x + 40.0 > tabs_end {
+                break;
+            }
             let selected = self.active == super::ActiveTab::Tab(i);
-            let r = Self::top_tab(&mut c, icon, &title, selected, 0.0, true);
+            let text_w = (pitch - 30.5 - 40.0).max(0.0);
+            let r = self.top_tab(ui, c, icon, &title, text_w, selected, &st);
             // Cerrar: × al pasar el ratón o botón central
-            let close = Rect::from_center_size(pos2(r.rect.max.x - 20.0, r.rect.center().y), vec2(20.0, 20.0));
-            let hovered = r.hovered() || c.rect_contains_pointer(close);
+            let close = Rect::from_center_size(pos2(c.x + pitch - 34.0, cy), vec2(20.0, 20.0));
+            let hovered = r.hovered() || ui.rect_contains_pointer(close);
             if hovered {
-                let cr = c.interact(close, c.id().with(("close_tab", i)), Sense::click());
-                icons::paint(c.painter(), close.shrink(5.0), if cr.hovered() { p.text } else { p.weak }, Icon::Close);
+                let cr = ui.interact(close, ui.id().with(("close_tab", i)), Sense::click());
+                icons::paint(ui.painter(), close.shrink(5.0), if cr.hovered() { p.text } else { st.text }, Icon::Close);
                 if cr.clicked() {
                     self.actions.push(Action::CloseTab(i));
                     continue;
@@ -195,23 +140,115 @@ impl App {
                 }
             });
         }
-        // Atrás / adelante
-        c.add_space(6.0);
-        let can_back = self.can_back();
-        let can_fwd = self.can_forward();
-        if icons::button(&mut c, Icon::Back, 32.0, if can_back { p.text } else { p.faint })
-            .on_hover_text("Atrás (Alt+←)")
-            .clicked()
-        {
-            self.back();
-        }
-        if icons::button(&mut c, Icon::Forward, 32.0, if can_fwd { p.text } else { p.faint })
-            .on_hover_text("Adelante (Alt+→)")
-            .clicked()
-        {
-            self.forward();
-        }
         ui.allocate_rect(full, Sense::hover());
+    }
+
+    /// Foto del perfil (o la inicial) en un círculo; abre el perfil o inicia sesión.
+    fn top_avatar(&mut self, ui: &mut egui::Ui, rect: Rect, p: &theme::Palette) {
+        let resp = ui.interact(rect, ui.id().with("top_avatar"), Sense::click());
+        // Foto del perfil interno si ya llegó; si no, la que da /me (viene en la instantánea).
+        let login_name = match &self.auth {
+            Auth::LoggedIn { username } | Auth::Connecting { username } => Some(username.clone()),
+            _ => None,
+        };
+        let img = self
+            .my_id()
+            .map(|s| s.to_string())
+            .or(login_name)
+            .and_then(|id| self.users.get(&id))
+            .and_then(|u| u.cover(64).map(|s| s.to_string()))
+            .or_else(|| self.user.as_ref().and_then(|u| u.cover(64).map(|s| s.to_string())));
+        match img {
+            Some(url) => self.cover_in(ui, Some(&url), rect, 17),
+            None => {
+                ui.painter().circle_filled(rect.center(), 17.0, p.card2);
+                let initial = self
+                    .user
+                    .as_ref()
+                    .and_then(|u| u.display_name.clone())
+                    .and_then(|n| n.chars().next())
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "·".to_string());
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, initial, theme::bold(15.0), p.text);
+            }
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let logged = self.logged_in();
+        if resp.clicked() {
+            if let Some(id) = self.my_id().map(|s| s.to_string()) {
+                self.go(Page::User(id));
+            } else if !logged {
+                self.login();
+            }
+        }
+        resp.on_hover_text(if logged { "Tu perfil" } else { "Iniciar sesión" });
+    }
+
+    /// Inicio o Buscar: icono centrado en `c` (de lado `size`) y el texto 31 px a su derecha.
+    fn top_item(&mut self, ui: &mut egui::Ui, c: egui::Pos2, icon: Icon, size: f32, text: &str, active: bool, st: &TopStyle) -> egui::Response {
+        let g = ui.painter().layout_no_wrap(text.to_string(), theme::regular(TOP_FONT), st.text);
+        let rect = Rect::from_min_max(pos2(c.x - 18.0, c.y - 18.0), pos2(c.x + 31.0 + g.size().x + 10.0, c.y + 18.0));
+        let resp = ui.interact(rect, ui.id().with(("top_item", text)), Sense::click());
+        let color = st.color(active, resp.hovered());
+        // La lupa (con el mango abajo a la derecha) va 1 px arriba a la izquierda.
+        let ic = if icon == Icon::Search { c - vec2(1.0, 2.0) } else { c };
+        icons::paint(ui.painter(), Rect::from_center_size(ic, vec2(size, size)), st.icon_of(color), icon);
+        let g = ui.painter().layout_no_wrap(text.to_string(), theme::regular(TOP_FONT), color);
+        text_on_baseline(ui.painter(), pos2(c.x + 31.0, c.y + 6.0), g, color);
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp
+    }
+
+    /// Pestaña de una página abierta: como Inicio y Buscar, con el texto recortado a `text_w`.
+    fn top_tab(&mut self, ui: &mut egui::Ui, c: egui::Pos2, icon: Icon, title: &str, text_w: f32, selected: bool, st: &TopStyle) -> egui::Response {
+        let rect = Rect::from_min_max(pos2(c.x - 18.0, c.y - 18.0), pos2(c.x + 31.0 + text_w + 34.0, c.y + 18.0));
+        let resp = ui.interact(rect, ui.id().with(("top_tab", title, c.x as i32)), Sense::click());
+        let color = st.color(selected, resp.hovered());
+        icons::paint(ui.painter(), Rect::from_center_size(c, vec2(26.0, 26.0)), st.icon_of(color), icon);
+        if text_w > 8.0 {
+            let g = galley_truncated(ui.painter(), title, theme::regular(TOP_FONT), color, text_w);
+            text_on_baseline(ui.painter(), pos2(c.x + 31.0, c.y + 6.0), g, color);
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp
+    }
+
+    /// Buscar en su página: la lupa en su sitio y el campo de texto a su derecha, sobre una
+    /// píldora tenue.
+    fn search_field(&mut self, ui: &mut egui::Ui, c: egui::Pos2, st: &TopStyle, p: &theme::Palette) {
+        let pill = Rect::from_min_max(pos2(c.x - 22.0, c.y - 19.0), pos2(c.x + 330.0, c.y + 19.0));
+        ui.painter().rect_filled(pill, CornerRadius::same(19), p.hover.gamma_multiply(0.8));
+        icons::paint(ui.painter(), Rect::from_center_size(c - vec2(1.0, 2.0), vec2(29.0, 29.0)), st.icon_of(st.active), Icon::Search);
+        let field = Rect::from_min_max(pos2(c.x + 31.0, c.y - 13.0), pos2(pill.max.x - 14.0, c.y + 13.0));
+        let mut f = child_in(ui, field, Layout::left_to_right(Align::Center));
+        let edit = egui::TextEdit::singleline(&mut self.search_query)
+            .id(egui::Id::new(SEARCH_ID))
+            .frame(egui::Frame::NONE)
+            .font(theme::regular(TOP_FONT))
+            .hint_text("Buscar…")
+            .desired_width(field.width());
+        let r = f.add(edit);
+        if self.focus_search {
+            self.focus_search = false;
+            r.request_focus();
+            // La consulta anterior queda seleccionada: lo que se escriba la sustituye (como
+            // Ctrl+F en un navegador), y con las flechas o un clic se puede seguir editando.
+            let id = egui::Id::new(SEARCH_ID);
+            if let Some(mut state) = egui::TextEdit::load_state(f.ctx(), id) {
+                let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.search_query.chars().count()));
+                state.cursor.set_char_range(Some(all));
+                state.store(f.ctx(), id);
+            }
+        }
+        if r.lost_focus() && f.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.run_search();
+        }
     }
 
     /// Píldora verde «Reiniciar para actualizar» de la barra superior (o solo su icono si no cabe).
@@ -244,29 +281,6 @@ impl App {
             if pill == UpdatePill::Icon { format!("{UPDATE_PILL_TEXT}. {tip}") } else { tip }
         };
         resp.on_hover_text(tip)
-    }
-
-    fn top_tab(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool, width: f32, closable: bool) -> egui::Response {
-        let p = theme::palette(ui.ctx());
-        let measured = ui.painter().layout_no_wrap(text.to_string(), theme::regular(14.0), p.text).size().x;
-        // Las pestañas cerrables reservan sitio para la × a la derecha del texto.
-        let right_pad = if closable { 36.0 } else { 14.0 };
-        let width = if width > 0.0 { width } else { (measured + 46.0 + right_pad + 2.0).min(240.0) };
-        let (rect, resp) = ui.allocate_exact_size(vec2(width, 36.0), Sense::click());
-        if selected {
-            ui.painter().rect_filled(rect, CornerRadius::same(18), p.card2);
-        } else if resp.hovered() {
-            ui.painter().rect_filled(rect, CornerRadius::same(18), p.hover.gamma_multiply(0.6));
-        }
-        let color = if selected { p.text } else { p.weak.lerp_to_gamma(p.text, 0.5) };
-        icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.min.x + 26.0, rect.center().y), vec2(18.0, 18.0)), color, icon);
-        let text_rect = Rect::from_min_max(pos2(rect.min.x + 46.0, rect.min.y), pos2(rect.max.x - right_pad, rect.max.y));
-        let mut t = child_in(ui, text_rect, Layout::left_to_right(Align::Center));
-        t.add(Label::new(RichText::new(text).font(theme::regular(14.0)).color(color)).truncate());
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        resp
     }
 
     /// Icono y título de una página, para las pestañas de la barra superior.
@@ -314,38 +328,37 @@ impl App {
 
     // ---------------------------------------------------------- barra lateral
 
+    /// Barra lateral, copia de la referencia de diseño: filas de 51,5 px (Fijados y Playlists
+    /// con «›» para desplegar), icono de 28 px y texto gris. Historial va al final, detrás de
+    /// Artistas. Abajo, el último aviso de estado si lo hay.
     pub fn sidebar(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui.ctx());
+        let st = TopStyle::new(&p);
         let page = self.page().clone();
-        ui.spacing_mut().item_spacing.y = 2.0;
-        ui.add_space(4.0);
-
-        if Self::nav_item(ui, Some(Icon::Artist), "Artistas", page == Page::Artists, 0.0).clicked() {
-            self.go(Page::Artists);
-        }
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        ui.add_space(SIDE_FIRST_CENTER - SIDE_ROW_H / 2.0);
 
         // Fijados. Índices y no copias: este panel se dibuja en todas las páginas, cada fotograma.
         let pinned: Vec<usize> = {
             let set: std::collections::HashSet<&str> = self.settings.pinned.iter().map(String::as_str).collect();
             (0..self.playlists.len()).filter(|&i| set.contains(self.playlists[i].id.as_str())).collect()
         };
-        let r = Self::nav_item(ui, Some(Icon::Pin), "Fijados", false, 0.0);
-        Self::chevron(ui, r.rect, self.sidebar_pins_open, p.weak);
+        let r = Self::side_row(ui, Icon::Pin, "Fijados", false, &st);
+        Self::side_chevron(ui, r.rect, self.sidebar_pins_open, st.icon_of(st.color(false, r.hovered())));
         if r.clicked() {
             self.sidebar_pins_open = !self.sidebar_pins_open;
         }
         if self.sidebar_pins_open {
             if pinned.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.add_space(44.0);
-                    ui.label(RichText::new("Fija playlists con el clic derecho").small().color(p.faint));
-                });
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), SIDE_CHILD_H), Sense::hover());
+                let g = ui.painter().layout_no_wrap("Fija playlists con el clic derecho".into(), theme::regular(12.5), p.faint);
+                text_on_baseline(ui.painter(), pos2(rect.min.x + SIDE_CHILD_TEXT_X, rect.center().y + 5.0), g, p.faint);
             }
             for i in pinned {
                 // Copia solo de las fijadas (pocas): el menú contextual necesita `&mut self`.
                 let pl = self.playlists[i].clone();
                 let sel = matches!(&page, Page::Playlist(id) if *id == pl.id);
-                let r = Self::nav_item(ui, Some(Icon::PlaylistItem), &pl.name, sel, 24.0);
+                let r = Self::side_child(ui, &pl.name, sel, &st);
                 if r.clicked() {
                     self.go(Page::Playlist(pl.id.clone()));
                 }
@@ -353,15 +366,14 @@ impl App {
             }
         }
 
-        // Playlists
-        let r = Self::nav_item(ui, Some(Icon::Playlist), "Playlists", false, 0.0);
-        Self::chevron(ui, r.rect, self.sidebar_playlists_open, p.weak);
+        // Playlists, con «+» (nueva playlist) al pasar el ratón.
+        let r = Self::side_row(ui, Icon::Playlist, "Playlists", false, &st);
+        Self::side_chevron(ui, r.rect, self.sidebar_playlists_open, st.icon_of(st.color(false, r.hovered())));
         {
-            // botón "+" a la izquierda del chevron
-            let plus = Rect::from_center_size(pos2(r.rect.max.x - 46.0, r.rect.center().y), vec2(24.0, 24.0));
+            let plus = Rect::from_center_size(pos2(r.rect.min.x + 214.0, r.rect.center().y), vec2(26.0, 26.0));
             let pr = ui.interact(plus, ui.id().with("new_pl"), Sense::click());
             if pr.hovered() || r.hovered() {
-                icons::paint(ui.painter(), plus.shrink(5.0), if pr.hovered() { p.text } else { p.weak }, Icon::Plus);
+                icons::paint(ui.painter(), plus.shrink(5.0), if pr.hovered() { st.hover } else { st.icon }, Icon::Plus);
             }
             if pr.clicked() && self.logged_in() {
                 self.actions.push(Action::OpenEditor(None));
@@ -374,29 +386,25 @@ impl App {
             // Sin copia (primer arranque): el hueco de las filas mientras llega el rootlist. Con
             // copia no hace falta aviso: se ve la lista y se sustituye al llegar.
             if self.signed_in() && !self.playlists_loaded && self.playlists.is_empty() {
-                Self::skeleton_rows(ui, 6, 34.0, 18.0, 28.0);
+                Self::skeleton_rows(ui, 6, SIDE_CHILD_H, 18.0, 28.0);
             }
-            let avail = (ui.available_height() - 9.0 * 36.0 - 60.0).max(80.0);
+            // Debajo quedan 8 filas (Me gusta… Historial) y el aviso de estado.
+            let avail = (ui.available_height() - 8.0 * SIDE_ROW_H - 40.0).max(SIDE_CHILD_H * 2.0);
             // Solo las filas a la vista: con cientos de playlists, copiarlas y maquetarlas todas
-            // costaba casi un milisegundo por fotograma en cualquier página. nav_item mide 34 px
-            // y show_rows ya suma el espaciado de 2 px entre filas.
+            // costaba casi un milisegundo por fotograma en cualquier página.
             egui::ScrollArea::vertical()
                 .id_salt("sidebar_playlists")
                 .auto_shrink([false, true])
                 .max_height(avail)
-                .show_rows(ui, 34.0, self.playlists.len(), |ui, range| {
+                .show_rows(ui, SIDE_CHILD_H, self.playlists.len(), |ui, range| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
                     for i in range {
                         let Some(pl) = self.playlists.get(i).cloned() else { break };
                         let sel = matches!(&page, Page::Playlist(id) if *id == pl.id);
-                        // Id de la fila por playlist: nav_item gasta dos ids automáticos y
-                        // show_rows solo salta uno por fila oculta, así que con ids automáticos
-                        // el hover y el menú abierto saltarían de fila al desplazarse.
+                        // Id de la fila por playlist: con ids automáticos el hover y el menú
+                        // abierto saltarían de fila al desplazarse.
                         let key = ui.id().with(("sb_pl", i, &pl.id));
-                        let r = ui
-                            .scope_builder(UiBuilder::new().id(key), |ui| {
-                                Self::nav_item(ui, Some(Icon::PlaylistItem), &pl.name, sel, 24.0)
-                            })
-                            .inner;
+                        let r = ui.scope_builder(UiBuilder::new().id(key), |ui| Self::side_child(ui, &pl.name, sel, &st)).inner;
                         if r.clicked() {
                             self.go(Page::Playlist(pl.id.clone()));
                         }
@@ -405,7 +413,6 @@ impl App {
                 });
         }
 
-        ui.add_space(6.0);
         let items = [
             (Icon::Heart, "Canciones que te gustan", Page::Liked),
             (Icon::Bookmark, "Guardados", Page::Saves),
@@ -413,56 +420,79 @@ impl App {
             (Icon::Folder, "Carpetas", Page::Folders),
             (Icon::Podcast, "Podcasts", Page::Shows),
             (Icon::Book, "Audiolibros", Page::Audiobooks),
+            (Icon::Artist, "Artistas", Page::Artists),
             (Icon::History, "Historial", Page::History),
         ];
         for (icon, label, pg) in items {
-            if Self::nav_item(ui, Some(icon), label, page == pg, 0.0).clicked() {
+            if Self::side_row(ui, icon, label, page == pg, &st).clicked() {
                 self.go(pg);
             }
         }
 
-        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            self.refresh_mem();
-            let mem = self
-                .mem_mb
-                .map(|m| format!("{m:.0} MB · {:.1} ms", self.frame_ms))
-                .unwrap_or_default();
-            ui.horizontal(|ui| {
-                ui.add_space(14.0);
-                ui.label(RichText::new(mem).small().color(p.faint))
-                    .on_hover_text("Memoria usada por Nanofy y coste del último fotograma");
-            });
-            if let Some((text, _, err)) = self.status.clone() {
+        // Último aviso de estado, abajo.
+        if let Some((text, _, err)) = self.status.clone() {
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                 let color = if err { theme::RED } else { p.weak };
-                ui.add_space(6.0);
+                ui.add_space(12.0);
                 // «Conecta tu biblioteca…» llega desde cualquier página que lea la Web API: la
-                // acción va con el aviso, sin buscarla en el inicio ni en Ajustes. (De abajo arriba:
-                // queda debajo del texto.)
+                // acción va con el aviso. (De abajo arriba: queda debajo del texto.)
                 if text == crate::api::NO_APP_HINT && !self.api.web_configured() && !self.web_busy {
                     ui.horizontal(|ui| {
-                        ui.add_space(14.0);
+                        ui.add_space(24.0);
                         if ui.link(RichText::new("Conectar con Spotify").small()).clicked() {
                             self.connect_library();
                         }
                     });
                 }
-                let w = ui.available_width() - 20.0;
+                let w = ui.available_width() - 48.0;
                 let galley = ui.painter().layout(text, theme::regular(12.0), color, w);
                 let (rect, _) = ui.allocate_exact_size(vec2(w, galley.size().y), Sense::hover());
-                ui.painter().galley(pos2(rect.min.x + 14.0, rect.min.y), galley, color);
-            }
-        });
+                ui.painter().galley(pos2(rect.min.x + 24.0, rect.min.y), galley, color);
+            });
+        }
     }
 
-    fn chevron(ui: &mut egui::Ui, rect: Rect, open: bool, color: Color32) {
-        let c = pos2(rect.max.x - 18.0, rect.center().y);
-        let s = 5.0;
+    /// Fila principal de la barra lateral: icono de 28 px centrado a 37 px del borde y el texto a
+    /// 67 px, con la línea base 7 px por debajo del centro.
+    fn side_row(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool, st: &TopStyle) -> egui::Response {
+        let w = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, SIDE_ROW_H), Sense::click());
+        let color = st.color(selected, resp.hovered());
+        let c = rect.center().y;
+        let (side, dx, dy) = side_icon_fit(icon);
+        icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.min.x + 37.0 + dx, c + dy), vec2(side, side)), st.icon_of(color), icon);
+        let g = galley_truncated(ui.painter(), text, theme::regular(SIDE_FONT), color, (w - 67.0 - 44.0).max(20.0));
+        text_on_baseline(ui.painter(), pos2(rect.min.x + 67.0, c + 7.0), g, color);
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp
+    }
+
+    /// Playlist dentro de Fijados o Playlists desplegados: fila de 40 px, más metida.
+    fn side_child(ui: &mut egui::Ui, text: &str, selected: bool, st: &TopStyle) -> egui::Response {
+        let w = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, SIDE_CHILD_H), Sense::click());
+        let color = st.color(selected, resp.hovered());
+        let c = rect.center().y;
+        icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.min.x + 60.0, c), vec2(22.0, 22.0)), st.icon_of(color), Icon::PlaylistItem);
+        let g = galley_truncated(ui.painter(), text, theme::regular(SIDE_CHILD_FONT), color, (w - SIDE_CHILD_TEXT_X - 24.0).max(20.0));
+        text_on_baseline(ui.painter(), pos2(rect.min.x + SIDE_CHILD_TEXT_X, c + 5.0), g, color);
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp
+    }
+
+    /// «›» (plegado) o «⌄» (desplegado) a 245,5 px del borde, de 9 × 14 px.
+    fn side_chevron(ui: &mut egui::Ui, rect: Rect, open: bool, color: Color32) {
+        let c = pos2(rect.min.x + 245.5, rect.center().y + 1.0);
         let pts = if open {
-            vec![pos2(c.x - s, c.y - s / 2.0), pos2(c.x, c.y + s / 2.0), pos2(c.x + s, c.y - s / 2.0)]
+            vec![pos2(c.x - 6.5, c.y - 3.0), pos2(c.x, c.y + 3.5), pos2(c.x + 6.5, c.y - 3.0)]
         } else {
-            vec![pos2(c.x - s / 2.0, c.y - s), pos2(c.x + s / 2.0, c.y), pos2(c.x - s / 2.0, c.y + s)]
+            vec![pos2(c.x - 3.0, c.y - 6.5), pos2(c.x + 3.5, c.y), pos2(c.x - 3.0, c.y + 6.5)]
         };
-        ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.6, color)));
+        ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(2.0, color)));
     }
 
     fn playlist_context_menu(&mut self, r: &egui::Response, pl: &Playlist) {
@@ -1407,20 +1437,6 @@ fn bar_layout(w: f32) -> BarLayout {
     BarLayout { prog_w: avail(&nano).max(60.0), ..nano }
 }
 
-/// Pinta `galley` con su borde izquierdo en `at.x` y la línea base en `at.y` (en un píxel
-/// entero); devuelve dónde quedó.
-fn text_on_baseline(painter: &egui::Painter, at: egui::Pos2, galley: std::sync::Arc<egui::Galley>, color: Color32) -> Rect {
-    let base = galley
-        .rows
-        .first()
-        .and_then(|r| r.row.glyphs.first().map(|g| r.pos.y + g.pos.y))
-        .unwrap_or(galley.size().y * 0.8);
-    let min = pos2(at.x.round(), (at.y - base).round());
-    let rect = Rect::from_min_size(min, galley.size());
-    painter.galley(min, galley, color);
-    rect
-}
-
 // ------------------------------------------------------------ píldora de actualización
 
 /// Texto de la píldora de la barra superior cuando hay una versión nueva lista.
@@ -1430,9 +1446,73 @@ const PILL_H: f32 = 32.0;
 const PILL_PAD: f32 = 14.0;
 /// Ancho de la zona de la derecha sin la píldora (ajustes y perfil).
 const TOP_RIGHT_W: f32 = 110.0;
-/// Lo que se deja como mínimo a las pestañas (Inicio, Buscar, atrás y adelante) antes de
-/// encoger la píldora a solo el icono.
-const TOP_TABS_MIN_W: f32 = 320.0;
+/// Lo que se deja como mínimo a Inicio y Buscar (hasta el final de «Buscar» en la referencia)
+/// antes de encoger la píldora a solo el icono.
+const TOP_TABS_MIN_W: f32 = 540.0;
+
+// ------------------------------------------------------------ medidas de la barra superior y la lateral
+
+/// Texto de la barra superior.
+const TOP_FONT: f32 = 14.0;
+/// Distancia entre las pestañas de páginas abiertas (de icono a icono), como de Inicio a Buscar.
+const TAB_PITCH: f32 = 210.0;
+/// Centro de la primera fila de la barra lateral desde su borde de arriba, alto de las filas,
+/// lado de sus iconos y tamaño de su texto.
+const SIDE_FIRST_CENTER: f32 = 30.0;
+const SIDE_ROW_H: f32 = 51.5;
+const SIDE_ICON: f32 = 28.0;
+const SIDE_FONT: f32 = 14.5;
+/// Filas de las playlists desplegadas: alto, texto y dónde empieza.
+const SIDE_CHILD_H: f32 = 40.0;
+const SIDE_CHILD_FONT: f32 = 14.0;
+const SIDE_CHILD_TEXT_X: f32 = 80.0;
+
+/// Lado y desplazamiento (x, y) de cada icono de la barra lateral para que su tinta caiga donde
+/// en la referencia (sus dibujos no ocupan el cuadro igual).
+fn side_icon_fit(icon: Icon) -> (f32, f32, f32) {
+    match icon {
+        Icon::Pin => (30.0, 0.0, 1.5),
+        Icon::Heart => (SIDE_ICON, 0.5, 2.0),
+        Icon::Album => (SIDE_ICON, -1.0, 0.5),
+        Icon::Podcast => (30.0, 1.0, -0.5),
+        _ => (SIDE_ICON, 0.0, 0.0),
+    }
+}
+
+/// Colores de la barra superior y la lateral: iconos y texto grises, más claros al pasar el
+/// ratón, y blancos en la página abierta.
+struct TopStyle {
+    icon: Color32,
+    text: Color32,
+    hover: Color32,
+    active: Color32,
+}
+
+impl TopStyle {
+    fn new(p: &theme::Palette) -> Self {
+        if p.dark {
+            Self { icon: Color32::from_gray(143), text: Color32::from_gray(130), hover: Color32::from_gray(205), active: p.text }
+        } else {
+            Self { icon: p.weak, text: p.weak, hover: p.text, active: p.text }
+        }
+    }
+
+    /// Color del texto según esté en su página o bajo el ratón.
+    fn color(&self, active: bool, hovered: bool) -> Color32 {
+        if active {
+            self.active
+        } else if hovered {
+            self.hover
+        } else {
+            self.text
+        }
+    }
+
+    /// Color del icono que acompaña a un texto de `color` (en reposo el icono es algo más claro).
+    fn icon_of(&self, color: Color32) -> Color32 {
+        if color == self.text { self.icon } else { color }
+    }
+}
 
 /// Cómo cabe la píldora: entera (con este ancho) o solo el icono.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1614,13 +1694,14 @@ mod tests {
         // Sin versión lista, la zona de siempre.
         assert_eq!(top_right_layout(1120.0, None), (TOP_RIGHT_W, None));
         // Ventana normal: entera, y la zona crece justo lo que ocupa.
-        let (w, pill) = top_right_layout(1120.0, Some(160.0));
+        let (w, pill) = top_right_layout(1280.0, Some(160.0));
         let Some(UpdatePill::Full(pw)) = pill else { panic!("{pill:?}") };
         assert_eq!(w, TOP_RIGHT_W + 6.0 + pw);
         assert!(pw >= 160.0 + 18.0 + 2.0 * PILL_PAD);
-        assert!(1120.0 - SIDEBAR_W - w >= TOP_TABS_MIN_W);
-        // Interfaz al 200 % (560 puntos de ancho) o la ventana mínima: solo el icono.
-        for full in [560.0, 760.0] {
+        assert!(1280.0 - SIDEBAR_W - w >= TOP_TABS_MIN_W);
+        // Interfaz al 200 % (560 puntos de ancho), la ventana mínima o una algo mayor: solo el
+        // icono, sin montarse sobre Buscar.
+        for full in [560.0, 760.0, 1000.0] {
             let (w, pill) = top_right_layout(full, Some(160.0));
             assert_eq!(pill, Some(UpdatePill::Icon), "{full}");
             assert_eq!(w, TOP_RIGHT_W + 6.0 + PILL_H);

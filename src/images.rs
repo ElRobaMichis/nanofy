@@ -136,6 +136,8 @@ pub struct Images {
     waiting: Option<Instant>,
     /// Portadas a la vista sin textura en este fotograma.
     waiting_now: usize,
+    /// Color dominante por URL de portada, para el degradado de la página de esa portada.
+    colors: HashMap<String, egui::Color32>,
 }
 
 impl Drop for Images {
@@ -223,6 +225,7 @@ impl Images {
             last_sweep: Instant::now(),
             waiting: None,
             waiting_now: 0,
+            colors: HashMap::new(),
         }
     }
 
@@ -275,10 +278,33 @@ impl Images {
     }
 
     /// `retry` solo cuenta sin imagen: el fallo fue pasajero y se reintentará.
+    /// Color de arriba del degradado de una página (playlist, álbum) según su portada ya
+    /// cargada: el tono dominante con la saturación moderada y oscurecido hasta una luminancia
+    /// de ~40 (en la referencia de diseño, una portada azul da (30, 39, 87)).
+    pub fn tint(&self, url: &str) -> Option<egui::Color32> {
+        let c = self.colors.get(url).copied()?;
+        let (r, g, b) = (c.r() as f32, c.g() as f32, c.b() as f32);
+        let lum = |r: f32, g: f32, b: f32| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let l = lum(r, g, b);
+        // Saturación como mucho ~0,65: un color puro saldría chillón en un fondo tan grande.
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
+        let k = if sat > 0.65 { 0.65 / sat } else { 1.0 };
+        let (r, g, b) = (l + (r - l) * k, l + (g - l) * k, l + (b - l) * k);
+        let target = 40.6;
+        let l2 = lum(r, g, b).max(1.0);
+        let f = (target / l2).min(255.0 / r.max(g).max(b).max(1.0));
+        Some(egui::Color32::from_rgb((r * f).clamp(0.0, 255.0) as u8, (g * f).clamp(0.0, 255.0) as u8, (b * f).clamp(0.0, 255.0) as u8))
+    }
+
     pub fn loaded(&mut self, ctx: &egui::Context, key: &str, image: Option<ColorImage>, retry: bool) {
         let slot = match image {
             Some(img) => {
                 let bytes = img.pixels.len() * 4;
+                if let Some(url) = key.split_once('|').map(|(_, u)| u.to_string()) {
+                    self.colors.entry(url).or_insert_with(|| dominant_color(&img));
+                }
                 Slot::Ready {
                     tex: ctx.load_texture(key, img, TextureOptions::LINEAR),
                     used: self.frame,
@@ -531,3 +557,25 @@ fn load(agent: &ureq::Agent, dir: &Path, url: &str, size: Size, stale: impl Fn()
     ))
 }
 
+/// Media de los píxeles ponderada por saturación (los colores vivos mandan); como mucho 4096
+/// muestras por imagen.
+fn dominant_color(img: &ColorImage) -> egui::Color32 {
+    let (mut r, mut g, mut b, mut wsum) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let step = (img.pixels.len() / 4096).max(1);
+    for px in img.pixels.iter().step_by(step) {
+        let (pr, pg, pb) = (px.r() as f64, px.g() as f64, px.b() as f64);
+        let max = pr.max(pg).max(pb);
+        let min = pr.min(pg).min(pb);
+        let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
+        let light = max / 255.0;
+        let w = sat * sat * light + 0.02;
+        r += pr * w;
+        g += pg * w;
+        b += pb * w;
+        wsum += w;
+    }
+    if wsum <= 0.0 {
+        return egui::Color32::from_rgb(128, 128, 128);
+    }
+    egui::Color32::from_rgb((r / wsum) as u8, (g / wsum) as u8, (b / wsum) as u8)
+}

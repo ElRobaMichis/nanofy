@@ -133,7 +133,11 @@ impl App {
         let op = s(cmd, "op").unwrap_or("");
         log::debug!("[control] {cmd}");
         match op {
-            "state" => json!({"ok": true, "state": self.control_state()}),
+            "state" => {
+                // La memoria ya no se mide en cada fotograma (la barra lateral no la enseña).
+                self.refresh_mem();
+                json!({"ok": true, "state": self.control_state()})
+            }
             // El pid deja al runner seguir a la versión que abre una actualización (al reiniciar o
             // al instalarse al abrir): es otro proceso, no un hijo suyo, en el mismo puerto.
             "ping" => json!({"ok": true, "version": crate::update::current_version(), "pid": std::process::id()}),
@@ -408,7 +412,13 @@ impl App {
             // Tamaño interior de la ventana, en puntos (para capturas a un ancho exacto).
             "window_size" => match (n(cmd, "w"), n(cmd, "h")) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => {
+                    // Maximizada no cambiaría de tamaño.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w as f32, h as f32)));
+                    // Opcional: dónde (una captura de una ventana que sale de la pantalla queda en negro).
+                    if let (Some(x), Some(y)) = (n(cmd, "x"), n(cmd, "y")) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x as f32, y as f32)));
+                    }
                     ok()
                 }
                 _ => err("faltan w y h"),

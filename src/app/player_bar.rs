@@ -538,7 +538,22 @@ impl App {
     /// texto cambian de ancho con la ventana.
     pub fn player_bar(&mut self, ui: &mut egui::Ui) {
         let full = ui.available_rect_before_wrap();
-        let st = BarStyle::new(ui);
+        // Fondo dinámico: el color de la portada mientras suena y gris en pausa, con transición.
+        let p = theme::palette(ui.ctx());
+        let paused = if p.dark { BAR_PAUSED } else { p.card2 };
+        let target = if self.player.state == PlayState::Playing {
+            self.player
+                .now
+                .as_ref()
+                .and_then(|n| n.cover_url.as_deref())
+                .and_then(|u| self.images.color(u, p.dark))
+                .unwrap_or(paused)
+        } else {
+            paused
+        };
+        let anim = |k: u8, v: u8| ui.ctx().animate_value_with_time(egui::Id::new(("player_bg", k)), v as f32, 0.6).round() as u8;
+        let bg = Color32::from_rgb(anim(0, target.r()), anim(1, target.g()), anim(2, target.b()));
+        let st = BarStyle::new(ui, bg);
         ui.painter().rect_filled(full, CornerRadius::same(BAR_RADIUS), st.bg);
         let lay = bar_layout(full.width());
         // Centro vertical de los mandos: un píxel por debajo del centro de la barra.
@@ -1289,8 +1304,18 @@ const PROG_MIN: f32 = 160.0;
 const TEXT_MAX: f32 = 357.0;
 const TEXT_MIN: f32 = 180.0;
 
-/// Colores del reproductor: en tema oscuro, los de la referencia de diseño; en claro, los de la
-/// paleta.
+/// Fondo del reproductor en pausa (o sin color de portada aún), en tema oscuro.
+const BAR_PAUSED: Color32 = Color32::from_gray(31);
+
+/// Aclara (`d` > 0) u oscurece un color por igual en sus tres canales.
+fn shade(c: Color32, d: i16) -> Color32 {
+    let f = |v: u8| (v as i16 + d).clamp(0, 255) as u8;
+    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+}
+
+/// Colores del reproductor: en tema oscuro, los de la referencia de diseño sobre el fondo
+/// dinámico `bg` (el carril del progreso y el separador, 20 más claros; la sombra, 16 más
+/// oscura); en claro, los de la paleta.
 struct BarStyle {
     bg: Color32,
     icon: Color32,
@@ -1305,24 +1330,24 @@ struct BarStyle {
 }
 
 impl BarStyle {
-    fn new(ui: &egui::Ui) -> Self {
+    fn new(ui: &egui::Ui, bg: Color32) -> Self {
         let p = theme::palette(ui.ctx());
         if ui.visuals().dark_mode {
             BarStyle {
-                bg: Color32::from_rgb(50, 56, 66),
+                bg,
                 icon: Color32::from_rgb(136, 141, 147),
                 title: Color32::from_rgb(212, 218, 228),
                 dim: Color32::from_rgb(126, 132, 142),
-                track: Color32::from_rgb(70, 76, 86),
+                track: shade(bg, 20),
                 fill: Color32::from_rgb(220, 224, 231),
-                shadow: Color32::from_rgb(34, 40, 50),
-                separator: Color32::from_rgb(70, 76, 86),
+                shadow: shade(bg, -16),
+                separator: shade(bg, 20),
                 play_ring: Color32::from_rgb(2, 44, 20),
-                loading: Color32::from_rgb(70, 76, 86),
+                loading: shade(bg, 20),
             }
         } else {
             BarStyle {
-                bg: p.card2,
+                bg,
                 icon: p.weak,
                 title: p.text,
                 dim: p.weak,

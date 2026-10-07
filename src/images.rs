@@ -281,6 +281,28 @@ impl Images {
     /// Color de arriba del degradado de una página (playlist, álbum) según su portada ya
     /// cargada: el tono dominante con la saturación moderada y oscurecido hasta una luminancia
     /// de ~40 (en la referencia de diseño, una portada azul da (30, 39, 87)).
+    /// Color de la portada para el fondo del reproductor, adaptado al tema: en oscuro con la
+    /// luminancia llevada a ~52; en claro, un tinte suave sobre blanco.
+    pub fn color(&self, url: &str, dark: bool) -> Option<egui::Color32> {
+        let raw = self.colors.get(url).copied()?;
+        let (r, g, b) = (raw.r() as f64, raw.g() as f64, raw.b() as f64);
+        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        Some(if dark {
+            let target = 52.0;
+            let k = if lum > 1.0 { (target / lum).min(1.4) } else { 1.0 };
+            let c = |v: f64| ((v * k).clamp(0.0, 255.0)) as u8;
+            egui::Color32::from_rgb(c(r), c(g), c(b))
+        } else {
+            // Tinte: 78 % blanco + 22 % color, y nunca más oscuro que ~215 de luminancia.
+            let mix = |v: f64| 255.0 * 0.78 + v * 0.22;
+            let (mr, mg, mb) = (mix(r), mix(g), mix(b));
+            let l2 = 0.2126 * mr + 0.7152 * mg + 0.0722 * mb;
+            let k = if l2 < 215.0 { 215.0 / l2 } else { 1.0 };
+            let c = |v: f64| ((v * k).clamp(0.0, 255.0)) as u8;
+            egui::Color32::from_rgb(c(mr), c(mg), c(mb))
+        })
+    }
+
     pub fn tint(&self, url: &str) -> Option<egui::Color32> {
         let c = self.colors.get(url).copied()?;
         let (r, g, b) = (c.r() as f32, c.g() as f32, c.b() as f32);

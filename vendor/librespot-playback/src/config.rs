@@ -9,8 +9,8 @@ pub enum Bitrate {
     #[default]
     Bitrate160,
     Bitrate320,
-    /// FLAC sin pérdida cuando Spotify lo ofrece; si no, Ogg Vorbis 320 kbps.
-    Lossless,
+    // Sin variante «sin pérdida»: las claves de los FLAC de Spotify están tras su DRM y sus
+    // metadatos (TRACK_V4) ni siquiera los listan, así que Nanofy nunca debe pedir una.
 }
 
 impl FromStr for Bitrate {
@@ -20,7 +20,6 @@ impl FromStr for Bitrate {
             "96" => Ok(Self::Bitrate96),
             "160" => Ok(Self::Bitrate160),
             "320" => Ok(Self::Bitrate320),
-            "lossless" | "flac" => Ok(Self::Lossless),
             _ => Err(()),
         }
     }
@@ -119,6 +118,13 @@ pub struct PlayerConfig {
     pub normalisation_release_cf: f64,
     pub normalisation_knee_db: f64,
 
+    /// Fundido entre canciones, en milisegundos; 0 lo apaga (por defecto, como en Spotify). Se
+    /// cambia en vivo con `Player::set_crossfade`, sin reiniciar el reproductor.
+    pub crossfade_ms: u32,
+    /// Fundir también dos pistas seguidas de un mismo álbum, que Spotify deja sin fundir para
+    /// respetar las transiciones del artista.
+    pub crossfade_albums: bool,
+
     pub local_file_directories: Vec<PathBuf>,
 
     // pass function pointers so they can be lazily instantiated *after* spawning a thread
@@ -142,11 +148,61 @@ impl Default for PlayerConfig {
             normalisation_attack_cf: duration_to_coefficient(Duration::from_millis(5)),
             normalisation_release_cf: duration_to_coefficient(Duration::from_millis(100)),
             normalisation_knee_db: 5.0,
+            crossfade_ms: 0,
+            crossfade_albums: false,
             passthrough: false,
             ditherer: Some(mk_ditherer::<TriangularDitherer>),
             position_update_interval: None,
             local_file_directories: Vec::new(),
         }
+    }
+}
+
+/// La parte de `PlayerConfig` que se puede cambiar con el reproductor en marcha
+/// (`Player::set_audio_tuning`), sin reiniciar la sesión: la calidad y gapless valen desde la
+/// próxima canción que se cargue (el cargador copia la configuración en cada carga) y la
+/// normalización, al instante.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioTuning {
+    pub bitrate: Bitrate,
+    pub gapless: bool,
+    pub normalisation: bool,
+    pub normalisation_type: NormalisationType,
+    pub normalisation_method: NormalisationMethod,
+    pub normalisation_pregain_db: f64,
+    pub normalisation_threshold_dbfs: f64,
+    pub normalisation_attack_cf: f64,
+    pub normalisation_release_cf: f64,
+    pub normalisation_knee_db: f64,
+}
+
+impl PlayerConfig {
+    pub fn tuning(&self) -> AudioTuning {
+        AudioTuning {
+            bitrate: self.bitrate,
+            gapless: self.gapless,
+            normalisation: self.normalisation,
+            normalisation_type: self.normalisation_type,
+            normalisation_method: self.normalisation_method,
+            normalisation_pregain_db: self.normalisation_pregain_db,
+            normalisation_threshold_dbfs: self.normalisation_threshold_dbfs,
+            normalisation_attack_cf: self.normalisation_attack_cf,
+            normalisation_release_cf: self.normalisation_release_cf,
+            normalisation_knee_db: self.normalisation_knee_db,
+        }
+    }
+
+    pub fn set_tuning(&mut self, t: &AudioTuning) {
+        self.bitrate = t.bitrate;
+        self.gapless = t.gapless;
+        self.normalisation = t.normalisation;
+        self.normalisation_type = t.normalisation_type;
+        self.normalisation_method = t.normalisation_method;
+        self.normalisation_pregain_db = t.normalisation_pregain_db;
+        self.normalisation_threshold_dbfs = t.normalisation_threshold_dbfs;
+        self.normalisation_attack_cf = t.normalisation_attack_cf;
+        self.normalisation_release_cf = t.normalisation_release_cf;
+        self.normalisation_knee_db = t.normalisation_knee_db;
     }
 }
 

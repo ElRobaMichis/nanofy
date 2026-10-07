@@ -1,11 +1,20 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    cell::RefCell,
+    ops::{Deref, DerefMut},
+    sync::{Mutex, MutexGuard},
+    time::Instant,
+};
 
 use protobuf::Message;
 use thiserror::Error;
 use time::Duration;
 use url::Url;
 
-use super::{Error, FileId, Session, date::Date};
+use super::{
+    Error, FileId, Session,
+    cdn_policy::{self, HostPrefs, StorageCache},
+    date::Date,
+};
 
 use librespot_protocol as protocol;
 use protocol::storage_resolve::StorageResolveResponse as CdnUrlMessage;
@@ -65,17 +74,58 @@ impl CdnUrl {
         }
     }
 
+    /// Dónde está el fichero en la CDN. Lo ya resuelto en este proceso se reutiliza mientras sus
+    /// URL no estén a punto de caducar (`cdn_policy`), y las URL vuelven ordenadas para probar
+    /// primero el servidor que contestó la última vez y al final los que fallaron hace poco.
     pub async fn resolve_audio(&self, session: &Session) -> Result<Self, Error> {
         let file_id = self.file_id;
+        let cached = storage().get(&file_id, Date::now_utc().as_timestamp_ms(), Instant::now());
+        if let Some(urls) = cached {
+            // Fase «storage» de la carga medida (si este es su hilo): sin petición.
+            crate::ttfs::mark_thread("storage", Some("hit".into()));
+            trace!("CDN storage of {file_id} from the in-memory cache");
+            return Ok(Self {
+                file_id,
+                urls: ordered(urls),
+            });
+        }
         let response = session.spclient().get_audio_storage(&file_id).await?;
+        crate::ttfs::mark_thread("storage", Some("miss".into()));
         let msg = CdnUrlMessage::parse_from_bytes(&response)?;
         let urls = MaybeExpiringUrls::try_from(msg)?;
+        if !urls.is_empty() {
+            storage().put(file_id, urls.clone(), urls.min_expiry_ms(), Instant::now());
+        }
 
-        let cdn_url = Self { file_id, urls };
+        let cdn_url = Self {
+            file_id,
+            urls: ordered(urls),
+        };
 
         trace!("Resolved CDN storage: {cdn_url:#?}");
 
         Ok(cdn_url)
+    }
+
+    /// ¿Ya se sabe dónde está el fichero (y sus URL aún sirven)? Sin pedir nada.
+    pub fn is_resolved(file_id: FileId) -> bool {
+        storage().contains(&file_id, Date::now_utc().as_timestamp_ms(), Instant::now())
+    }
+
+    /// Olvida dónde estaba el fichero: todas sus URL fallaron (o una caducó antes de tiempo), así
+    /// que la próxima carga vuelve a preguntar.
+    pub fn forget(file_id: FileId) {
+        storage().forget(&file_id);
+    }
+
+    /// Olvida todo lo resuelto (al cerrar sesión).
+    pub fn forget_all() {
+        storage().clear();
+    }
+
+    /// Ficheros con la ubicación guardada (para el modo de control).
+    pub fn resolved_count() -> usize {
+        storage().len()
     }
 
     #[deprecated = "This function only returns the first valid URL. Use try_get_urls instead, which allows for fallback logic."]
@@ -124,6 +174,90 @@ impl CdnUrl {
             Ok(urls)
         }
     }
+}
+
+impl MaybeExpiringUrls {
+    /// Caducidad (ms desde 1970, ya con el margen) de la URL que antes caduca; `None` si ninguna
+    /// la trae.
+    fn min_expiry_ms(&self) -> Option<i64> {
+        self.iter()
+            .filter_map(|MaybeExpiringUrl(_, expiry)| expiry.map(|e| e.as_timestamp_ms()))
+            .min()
+    }
+}
+
+/// Ubicaciones ya resueltas, por fichero (ver `CdnUrl::resolve_audio`).
+static STORAGE: Mutex<StorageCache<FileId, MaybeExpiringUrls>> =
+    Mutex::new(StorageCache::new(cdn_policy::CAP));
+/// Qué servidores de la CDN contestaron y cuáles fallaron (ver `end_open`).
+static HOSTS: Mutex<HostPrefs> = Mutex::new(HostPrefs::new());
+
+fn storage() -> MutexGuard<'static, StorageCache<FileId, MaybeExpiringUrls>> {
+    STORAGE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn hosts() -> MutexGuard<'static, HostPrefs> {
+    HOSTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// El servidor de la CDN que contestó la última vez (para el modo de control de Nanofy).
+pub fn last_good_host() -> Option<String> {
+    hosts().last_good().map(str::to_string)
+}
+
+/// Las URL en el orden en que conviene probarlas (`HostPrefs::order`).
+fn ordered(mut urls: MaybeExpiringUrls) -> MaybeExpiringUrls {
+    hosts().order(&mut urls.0, |u| u.0.as_str(), Instant::now());
+    urls
+}
+
+thread_local! {
+    /// Servidores de la CDN probados por este hilo desde `begin_open` (`None`: no se apunta). El
+    /// reproductor abre cada fichero en un hilo propio y librespot-audio prueba las URL una tras
+    /// otra en ese mismo hilo, así que lo apuntado aquí es justo lo que probó esa apertura; las
+    /// descargas posteriores van en otros hilos y no se apuntan.
+    static ATTEMPTS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+/// Lo que se apunta como mucho por apertura (Spotify da 2-4 URL por fichero).
+const ATTEMPTS_CAP: usize = 8;
+
+/// Empieza a apuntar los servidores que prueba la apertura del fichero en este hilo.
+pub fn begin_open() {
+    ATTEMPTS.with(|a| *a.borrow_mut() = Some(Vec::new()));
+}
+
+/// spclient va a pedir un trozo a la CDN desde este hilo (ver `ATTEMPTS`).
+pub(crate) fn note_attempt(host: Option<&str>) {
+    ATTEMPTS.with(|a| {
+        if let (Some(list), Some(host)) = (a.borrow_mut().as_mut(), host) {
+            if list.len() < ATTEMPTS_CAP {
+                list.push(host.to_string());
+            }
+        }
+    });
+}
+
+/// Termina la apertura de `file_id` en este hilo: si se abrió (`ok`), el último servidor probado
+/// es el bueno y los anteriores fallaron; si no, fallaron todos y se olvida dónde estaba el
+/// fichero (quizá sus URL caducaron), para preguntar otra vez en la próxima carga.
+pub fn end_open(file_id: FileId, ok: bool) {
+    let attempted = ATTEMPTS.with(|a| a.borrow_mut().take()).unwrap_or_default();
+    if !ok {
+        CdnUrl::forget(file_id);
+    }
+    if attempted.is_empty() {
+        return;
+    }
+    if !ok || attempted.len() > 1 {
+        warn!(
+            "CDN: {} de {} servidores fallaron al abrir {file_id} ({})",
+            if ok { attempted.len() - 1 } else { attempted.len() },
+            attempted.len(),
+            attempted.join(", ")
+        );
+    }
+    hosts().note(&attempted, ok, Instant::now());
 }
 
 impl TryFrom<CdnUrlMessage> for MaybeExpiringUrls {

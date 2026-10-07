@@ -11,6 +11,7 @@ mod control;
 mod fonts;
 mod images;
 mod media;
+mod mixprobe;
 #[cfg(windows)]
 mod taskbar;
 mod model;
@@ -19,6 +20,71 @@ mod raster;
 mod shell;
 mod update;
 mod webauth;
+
+// Las pruebas del remuestreador de la salida de audio (en el librespot-playback parcheado) se
+// compilan también aquí: `cargo test` del binario no ejecuta las de las dependencias.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-playback/src/audio_backend/resample.rs"]
+mod resample_tests;
+// Igual con la ganancia de la normalización (factores de Spotify y rampa de los cambios en vivo).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-playback/src/gain.rs"]
+mod gain_tests;
+// Y con las primitivas del fundido entre canciones (rampas, mezcla de la saliente, limitador).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-playback/src/crossfade.rs"]
+mod crossfade_tests;
+// Y con la instrumentación del tiempo hasta el primer sonido y los fallos simulados
+// (`NANOFY_FAULT`), en el librespot-core parcheado.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-core/src/ttfs.rs"]
+mod ttfs_tests;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-core/src/fault.rs"]
+mod fault_tests;
+// Y con los reintentos, la caché y el freno de las claves de audio, y el cortacircuitos de
+// saltos automáticos de Spirc.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-core/src/key_policy.rs"]
+mod key_policy_tests;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-connect/src/cascade.rs"]
+mod cascade_tests;
+// Y con la pausa instantánea (cola de la salida, rampa tras vaciarla, rebobinado al reanudar),
+// los plazos de spclient y la cola de los avisos de estado de Spirc.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-playback/src/audio_backend/out_queue.rs"]
+mod out_queue_tests;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-core/src/request_policy.rs"]
+mod request_policy_tests;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-connect/src/state_queue.rs"]
+mod state_queue_tests;
+// Y con la caché de metadatos (semillas incluidas), la de storage-resolve con el orden de los
+// servidores de la CDN, y la canción con la que empieza una carga (fila pulsada, más páginas).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-core/src/meta_cache.rs"]
+mod meta_cache_tests;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-core/src/cdn_policy.rs"]
+mod cdn_policy_tests;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-connect/src/start_index.rs"]
+mod start_index_tests;
 
 /// Copia del registro en `<state_dir>/nanofy.log`, además de la salida de error habitual. La
 /// versión publicada corre sin consola: sin esto no queda rastro de los fallos que solo aparecen
@@ -86,6 +152,12 @@ fn main() {
     let t0 = std::time::Instant::now();
     let _ = START.set(t0);
     log::info!("[t] main {}", env!("CARGO_PKG_VERSION"));
+    // Antes de la primera sesión: es un OnceLock, y el primer `get` (al abrir un fichero de
+    // audio) fijaría los valores por defecto para siempre. No va en `Backend::start`, que se
+    // repite en cada reconexión.
+    if librespot_audio::AudioFetchParams::set(audio_fetch_params()).is_err() {
+        log::warn!("parámetros de descarga del audio ya fijados; se usan los de librespot");
+    }
     // Actualizaciones, antes que nada más (ajustes, ventana): esperar a la ventana que se cerró
     // para actualizar, volver a la versión anterior si esta no llega a arrancar e instalar la que
     // quedó preparada. Si con eso ya se abrió otra versión, esta termina aquí.
@@ -197,6 +269,22 @@ pub fn ms_since_process_creation() -> Option<f64> {
 pub static FIRST_FRAME_MS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 pub static VISIBLE_MS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
+/// Parámetros de descarga del audio: los de librespot salvo dos.
+/// - `read_ahead_before_playback`, que librespot define pero no usa y el reproductor parcheado
+///   usa como lo que espera tras una búsqueda antes de seguir (0,5 s de audio; por delante se
+///   siguen pidiendo 5 s).
+/// - El plazo de descarga baja de 8 a 5 s. Es lo que espera una lectura sin datos antes de darse
+///   por cortada. Con 8 s no se podía bajar mientras un corte a media canción acababa en un salto
+///   a la siguiente; ahora la canción queda en pausa en su segundo y sigue al volver la red, así
+///   que antes se avisa y antes se reintenta (y menos tiempo pasa el reproductor bloqueado).
+fn audio_fetch_params() -> librespot_audio::AudioFetchParams {
+    librespot_audio::AudioFetchParams {
+        read_ahead_before_playback: std::time::Duration::from_millis(500),
+        download_timeout: std::time::Duration::from_secs(5),
+        ..Default::default()
+    }
+}
+
 /// Instante de arranque para las marcas de tiempo `[t]`.
 pub static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
@@ -210,5 +298,32 @@ pub fn tmark(label: &str) {
         if let Some(s) = START.get() {
             log::info!("[t] {label}: {:.1} ms", s.elapsed().as_secs_f64() * 1000.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn parametros_de_descarga_solo_cambian_la_espera_tras_buscar_y_el_plazo() {
+        let p = super::audio_fetch_params();
+        let d = librespot_audio::AudioFetchParams::default();
+        assert_eq!(p.read_ahead_before_playback, Duration::from_millis(500));
+        // Menos de lo que se pide por delante: si no, esperar «antes» no ahorraría nada.
+        assert!(p.read_ahead_before_playback < p.read_ahead_during_playback);
+        // Un corte a media canción ya no salta de canción: el plazo baja de los 8 s de librespot
+        // a 5 s, y sigue por encima de lo que se espera tras buscar.
+        assert_eq!(d.download_timeout, Duration::from_secs(8));
+        assert_eq!(p.download_timeout, Duration::from_secs(5));
+        assert!(p.download_timeout > p.read_ahead_before_playback);
+        // El resto, como en librespot: el tamaño mínimo de cada petición sigue en 64 KB (el
+        // decodificador lo necesita potencia de 2 y > 32 KB).
+        assert_eq!(p.minimum_download_size, d.minimum_download_size);
+        assert_eq!(p.minimum_throughput, d.minimum_throughput);
+        assert_eq!(p.initial_ping_time_estimate, d.initial_ping_time_estimate);
+        assert_eq!(p.maximum_assumed_ping_time, d.maximum_assumed_ping_time);
+        assert_eq!(p.read_ahead_during_playback, d.read_ahead_during_playback);
+        assert_eq!(p.prefetch_threshold_factor, d.prefetch_threshold_factor);
     }
 }

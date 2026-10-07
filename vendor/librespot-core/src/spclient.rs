@@ -1,6 +1,8 @@
 use std::{
+    cell::Cell,
     fmt::Write,
-    time::{Duration, SystemTime},
+    sync::{LazyLock, Mutex, MutexGuard},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::config::{OS, os_version};
@@ -10,6 +12,8 @@ use crate::{
     config::SessionConfig,
     dealer::protocol::TransferOptions,
     error::ErrorKind,
+    meta_cache::{self, MetaCache, MetaKey, SeedTrust},
+    request_policy,
     protocol::{
         autoplay_context_request::AutoplayContextRequest,
         clienttoken_http::{
@@ -56,10 +60,67 @@ pub const CLIENT_TOKEN: HeaderName = HeaderName::from_static("client-token");
 #[allow(clippy::declare_interior_mutable_const)]
 const CONNECTION_ID: HeaderName = HeaderName::from_static("x-spotify-connection-id");
 
+/// Metadatos ya pedidos o sembrados por Nanofy, de todo el proceso (ver `meta_cache`).
+static META: LazyLock<Mutex<MetaCache<Bytes>>> =
+    LazyLock::new(|| Mutex::new(MetaCache::new(meta_cache::CAP_BYTES, meta_cache::TTL)));
+/// ¿Se pueden servir las semillas? (ver `SeedTrust`).
+static SEED_TRUST: Mutex<SeedTrust> = Mutex::new(SeedTrust::Unverified);
+
+fn meta_cache() -> MutexGuard<'static, MetaCache<Bytes>> {
+    META.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Metadatos que se guardan: los que pide el reproductor al cargar (ver `get_metadata`).
+fn cacheable(kind: ExtensionKind) -> bool {
+    matches!(kind, ExtensionKind::TRACK_V4 | ExtensionKind::EPISODE_V4)
+}
+
+fn seed_trust() -> SeedTrust {
+    *SEED_TRUST.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+thread_local! {
+    /// De dónde salieron los últimos metadatos que pidió este hilo («hit», «seed», «check» o
+    /// «miss»): el reproductor lo pone en su marca de `ttfs` (cada carga va en su propio hilo).
+    static META_SOURCE: Cell<&'static str> = const { Cell::new("miss") };
+}
+
+fn set_metadata_source(source: &'static str) {
+    META_SOURCE.with(|s| s.set(source));
+}
+
+/// De dónde salieron los últimos metadatos que pidió este hilo (ver `META_SOURCE`).
+pub fn metadata_source() -> &'static str {
+    META_SOURCE.with(|s| s.get())
+}
+
+/// Estado de la caché de metadatos para el modo de control: entradas, bytes, semillas y si las
+/// semillas se usan.
+pub fn metadata_cache_stats() -> (usize, usize, usize, &'static str) {
+    let cache = meta_cache();
+    (cache.len(), cache.bytes(), cache.seeded(), seed_trust().name())
+}
+
+/// Olvida los metadatos guardados (al cerrar sesión: otra cuenta puede ser de otro país).
+pub fn forget_cached_metadata() {
+    let mut cache = meta_cache();
+    *cache = MetaCache::new(meta_cache::CAP_BYTES, meta_cache::TTL);
+}
+
 const NO_METRICS_AND_SALT: RequestOptions = RequestOptions {
     metrics: false,
     salt: false,
     base_url: None,
+    fast: false,
+};
+
+/// Los metadatos de una canción que pide el reproductor al cargarla: van por la misma ruta que
+/// los lotes de 500 de Nanofy, pero son una respuesta pequeña en el camino del primer sonido.
+const ONE_ITEM_METADATA: RequestOptions = RequestOptions {
+    metrics: true,
+    salt: true,
+    base_url: None,
+    fast: true,
 };
 
 #[derive(Debug, Error)]
@@ -94,6 +155,8 @@ pub struct RequestOptions {
     metrics: bool,
     salt: bool,
     base_url: Option<&'static str>,
+    /// Plazo corto (`request_policy::FAST`) aunque la ruta sea la de algo que puede ser grande.
+    fast: bool,
 }
 
 impl Default for RequestOptions {
@@ -102,6 +165,7 @@ impl Default for RequestOptions {
             metrics: true,
             salt: true,
             base_url: None,
+            fast: false,
         }
     }
 }
@@ -469,83 +533,125 @@ impl SpClient {
 
         let body = body.unwrap_or_default();
 
+        // Plazo de cada intento e intentos como mucho (ver `request_policy`): sin ellos una
+        // petición que no vuelve dejaba esperando para siempre a Spirc o a la carga de la canción.
+        let policy = if options.fast {
+            request_policy::fast_policy(method.as_str(), endpoint)
+        } else {
+            request_policy::attempt_policy(method.as_str(), endpoint)
+        };
+        let max_tries = match self.lock(|inner| inner.strategy) {
+            RequestStrategy::TryTimes(n) => Some(n.min(policy.max_tries)),
+            RequestStrategy::Infinitely => None,
+        };
+
         loop {
             tries += 1;
 
-            // Reconnection logic: retrieve the endpoint every iteration, so we can try
-            // another access point when we are experiencing network issues (see below).
-            let mut url = match options.base_url {
-                Some(base_url) => base_url.to_string(),
-                None => self.base_url().await?,
+            // Todo el intento va dentro del plazo, también los tokens y el punto de acceso: un
+            // socket medio cerrado puede colgar cualquiera de esas peticiones. Un error al montar
+            // la petición sale tal cual (`Err` de fuera), como antes con `?`.
+            let attempt = async {
+                // Reconnection logic: retrieve the endpoint every iteration, so we can try
+                // another access point when we are experiencing network issues (see below).
+                let mut url = match options.base_url {
+                    Some(base_url) => base_url.to_string(),
+                    None => self.base_url().await?,
+                };
+                url.push_str(endpoint);
+
+                // Add metrics. There is also an optional `partner` key with a value like
+                // `vodafone-uk` but we've yet to discover how we can find that value.
+                // For the sake of documentation you could also do "product=free" but
+                // we only support premium anyway.
+                if options.metrics && !url.contains("product=0") {
+                    let _ = write!(
+                        url,
+                        "{}product=0&country={}",
+                        util::get_next_query_separator(&url),
+                        self.session().country()
+                    );
+                }
+
+                // Defeat caches. Spotify-generated URLs already contain this.
+                if options.salt && !url.contains("salt=") {
+                    let _ = write!(
+                        url,
+                        "{}salt={}",
+                        util::get_next_query_separator(&url),
+                        rand::rng().next_u32()
+                    );
+                }
+
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(url)
+                    .header(CONTENT_LENGTH, body.len())
+                    .body(Bytes::copy_from_slice(body))?;
+
+                // Reconnection logic: keep getting (cached) tokens because they might have expired.
+                let token = self.session().login5().auth_token().await?;
+
+                let headers_mut = request.headers_mut();
+                if let Some(ref headers) = headers {
+                    for (name, value) in headers {
+                        headers_mut.insert(name, value.clone());
+                    }
+                }
+
+                headers_mut.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("{} {}", token.token_type, token.access_token,))?,
+                );
+
+                match self.client_token().await {
+                    Ok(client_token) => {
+                        let _ =
+                            headers_mut.insert(CLIENT_TOKEN, HeaderValue::from_str(&client_token)?);
+                    }
+                    Err(e) => {
+                        // currently these endpoints seem to work fine without it
+                        warn!("Unable to get client token: {e} Trying to continue without...")
+                    }
+                }
+
+                Ok::<_, Error>(self.session().http_client().request_body(request).await)
             };
-            url.push_str(endpoint);
 
-            // Add metrics. There is also an optional `partner` key with a value like
-            // `vodafone-uk` but we've yet to discover how we can find that value.
-            // For the sake of documentation you could also do "product=free" but
-            // we only support premium anyway.
-            if options.metrics && !url.contains("product=0") {
-                let _ = write!(
-                    url,
-                    "{}product=0&country={}",
-                    util::get_next_query_separator(&url),
-                    self.session().country()
-                );
-            }
-
-            // Defeat caches. Spotify-generated URLs already contain this.
-            if options.salt && !url.contains("salt=") {
-                let _ = write!(
-                    url,
-                    "{}salt={}",
-                    util::get_next_query_separator(&url),
-                    rand::rng().next_u32()
-                );
-            }
-
-            let mut request = Request::builder()
-                .method(method)
-                .uri(url)
-                .header(CONTENT_LENGTH, body.len())
-                .body(Bytes::copy_from_slice(body))?;
-
-            // Reconnection logic: keep getting (cached) tokens because they might have expired.
-            let token = self.session().login5().auth_token().await?;
-
-            let headers_mut = request.headers_mut();
-            if let Some(ref headers) = headers {
-                for (name, value) in headers {
-                    headers_mut.insert(name, value.clone());
+            let timed_out;
+            last_response = match tokio::time::timeout(policy.timeout, attempt).await {
+                Ok(Ok(response)) => {
+                    timed_out = false;
+                    response
                 }
-            }
-
-            headers_mut.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("{} {}", token.token_type, token.access_token,))?,
-            );
-
-            match self.client_token().await {
-                Ok(client_token) => {
-                    let _ = headers_mut.insert(CLIENT_TOKEN, HeaderValue::from_str(&client_token)?);
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    timed_out = true;
+                    warn!(
+                        "spclient: {method} {endpoint} sin respuesta en {} s (intento {tries})",
+                        policy.timeout.as_secs()
+                    );
+                    Err(Error::deadline_exceeded(format!(
+                        "{endpoint}: sin respuesta en {} s",
+                        policy.timeout.as_secs()
+                    )))
                 }
-                Err(e) => {
-                    // currently these endpoints seem to work fine without it
-                    warn!("Unable to get client token: {e} Trying to continue without...")
-                }
-            }
-
-            last_response = self.session().http_client().request_body(request).await;
+            };
 
             if last_response.is_ok() {
                 return last_response;
             }
 
+            // Una escritura que no es idempotente quizá ya se aplicó aunque la respuesta no
+            // llegara a tiempo: no se repite (se añadiría dos veces, se saltarían dos canciones).
+            if timed_out && !policy.retry_on_timeout {
+                break;
+            }
+
             // Break before the reconnection logic below, so that the current access point
             // is retained when max_tries == 1. Leave it up to the caller when to flush.
-            if let RequestStrategy::TryTimes(max_tries) = self.lock(|inner| inner.strategy) {
-                if tries >= max_tries {
-                    break;
-                }
+            if max_tries.is_some_and(|max| tries >= max) {
+                break;
             }
 
             // Reconnection logic: drop the current access point if we are experiencing issues.
@@ -553,8 +659,9 @@ impl SpClient {
             if let Err(ref network_error) = last_response {
                 match network_error.kind {
                     ErrorKind::Unavailable | ErrorKind::DeadlineExceeded => {
-                        // Keep trying the current access point three times before dropping it.
-                        if tries % 3 == 0 {
+                        // Keep trying the current access point three times before dropping it
+                        // (y antes del último intento, para que no vaya también al que falla).
+                        if request_policy::flush_accesspoint_after(tries, max_tries) {
                             self.flush_accesspoint().await
                         }
                     }
@@ -600,18 +707,116 @@ impl SpClient {
         &self,
         request: BatchedEntityRequest,
     ) -> Result<BatchedExtensionResponse, Error> {
+        self.extended_metadata_with(request, &Default::default())
+            .await
+    }
+
+    async fn extended_metadata_with(
+        &self,
+        request: BatchedEntityRequest,
+        options: &RequestOptions,
+    ) -> Result<BatchedExtensionResponse, Error> {
         let res = self
-            .request_with_protobuf(
+            .request_with_protobuf_and_options(
                 &Method::POST,
                 "/extended-metadata/v0/extended-metadata",
                 None,
                 &request,
+                options,
             )
             .await?;
         Ok(BatchedExtensionResponse::parse_from_bytes(&res)?)
     }
 
+    /// Metadatos de una entidad, de la caché si ya se tienen (ver `meta_cache`). Es lo que pide
+    /// el reproductor al cargar una canción. Solo se guardan los de canciones y episodios (los que
+    /// están en el camino del primer sonido): álbumes, artistas y demás se piden como siempre.
     pub async fn get_metadata(&self, kind: ExtensionKind, id: &SpotifyUri) -> SpClientResult {
+        if !cacheable(kind) {
+            return self.fetch_metadata(kind, id).await;
+        }
+        let key = MetaKey::new(self.session().country(), kind.value(), id.to_uri()?);
+        let hit = meta_cache().get(&key, Instant::now());
+        let seed = match meta_cache::lookup(hit, seed_trust()) {
+            meta_cache::Lookup::Serve { value, seeded } => {
+                set_metadata_source(if seeded { "seed" } else { "hit" });
+                return Ok(value);
+            }
+            meta_cache::Lookup::Check(seed) => Some(seed),
+            meta_cache::Lookup::Fetch => None,
+        };
+        let fetched = self.fetch_metadata(kind, id).await?;
+        if let Some(seed) = seed {
+            // La comprobación única: ¿los bytes del lote de Nanofy son los mismos que los de esta
+            // petición? Decide para el resto del proceso.
+            let mut trust = SEED_TRUST.lock().unwrap_or_else(|e| e.into_inner());
+            let before = *trust;
+            *trust = before.after_check(&seed, &fetched);
+            if *trust != before {
+                if trust.serves_seeds() {
+                    info!("metadatos sembrados por Nanofy: coinciden con los del reproductor; se usan");
+                } else {
+                    warn!("metadatos sembrados por Nanofy: no coinciden con los del reproductor; se dejan de usar");
+                    drop(trust);
+                    meta_cache().drop_seeded();
+                }
+            }
+            set_metadata_source("check");
+        } else {
+            set_metadata_source("miss");
+        }
+        meta_cache().put(key, fetched.clone(), false, Instant::now());
+        Ok(fetched)
+    }
+
+    /// Siembra en la caché lo que trajo un lote de extended-metadata de Nanofy (`any.value` de
+    /// cada entidad), para que el reproductor no lo vuelva a pedir. Mientras las semillas no se
+    /// hayan comprobado se guardan sin servirse; si no coincidieron, ni se guardan.
+    pub fn seed_metadata(&self, kind: ExtensionKind, uri: &str, value: impl Into<Bytes>) {
+        if !cacheable(kind) || !seed_trust().accepts_seeds() {
+            return;
+        }
+        let key = MetaKey::new(self.session().country(), kind.value(), uri);
+        meta_cache().put(key, value.into(), true, Instant::now());
+    }
+
+    /// ¿Ya están en la caché (y se servirían sin pedir nada) los metadatos de `uri`?
+    pub fn metadata_cached(&self, kind: ExtensionKind, uri: &str) -> bool {
+        let key = MetaKey::new(self.session().country(), kind.value(), uri);
+        // Una semilla aún sin comprobar se volvería a pedir: no cuenta como guardada.
+        let serves_seeds = seed_trust().serves_seeds();
+        meta_cache()
+            .peek(&key, Instant::now())
+            .is_some_and(|seeded| !seeded || serves_seeds)
+    }
+
+    /// ¿Hay ya algo guardado para `uri`, aunque sea una semilla sin comprobar? (Volver a sembrarla
+    /// no cambiaría nada: los bytes del lote serían los mismos.)
+    pub fn metadata_held(&self, kind: ExtensionKind, uri: &str) -> bool {
+        let key = MetaKey::new(self.session().country(), kind.value(), uri);
+        meta_cache().contains(&key, Instant::now())
+    }
+
+    /// ¿Sirve de algo sembrar? No si la comprobación única dijo que las semillas no coinciden
+    /// (`seed_metadata` ya no guarda nada): pedir un lote solo para sembrar sería una petición
+    /// tirada.
+    pub fn seeds_accepted() -> bool {
+        seed_trust().accepts_seeds()
+    }
+
+    /// Como `metadata_cached`, con el tipo que pide el reproductor para `uri` (TRACK_V4 para una
+    /// canción, EPISODE_V4 para un episodio).
+    pub fn playable_metadata_cached(&self, uri: &SpotifyUri) -> bool {
+        let kind = match uri {
+            SpotifyUri::Track { .. } => ExtensionKind::TRACK_V4,
+            SpotifyUri::Episode { .. } => ExtensionKind::EPISODE_V4,
+            _ => return false,
+        };
+        uri.to_uri()
+            .is_ok_and(|u| self.metadata_cached(kind, &u))
+    }
+
+    async fn fetch_metadata(&self, kind: ExtensionKind, id: &SpotifyUri) -> SpClientResult {
         let req = BatchedEntityRequest {
             entity_request: vec![EntityRequest {
                 entity_uri: id.to_uri()?,
@@ -624,7 +829,8 @@ impl SpClient {
             ..Default::default()
         };
 
-        let mut res = self.get_extended_metadata(req).await?;
+        // Una sola entidad (la canción que se va a cargar): plazo corto, no el de los lotes.
+        let mut res = self.extended_metadata_with(req, &ONE_ITEM_METADATA).await?;
         let mut extended_metadata = res
             .extended_metadata
             .pop()
@@ -816,7 +1022,12 @@ impl SpClient {
             )
             .body(Bytes::new())?;
 
+        let uri = req.uri().clone();
         let stream = self.session().http_client().request_stream(req)?;
+        // Qué servidor de la CDN prueba la apertura de un fichero (ver `cdn_url::end_open`). Solo
+        // si la petición sale: si la frenó el limitador propio, el servidor no tiene la culpa y no
+        // debe pasar al final de la lista como fallido.
+        crate::cdn_url::note_attempt(uri.host());
 
         Ok(stream)
     }
@@ -896,11 +1107,7 @@ impl SpClient {
     ///   - the query result shown by the search expects no query at all
     ///   - uri looks like `spotify:search:never+gonna`
     pub async fn get_context(&self, uri: &str) -> Result<Context, Error> {
-        let uri = format!("/context-resolve/v1/{uri}");
-
-        let res = self
-            .request_with_options(&Method::GET, &uri, None, None, &NO_METRICS_AND_SALT)
-            .await?;
+        let res = self.get_context_raw(uri).await?;
         let ctx_json = String::from_utf8(res.to_vec())?;
         if ctx_json.is_empty() {
             Err(SpClientError::NoData)?
@@ -913,6 +1120,15 @@ impl SpClient {
         }
 
         Ok(ctx?)
+    }
+
+    /// La misma petición que `get_context`, sin interpretarla: el JSON tal cual llega. La sonda de
+    /// mezclas de Nanofy lo lee entero (claves que el modelo `Context` no recoge) y debe ver
+    /// exactamente lo que ve Spirc, sin parámetros de más en la URL.
+    pub async fn get_context_raw(&self, uri: &str) -> SpClientResult {
+        let uri = format!("/context-resolve/v1/{uri}");
+        self.request_with_options(&Method::GET, &uri, None, None, &NO_METRICS_AND_SALT)
+            .await
     }
 
     pub async fn get_autoplay_context(

@@ -82,6 +82,13 @@ pub struct Snapshot {
     pub liked_extra: Vec<String>,
     /// Cuándo llegaron por última vez los artistas seguidos.
     pub artists_synced_at: u64,
+    /// Cuándo completó la Web API por última vez el listado de playlists que sale del rootlist
+    /// (mosaicos de portada, nombre visible del propietario, privacidad). 0 = nunca (o una
+    /// instantánea de antes): se pide en segundo plano.
+    pub playlists_web_at: u64,
+    /// Las playlists que había en el listado cuando la Web API lo completó: una nueva desde
+    /// entonces (seguida o creada en el móvil) hace que se vuelva a completar antes de tiempo.
+    pub playlists_web_ids: Vec<String>,
 }
 
 pub fn now_secs() -> u64 {

@@ -30,6 +30,24 @@ pub trait Sink {
     fn stop(&mut self) -> SinkResult<()> {
         Ok(())
     }
+    /// Pausa ya: calla la salida sin esperar a que suene lo que tiene en cola, que se queda ahí
+    /// para reanudar justo donde se paró (`start`). `stop`, en cambio, deja que termine de sonar.
+    /// Por defecto, `stop`.
+    fn pause_now(&mut self) -> SinkResult<()> {
+        self.stop()
+    }
+    /// Tira lo que haya en cola sin que suene (buscar, otra canción, parar) y deja la salida como
+    /// estaba, sonando o en pausa. Lo siguiente que se escriba entra con una rampa corta.
+    fn clear(&mut self) {}
+    /// Deja abierta la salida, en pausa y sin sonar, para que el próximo `start` no tenga que
+    /// abrirla: el reproductor lo pide al empezar a cargar una canción, mientras va la red.
+    fn prepare(&mut self) -> SinkResult<()> {
+        Ok(())
+    }
+    /// Audio escrito que aún no ha sonado (lo que hay en cola), en ms; 0 si no se sabe.
+    fn queued_ms(&self) -> u32 {
+        0
+    }
     /// Suelta el dispositivo de salida tras un rato en pausa (lo pide el reproductor); el
     /// siguiente `start` lo vuelve a abrir.
     fn release(&mut self) {}
@@ -108,12 +126,16 @@ mod gstreamer;
 #[cfg(feature = "gstreamer-backend")]
 use self::gstreamer::GstreamerSink;
 
+/// Cola de la salida sin sonar y entrada suave tras vaciarla; el reproductor usa `resume_from`.
+pub mod out_queue;
+#[cfg(any(feature = "rodio-backend", feature = "rodiojack-backend"))]
+mod resample;
 #[cfg(any(feature = "rodio-backend", feature = "rodiojack-backend"))]
 mod rodio;
 #[cfg(feature = "rodio-backend")]
 use self::rodio::RodioSink;
 #[cfg(feature = "rodio-backend")]
-pub use self::rodio::set_output_volume;
+pub use self::rodio::{output_info, output_ok, probe_output, set_output_volume};
 
 #[cfg(feature = "sdl-backend")]
 mod sdl;

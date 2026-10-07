@@ -18,17 +18,21 @@ Cómo abrirlo
 2. Abre nanofy.exe.
    Si Windows muestra "Windows protegió tu PC" (el archivo no está firmado):
    pulsa "Más información" y luego "Ejecutar de todas formas". Solo la primera vez.
-3. Pulsa "Iniciar sesión": se abre el navegador con la página oficial de Spotify.
-   Acepta y vuelve a Nanofy. Ya puedes reproducir.
+3. Pulsa "Iniciar sesión con Spotify": se abre el navegador con la página
+   oficial de Spotify. Acepta; la misma pestaña te pide permiso para tu
+   biblioteca, acepta otra vez y vuelve a Nanofy. Ya está todo: no tienes que
+   crear ninguna "app de desarrollador" ni copiar ningún código.
+   Si cerraste la pestaña antes de tiempo, pulsa "Conectar con Spotify" en el
+   aviso "Conecta tu biblioteca".
 
-Biblioteca, búsqueda y playlists (Web API)
-------------------------------------------
-Para ver tu biblioteca, buscar y editar playlists, Nanofy usa la Web API de
-Spotify con una "app de desarrollador". Quien te pasó Nanofy ya tiene una y
-puede añadir tu correo de Spotify a su lista de usuarios (hasta 25 personas):
-- Si te lo pasó con su Client ID ya incluido, solo tienes que ir a
-  Ajustes → Web API → "Conectar" y aceptar en el navegador.
-- Si no, pega el Client ID que te dé en ese mismo campo y pulsa "Conectar".
+Sonido
+------
+En Ajustes → Reproducción:
+- Fundido entre canciones (como en Spotify), de 1 a 12 segundos.
+- Normalizar volumen, activado de serie, con los niveles de Spotify: Alto,
+  Normal y Bajo.
+- Calidad "Muy alta" = 320 kbps, lo máximo que Spotify da a apps que no son las
+  suyas. Sin pérdida (FLAC) solo existe en las apps oficiales de Spotify.
 
 Actualizaciones
 ---------------

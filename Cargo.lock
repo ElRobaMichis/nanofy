@@ -2689,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "nanofy"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "base64 0.22.1",
  "directories",
@@ -2709,6 +2709,8 @@ dependencies = [
  "librespot-protocol",
  "log",
  "memmap2",
+ "oauth2",
+ "open",
  "protobuf",
  "rfd",
  "serde",

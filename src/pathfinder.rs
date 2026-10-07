@@ -327,6 +327,12 @@ impl Pathfinder {
         };
         let errors = v["errors"].as_array().filter(|e| !e.is_empty()).map(|e| snippet(&Value::Array(e.clone()).to_string()));
         let Some((result, raw, mapped)) = map_search(&v) else {
+            // Spotify no pudo con ESTA consulta (un texto larguísimo o raro): solo esta búsqueda
+            // va por la Web API. Antes apartaba pathfinder 10 min y, con la Web API limitada, las
+            // búsquedas siguientes fallaban todas.
+            if query_failed(&v) {
+                return Err(PfErr::Failed(format!("errores: {}", errors.unwrap_or_default())));
+            }
             return Err(PfErr::Down(match errors {
                 Some(e) => format!("errores: {e}"),
                 None => "respuesta sin data.searchV2".to_string(),
@@ -512,6 +518,15 @@ fn unknown_hash(v: Option<&Value>, text: &str) -> bool {
         }),
         None => is_pqnf(text),
     }
+}
+
+/// `true` si Spotify entendió la consulta pero falló al ejecutarla (`DataFetchingException`, por
+/// ejemplo con 200 «a» seguidas): es cosa de esa búsqueda, no de que pathfinder haya cambiado
+/// (eso da errores de validación o una respuesta sin `searchV2`).
+fn query_failed(v: &Value) -> bool {
+    v["errors"].as_array().is_some_and(|errs| {
+        !errs.is_empty() && errs.iter().all(|e| e["extensions"]["classification"].as_str() == Some("DataFetchingException"))
+    })
 }
 
 /// Un plazo agotado aparta pathfinder: si no contesta (un cortafuegos que lo bloquea, por
@@ -969,6 +984,21 @@ mod tests {
         // Una canción con ese nombre no lo es.
         let song = json!({"data": {"searchV2": {"tracksV2": {"items": [{"item": {"data": {"name": "PersistedQueryNotFound"}}}]}}}});
         assert!(!unknown_hash(Some(&song), &song.to_string()));
+    }
+
+    #[test]
+    fn una_consulta_que_spotify_no_puede_ejecutar_no_aparta_pathfinder() {
+        // Lo que devolvió con 200 «a» seguidas (7 oct 2026).
+        let fallo = json!({"errors": [{"extensions": {"classification": "DataFetchingException", "service": "oxygen-search"},
+            "locations": [{"column": 363, "line": 1}], "message": "Exception while fetching data (/searchV2)"}], "data": null});
+        assert!(map_search(&fallo).is_none());
+        assert!(query_failed(&fallo));
+        // Un cambio de esquema (validación) o una respuesta sin errores sí lo apartan.
+        let esquema = json!({"errors": [{"extensions": {"classification": "ValidationError"}, "message": "Field 'x' undefined"}], "data": null});
+        assert!(!query_failed(&esquema));
+        let mixto = json!({"errors": [{"extensions": {"classification": "DataFetchingException"}}, {"extensions": {"classification": "ValidationError"}}]});
+        assert!(!query_failed(&mixto));
+        assert!(!query_failed(&json!({"data": null})));
     }
 
     #[test]

@@ -44,6 +44,12 @@ pub struct LoadRequestOptions {
     ///
     /// If `None` is provided and `shuffle` is `true`, a random track is played, otherwise the first
     pub playing_track: Option<PlayingTrack>,
+    /// Nanofy: la fila pulsada en la interfaz (posición en la lista sin filtrar) cuando
+    /// `playing_track` es un uri. Solo se usa si en esa posición del contexto está justo esa
+    /// canción (una canción repetida suena en la fila pulsada); si no, se busca por uri y, si no
+    /// aparece, se traen más páginas del contexto antes de empezar por la primera (ver
+    /// `start_index`).
+    pub fallback_index: Option<u32>,
 }
 
 /// The options which decide how the playback is started

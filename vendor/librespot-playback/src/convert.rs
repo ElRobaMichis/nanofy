@@ -92,9 +92,16 @@ impl Converter {
         int_value.clamp(min, max)
     }
 
+    /// Los formatos enteros ya saturan al convertir (`as` satura); en f32 una mezcla por encima
+    /// de 0 dBFS llegaba tal cual a la salida. Se recorta a ±1 como ellos. (La salida de rodio de
+    /// Nanofy no pasa por aquí: convierte al remuestrear y aplica el volumen después, así que
+    /// recortar antes añadiría una distorsión que el volumen evitaría.)
     #[inline]
     pub fn f64_to_f32(&mut self, samples: &[f64]) -> Vec<f32> {
-        samples.iter().map(|sample| *sample as f32).collect()
+        samples
+            .iter()
+            .map(|sample| sample.clamp(-1.0, 1.0) as f32)
+            .collect()
     }
 
     #[inline]

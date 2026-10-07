@@ -6,12 +6,14 @@
 
 use std::time::{Duration, Instant};
 
+use librespot_core::ttfs::{Breakdown, LastError};
 use serde_json::{json, Value};
 
-use super::{Action, ActiveTab, App, Auth, Page, PlayState, PlayTarget, PlaylistEditor, Repeat, Shortcut, SideTab};
+use super::{warm, Action, ActiveTab, App, Auth, LastTransition, Page, PlayState, PlayTarget, PlaylistEditor, Repeat, Shortcut, SideTab};
 use crate::api::Req;
 use crate::backend::Cmd;
-use crate::config::vol_pct_to_raw;
+use crate::config::{vol_pct_to_raw, Loudness};
+use crate::model::{AudioInfo, AudioOutput, Resampling};
 use crate::update::{Asset, FailKind, MoveReason, Stage, UpdateInfo};
 
 fn s<'a>(cmd: &'a Value, key: &str) -> Option<&'a str> {
@@ -231,6 +233,35 @@ impl App {
                 self.next();
                 ok()
             }
+            // Los botones del aviso de reproducción ([Reintentar], [Saltar], ×).
+            "playback_retry" => {
+                self.retry_failed_load();
+                ok()
+            }
+            "playback_skip" => {
+                self.skip_failed_load();
+                ok()
+            }
+            // Precarga inteligente sin ratón (pruebas de latencia): como quedarse 150 ms sobre la
+            // fila (`press`: false) o apretar su botón de reproducir (`press`: true).
+            "warm" => {
+                let Some(uri) = s(cmd, "uri") else {
+                    return err("falta uri");
+                };
+                if !warm::warmable(uri) {
+                    return err("solo canciones o episodios");
+                }
+                if !self.warm_allowed() {
+                    return err("precarga no disponible ahora (ajuste, cuenta, otro dispositivo, Jam o carga en curso)");
+                }
+                let uri = uri.to_string();
+                self.backend.send(if b(cmd, "press", false) { Cmd::WarmHead(uri) } else { Cmd::Warm(uri) });
+                ok()
+            }
+            "playback_dismiss" => {
+                self.playback_error = None;
+                ok()
+            }
             "prev" => {
                 self.prev();
                 ok()
@@ -447,19 +478,32 @@ impl App {
                 match cmd.get("minutes").and_then(|v| v.as_u64()) {
                     Some(m) if m > 0 => {
                         self.sleep_at = Some(Instant::now() + Duration::from_secs(m * 60));
-                        self.sleep_end_of_track = false;
+                        self.set_sleep_end_of_track(false);
                     }
                     _ => match s(cmd, "mode") {
                         Some("end") => {
-                            self.sleep_end_of_track = true;
+                            self.set_sleep_end_of_track(true);
                             self.sleep_at = None;
                         }
                         _ => {
                             self.sleep_at = None;
-                            self.sleep_end_of_track = false;
+                            self.set_sleep_end_of_track(false);
                         }
                     },
                 }
+                ok()
+            }
+            // Lo mismo que el interruptor, el deslizador y el de álbumes de Ajustes (al instante,
+            // sin «Guardar»); lo que no se indica queda como está.
+            "crossfade" => {
+                let secs = match cmd.get("secs").map(|v| v.as_u64()) {
+                    None => self.settings.crossfade_secs,
+                    Some(Some(n)) => n.min(u8::MAX as u64) as u8,
+                    Some(None) => return err("secs debe ser un número de segundos"),
+                };
+                let on = b(cmd, "on", self.settings.crossfade);
+                let albums = b(cmd, "albums", self.settings.crossfade_albums);
+                self.set_crossfade(on, secs, albums, true);
                 ok()
             }
             "hide_track" => match s(cmd, "id") {
@@ -518,6 +562,7 @@ impl App {
                     name: name.clone(),
                     description: s(cmd, "description").unwrap_or("").trim().to_string(),
                     public: b(cmd, "public", true),
+                    public_known: true,
                     collaborative: b(cmd, "collaborative", false),
                     image_path: s(cmd, "image").map(std::path::PathBuf::from),
                     busy: true,
@@ -543,13 +588,15 @@ impl App {
                     .map(str::to_string)
                     .or_else(|| current.as_ref().and_then(|p| p.description.clone()))
                     .unwrap_or_default();
-                let public = cmd.get("public").and_then(|v| v.as_bool()).or_else(|| current.as_ref().and_then(|p| p.public)).unwrap_or(true);
+                // Como el editor: sin saber si es pública (ni pedirlo), no se envía.
+                let public = cmd.get("public").and_then(|v| v.as_bool()).or_else(|| current.as_ref().and_then(|p| p.public));
                 let collaborative = cmd.get("collaborative").and_then(|v| v.as_bool()).or_else(|| current.as_ref().and_then(|p| p.collaborative)).unwrap_or(false);
                 self.editor = Some(PlaylistEditor {
                     id: Some(id.to_string()),
                     name: name.trim().to_string(),
                     description: description.trim().to_string(),
-                    public,
+                    public: public.unwrap_or(!collaborative),
+                    public_known: public.is_some(),
                     collaborative,
                     image_path: None,
                     busy: true,
@@ -919,12 +966,28 @@ impl App {
                 self.login();
                 ok()
             }
+            // Lo mismo que «Cancelar» bajo «Completa el inicio de sesión en el navegador».
+            "login_cancel" => {
+                self.cancel_login();
+                ok()
+            }
+            // «Conectar con Spotify» del aviso «Conecta tu biblioteca» (abre el navegador) y su
+            // «Cancelar».
+            "library_connect" => {
+                self.connect_library();
+                ok()
+            }
+            "library_cancel" => {
+                self.cancel_web_chain();
+                ok()
+            }
             "logout" => {
                 self.backend.send(Cmd::Logout);
                 self.go(Page::Home);
                 ok()
             }
             "request" => self.control_request(cmd),
+            "mix_probe" => self.control_mix_probe(cmd),
             "invalidate" => match s(cmd, "key") {
                 Some(k) => {
                     self.invalidate(k);
@@ -942,6 +1005,49 @@ impl App {
             }
             _ => err(format!("operación desconocida: {op}")),
         }
+    }
+
+    /// `mix_probe {id}` o `mix_probe {name}`: la sonda de las mezclas de Spotify de una playlist
+    /// (ver `crate::mixprobe`), por id (también `spotify:playlist:…` o el enlace) o por su nombre
+    /// exacto en la biblioteca. Responde al momento con la ruta del informe; el informe aparece
+    /// ahí entero (se escribe de una vez) cuando la sonda termina, en unos segundos. El de una
+    /// sonda anterior se borra antes, para que quien espera no lea uno viejo.
+    fn control_mix_probe(&mut self, cmd: &Value) -> Value {
+        let id = match (s(cmd, "id"), s(cmd, "name")) {
+            (Some(raw), _) => match crate::mixprobe::playlist_id(raw) {
+                Some(id) => id,
+                None => return err(format!("id de playlist no válido: {raw}")),
+            },
+            (None, Some(name)) => {
+                let found: Vec<&str> = self.playlists.iter().filter(|p| p.name == name).map(|p| p.id.as_str()).collect();
+                match found.as_slice() {
+                    [one] => one.to_string(),
+                    [] if !self.playlists_loaded => return err("la biblioteca aún no ha cargado"),
+                    [] => {
+                        // Sin adivinar: el nombre tiene que ser exacto, pero se dicen las parecidas.
+                        let close: Vec<String> = self
+                            .playlists
+                            .iter()
+                            .filter(|p| p.name.trim().eq_ignore_ascii_case(name.trim()))
+                            .map(|p| format!("«{}» ({})", p.name, p.id))
+                            .collect();
+                        return err(format!(
+                            "no hay ninguna playlist llamada «{name}» en la biblioteca ({} playlists){}",
+                            self.playlists.len(),
+                            if close.is_empty() { String::new() } else { format!("; parecidas: {}", close.join(", ")) }
+                        ));
+                    }
+                    many => return err(format!("hay {} playlists llamadas «{name}» ({}): pásala por id", many.len(), many.join(", "))),
+                }
+            }
+            (None, None) => return err("falta id o name"),
+        };
+        let path = crate::mixprobe::report_path(&id);
+        let _ = std::fs::remove_file(&path);
+        // Por el carril de fondo: son una docena de peticiones seguidas y no deben retrasar las
+        // de la interfaz.
+        self.api.send_bg(Req::MixProbe(id.clone()));
+        json!({"ok": true, "id": id, "file": path.display().to_string()})
     }
 
     /// Peticiones de lectura sueltas a la API (para precargar o forzar una recarga).
@@ -1155,7 +1261,7 @@ impl App {
                 "duration_ms": n.duration_ms, "cover": n.cover_url,
             })
         });
-        let player = json!({
+        let mut player = json!({
             "state": match self.player.state { PlayState::Stopped => "stopped", PlayState::Loading => "loading", PlayState::Playing => "playing", PlayState::Paused => "paused" },
             "now": now,
             "position_ms": self.player.position(),
@@ -1170,6 +1276,66 @@ impl App {
                 PlayTarget::Context { uri, track_uri, index, shuffle } => json!({"context_uri": uri, "track_uri": track_uri, "index": index, "shuffle": shuffle}),
                 PlayTarget::Tracks { uris, index, shuffle } => json!({"uris": uris, "index": index, "shuffle": shuffle}),
             }),
+        });
+        // Aparte del json! de arriba, por su límite de recursión.
+        player["transition"] = transition_json(self.player.transitions, self.player.last_transition.as_ref(), Instant::now());
+        // Tiempo hasta el primer sonido de la última orden (por fases), el último fallo de carga y
+        // los contadores de fallos: lo que mide qa/latency.py en cada reproducción.
+        player["ttfs"] = ttfs_json(librespot_core::ttfs::snapshot().as_ref());
+        player["error"] = error_json(librespot_core::ttfs::last_error().as_ref(), Instant::now());
+        player["kpi"] = kpi_json(&librespot_core::ttfs::counters(), librespot_core::fault::injected_count());
+        player["fault"] = json!(librespot_core::fault::describe());
+        // Aviso de reproducción encima de la barra y su reintento automático, y el freno de
+        // las claves de audio (sin precarga temprana mientras dura).
+        let t_now = Instant::now();
+        player["playback_error"] = json!(self.playback_error.as_ref().map(|e| json!({
+            "kind": format!("{:?}", e.kind),
+            "text": e.text,
+            "age_ms": t_now.saturating_duration_since(e.since).as_millis() as u64,
+            "actions": e.has_actions(),
+        })));
+        player["load_retry"] = json!(self.load_retry.as_ref().map(|r| json!({
+            "uri": r.uri,
+            "failures": r.failures,
+            "in_ms": r.at.map(|at| at.saturating_duration_since(t_now).as_millis() as u64),
+        })));
+        player["keys_throttled_ms"] = json!(librespot_core::key_policy::keys_throttled_for().map(|d| d.as_millis() as u64));
+        // Vigilante de «cargando» (etapa y edad), canción cortada por la red y sus reintentos,
+        // salida de audio que falta y cuenta sin Premium: lo que miran las pruebas de «nunca
+        // atascado».
+        player["watchdog"] = json!(self.load_watch.as_ref().map(|w| json!({
+            "stage": w.stage_name(),
+            "loading_ms": w.age(t_now).as_millis() as u64,
+            "slow": w.is_slow(),
+        })));
+        player["stall"] = json!(self.stall.as_ref().map(|s| json!({
+            "uri": s.uri,
+            "position_ms": s.position_ms,
+            "failures": s.failures,
+            "reloaded": s.reloaded,
+            "in_ms": s.due_in(t_now).map(|d| d.as_millis() as u64),
+            "resumed": s.resumed_at.is_some(),
+        })));
+        // Precarga inteligente y cachés en memoria del reproductor (metadatos, con lo que siembran
+        // las listas, y ubicaciones de ficheros en la CDN).
+        let (meta_entries, meta_bytes, meta_seeded, seed_trust) = librespot_core::spclient::metadata_cache_stats();
+        player["warm"] = json!({
+            "enabled": self.settings.smart_preload,
+            "allowed": self.warm_allowed(),
+            "meta_entries": meta_entries,
+            "meta_bytes": meta_bytes,
+            "meta_seeded": meta_seeded,
+            "seed_trust": seed_trust,
+            "storage_entries": librespot_core::cdn_url::CdnUrl::resolved_count(),
+            "cdn_last_good": librespot_core::cdn_url::last_good_host(),
+        });
+        player["no_output"] = json!(self.output_lost.is_some());
+        player["not_premium"] = json!(self.not_premium);
+        player["crossfade"] = json!({
+            "ms": self.settings.crossfade_ms(),
+            "albums": self.settings.crossfade_albums,
+            // Lo que tiene el reproductor: 0 con el temporizador «al terminar la canción» puesto.
+            "effective_ms": self.settings.crossfade_effective_ms(self.sleep_end_of_track),
         });
         let tracks_json = |list: &[crate::model::Track]| -> Vec<Value> {
             list.iter().map(|t| json!({"uri": t.uri, "id": t.id, "name": t.name, "artist": t.artists.first().map(|a| a.name.clone()), "duration_ms": t.duration_ms})).collect()
@@ -1187,6 +1353,7 @@ impl App {
                     "id": p.id, "name": p.name, "uri": p.uri, "public": p.public, "collaborative": p.collaborative,
                     "description": p.description, "owner": p.owner.id, "tracks_total": p.tracks.as_ref().map(|t| t.total),
                     "mine": self.is_mine(p), "pinned": self.settings.pinned.contains(&p.id),
+                    "owner_name": p.owner.display_name, "cover": p.cover(300),
                 })
             })
             .collect();
@@ -1239,7 +1406,8 @@ impl App {
         // se borran el ejecutable anterior y los restos de 1.4–1.6.
         update["view"] = self.control_update_view();
         update["health_marked"] = json!(self.health_marked);
-        json!({
+        let output = crate::backend::audio_output();
+        let mut state = json!({
             "version": crate::update::current_version(),
             "auth": auth,
             "user": self.user.as_ref().map(|u| json!({"id": u.id, "name": u.display_name, "product": u.product})),
@@ -1262,6 +1430,7 @@ impl App {
             "side": self.side.map(|t| match t { SideTab::Queue => "queue", SideTab::Lyrics => "lyrics" }),
             "playlists": playlists,
             "playlists_loaded": self.playlists_loaded,
+            "playlists_source": self.playlists_source,
             "playlist_meta": self.playlist_meta.iter().map(|(k, p)| (k.clone(), json!({"name": p.name, "public": p.public, "collaborative": p.collaborative, "description": p.description, "tracks_total": p.tracks.as_ref().map(|t| t.total)}))).collect::<serde_json::Map<_, _>>(),
             "lists": lists,
             "liked_count": self.liked_set.len(),
@@ -1310,6 +1479,11 @@ impl App {
             "show_shortcuts": self.show_shortcuts,
             "requested": self.requested,
             "web_busy": self.web_busy,
+            "web_configured": self.api.web_configured(),
+            // Autorización de la biblioteca esperando al navegador (encadenada o con «Conectar»).
+            "web_chain": self.web_chain.is_some(),
+            "library_consent_asked": self.settings.library_consent_asked,
+            "login_cancelling": self.login_cancelling(),
             "ephemeral": self.ephemeral,
             "mem_mb": self.mem_mb,
             "frame_ms": self.frame_ms,
@@ -1324,6 +1498,253 @@ impl App {
                 "visible_ms": crate::VISIBLE_MS.get().copied(),
                 "since_main_ms": crate::since_start_ms(),
             },
-        })
+        });
+        // Fuera del json! grande, como `update`, por su límite de recursión.
+        state["audio"] = audio_json(self.player.local_audio(), output, self.settings.loudness);
+        state["audio_output"] = output_json(output);
+        state
+    }
+}
+
+/// Lo que suena aquí, para el modo de control: `null` si no suena nada en este equipo (también
+/// cuando la reproducción está en otro dispositivo).
+fn audio_json(info: Option<&AudioInfo>, out: AudioOutput, loudness: Loudness) -> Value {
+    let Some(a) = info else { return Value::Null };
+    // Dos decimales: lo bastante para comparar niveles sin el ruido de los f32.
+    let gain_db = a.gain_db.map(|db| (db as f64 * 100.0).round() / 100.0);
+    json!({
+        "uri": a.uri,
+        "format": a.format,
+        "codec": a.codec,
+        "kbps": a.kbps,
+        "bits": a.bits,
+        "badge": a.badge(),
+        "source_rate": a.sample_rate,
+        "requested_kbps": a.requested_kbps,
+        "below_requested": a.below_requested(),
+        "from_cache": a.from_cache,
+        "episode": a.episode,
+        "output_rate": out.rate,
+        "output_channels": out.channels,
+        "resampler": out.resampling().map(Resampling::name),
+        "normalisation": {
+            "enabled": a.gain_db.is_some(),
+            // Nombre de la variante, el mismo que en `settings.loudness`.
+            "level": format!("{loudness:?}"),
+            "label": loudness.label(),
+            "gain_db": gain_db,
+            "album": a.album_gain,
+            "gain_data": a.gain_data,
+        },
+    })
+}
+
+/// Fundidos que han empezado aquí: cuántos y el último (de qué uri a cuál, su duración y hace
+/// cuánto empezó), para que las pruebas midan cada fundido sin leer el registro.
+fn transition_json(count: u32, last: Option<&LastTransition>, now: Instant) -> Value {
+    json!({
+        "count": count,
+        "last": last.map(|t| json!({
+            "from": t.from,
+            "to": t.to,
+            "ms": t.ms,
+            "ago_ms": now.saturating_duration_since(t.at).as_millis() as u64,
+        })),
+    })
+}
+
+/// La última medida del tiempo hasta el primer sonido (`player.ttfs`): cada fase con su momento
+/// desde la orden (`at_ms`) y lo que tardó desde la anterior (`ms`), y cómo terminó. `null` si
+/// aún no se ha medido ninguna orden.
+fn ttfs_json(b: Option<&Breakdown>) -> Value {
+    let Some(b) = b else { return Value::Null };
+    let phases: Vec<Value> = b
+        .phases
+        .iter()
+        .map(|p| json!({"name": p.name, "at_ms": p.at_ms, "ms": p.ms, "info": p.info}))
+        .collect();
+    json!({
+        "seq": b.seq,
+        "kind": b.kind,
+        "track": b.track,
+        "outcome": b.outcome.name(),
+        "total_ms": b.total_ms,
+        "age_ms": b.age_ms,
+        "error": b.error,
+        "phases": phases,
+    })
+}
+
+/// El último fallo de carga (`player.error`), venga o no de una orden medida (el paso automático a
+/// la siguiente también cuenta); `null` si no ha habido ninguno.
+fn error_json(e: Option<&LastError>, now: Instant) -> Value {
+    let Some(e) = e else { return Value::Null };
+    json!({
+        "what": e.what,
+        "track": e.track,
+        "kind": (!e.kind.is_empty()).then_some(e.kind),
+        "measured": e.seq != 0,
+        "age_ms": now.saturating_duration_since(e.at).as_millis() as u64,
+    })
+}
+
+/// Contadores de fallos de todo el proceso (`player.kpi`), más los fallos simulados con
+/// `NANOFY_FAULT`. No se reinician: las pruebas restan los de antes de cada ronda.
+fn kpi_json(counters: &[(&str, u64)], injected: u64) -> Value {
+    let mut m: serde_json::Map<String, Value> =
+        counters.iter().map(|(name, n)| (name.to_string(), json!(n))).collect();
+    m.insert("faults_injected".into(), json!(injected));
+    Value::Object(m)
+}
+
+/// Cómo sale el audio hacia el dispositivo aunque no suene nada (la última salida abierta).
+fn output_json(out: AudioOutput) -> Value {
+    json!({
+        "rate": out.rate,
+        "channels": out.channels,
+        "resampler": out.resampling().map(Resampling::name),
+        "summary": out.summary(true),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info() -> AudioInfo {
+        AudioInfo {
+            uri: "spotify:track:abc".into(),
+            format: Some("OGG_VORBIS_320".into()),
+            codec: "Ogg Vorbis".into(),
+            kbps: Some(320),
+            sample_rate: 44_100,
+            requested_kbps: Some(320),
+            gain_db: Some(-5.3),
+            gain_data: true,
+            ..Default::default()
+        }
+    }
+
+    /// Lo que piden las pruebas P40/P45: formato y kbps de lo que suena, y a 48 kHz el
+    /// remuestreo es el sinc propio (nunca rodio salvo que se pida).
+    #[test]
+    fn estado_de_audio_para_el_modo_de_control() {
+        let out = AudioOutput { rate: 48_000, channels: 2, sinc: true };
+        let v = audio_json(Some(&info()), out, Loudness::Normal);
+        assert_eq!(v["format"], "OGG_VORBIS_320");
+        assert_eq!(v["kbps"], 320);
+        assert_eq!(v["source_rate"], 44_100);
+        assert_eq!(v["output_rate"], 48_000);
+        assert_eq!(v["resampler"], "sinc");
+        assert_eq!(v["below_requested"], false);
+        assert_eq!(v["normalisation"]["enabled"], true);
+        assert_eq!(v["normalisation"]["level"], "Normal");
+        assert_eq!(v["normalisation"]["gain_db"], -5.3);
+        assert_eq!(v["normalisation"]["album"], false);
+
+        // Dispositivo a 44,1 kHz: sin remuestreo. Con NANOFY_RESAMPLER=rodio: rodio.
+        let v = audio_json(Some(&info()), AudioOutput { rate: 44_100, channels: 2, sinc: false }, Loudness::Loud);
+        assert_eq!(v["resampler"], "none");
+        assert_eq!(v["normalisation"]["level"], "Loud");
+        let v = audio_json(Some(&info()), AudioOutput { rate: 48_000, channels: 2, sinc: false }, Loudness::Normal);
+        assert_eq!(v["resampler"], "rodio");
+
+        // Normalización apagada.
+        let off = AudioInfo { gain_db: None, ..info() };
+        let v = audio_json(Some(&off), out, Loudness::Normal);
+        assert_eq!(v["normalisation"]["enabled"], false);
+        assert!(v["normalisation"]["gain_db"].is_null());
+
+        // Nada sonando aquí (o suena en otro dispositivo): null.
+        assert!(audio_json(None, out, Loudness::Normal).is_null());
+        // Salida aún sin abrir.
+        let none = output_json(AudioOutput::default());
+        assert_eq!(none["rate"], 0);
+        assert!(none["resampler"].is_null());
+        assert!(none["summary"].is_null());
+        assert_eq!(output_json(out)["summary"], "48 kHz · remuestreo de alta calidad (44,1 → 48 kHz)");
+    }
+
+    /// Lo que lee qa/latency.py: la medida por fases (con su momento y su duración), cómo terminó
+    /// y, si falló, el último error; y los contadores con los fallos simulados.
+    #[test]
+    fn tiempo_hasta_el_sonido_para_el_modo_de_control() {
+        use librespot_core::ttfs::Recorder;
+
+        assert!(ttfs_json(None).is_null());
+        assert!(error_json(None, Instant::now()).is_null());
+
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut r = Recorder::new();
+        let (seq, _) = r.begin("play", t0);
+        r.mark(seq, "spirc:load", None, ms(4));
+        r.claim(|| "spotify:track:a".into(), ms(130));
+        r.mark(seq, "metadata", Some("miss".into()), ms(212));
+        r.finish(seq, "audible", None, ms(480));
+        let v = ttfs_json(r.snapshot(ms(500)).as_ref());
+        assert_eq!(v["kind"], "play");
+        assert_eq!(v["outcome"], "done");
+        assert_eq!(v["total_ms"], 480);
+        assert_eq!(v["age_ms"], 500);
+        assert_eq!(v["track"], "spotify:track:a");
+        assert!(v["error"].is_null());
+        let phases = v["phases"].as_array().unwrap();
+        let names: Vec<&str> = phases.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["cmd", "spirc:load", "player:load", "metadata", "audible"]);
+        assert_eq!(phases[3]["at_ms"], 212);
+        assert_eq!(phases[3]["ms"], 82);
+        assert_eq!(phases[3]["info"], "miss");
+        assert!(phases[0]["info"].is_null());
+
+        // Pendiente: sin total. Fallida: el error en la medida y como último fallo.
+        let (next, _) = r.begin("next", ms(600));
+        assert!(ttfs_json(r.snapshot(ms(700)).as_ref())["total_ms"].is_null());
+        r.claim(|| "spotify:track:b".into(), ms(610));
+        r.load_failed(next, "spotify:track:b".into(), "clave: denegada".into(), ms(900));
+        let v = ttfs_json(r.snapshot(ms(950)).as_ref());
+        assert_eq!(v["outcome"], "failed");
+        assert_eq!(v["error"], "clave: denegada");
+        let e = error_json(r.last_error(), ms(1900));
+        assert_eq!(e["what"], "clave: denegada");
+        assert_eq!(e["track"], "spotify:track:b");
+        assert_eq!(e["kind"], "next");
+        assert_eq!(e["measured"], true);
+        assert_eq!(e["age_ms"], 1000);
+        // Un fallo sin orden medida detrás (precarga): sin tipo.
+        r.load_failed(0, "spotify:track:c".into(), "metadatos".into(), ms(2000));
+        let e = error_json(r.last_error(), ms(2000));
+        assert!(e["kind"].is_null());
+        assert_eq!(e["measured"], false);
+
+        let k = kpi_json(&[("plays", 5), ("failed", 1)], 3);
+        assert_eq!(k["plays"], 5);
+        assert_eq!(k["failed"], 1);
+        assert_eq!(k["faults_injected"], 3);
+    }
+
+    /// Lo que piden FU01/FU06/FU10: cuántos fundidos, el último con sus uris, su duración y hace
+    /// cuánto empezó; sin ninguno, `last` es null.
+    #[test]
+    fn fundidos_para_el_modo_de_control() {
+        let now = Instant::now();
+        let none = transition_json(0, None, now);
+        assert_eq!(none["count"], 0);
+        assert!(none["last"].is_null());
+
+        let t = LastTransition {
+            from: "spotify:track:a".into(),
+            to: "spotify:track:b".into(),
+            ms: 5980,
+            at: now - Duration::from_millis(1500),
+        };
+        let v = transition_json(3, Some(&t), now);
+        assert_eq!(v["count"], 3);
+        assert_eq!(v["last"]["from"], "spotify:track:a");
+        assert_eq!(v["last"]["to"], "spotify:track:b");
+        assert_eq!(v["last"]["ms"], 5980);
+        assert_eq!(v["last"]["ago_ms"], 1500);
+        // Un instante anterior al fundido (no debería pasar) no da negativos.
+        assert_eq!(transition_json(3, Some(&t), now - Duration::from_secs(5))["last"]["ago_ms"], 0);
     }
 }

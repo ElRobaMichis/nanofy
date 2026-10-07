@@ -3,7 +3,6 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    process::exit,
     sync::{Arc, OnceLock, RwLock, Weak},
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -75,6 +74,23 @@ impl From<quick_xml::encoding::EncodingError> for Error {
 }
 
 pub type UserAttributes = HashMap<String, String>;
+
+/// El punto de acceso rechazó el inicio de sesión porque la cuenta no es Premium.
+pub fn is_premium_required(e: &Error) -> bool {
+    let premium = |a: &AuthenticationError| {
+        matches!(
+            a,
+            AuthenticationError::LoginFailed(ErrorCode::PremiumAccountRequired)
+        )
+    };
+    if let Some(a) = e.error.downcast_ref::<AuthenticationError>() {
+        return premium(a);
+    }
+    matches!(
+        e.error.downcast_ref::<SessionError>(),
+        Some(SessionError::AuthenticationError(a)) if premium(a)
+    )
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct UserData {
@@ -361,16 +377,33 @@ impl Session {
         );
     }
 
-    fn check_catalogue(attributes: &UserAttributes) {
-        if let Some(account_type) = attributes.get("type") {
-            if account_type != "premium" {
+    /// ¿Permite la cuenta reproducir aquí? Solo con Premium: Spotify no sirve audio a apps
+    /// externas para otras cuentas. Un tipo que aún no se conoce cuenta como permitido.
+    ///
+    /// Nanofy: antes, con otra cuenta, cerraba el proceso (`exit(1)`): la app desaparecía sin
+    /// ningún mensaje. Ahora solo lo anota; el tipo queda en los atributos (`account_type`) y
+    /// Nanofy, al verlo (`is_premium`), lo explica y deja seguir usando la biblioteca y la
+    /// búsqueda sin reproducir.
+    pub fn check_catalogue(attributes: &UserAttributes) -> bool {
+        match attributes.get("type") {
+            Some(account_type) if account_type != "premium" => {
                 error!("librespot does not support {account_type:?} accounts.");
                 info!("Please support Spotify and your artists and sign up for a premium account.");
-
-                // TODO: logout instead of exiting
-                exit(1);
+                false
             }
+            _ => true,
         }
+    }
+
+    /// Tipo de cuenta («premium», «free»…) según Spotify; `None` hasta que llega (justo después
+    /// de iniciar sesión en el punto de acceso).
+    pub fn account_type(&self) -> Option<String> {
+        self.get_user_attribute("type")
+    }
+
+    /// La cuenta puede reproducir aquí (ver `check_catalogue`); mientras no se sabe, sí.
+    pub fn is_premium(&self) -> bool {
+        self.account_type().is_none_or(|t| t == "premium")
     }
 
     pub fn send_packet(&self, cmd: PacketType, data: Vec<u8>) -> Result<(), Error> {

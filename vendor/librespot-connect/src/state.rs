@@ -463,37 +463,18 @@ impl ConnectState {
         session.spclient().put_connect_state_inactive(false).await
     }
 
-    async fn send_with_reason(
-        &mut self,
-        session: &Session,
-        reason: PutStateReason,
-    ) -> SpClientResult {
-        let prev_reason = self.request.put_state_reason;
-
-        self.request.put_state_reason = EnumOrUnknown::new(reason);
-        let res = self.send_state(session).await;
-
-        self.request.put_state_reason = prev_reason;
-        res
+    /// El estado que se envía a Spotify (PUT a connect-state) con cada cambio. Nanofy: Spirc lo
+    /// copia y lo envía en segundo plano (`state_sender`), sin esperar a la red; por eso ya no hay
+    /// aquí métodos que lo envíen y esperen.
+    pub fn state_request(&self) -> PutStateRequest {
+        self.request.clone()
     }
 
-    /// Notifies the remote server about a new device
-    pub async fn notify_new_device_appeared(&mut self, session: &Session) -> SpClientResult {
-        self.send_with_reason(session, PutStateReason::NEW_DEVICE)
-            .await
-    }
-
-    /// Notifies the remote server about a new volume
-    pub async fn notify_volume_changed(&mut self, session: &Session) -> SpClientResult {
-        self.send_with_reason(session, PutStateReason::VOLUME_CHANGED)
-            .await
-    }
-
-    /// Sends the connect state for the connect session to the remote server
-    pub async fn send_state(&self, session: &Session) -> SpClientResult {
-        session
-            .spclient()
-            .put_connect_state_request(&self.request)
-            .await
+    /// Como [ConnectState::state_request], con un motivo propio (dispositivo nuevo, cambio de
+    /// volumen) en vez del de cada cambio.
+    pub fn state_request_with_reason(&self, reason: PutStateReason) -> PutStateRequest {
+        let mut request = self.request.clone();
+        request.put_state_reason = EnumOrUnknown::new(reason);
+        request
     }
 }

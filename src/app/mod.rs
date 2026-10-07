@@ -11,6 +11,8 @@ mod pages;
 mod panels;
 mod player_bar;
 mod theme;
+mod warm;
+mod watchdog;
 mod widgets;
 
 use std::collections::{HashMap, HashSet};
@@ -135,9 +137,35 @@ pub struct PlayerState {
     /// `Some` cuando la reproducción suena en otro dispositivo (se controla por Web API).
     pub remote: Option<Device>,
     pub liked: Option<bool>,
+    /// Formato, calidad y normalización de lo que suena en este equipo (`Event::AudioFormat`).
+    /// Se borra al cambiar de canción y al pasar la reproducción a otro dispositivo.
+    pub audio: Option<AudioInfo>,
+    /// Fundidos entre canciones que han empezado en este equipo (`Event::Crossfade`) y el último,
+    /// para el modo de control.
+    pub transitions: u32,
+    pub last_transition: Option<LastTransition>,
+}
+
+/// Un fundido que empezó: de qué canción a cuál (uris), cuánto dura y cuándo empezó.
+#[derive(Debug, Clone)]
+pub struct LastTransition {
+    pub from: String,
+    pub to: String,
+    pub ms: u32,
+    pub at: Instant,
 }
 
 impl PlayerState {
+    /// Información de audio de la canción que muestra la barra, si suena aquí. Con la canción
+    /// mostrada por adelantado (al hacer clic) o restaurada, la que hubiera es de otra pista.
+    pub fn local_audio(&self) -> Option<&AudioInfo> {
+        if self.remote.is_some() {
+            return None;
+        }
+        let now = self.now.as_ref()?;
+        self.audio.as_ref().filter(|a| a.uri == now.uri)
+    }
+
     pub fn position(&self) -> u32 {
         let dur = self.now.as_ref().map(|n| n.duration_ms).unwrap_or(0);
         let p = match (self.state, self.position_at) {
@@ -317,6 +345,10 @@ pub struct UpdatedToast {
 /// Tiempo durante el que el listado de playlists de esta sesión decide si una copia en disco
 /// sigue al día (ver `App::listing_fresh`).
 const LISTING_TRUST: Duration = Duration::from_secs(10 * 60);
+/// El listado del rootlist se completa con la Web API (mosaicos, nombre del propietario,
+/// privacidad) como mucho una vez cada tanto (24 h) si no aparece ninguna playlist nueva: la
+/// cuota de la Web API es compartida con otros clientes y la biblioteca no debe depender de ella.
+const PLAYLISTS_WEB_SECS: u64 = 24 * 3600;
 /// Una carga de playlist sin noticias (ni un lote) durante esto se da por perdida (un hilo
 /// colgado, una respuesta que no llegará) y deja pasar otra de la misma playlist.
 const PL_INFLIGHT_STALE: Duration = Duration::from_secs(60);
@@ -417,6 +449,17 @@ fn ctx_list_key(uri: &str) -> Option<(String, CtxKind)> {
     is_playlist_key(id).then(|| (id.to_string(), kind))
 }
 
+/// Abre la medida del tiempo hasta que suena una orden al reproductor de este equipo
+/// (`librespot_core::ttfs`, que el modo de control enseña como `player.ttfs`). Se mide desde
+/// aquí, el clic, porque eso es lo que espera quien escucha. Con `NANOFY_FAULT=limiter_exhaust`
+/// es también cuando el presupuesto de peticiones de librespot aparece agotado.
+fn ttfs_begin(kind: &'static str) {
+    librespot_core::ttfs::begin(kind);
+    if librespot_core::ttfs::is_play(kind) {
+        librespot_core::fault::arm_limiter_drain();
+    }
+}
+
 /// Fecha de hoy (AAAA-MM-DD, UTC), como la de `added_at` que da playlist4.
 fn today_utc() -> String {
     // Días desde 1970 a fecha civil (algoritmo de Howard Hinnant, «civil_from_days»).
@@ -437,6 +480,17 @@ fn today_utc() -> String {
 struct ResumePoint {
     pos: u32,
     playing: bool,
+}
+
+/// Una canción que no se pudo cargar por algo pasajero (Spotify frenando las claves, la red) y
+/// que la app reintenta sola (`player_bar::LOAD_RETRY_DELAYS`).
+#[derive(Clone, Debug)]
+struct LoadRetry {
+    uri: String,
+    /// Fallos seguidos de esta canción hasta ahora.
+    failures: u8,
+    /// Cuándo reintentar; `None` si ya se reintentó (o se pidió a mano) y se espera el resultado.
+    at: Option<Instant>,
 }
 
 pub enum Action {
@@ -484,6 +538,9 @@ pub struct PlaylistEditor {
     pub name: String,
     pub description: String,
     pub public: bool,
+    /// Se sabe si es pública (o ella tocó el interruptor). Si no (el listado del rootlist no lo
+    /// trae y la Web API no contestó), al guardar no se envía: `public` es solo lo que se ve.
+    pub public_known: bool,
     pub collaborative: bool,
     pub image_path: Option<PathBuf>,
     pub busy: bool,
@@ -579,6 +636,15 @@ pub struct App {
     /// Hay un listado pedido al conectar (arranque o reconexión) que aún no ha respondido: el
     /// inicio espera a él para decidir si sus secciones de playlists hace falta pedirlas.
     playlists_asked: bool,
+    /// De dónde salió `playlists`: "instantánea", "rootlist" o "web" (vacío: aún nada). Para
+    /// el modo de control.
+    pub playlists_source: &'static str,
+    /// Cuándo completó la Web API por última vez el listado del rootlist (segundos Unix) y qué
+    /// playlists había entonces (ver `Snapshot::playlists_web_at` y `playlists_web_ids`).
+    playlists_web_at: u64,
+    playlists_web_ids: HashSet<String>,
+    /// Hay un `Req::PlaylistsWeb` en el carril de fondo sin responder: no se encola otro.
+    playlists_web_pending: bool,
     pub playlist_meta: HashMap<String, Playlist>,
     pub lists: HashMap<String, TrackList>,
     /// Última versión dada a una lista (ver `TrackList::gen`).
@@ -791,8 +857,33 @@ pub struct App {
     last_skipped: Option<String>,
     /// Temporizador de apagado: instante de pausa o "al terminar la canción".
     pub sleep_at: Option<Instant>,
-    /// Desde cuándo el reproductor está en «cargando» (vigilante de reproducción estancada).
-    loading_since: Option<Instant>,
+    /// Vigilante por etapas de la canción que está cargando aquí (`watchdog::LoadWatchdog`):
+    /// lenta, reintento, reconexión y, a los 30 s, aviso. `None` si no carga nada.
+    load_watch: Option<watchdog::LoadWatchdog>,
+    /// La carga que se dejó de esperar a los 30 s, para que [Reintentar] la vuelva a pedir.
+    stuck_load: Option<Cmd>,
+    /// Aviso encima de la barra cuando una canción no se pudo reproducir (`playback_error_banner`).
+    playback_error: Option<player_bar::PlaybackError>,
+    /// Reintento automático de la canción que no se pudo cargar por algo pasajero.
+    load_retry: Option<LoadRetry>,
+    /// Canción cortada por la red a media reproducción, en pausa en su segundo, y sus reintentos.
+    stall: Option<watchdog::StallRecovery>,
+    /// Precarga inteligente: cuándo preparar la canción bajo el ratón o la del botón apretado.
+    warm: warm::WarmTracker,
+    /// Lo que las filas vieron en este fotograma (lo recoge `tick_warm` al final): la canción con
+    /// el ratón encima y la del botón de reproducir apretado.
+    warm_hover: Option<String>,
+    warm_press: Option<String>,
+    /// Falta la salida de audio: la canción (uri) que se pausó por eso y si sonaba, para seguir
+    /// al volver un dispositivo.
+    output_lost: Option<(Option<String>, bool)>,
+    /// Reanudaciones automáticas al volver la salida, con su límite (`watchdog::OutputResumes`).
+    output_resumes: watchdog::OutputResumes,
+    /// La última pausa llegó con algo sonando o cargando (y no a mano desde la pausa): si fue por
+    /// falta de salida, al volver un dispositivo se reanuda.
+    paused_while_playing: bool,
+    /// La cuenta no es Premium: Spotify no deja reproducir aquí (se explica en el aviso).
+    not_premium: bool,
     stall_test: Option<Instant>,
     pub sleep_end_of_track: bool,
     pause_on_play: bool,
@@ -891,6 +982,15 @@ pub struct App {
     /// Suma de fases [ui, teselado, raster, presentación] de los fotogramas de `frame_hist`.
     pub frame_phases: [f32; 4],
     pub web_busy: bool,
+    /// Autorización de la biblioteca preparada y esperando al navegador (encadenada al inicio de
+    /// sesión o abierta con «Conectar con Spotify»): su URL para abrirla otra vez y su cancelación.
+    pub web_chain: Option<crate::webauth::WebChain>,
+    /// `web_chain` la armó `login` (encadenada al inicio de sesión): solo esa se suelta si el inicio
+    /// de sesión se cancela o entra sin navegador; la de «Conectar con Spotify» sigue esperando.
+    web_chain_login: bool,
+    /// Cuándo se pulsó «Cancelar» en el inicio de sesión (el botón espera la respuesta del
+    /// backend, normalmente al momento; pasados unos segundos sin ella se puede volver a pulsar).
+    pub login_cancel_at: Option<Instant>,
     media_dirty: bool,
     /// Instantánea de la biblioteca en disco.
     snapshot_path: PathBuf,
@@ -1020,6 +1120,10 @@ impl App {
             playlists_loaded: false,
             playlists_fresh: None,
             playlists_asked: false,
+            playlists_source: "",
+            playlists_web_at: 0,
+            playlists_web_ids: HashSet::new(),
+            playlists_web_pending: false,
             playlist_meta: HashMap::new(),
             lists: HashMap::new(),
             list_gen: 0,
@@ -1138,7 +1242,18 @@ impl App {
             hidden_path,
             last_skipped: None,
             sleep_at: None,
-            loading_since: None,
+            load_watch: None,
+            stuck_load: None,
+            playback_error: None,
+            load_retry: None,
+            stall: None,
+            warm: warm::WarmTracker::default(),
+            warm_hover: None,
+            warm_press: None,
+            output_lost: None,
+            output_resumes: watchdog::OutputResumes::default(),
+            paused_while_playing: false,
+            not_premium: false,
             stall_test: None,
             sleep_end_of_track: false,
             pause_on_play: false,
@@ -1209,6 +1324,9 @@ impl App {
             frame_hist: std::collections::VecDeque::with_capacity(240),
             frame_phases: [0.0; 4],
             web_busy: false,
+            web_chain: None,
+            web_chain_login: false,
+            login_cancel_at: None,
             media_dirty: false,
             snapshot_path,
             snapshot_dirty: false,
@@ -1282,6 +1400,11 @@ impl App {
         self.user = snap.user;
         self.playlists = snap.playlists;
         self.playlists_loaded = !self.playlists.is_empty();
+        if self.playlists_loaded {
+            self.playlists_source = "instantánea";
+        }
+        self.playlists_web_at = snap.playlists_web_at;
+        self.playlists_web_ids = snap.playlists_web_ids.into_iter().collect();
         // Sus snapshot_id son de la sesión anterior: no dicen si una copia sigue al día.
         self.playlists_fresh = None;
         self.recent = snap.recent;
@@ -1336,6 +1459,8 @@ impl App {
             liked_server_total: self.liked_server_total,
             liked_extra,
             artists_synced_at: self.artists_synced_at,
+            playlists_web_at: self.playlists_web_at,
+            playlists_web_ids: self.playlists_web_ids.iter().cloned().collect(),
         }
     }
 
@@ -1614,8 +1739,55 @@ impl App {
         username.to_string()
     }
 
+    /// Id de usuario propio: el del perfil (/me) o, si aún no llegó (primer arranque con la Web
+    /// API limitada), el nombre de usuario de la sesión, que es el mismo id (el del rootlist).
+    /// Así «Tu playlist» y la edición no dependen de la cuota compartida.
     pub fn my_id(&self) -> Option<&str> {
-        self.user.as_ref().map(|u| u.id.as_str())
+        self.user.as_ref().map(|u| u.id.as_str()).or(match &self.auth {
+            Auth::LoggedIn { username } | Auth::Connecting { username } => Some(username.as_str()).filter(|u| !u.is_empty()),
+            _ => None,
+        })
+    }
+
+    /// Nombre visible propio, del perfil de /me o del interno.
+    fn my_display_name(&self) -> Option<String> {
+        self.user
+            .as_ref()
+            .and_then(|u| u.display_name.clone())
+            .or_else(|| self.my_id().and_then(|id| self.users.get(id)).and_then(|u| u.display_name.clone()))
+            .filter(|n| !n.is_empty())
+    }
+
+    /// Una playlist de la biblioteca sin portada (ni subida ni de la Web API), o con la armada
+    /// aquí, toma el mosaico de su lista ya en memoria (`mosaic_cover`), como en Spotify. Así
+    /// las propias sin imagen no se quedan en gris aunque la Web API no conteste.
+    fn fill_list_cover(&mut self, id: &str) {
+        let Some(i) = self.playlists.iter().position(|p| p.id == id && p.own_cover()) else { return };
+        let Some(img) = self.lists.get(id).filter(|l| !l.tracks.is_empty()).and_then(|l| mosaic_cover(&l.tracks)) else { return };
+        let p = &mut self.playlists[i];
+        if p.images.as_deref().and_then(|v| v.first()).map(|im| im.url.as_str()) != Some(img.url.as_str()) {
+            p.images = Some(vec![img]);
+            self.snapshot_dirty = true;
+        }
+    }
+
+    /// Pide a la Web API, en segundo plano, lo que el listado del rootlist no trae, si hace
+    /// falta: hay playlists que no estaban la última vez que se completó (seguidas o creadas en
+    /// otro dispositivo) o eso fue hace más de `PLAYLISTS_WEB_SECS` (los mosaicos de portada
+    /// cambian con las canciones). La cuota es compartida con otros clientes: en cada arranque
+    /// no se gasta.
+    fn enrich_listing_if_needed(&mut self) {
+        if self.playlists_web_pending || self.playlists.is_empty() {
+            return;
+        }
+        let stale = crate::cache::now_secs().saturating_sub(self.playlists_web_at) > PLAYLISTS_WEB_SECS;
+        let new = self.playlists.iter().filter(|p| !self.playlists_web_ids.contains(&p.id)).count();
+        if !stale && new == 0 {
+            return;
+        }
+        log::info!("[biblioteca] se completa el listado con la Web API (nuevas: {new}, caducado: {stale})");
+        self.playlists_web_pending = true;
+        self.api.send_bg(Req::PlaylistsWeb);
     }
 
     /// Submenú «Añadir a carpeta»: carpetas existentes, quitar de la actual y crear una nueva.
@@ -2024,6 +2196,47 @@ impl App {
         // Sin consulta automática tampoco hay actualización automática (ver `auto_update_on`).
         if !on {
             self.stop_silent_update();
+        }
+    }
+
+    /// Fundido entre canciones: se aplica al reproductor al instante, sin reiniciarlo, y fuera de
+    /// «Guardar» (como el aviso de actualizaciones): cambia los ajustes y el borrador a la vez, así
+    /// que lo que hubiera sin guardar en el borrador sigue igual. `persist` = false mientras se
+    /// arrastra el deslizador: suena ya con el valor nuevo y el archivo se escribe al soltarlo.
+    pub fn set_crossfade(&mut self, on: bool, secs: u8, albums: bool, persist: bool) {
+        let secs = secs.clamp(crate::config::CROSSFADE_SECS_MIN, crate::config::CROSSFADE_SECS_MAX);
+        let changed = (self.settings.crossfade, self.settings.crossfade_secs, self.settings.crossfade_albums) != (on, secs, albums);
+        for s in [&mut self.settings, &mut self.draft] {
+            s.crossfade = on;
+            s.crossfade_secs = secs;
+            s.crossfade_albums = albums;
+        }
+        if changed {
+            self.sync_crossfade();
+        }
+        if persist && !self.ephemeral {
+            self.settings.save(&self.paths);
+        }
+    }
+
+    /// Manda al reproductor el fundido en vigor (`Settings::crossfade_effective_ms`: 0 mientras el
+    /// temporizador «al terminar la canción» está puesto). El backend lo guarda aparte de los
+    /// ajustes y los reproductores nuevos (reconexión, `Restart`) nacen con él.
+    fn sync_crossfade(&self) {
+        let ms = self.settings.crossfade_effective_ms(self.sleep_end_of_track);
+        self.backend.send(Cmd::Crossfade { ms, albums: self.settings.crossfade_albums });
+    }
+
+    /// Pone o quita el temporizador «al terminar la canción» (todas las vías: menú, modo de
+    /// control, al cumplirse, al elegir minutos). Mientras está puesto no hay fundido: pausa al
+    /// cambiar de canción, y con un fundido ese cambio llega al principio de la mezcla, con la
+    /// siguiente ya sonando encima de la que acaba.
+    pub fn set_sleep_end_of_track(&mut self, on: bool) {
+        if self.sleep_end_of_track != on {
+            self.sleep_end_of_track = on;
+            if self.settings.crossfade {
+                self.sync_crossfade();
+            }
         }
     }
 
@@ -2602,6 +2815,7 @@ impl App {
         self.list_disk.insert(id.clone(), ListDisk { snapshot_id: cached.snapshot_id, saved_at: cached.saved_at, gen: list.gen });
         self.lists.insert(id.clone(), list);
         self.list_cached.insert(id.clone());
+        self.fill_list_cover(&id);
         // Puede ser el contexto de la sesión restaurada: su cola se arma ya con la copia.
         self.restore_ctx_arrived(&id);
         // Después: si la cola salió de la copia, ya no hay carga de la restauración que lo traiga.
@@ -2907,8 +3121,142 @@ impl App {
     }
 
     pub fn login(&mut self) {
+        // Un segundo clic (p. ej. en el avatar) no lanza otro inicio de sesión detrás del primero.
+        if matches!(self.auth, Auth::LoggingIn) {
+            return;
+        }
         self.auth = Auth::LoggingIn;
-        self.backend.send(Cmd::Login);
+        self.login_cancel_at = None;
+        // Sin la biblioteca conectada, su autorización se prepara ya y la página de vuelta del
+        // inicio de sesión salta a ella en la misma pestaña: un solo «Iniciar sesión con Spotify»
+        // y nada que hacer en Ajustes. Una sola vez de forma automática (`library_consent_asked`).
+        // Si quedó una encadenada de un intento anterior que falló al conectar (`Event::Error` no la
+        // suelta), se reutiliza: sigue escuchando, y sin ella `web_busy` impediría preparar otra y
+        // `LoggedIn` diría «un último paso en el navegador» sin que la pestaña hubiera saltado.
+        let mut chain = if self.web_chain_login { self.web_chain.as_ref().map(|c| c.url.clone()) } else { None };
+        if chain.is_none() && !self.api.web_configured() && !self.settings.library_consent_asked && !self.web_busy {
+            match self.api.begin_web_chain(false) {
+                Ok(c) => {
+                    chain = Some(c.url.clone());
+                    self.web_chain = Some(c);
+                    self.web_chain_login = true;
+                    self.web_busy = true;
+                }
+                // Sin cadena (puerto ocupado): al conectar se abre en una segunda pestaña.
+                Err(e) => log::warn!("no se pudo preparar la autorización de la biblioteca: {e}"),
+            }
+        }
+        self.backend.send(Cmd::Login { chain });
+    }
+
+    /// «Cancelar» mientras se espera al navegador: corta la espera del backend (como si se hubiera
+    /// cancelado en Spotify), que contesta con `LoginAborted`. También la autorización encadenada.
+    pub fn cancel_login(&mut self) {
+        if !matches!(self.auth, Auth::LoggingIn) || self.login_cancelling() {
+            return;
+        }
+        self.login_cancel_at = Some(Instant::now());
+        self.cancel_login_chain();
+        let ui = self.ui_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("nanofy-login-cancel".into())
+            .spawn(move || {
+                // No había ninguna espera del navegador que cortar (el backend estaba conectando
+                // con credenciales guardadas, o algo la retiene): la interfaz sale igualmente de
+                // «iniciando sesión». Si la sesión llega después, `LoggedIn` manda.
+                if !crate::backend::cancel_login_listener() {
+                    ui.send(Msg::Backend(Event::LoginAborted { reason: "Inicio de sesión cancelado".to_string(), by_user: true }));
+                }
+            });
+        if let Err(e) = spawned {
+            log::warn!("no se pudo cancelar el inicio de sesión: {e}");
+            self.login_cancel_at = None;
+        }
+    }
+
+    /// «Cancelar» pulsado hace poco y aún sin respuesta del backend.
+    pub fn login_cancelling(&self) -> bool {
+        self.login_cancel_at.is_some_and(|t| t.elapsed() < Duration::from_secs(3))
+    }
+
+    /// «Conectar con Spotify» (aviso del inicio, Ajustes, barra lateral): abre en el navegador la
+    /// autorización de la biblioteca. Nadie tiene que crear ninguna app.
+    pub fn connect_library(&mut self) {
+        if self.web_busy {
+            return;
+        }
+        match self.api.begin_web_chain(true) {
+            Ok(c) => {
+                self.web_chain = Some(c);
+                self.web_chain_login = false;
+                self.web_busy = true;
+                self.status("Se ha abierto el navegador: permite que Nanofy lea tu biblioteca…");
+            }
+            Err(e) => self.status_err(format!("No se pudo abrir la autorización de la biblioteca: {e}")),
+        }
+    }
+
+    /// Suelta la autorización de la biblioteca que esperaba al navegador (si había una).
+    pub fn cancel_web_chain(&mut self) {
+        self.web_chain_login = false;
+        if let Some(c) = self.web_chain.take() {
+            c.cancel();
+            self.web_busy = false;
+        }
+    }
+
+    /// Suelta la autorización de la biblioteca solo si la encadenó el inicio de sesión.
+    fn cancel_login_chain(&mut self) {
+        if self.web_chain_login {
+            self.cancel_web_chain();
+        }
+    }
+
+    /// La autorización en curso terminó (llegó su resultado): ya no hay nada que cancelar.
+    fn web_chain_done(&mut self) {
+        self.web_busy = false;
+        self.web_chain = None;
+        self.web_chain_login = false;
+    }
+
+    /// Tras conectar la sesión: sigue con la autorización de la biblioteca si hace falta. `fresh`:
+    /// se acaba de iniciar sesión en el navegador (ver `Event::LoggedIn`).
+    fn after_login_library(&mut self, fresh: bool) {
+        if self.api.web_configured() {
+            return;
+        }
+        if !fresh {
+            // Entró con credenciales guardadas (o es una reconexión): el navegador no pasó por la
+            // página que encadena.
+            self.cancel_login_chain();
+            return;
+        }
+        if self.web_chain.is_some() {
+            // La pestaña del inicio de sesión ya saltó (o salta) a la autorización de la biblioteca.
+            // Desde aquí es una autorización como la de «Conectar con Spotify»: una reconexión
+            // (`LoggedIn` sin `fresh`) no debe soltarla mientras se acepta en el navegador.
+            self.web_chain_login = false;
+            self.mark_library_consent_asked();
+            self.status("Un último paso en el navegador: permite que Nanofy lea tu biblioteca (no tienes que crear nada).");
+        } else if !self.settings.library_consent_asked && !self.web_busy {
+            // No se pudo encadenar: una segunda pestaña, una sola vez, diciendo por qué se abre.
+            self.mark_library_consent_asked();
+            self.connect_library();
+            if self.web_busy {
+                self.status("Un último paso en otra pestaña del navegador: permite que Nanofy lea tu biblioteca (no tienes que crear nada).");
+            }
+        }
+    }
+
+    fn mark_library_consent_asked(&mut self) {
+        if self.settings.library_consent_asked {
+            return;
+        }
+        self.settings.library_consent_asked = true;
+        self.draft.library_consent_asked = true;
+        if !self.ephemeral {
+            self.settings.save(&self.paths);
+        }
     }
 
     pub fn apply_theme(&self, ctx: &egui::Context) {
@@ -3035,7 +3383,10 @@ impl App {
         } else {
             log::debug!("[evento] {e:?}");
         }
-        if matches!(e, Event::Playing { .. } | Event::Paused { .. } | Event::Stopped | Event::Unavailable) {
+        if matches!(
+            e,
+            Event::Playing { .. } | Event::Paused { .. } | Event::Stopped | Event::Unavailable | Event::LoadFailed { .. } | Event::Stalled { .. }
+        ) {
             // Lo pedido ya llegó al reproductor: a partir de aquí, si la conexión cae, se retoma
             // desde donde suene, no desde donde se pidió.
             self.pending_load = None;
@@ -3051,7 +3402,9 @@ impl App {
             Event::LoggedIn {
                 username,
                 device_id,
+                fresh,
             } => {
+                self.login_cancel_at = None;
                 // Foto y nombre del perfil por el protocolo interno (no gasta cuota de la Web API).
                 // Sale la primera, antes de la tanda de refresh_from_network; su clave se marca
                 // después de esa (que vacía `requested`), para que Resp::Me no lo pida otra vez.
@@ -3061,6 +3414,11 @@ impl App {
                 }
                 self.auth = Auth::LoggedIn { username };
                 self.device_id = device_id;
+                // Si la cuenta no es Premium, `NotPremium` llega justo detrás.
+                self.not_premium = false;
+                if self.playback_error.as_ref().is_some_and(|e| e.kind == player_bar::PlaybackErrorKind::NotPremium) {
+                    self.playback_error = None;
+                }
                 crate::tmark("sesión: conectado");
                 // Lo que casi seguro se va a restaurar se prepara ya en el reproductor, mientras
                 // llega el estado de la cuenta (necesario antes de activar Connect, para no
@@ -3107,21 +3465,40 @@ impl App {
                 if let Some(uri) = self.pending_loadctx.take() {
                     self.restore_wanted = false;
                     self.restore_pending = None;
-                    self.backend.send(Cmd::LoadContext { uri, track_uri: None, index: Some(0), shuffle: false, resume: Some(0) });
+                    self.backend.send(Cmd::LoadContext { uri, track_uri: None, index: Some(0), shuffle: false, resume: Some(0), first: None });
                 }
                 if !self.pending_downloads.is_empty() {
                     let ids = std::mem::take(&mut self.pending_downloads);
                     self.download(ids);
                 }
                 self.status("Conectado a Spotify");
+                self.after_login_library(fresh);
+            }
+            Event::LoginAborted { reason, by_user } => {
+                self.auth = Auth::LoggedOut;
+                self.login_cancel_at = None;
+                // La autorización encadenada ya no tiene por dónde llegar (la página de vuelta no
+                // salta sin código).
+                self.cancel_login_chain();
+                if by_user {
+                    self.status(reason);
+                } else {
+                    self.status_err(reason);
+                }
             }
             Event::LoggedOut => {
                 self.auth = Auth::LoggedOut;
                 self.user = None;
+                // Lo ya preparado era de esta cuenta (el backend también olvida sus cachés).
+                self.warm.forget();
                 self.playlists.clear();
                 self.playlists_loaded = false;
                 self.playlists_fresh = None;
                 self.playlists_asked = false;
+                self.playlists_source = "";
+                self.playlists_web_at = 0;
+                self.playlists_web_ids.clear();
+                self.playlists_web_pending = false;
                 self.playlist_meta.clear();
                 self.lists.clear();
                 self.list_disk.clear();
@@ -3184,6 +3561,12 @@ impl App {
                 };
                 self.reconnect_resume = None;
                 self.pending_load = None;
+                self.playback_error = None;
+                self.load_retry = None;
+                self.stall = None;
+                self.stuck_load = None;
+                self.output_lost = None;
+                self.not_premium = false;
                 self.media_dirty = true;
                 self.status("Sesión cerrada");
             }
@@ -3203,18 +3586,26 @@ impl App {
                     self.restore_pending = None;
                 }
                 self.player.remote = None;
+                // La de la canción anterior; la nueva llega justo detrás (`Event::AudioFormat`).
+                self.player.audio = None;
+                // Otra canción: el corte de red de la anterior ya no se reanuda.
+                if self.stall.as_ref().is_some_and(|s| !s.is(&np.uri)) {
+                    self.stall = None;
+                }
                 self.set_now_playing(np);
             }
             Event::Playing { position_ms } if self.pause_after_restore => {
                 // Al abrir nunca suena solo: la sesión restaurada se deja en pausa.
                 self.player.state = PlayState::Playing;
                 self.player.position_ms = position_ms;
+                self.playback_recovered();
                 self.play_pause();
             }
             Event::Playing { position_ms } if self.pause_on_play => {
                 self.pause_on_play = false;
                 self.player.state = PlayState::Playing;
                 self.player.position_ms = position_ms;
+                self.playback_recovered();
                 self.play_pause();
                 self.status("Temporizador: reproducción pausada al terminar la canción");
             }
@@ -3224,8 +3615,14 @@ impl App {
                 self.player.position_ms = position_ms;
                 self.player.position_at = Some(Instant::now());
                 self.media_dirty = true;
+                self.playback_recovered();
             }
             Event::Paused { position_ms } => {
+                // Si esta pausa es por falta de salida (`NoAudioOutput` llega justo detrás), ¿iba a
+                // sonar? Entonces se reanuda sola al volver un dispositivo. Nunca lo restaurado al
+                // abrir, que no suena sin pedirlo.
+                self.paused_while_playing =
+                    matches!(self.player.state, PlayState::Playing | PlayState::Loading) && !self.pause_after_restore;
                 self.pause_after_restore = false;
                 self.player.remote = None;
                 self.player.state = PlayState::Paused;
@@ -3248,10 +3645,65 @@ impl App {
                 self.player.state = PlayState::Stopped;
                 self.player.position_at = None;
                 self.media_dirty = true;
+                // Parada (fin de la lista, otro dispositivo): nada que reanudar.
+                self.stall = None;
             }
             Event::Loading => self.player.state = PlayState::Loading,
+            Event::Stalled { uri, position_ms } => self.on_stalled(uri, position_ms),
+            Event::NoAudioOutput => {
+                let uri = self.player.now.as_ref().map(|n| n.uri.clone());
+                let resume = self.paused_while_playing || self.output_lost.as_ref().is_some_and(|(_, r)| *r);
+                log::warn!("[reproducción] no hay salida de audio{}", if resume { "; se reanudará al volver" } else { "" });
+                self.output_lost = Some((uri, resume));
+                self.playback_error = Some(player_bar::PlaybackError::new(
+                    player_bar::PlaybackErrorKind::NoOutput,
+                    player_bar::NO_OUTPUT_TEXT.to_string(),
+                ));
+            }
+            Event::AudioOutputBack => {
+                let mut keep_banner = false;
+                if let Some((uri, resume)) = self.output_lost.take() {
+                    let same = uri.is_some() && self.player.now.as_ref().map(|n| n.uri.clone()) == uri;
+                    let wanted = resume && same && self.player.state == PlayState::Paused && self.player.remote.is_none();
+                    if wanted && !self.output_resumes.allow(Instant::now()) {
+                        // El dispositivo está pero no se deja abrir: sin insistir más (ver
+                        // `watchdog::OutputResumes`); el aviso se queda y reproducir lo reintenta.
+                        log::warn!("[reproducción] vuelve la salida pero no suena; no se reanuda sola otra vez");
+                        keep_banner = true;
+                        self.output_lost = Some((uri, false));
+                    } else if wanted {
+                        log::info!("[reproducción] vuelve la salida de audio: se reanuda");
+                        self.load_watch = None;
+                        self.backend.send(Cmd::Play);
+                        self.player.state = PlayState::Loading;
+                        self.media_dirty = true;
+                    }
+                }
+                if !keep_banner && self.playback_error.as_ref().is_some_and(|e| e.kind == player_bar::PlaybackErrorKind::NoOutput) {
+                    self.playback_error = None;
+                }
+            }
+            Event::NotPremium => {
+                if matches!(self.auth, Auth::LoggingIn | Auth::Connecting { .. }) {
+                    self.auth = Auth::LoggedOut;
+                }
+                self.not_premium = true;
+                self.pending_load = None;
+                self.load_retry = None;
+                self.stall = None;
+                self.stuck_load = None;
+                if self.player.state == PlayState::Loading && self.player.remote.is_none() {
+                    self.player.state = PlayState::Stopped;
+                    self.media_dirty = true;
+                }
+                self.playback_error = Some(player_bar::PlaybackError::new(
+                    player_bar::PlaybackErrorKind::NotPremium,
+                    player_bar::NOT_PREMIUM_TEXT.to_string(),
+                ));
+            }
             Event::Unavailable => {
-                self.status_err("Esta canción no está disponible (¿cuenta sin Premium?)");
+                // El aviso con el motivo ya lo puso `LoadFailed`, que llega justo antes (antes se
+                // decía siempre «¿cuenta sin Premium?», y casi nunca era eso).
                 // Si no hay nada más que reproducir, librespot no manda «parado»: el botón se
                 // quedaría en «cargando». Si sigue con otra pista, el evento Playing lo corrige.
                 if self.player.state == PlayState::Loading {
@@ -3259,6 +3711,15 @@ impl App {
                     self.player.position_at = None;
                     self.media_dirty = true;
                 }
+            }
+            Event::LoadFailed { uri, reason, transient, play } => self.on_load_failed(uri, reason, transient, play),
+            Event::SkipCascade { failed } => {
+                log::warn!("[reproducción] {failed} canciones seguidas no se pudieron reproducir: se detuvo");
+                self.load_retry = None;
+                self.playback_error = Some(player_bar::PlaybackError::new(
+                    player_bar::PlaybackErrorKind::Cascade,
+                    player_bar::CASCADE_TEXT.to_string(),
+                ));
             }
             Event::Volume(v) => {
                 if self.volume_drag.is_none() && self.accept_volume_echo(v) {
@@ -3297,8 +3758,16 @@ impl App {
                 self.reconnect_resume = match self.player.state {
                     _ if self.player.remote.is_some() || self.jam.is_some() || self.now_placeholder => None,
                     _ if self.player.now.is_none() => None,
+                    // Parada tras agotar los reintentos de una carga fallida: Spirc la tenía en
+                    // pausa para [Reintentar], pero el de la conexión nueva no tendrá nada. Se
+                    // retoma en pausa para que [Reintentar] o reproducir sigan sirviendo.
+                    PlayState::Stopped if self.failed_load_wanted_play() => Some(ResumePoint { pos, playing: false }),
                     PlayState::Stopped => None,
-                    s => Some(ResumePoint { pos, playing: s != PlayState::Paused }),
+                    // En pausa a la espera del reintento automático de una carga fallida: iba a
+                    // sonar, y la reconexión es el reintento (si se retomara en pausa y volviera a
+                    // fallar, el aviso diría «reintentando…» sin reintento pendiente).
+                    // Lo mismo con una canción cortada por la red, en pausa a la espera de reanudar.
+                    s => Some(ResumePoint { pos, playing: s != PlayState::Paused || self.load_retry.is_some() || self.stall.is_some() }),
                 };
                 if self.player.remote.is_none() {
                     self.player.position_ms = pos;
@@ -3311,7 +3780,7 @@ impl App {
             }
             Event::Reconnected => {
                 self.status("Conexión con Spotify restablecida");
-                self.loading_since = None;
+                // El vigilante de «cargando» sigue contando: una reconexión no le da otros 30 s.
                 // Las miniaturas de artistas que fallaron con la sesión caída siguen marcadas como
                 // pedidas (para no repetirlas en cada fotograma): se pueden volver a pedir. Las
                 // que ya tienen imagen no se piden; el resto, en un lote por tarjeta a la vista.
@@ -3345,6 +3814,13 @@ impl App {
                 self.jam_queue_active = true;
                 self.api.send(Req::JamQueue { current, next });
             }
+            Event::AudioFormat(info) => self.player.audio = Some(info),
+            Event::Crossfade { from, to, ms } => {
+                // La barra ya enseña la nueva (llegaron `TrackChanged` y `Playing`); esto solo se
+                // cuenta para el modo de control.
+                self.player.transitions = self.player.transitions.saturating_add(1);
+                self.player.last_transition = Some(LastTransition { from, to, ms, at: Instant::now() });
+            }
         }
     }
 
@@ -3356,18 +3832,21 @@ impl App {
             return;
         }
         self.player.liked = np.id.as_ref().map(|id| self.liked_set.contains(id));
-        // Canción oculta: se salta (una vez por pista, para no entrar en bucle).
+        // Canción oculta: se salta (una vez por pista, para no entrar en bucle). Es un salto que
+        // no pidió el usuario: si la oculta entraba fundiéndose, la anterior sigue apagándose a
+        // su ritmo en vez de cortarse en seco (con `Cmd::Next` normal perdería lo que le quedaba).
         if let Some(id) = &np.id {
             if self.hidden_tracks.contains(id) && self.player.remote.is_none() && self.last_skipped.as_deref() != Some(id.as_str()) {
                 self.last_skipped = Some(id.clone());
-                self.next();
+                self.backend.send(Cmd::Next { auto: true });
             }
         }
         if self.queued_local.first() == Some(&np.uri) {
             self.queued_local.remove(0);
         }
         if self.sleep_end_of_track {
-            self.sleep_end_of_track = false;
+            // Cumplido: el fundido elegido vuelve (estaba suspendido mientras tanto).
+            self.set_sleep_end_of_track(false);
             self.pause_on_play = true;
         }
         let played = track_from_now(&np);
@@ -3594,6 +4073,8 @@ impl App {
                     // marcadas como pedidas (si no, se pedirían en cada fotograma); se desmarcan
                     // al reconectar (Event::Reconnected) o al iniciar sesión.
                     Req::ArtistThumbs(_) => log::info!("miniaturas de artistas: {e}"),
+                    // Precarga de los metadatos de una búsqueda: era por adelantado, sin aviso.
+                    Req::WarmMeta(_) => log::debug!("[precarga] metadatos de la búsqueda: {e}"),
                     // El perfil propio que se pide al conectar deja su clave marcada (para que
                     // Resp::Me no lo repita): si falla, se desmarca una vez, para que Resp::Me o
                     // la página del perfil lo vuelvan a pedir en vez de quedar sin avatar ni
@@ -3639,7 +4120,19 @@ impl App {
                     Req::Playlists => {
                         self.playlists_loaded = true;
                         self.playlists_asked = false;
-                        self.status_err(e);
+                        // Ni rootlist ni Web API. Con la copia a la vista, un límite pasajero de la
+                        // cuota compartida no merece aviso: se ve la biblioteca de siempre.
+                        if !self.playlists.is_empty() && crate::api::retry_secs(&e).is_some() {
+                            log::info!("listado de playlists: {e}; se mantiene la copia");
+                        } else {
+                            self.status_err(e);
+                        }
+                    }
+                    // Completar el listado del rootlist era opcional: se queda como estaba y se
+                    // vuelve a intentar con el próximo listado.
+                    Req::PlaylistsWeb => {
+                        self.playlists_web_pending = false;
+                        log::info!("[biblioteca] la Web API no completó el listado: {e}");
                     }
                     Req::Liked if self.liked_refresh_pending => {
                         // La recarga completa falló: se conserva la lista cacheada.
@@ -3691,8 +4184,13 @@ impl App {
                         self.status_err(e);
                     }
                     Req::WebConnect(_) => {
-                        self.web_busy = false;
-                        self.status_err(format!("No se pudo conectar la Web API: {e}"));
+                        self.web_chain_done();
+                        // Caducada sin respuesta: vuelve el «Conectar con Spotify», sin más aviso.
+                        if e == crate::webauth::CONNECT_EXPIRED {
+                            log::info!("autorización de la biblioteca: {e}");
+                        } else {
+                            self.status_err(format!("No se pudo conectar la biblioteca: {e}"));
+                        }
                     }
                     Req::Lyrics { .. } => {
                         self.lyrics_loading = false;
@@ -3725,11 +4223,32 @@ impl App {
                 if !self.users.contains_key(&u.id) {
                     self.request_once(&format!("user:{}", u.id), Req::User(u.id.clone()));
                 }
+                // Las propias que llegaron del rootlist antes que el perfil: «De <tu nombre>».
+                if let Some(name) = u.display_name.as_ref().filter(|n| !n.is_empty()) {
+                    for p in self.playlists.iter_mut().filter(|p| p.owner.display_name.is_none() && p.owner.id.as_deref() == Some(u.id.as_str())) {
+                        p.owner.display_name = Some(name.clone());
+                        self.snapshot_dirty = true;
+                    }
+                }
                 self.user = Some(u)
             }
-            Resp::Playlists(p) => {
+            Resp::Playlists { list, rootlist } => {
+                // Del rootlist: lo que no trae (nombre visible del propietario, privacidad, la
+                // portada de las que no tienen una subida) sale del listado anterior.
+                let p = if rootlist {
+                    let me = self.my_id().map(str::to_string);
+                    let my_name = self.my_display_name();
+                    // Las recién seguidas no están en el listado anterior, pero su página ya
+                    // trajo propietario, privacidad y portada.
+                    let mut prev = self.playlists.clone();
+                    let known: HashSet<&str> = self.playlists.iter().map(|p| p.id.as_str()).collect();
+                    prev.extend(list.iter().filter(|p| !known.contains(p.id.as_str())).filter_map(|p| self.playlist_meta.get(&p.id).cloned()));
+                    merge_rootlist_listing(&prev, list, me.as_deref(), my_name.as_deref())
+                } else {
+                    list
+                };
                 if self.diag {
-                    log::info!("[diag] playlists: {}", p.len());
+                    log::info!("[diag] playlists: {} ({})", p.len(), if rootlist { "rootlist" } else { "web" });
                     if let Some(first) = p.first() {
                         self.load_playlist(&first.id, false, false);
                         self.api.send(Req::PlaylistMeta(first.id.clone()));
@@ -3739,6 +4258,21 @@ impl App {
                 self.playlists_loaded = true;
                 self.playlists_fresh = Some(Instant::now());
                 self.playlists_asked = false;
+                self.playlists_source = if rootlist { "rootlist" } else { "web" };
+                if !rootlist {
+                    // El de la Web API ya viene completo: cuenta como completado ahora.
+                    self.playlists_web_at = crate::cache::now_secs();
+                    self.playlists_web_ids = self.playlists.iter().map(|p| p.id.clone()).collect();
+                }
+                // Sin portada todavía: el mosaico de su lista, si ya está en memoria.
+                let bare: Vec<String> =
+                    self.playlists.iter().filter(|p| p.own_cover() && self.lists.contains_key(&p.id)).map(|p| p.id.clone()).collect();
+                for id in bare {
+                    self.fill_list_cover(&id);
+                }
+                if rootlist {
+                    self.enrich_listing_if_needed();
+                }
                 // Precarga en segundo plano: primero las fijadas, luego las propias, de la copia en
                 // disco más reciente (las que más abre) a las que no tienen. Así cambiar entre
                 // playlists es instantáneo (ya están en memoria al abrirlas).
@@ -3772,6 +4306,15 @@ impl App {
                         self.actions.push(Action::OpenEditor(Some(pl)));
                     }
                 }
+                self.snapshot_dirty = true;
+            }
+            Resp::PlaylistsWeb(web) => {
+                self.playlists_web_pending = false;
+                let total = web.len();
+                let n = enrich_listing(&mut self.playlists, web);
+                log::info!("[biblioteca] la Web API completó {n} de {} playlists ({total} en su listado)", self.playlists.len());
+                self.playlists_web_at = crate::cache::now_secs();
+                self.playlists_web_ids = self.playlists.iter().map(|p| p.id.clone()).collect();
                 self.snapshot_dirty = true;
             }
             Resp::PlaylistMeta(mut p) => {
@@ -4004,6 +4547,7 @@ impl App {
                         }
                         if !keep_shown && !mixed && !self.pl_rerun.contains(&list_key) {
                             self.save_list(&list_key);
+                            self.fill_list_cover(&list_key);
                         }
                     }
                 }
@@ -4137,6 +4681,7 @@ impl App {
                     // guardan: valen para su consulta, y si ella vuelve a escribirla aparece al
                     // instante.
                     if current && !(refresh && search_is_empty(&s)) {
+                        self.warm_search(&s);
                         self.cache_search(&q, s.clone());
                         self.search_result = Some(s);
                         self.search_result_for = Some(q);
@@ -4318,6 +4863,9 @@ impl App {
                 if !self.playlists.iter().any(|x| x.id == id) {
                     self.playlists.insert(0, p.clone());
                 }
+                // Llega completa de la Web API: el listado del rootlist que sale abajo no tiene
+                // que completarla otra vez.
+                self.playlists_web_ids.insert(id.clone());
                 self.playlist_meta.insert(id.clone(), p);
                 self.api.send(Req::Playlists);
                 if let Some(ed) = self.editor.take() {
@@ -4337,6 +4885,20 @@ impl App {
                 // para guardarlo con la recarga que sale ahora.
                 if let Some(p) = self.playlists.iter_mut().find(|p| p.id == id) {
                     p.snapshot_id = None;
+                    // Lo editado ya está confirmado: a la biblioteca al momento. El listado del
+                    // rootlist no trae la privacidad; sin esto quedaría la de antes del cambio.
+                    if let Req::UpdatePlaylist { name, description, public, collaborative, .. } = &r.req {
+                        p.name = name.clone();
+                        p.description = Some(description.clone()).filter(|d| !d.is_empty());
+                        match *public {
+                            Some(public) => {
+                                p.public = Some(public);
+                                p.collaborative = Some(*collaborative && !public);
+                            }
+                            None => p.collaborative = Some(*collaborative),
+                        }
+                        self.snapshot_dirty = true;
+                    }
                 }
                 match &r.req {
                     // Añadir o quitar: se aplica ya a la lista que se ve y la fresca la sustituye
@@ -4385,6 +4947,16 @@ impl App {
             Resp::User(u) => {
                 if self.diag {
                     log::info!("[diag] user: id={} nombre={:?} imgs={}", u.id, u.display_name, u.images.len());
+                }
+                // Playlists del listado del rootlist (solo trae el id del propietario) de este
+                // usuario: ya tienen nombre que enseñar sin esperar a la Web API.
+                if let Some(name) = u.display_name.as_ref().filter(|n| !n.is_empty()) {
+                    let mut changed = false;
+                    for p in self.playlists.iter_mut().filter(|p| p.owner.display_name.is_none() && p.owner.id.as_deref() == Some(u.id.as_str())) {
+                        p.owner.display_name = Some(name.clone());
+                        changed = true;
+                    }
+                    self.snapshot_dirty |= changed;
                 }
                 self.users.insert(u.id.clone(), u);
             }
@@ -4458,13 +5030,30 @@ impl App {
                 self.shows.insert(show.id.clone(), (show, episodes));
             }
             Resp::WebConnected => {
-                self.web_busy = false;
-                self.status("Web API conectada con tu app. Cargando tu biblioteca…");
-                self.reload_library();
+                let personal = matches!(r.req, Req::WebConnectPersonal(_));
+                if personal {
+                    self.web_busy = false;
+                } else {
+                    self.web_chain_done();
+                }
+                self.status(if personal {
+                    "Tu app propia está conectada. Recargando la biblioteca…"
+                } else {
+                    "Biblioteca conectada con Spotify. Cargándola…"
+                });
+                // Si la autorización llegó antes que la sesión (encadenada al iniciar sesión), la
+                // carga la hará `LoggedIn`, ya con el token nuevo.
+                if self.logged_in() {
+                    self.reload_library();
+                }
             }
             Resp::WebDisconnected => {
                 self.web_busy = false;
-                self.status("Web API desconectada");
+                self.status(if matches!(r.req, Req::WebDisconnectPersonal) {
+                    "Tu app propia está desconectada"
+                } else {
+                    "Biblioteca desconectada de Spotify"
+                });
             }
             Resp::Done => {
                 if matches!(r.req, Req::AddToQueue(_)) {
@@ -4573,6 +5162,9 @@ impl App {
         // Las listas a medias se descartan abajo: se piden de nuevo al abrirlas.
         self.list_retry.clear();
         self.playlists_loaded = false;
+        // Con la Web API recién conectada, el listado del rootlist que sale abajo se completa
+        // con ella aunque se hubiera hecho hace poco (antes pudo fallar sin ella).
+        self.playlists_web_at = 0;
         // Lo que ya se ve se conserva hasta que llegue lo nuevo: si la red falla (cuota, sin
         // conexión) la biblioteca no se queda vacía ni la instantánea se guarda a ceros.
         self.lists.retain(|k, _| k == LIKED);
@@ -4681,6 +5273,10 @@ impl App {
             self.player.remote = None;
             return;
         }
+        // Lo que suena allí no lo decodifica este equipo: `local_audio` ya no enseña nada con
+        // `remote`. No se borra: un sondeo atrasado (justo tras traer la reproducción aquí) pone
+        // `remote` un momento y, al volver a `None` sin otro TrackChanged, la etiqueta de la
+        // canción que sigue sonando aquí se habría perdido hasta la siguiente.
         self.player.remote = Some(dev.clone());
         if let Some(t) = &st.item {
             self.set_now_playing(NowPlaying::from_track(t));
@@ -4932,7 +5528,12 @@ impl App {
             if Instant::now() >= t {
                 self.restore_fallback_at = None;
                 self.restore_mark = false;
-                self.pause_after_restore = false;
+                // Si la pista transferida aún está cargando (claves lentas, reintentos), sigue
+                // valiendo que al abrir nunca suena sola: al llegar se pausa y, si falla, no se
+                // reintenta sola (`on_load_failed`, que consume la marca).
+                if self.player.state != PlayState::Loading {
+                    self.pause_after_restore = false;
+                }
                 if self.restore_pending.is_some() {
                     log::info!("[restore] la sesión de Spotify no trajo ninguna pista; se usa la copia local");
                     self.restore_local();
@@ -4965,18 +5566,45 @@ impl App {
             }
             ctx.request_repaint_after(Duration::from_secs(1));
         }
-        // Vigilante: si «cargando» dura más de 20 s, la sesión con Spotify suele estar muerta
-        // (equipo dormido, red caída, sesión caducada). Se pide al backend que reconecte.
-        if self.player.state == PlayState::Loading && self.player.remote.is_none() {
-            let since = *self.loading_since.get_or_insert_with(Instant::now);
-            if since.elapsed() > Duration::from_secs(20) {
-                self.loading_since = Some(Instant::now());
-                self.backend.send(Cmd::Stalled);
+        // Mientras una canción carga aquí, los lotes de metadatos en segundo plano (una playlist
+        // de miles) esperan entre lote y lote para no ir por delante de ella en spclient.
+        let loading_here = self.player.state == PlayState::Loading && self.player.remote.is_none();
+        crate::api::set_playback_loading(loading_here);
+        // Vigilante por etapas (`watchdog`): «cargando» nunca se queda así sin más. A los 2,5 s la
+        // barra dice que va lenta; a los 8 s, si la carga no avanza, se comprueba Spirc y se pide
+        // otra vez; a los 15 s, si sigue sin avanzar, se reconecta; a los 30 s se deja de esperar
+        // con un aviso y [Reintentar]. Antes eran 20 s de «cargando» sin explicación y una
+        // reconexión que se repetía cada 20 s si la canción no podía sonar.
+        if loading_here {
+            let now = Instant::now();
+            let activity = librespot_core::ttfs::activity();
+            let watch = self.load_watch.get_or_insert_with(|| watchdog::LoadWatchdog::new(now, activity));
+            match watch.tick(now, activity) {
+                watchdog::Stage::Wait => {}
+                watchdog::Stage::Slow => self.prefetch_pending_context(),
+                watchdog::Stage::Retry => {
+                    log::warn!("[vigilante] 8 s cargando sin avanzar: se comprueba Spirc y se pide otra vez");
+                    self.skip_stuck_context();
+                    // En una Jam, volver a pedir la carga la repetiría para todos: solo el ping.
+                    let again = self.pending_load.clone().filter(|_| self.jam.is_none()).map(Box::new);
+                    self.backend.send(Cmd::RetryLoad(again));
+                }
+                watchdog::Stage::Reconnect => {
+                    log::warn!("[vigilante] 15 s cargando sin avanzar: se reconecta");
+                    // Las pistas del contexto pudieron llegar después de los 8 s: al volver, la
+                    // carga que se repite ya no espera al contexto.
+                    self.skip_stuck_context();
+                    self.backend.send(Cmd::Stalled);
+                }
+                watchdog::Stage::GiveUp => self.give_up_loading(),
             }
-            ctx.request_repaint_after(Duration::from_secs(1));
+            // A menudo: el avance se mide en ventanas de 2 s.
+            ctx.request_repaint_after(Duration::from_millis(500));
         } else {
-            self.loading_since = None;
+            self.load_watch = None;
         }
+        self.tick_failed_load(ctx);
+        self.tick_stall(ctx);
         #[cfg(windows)]
         {
             // Una sola vez, pasados 4 s: devuelve al sistema las páginas que solo se usaron al
@@ -5235,26 +5863,39 @@ impl App {
                     if let Some(p) = &p {
                         self.request_once(&format!("members:{}", p.id), Req::Members(p.id.clone()));
                     }
-                    self.editor = Some(match p {
-                        Some(p) => PlaylistEditor {
-                            id: Some(p.id.clone()),
-                            name: p.name.clone(),
-                            description: p.description.clone().unwrap_or_default(),
-                            public: p.public.unwrap_or(true),
-                            collaborative: p.collaborative.unwrap_or(false),
-                            image_path: None,
-                            busy: false,
-                        },
+                    let editor = match p {
+                        Some(p) => {
+                            // La privacidad, de donde se sepa (la copia que se pasa puede no traerla).
+                            let public = p
+                                .public
+                                .or_else(|| self.playlists.iter().find(|x| x.id == p.id).and_then(|x| x.public))
+                                .or_else(|| self.playlist_meta.get(&p.id).and_then(|x| x.public));
+                            let collaborative = p.collaborative.unwrap_or(false);
+                            PlaylistEditor {
+                                id: Some(p.id.clone()),
+                                name: p.name.clone(),
+                                description: p.description.clone().unwrap_or_default(),
+                                // Sin saberla, se ve como la deja la colaboración (colaborativa
+                                // es privada) y no se envía al guardar.
+                                public: public.unwrap_or(!collaborative),
+                                public_known: public.is_some(),
+                                collaborative,
+                                image_path: None,
+                                busy: false,
+                            }
+                        }
                         None => PlaylistEditor {
                             id: None,
                             name: "Nueva playlist".to_string(),
                             description: String::new(),
                             public: true,
+                            public_known: true,
                             collaborative: false,
                             image_path: None,
                             busy: false,
                         },
-                    });
+                    };
+                    self.editor = Some(editor);
                 }
                 Action::PickPlaylistImage(id) => {
                     if let Some(path) = pick_image_file() {
@@ -5539,8 +6180,9 @@ impl App {
                 index: None,
                 shuffle: self.player.shuffle,
                 resume: Some(0),
+                first: None,
             },
-            _ => Cmd::LoadTracks { uris: vec![last.track_uri.clone()], index: Some(0), shuffle: false, resume: Some(0) },
+            _ => Cmd::LoadTracks { uris: vec![last.track_uri.clone()], index: Some(0), shuffle: false, resume: Some(0), first: None },
         };
         self.last_play = match &last.context_uri {
             Some(uri) if !uri.is_empty() && uri != "-" => Some(PlayTarget::Context { uri: uri.clone(), track_uri: Some(last.track_uri.clone()), index: None, shuffle: self.player.shuffle }),
@@ -5817,8 +6459,9 @@ impl App {
                 index: None,
                 shuffle,
                 resume: Some(pos),
+                first: None,
             },
-            None => Cmd::LoadTracks { uris: vec![item.uri.clone()], index: Some(0), shuffle: false, resume: Some(pos) },
+            None => Cmd::LoadTracks { uris: vec![item.uri.clone()], index: Some(0), shuffle: false, resume: Some(pos), first: None },
         };
         if let Some(uri) = &ctx {
             self.last_play = Some(PlayTarget::Context { uri: uri.clone(), track_uri: Some(item.uri.clone()), index: None, shuffle });
@@ -5874,11 +6517,12 @@ impl App {
                 index: None,
                 shuffle: info.shuffle,
                 resume: Some(pos),
+                first: None,
             }
         } else {
             let mut uris = vec![info.track_uri.clone()];
             uris.extend(info.next.iter().filter(|u| !info.queue.contains(u)).cloned());
-            Cmd::LoadTracks { uris, index: Some(0), shuffle: false, resume: Some(pos) }
+            Cmd::LoadTracks { uris, index: Some(0), shuffle: false, resume: Some(pos), first: None }
         };
         if let Cmd::LoadContext { uri, track_uri, index, shuffle, .. } = &cmd {
             self.last_play = Some(PlayTarget::Context { uri: uri.clone(), track_uri: track_uri.clone(), index: *index, shuffle: *shuffle });
@@ -5956,10 +6600,11 @@ impl App {
                 index: None,
                 shuffle,
                 resume: Some(pos),
+                first: None,
             },
             PlayTarget::Tracks { uris, index, shuffle } => {
                 let index = uris.iter().position(|u| u == &saved.now.uri).map(|i| i as u32).or(index);
-                Cmd::LoadTracks { uris, index, shuffle, resume: Some(pos) }
+                Cmd::LoadTracks { uris, index, shuffle, resume: Some(pos), first: None }
             }
         };
         self.backend.send(cmd);
@@ -6001,12 +6646,13 @@ impl App {
                 index: None,
                 shuffle,
                 resume: Some(point.pos),
+                first: None,
             },
             Some(PlayTarget::Tracks { uris, .. }) if uris.contains(&now.uri) => {
                 let index = uris.iter().position(|u| u == &now.uri).map(|i| i as u32);
-                Cmd::LoadTracks { uris, index, shuffle, resume: Some(point.pos) }
+                Cmd::LoadTracks { uris, index, shuffle, resume: Some(point.pos), first: None }
             }
-            _ => Cmd::LoadTracks { uris: vec![now.uri.clone()], index: Some(0), shuffle: false, resume: Some(point.pos) },
+            _ => Cmd::LoadTracks { uris: vec![now.uri.clone()], index: Some(0), shuffle: false, resume: Some(point.pos), first: None },
         };
         self.backend.send(cmd);
         let (context, track) = match self.player.repeat {
@@ -6032,6 +6678,376 @@ impl App {
             point.pos,
             if point.playing { "sonando" } else { "en pausa" }
         );
+    }
+
+    /// La canción pedida (`uri`) no se pudo cargar. Un fallo pasajero (Spotify frenando las
+    /// claves o las peticiones, la red) ya no se trata como «no disponible»: Spirc la deja en
+    /// pausa en su posición, sin marcarla ni saltar, y aquí se reintenta sola a los 15 s y a los
+    /// 60 s; si tampoco, queda el aviso con [Reintentar] y [Saltar]. Uno definitivo se avisa y
+    /// Spirc pasa a la siguiente (o se detiene si ya van varias seguidas).
+    fn on_load_failed(&mut self, uri: String, reason: librespot_playback::player::LoadFailure, transient: bool, play: bool) {
+        use player_bar::{PlaybackError, PlaybackErrorKind};
+        let name = self.known_track_name(&uri);
+        log::warn!(
+            "[reproducción] no se pudo cargar {uri} ({reason}; {})",
+            if transient { "pasajero" } else { "definitivo" }
+        );
+        // La carga de la restauración terminó, aunque sin sonar: ya no se está restaurando (antes
+        // la marca solo la quitaba `TrackChanged`, que no llega nunca si la canción no carga). La
+        // canción queda en pausa para «Reproducir» y la cola de su contexto se pide como al
+        // cargar. Si la trajo la sesión de Spotify, la copia local de respaldo ya no hace falta:
+        // sí trajo una pista.
+        if std::mem::take(&mut self.restore_mark) {
+            if self.restore_fallback_at.take().is_some() {
+                self.restore_pending = None;
+            }
+            self.queue_retry = Some((Instant::now() + Duration::from_millis(300), 0));
+        }
+        // ¿Era la recarga (o un reintento) de una canción cortada por la red, y sigue sin red?
+        let stalled_here = transient
+            && matches!(reason, librespot_playback::player::LoadFailure::Network(_))
+            && self.stall.as_ref().is_some_and(|s| s.is(&uri));
+        if !stalled_here {
+            // Otro motivo (o definitivo): ya no es un corte de red que esperar.
+            self.stall = None;
+        }
+        if !transient {
+            self.load_retry = None;
+            self.playback_error = Some(PlaybackError::new(PlaybackErrorKind::Skipped, player_bar::skipped_text(&reason, name.as_deref())));
+            return;
+        }
+        // Spirc la dejó en pausa, en su posición. Si la barra aún enseña la anterior (un
+        // «siguiente» o el paso automático: `TrackChanged` llega al empezar a sonar), pasa a
+        // enseñar esta, que es la que está en pausa y la que se reintenta.
+        // La cortada por la red puede verse con otro id (relinking, `StallRecovery::alias`): es
+        // la misma, no se cambia la barra.
+        let same = |n: &NowPlaying| n.uri == uri || self.stall.as_ref().is_some_and(|s| s.is(&uri) && s.is(&n.uri));
+        if self.player.now.as_ref().is_none_or(|n| !same(n)) {
+            if let Some(track) = self.known_track(&uri).cloned() {
+                self.player.now = Some(NowPlaying::from_track(&track));
+                self.player.liked = track.id.as_ref().map(|id| self.liked_set.contains(id));
+                self.player.audio = None;
+                self.player.position_ms = 0;
+                self.now_optimistic = true;
+            }
+        }
+        // Spirc ya la tiene (en pausa): «reproducir» debe pedírsela a él, que la recarga en su
+        // posición, y no empezar de cero la canción de la instantánea como si aún no hubiera nada.
+        self.now_placeholder = false;
+        self.player.state = PlayState::Paused;
+        self.player.position_at = None;
+        self.media_dirty = true;
+        // Una carga en pausa (restaurar al abrir) no se reintenta sola: al abrir nunca suena
+        // nada sin pedirlo. «Reproducir» la vuelve a cargar. Lo que iba a sonar (también lo que
+        // se retomaba sonando tras una reconexión o una actualización) sí. El «reproducir
+        // pendiente» de esa carga se consume aquí: si quedara puesto, la próxima pausa la
+        // reanudaría sola.
+        // Igual con «pausar al llegar» de la restauración: esa carga ya terminó, y si quedara
+        // puesta la próxima canción que se pidiera se pausaría sola al empezar.
+        let play_after_restore = std::mem::take(&mut self.play_after_restore);
+        let pause_after_restore = std::mem::take(&mut self.pause_after_restore);
+        let wants_play = (play && !pause_after_restore) || play_after_restore;
+        if stalled_here {
+            // Sigue sin red: se mantiene el aviso del corte y sus reintentos (cada uno vuelve a
+            // cargar la canción en su segundo: Spirc la tiene como carga fallida).
+            self.load_retry = None;
+            let step = self.stall.as_mut().map(|s| s.on_failed_attempt(Instant::now()));
+            self.apply_stall_step(step);
+            return;
+        }
+        if !wants_play {
+            self.load_retry = None;
+            return;
+        }
+        let failures = match &self.load_retry {
+            Some(r) if r.uri == uri => r.failures,
+            _ => 0,
+        }
+        .saturating_add(1);
+        match player_bar::load_retry_delay(failures) {
+            Some(delay) => {
+                log::info!("[reproducción] reintento automático en {} s (fallo {failures})", delay.as_secs());
+                self.load_retry = Some(LoadRetry { uri, failures, at: Some(Instant::now() + delay) });
+                self.playback_error = Some(PlaybackError::new(PlaybackErrorKind::Retrying, player_bar::retrying_text(&reason, name.as_deref())));
+            }
+            None => {
+                // Sin más reintentos: parada, a la espera de [Reintentar] o [Saltar]. Spirc la
+                // sigue teniendo en pausa, así que el botón de reproducir también la recarga.
+                self.load_retry = None;
+                self.player.state = PlayState::Stopped;
+                self.playback_error = Some(PlaybackError::new(PlaybackErrorKind::Failed, player_bar::failed_text(name.as_deref())));
+            }
+        }
+    }
+
+    /// Algo suena: el aviso de un fallo (salvo el que solo informa de un salto, que se va solo) y
+    /// el reintento pendiente sobran. Una canción cortada por la red vuelve a sonar: se recuerda
+    /// un rato por si se corta otra vez enseguida (`watchdog::StallRecovery`).
+    fn playback_recovered(&mut self) {
+        self.load_retry = None;
+        self.stuck_load = None;
+        self.output_lost = None;
+        if let Some(stall) = self.stall.as_mut() {
+            stall.on_playing(Instant::now());
+        }
+        if self.playback_error.as_ref().is_some_and(|e| e.kind != player_bar::PlaybackErrorKind::Skipped) {
+            self.playback_error = None;
+        }
+    }
+
+    /// El usuario cambia de canción: lo pendiente de la anterior ya no aplica.
+    fn forget_failed_load(&mut self) {
+        self.load_retry = None;
+        self.playback_error = None;
+        self.stall = None;
+        self.stuck_load = None;
+        // Lo nuevo se vigila desde cero (sin heredar los segundos de la carga anterior).
+        self.load_watch = None;
+    }
+
+    /// El usuario pausa: una canción cortada por la red ya no se reanuda sola, y el aviso que lo
+    /// prometía sobra.
+    fn forget_stall(&mut self) {
+        if self.stall.take().is_some()
+            && self.playback_error.as_ref().is_some_and(|e| e.kind == player_bar::PlaybackErrorKind::Stalled)
+        {
+            self.playback_error = None;
+        }
+    }
+
+    /// La red se cortó a media canción (`Event::Stalled`): Spirc y el reproductor la tienen en
+    /// pausa en `position_ms`, lo último que se oyó, sin saltar. Se reintenta sola (3, 6, 12 y
+    /// luego cada 30 s); si tras dos intentos no llegan datos, o vuelve a sonar y se corta
+    /// enseguida dos veces, se recarga entera en su segundo (el enlace del audio pudo caducar).
+    fn on_stalled(&mut self, uri: String, position_ms: u32) {
+        let now = Instant::now();
+        log::warn!("[reproducción] se cortó la red en {uri} a {position_ms} ms; en pausa hasta que vuelva");
+        self.player.state = PlayState::Paused;
+        self.player.position_ms = position_ms;
+        self.player.position_at = None;
+        self.media_dirty = true;
+        self.load_retry = None;
+        let step = match self.stall.as_mut().filter(|s| s.is(&uri)) {
+            Some(stall) => Some(stall.on_stalled(position_ms, now)),
+            None => {
+                // El corte es siempre de la que suena, que la barra puede enseñar con otro id
+                // (relinking): se sigue con ese, y el pedido queda como alias. Antes no casaban
+                // y el reintento automático se descartaba sin decir nada.
+                let shown = self.player.now.as_ref().map(|n| n.uri.clone()).filter(|u| *u != uri && !self.now_optimistic);
+                let stall = match shown {
+                    Some(shown) => {
+                        let mut s = watchdog::StallRecovery::new(shown, position_ms, now);
+                        s.alias = Some(uri);
+                        s
+                    }
+                    None => watchdog::StallRecovery::new(uri, position_ms, now),
+                };
+                let first = stall.due_in(now).map(watchdog::StallStep::Retry);
+                self.stall = Some(stall);
+                first
+            }
+        };
+        self.apply_stall_step(step);
+    }
+
+    /// Lo que toca tras un corte o un intento fallido de reanudar (`watchdog::StallStep`).
+    fn apply_stall_step(&mut self, step: Option<watchdog::StallStep>) {
+        let Some(stall) = self.stall.as_ref() else { return };
+        let name = self.known_track_name(&stall.uri);
+        let pos = stall.position_ms;
+        match step {
+            Some(watchdog::StallStep::Retry(delay)) => {
+                log::info!("[reproducción] se intentará seguir en {} s", delay.as_secs());
+                self.player.state = PlayState::Paused;
+                self.playback_error = Some(player_bar::PlaybackError::new(
+                    player_bar::PlaybackErrorKind::Stalled,
+                    player_bar::stalled_text(pos),
+                ));
+            }
+            Some(watchdog::StallStep::Reload) => {
+                // Con el enlace viejo los datos no volverían: Spirc la carga otra vez desde cero,
+                // en su segundo y sonando (fichero y enlace nuevos). Sin pasar por la reconexión:
+                // aquella vuelve a cargar el contexto (aleatorio nuevo) y a añadir la cola manual,
+                // que en este Spirc sigue ahí y quedaría repetida.
+                log::info!("[reproducción] tras el corte no llegan datos: se vuelve a cargar en {pos} ms");
+                self.playback_error = Some(player_bar::PlaybackError::new(
+                    player_bar::PlaybackErrorKind::Stalled,
+                    player_bar::stalled_text(pos),
+                ));
+                self.load_watch = None;
+                self.backend.send(Cmd::Reload);
+                self.player.state = PlayState::Loading;
+            }
+            Some(watchdog::StallStep::GiveUp) | None => {
+                // Demasiado sin red: se deja de intentar solo. Spirc la sigue teniendo en pausa,
+                // así que [Reintentar] o reproducir siguen sirviendo.
+                log::warn!("[reproducción] la red no vuelve: se deja de reintentar solo");
+                self.stall = None;
+                self.player.state = PlayState::Paused;
+                self.playback_error = Some(player_bar::PlaybackError::new(
+                    player_bar::PlaybackErrorKind::Failed,
+                    player_bar::failed_text(name.as_deref()),
+                ));
+            }
+        }
+        self.media_dirty = true;
+    }
+
+    /// Reintento de una canción cortada por la red, cuando toca o con [Reintentar]: «reproducir»
+    /// la reanuda desde su segundo si ya llegan datos; si no, llega otro `Stalled`.
+    fn retry_stall_now(&mut self) {
+        if let Some(stall) = self.stall.as_mut() {
+            stall.at = None;
+        }
+        self.load_watch = None;
+        self.backend.send(Cmd::Play);
+        self.player.state = PlayState::Loading;
+        self.media_dirty = true;
+    }
+
+    /// Reintentos de una canción cortada por la red y olvidarla cuando ya suena bien.
+    fn tick_stall(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let Some(stall) = self.stall.as_ref() else { return };
+        if stall.settled(now) {
+            self.stall = None;
+            return;
+        }
+        let Some(left) = stall.due_in(now) else { return };
+        if !left.is_zero() {
+            ctx.request_repaint_after(left);
+            return;
+        }
+        let here = self.player.now.as_ref().is_some_and(|n| stall.is(&n.uri));
+        let reconnecting = self.reconnect_resume.is_some() || !self.logged_in();
+        let waiting = here && self.player.state == PlayState::Paused && self.player.remote.is_none();
+        if reconnecting {
+            // Reconectando: al volver se retoma sonando (`Reconnecting`); hasta entonces se espera.
+            if let Some(stall) = self.stall.as_mut() {
+                stall.at = Some(now + Duration::from_secs(5));
+            }
+            ctx.request_repaint_after(Duration::from_secs(5));
+        } else if waiting {
+            log::info!("[reproducción] se intenta seguir tras el corte de la red");
+            self.retry_stall_now();
+        } else if let Some(stall) = self.stall.as_mut() {
+            // Ya no espera (se pidió a mano, suena otra cosa, otro dispositivo): no se insiste.
+            stall.at = None;
+        }
+    }
+
+    /// 30 s en «cargando» (`watchdog::GIVE_UP_AFTER`): se deja de esperar y se dice, con
+    /// [Reintentar] (vuelve a pedir lo mismo) y [Saltar]. Si la carga termina más tarde, llega en
+    /// pausa: nadie espera ya a que suene de golpe.
+    fn give_up_loading(&mut self) {
+        let name = self.player.now.as_ref().map(|n| n.name.clone());
+        log::warn!("[vigilante] 30 s cargando: se deja de esperar ({})", name.as_deref().unwrap_or("?"));
+        self.stuck_load = self.pending_load.take();
+        // Lo que se retome al reconectar, en pausa; la reproducción pendiente tras restaurar, igual.
+        if let Some(point) = self.reconnect_resume.as_mut() {
+            point.playing = false;
+        }
+        self.play_after_restore = false;
+        self.load_retry = None;
+        self.stall = None;
+        self.backend.send(Cmd::Pause);
+        self.player.state = PlayState::Stopped;
+        self.player.position_at = None;
+        self.media_dirty = true;
+        self.playback_error = Some(player_bar::PlaybackError::new(
+            player_bar::PlaybackErrorKind::Stuck,
+            player_bar::stuck_text(name.as_deref()),
+        ));
+    }
+
+    /// [Reintentar] tras dejar de esperar una carga: se pide otra vez lo mismo (o, si mientras
+    /// tanto llegó cargada en pausa o se está reconectando, que suene).
+    fn retry_stuck_load(&mut self) {
+        self.playback_error = None;
+        self.load_watch = None;
+        if let Some(point) = self.reconnect_resume.as_mut() {
+            point.playing = true;
+        } else if let Some(cmd) = self.stuck_load.take().filter(|_| self.player.state != PlayState::Paused) {
+            self.pending_load = Some(cmd.clone());
+            self.backend.send(cmd);
+        } else {
+            self.stuck_load = None;
+            self.backend.send(Cmd::Play);
+        }
+        self.player.state = PlayState::Loading;
+        self.media_dirty = true;
+    }
+
+    /// [Reintentar] del aviso, o el reintento automático: Spirc tiene la canción en pausa sin
+    /// nada cargado y «reproducir» la vuelve a cargar en su posición.
+    fn retry_failed_load(&mut self) {
+        if let Some(r) = self.load_retry.as_mut() {
+            // Los fallos siguen contando: si vuelve a fallar, toca el siguiente reintento.
+            r.at = None;
+        }
+        self.load_watch = None;
+        if self.playback_error.as_ref().is_some_and(|e| e.kind == player_bar::PlaybackErrorKind::Failed) {
+            self.playback_error = None;
+        }
+        self.backend.send(Cmd::Play);
+        self.player.state = PlayState::Loading;
+        self.media_dirty = true;
+    }
+
+    /// [Saltar] del aviso: la siguiente, sonando. Spirc tiene la fallida en pausa, así que la
+    /// siguiente cargaría en pausa: se pide reproducir detrás.
+    fn skip_failed_load(&mut self) {
+        self.forget_failed_load();
+        self.next();
+        self.backend.send(Cmd::Play);
+        self.player.state = PlayState::Loading;
+        self.media_dirty = true;
+    }
+
+    /// Lo pendiente de una canción que no se pudo cargar: el reintento automático cuando toca y
+    /// quitar el aviso que solo informaba.
+    fn tick_failed_load(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if let Some(at) = self.load_retry.as_ref().and_then(|r| r.at) {
+            if now < at {
+                ctx.request_repaint_after(at - now);
+            } else if self.reconnect_resume.is_some() || !self.logged_in() {
+                // Reconectando: no hay reproductor al que pedírselo; se espera a que vuelva.
+                if let Some(r) = self.load_retry.as_mut() {
+                    r.at = Some(now + Duration::from_secs(5));
+                }
+                ctx.request_repaint_after(Duration::from_secs(5));
+            } else if self.player.state == PlayState::Paused && self.player.remote.is_none() {
+                log::info!("[reproducción] reintento automático de la canción que no se pudo cargar");
+                self.retry_failed_load();
+            } else if let Some(r) = self.load_retry.as_mut() {
+                // Ya no está esperando (se pidió a mano o suena otra cosa): no se insiste.
+                r.at = None;
+            }
+        }
+        if self.playback_error.as_ref().is_some_and(|e| e.expired(now)) {
+            self.playback_error = None;
+        } else if let Some(left) = self.playback_error.as_ref().and_then(|e| e.remaining(now)) {
+            ctx.request_repaint_after(left);
+        }
+    }
+
+    /// Nombre de una canción que ya está en pantalla (la que suena, listas, álbumes, cola,
+    /// búsqueda o historial), para los avisos.
+    fn known_track_name(&self, uri: &str) -> Option<String> {
+        if let Some(now) = self.player.now.as_ref().filter(|n| n.uri == uri) {
+            return Some(now.name.clone());
+        }
+        self.known_track(uri).map(|t| t.name.clone())
+    }
+
+    /// Una canción que ya tenemos en pantalla (listas, álbumes, cola, búsqueda o historial).
+    fn known_track(&self, uri: &str) -> Option<&Track> {
+        let lists = self.lists.values().flat_map(|l| l.tracks.iter());
+        let albums = self.albums.values().filter_map(|a| a.tracks.as_ref()).flat_map(|p| p.items.iter());
+        let queue = self.queue.iter().flat_map(|q| q.queue.iter());
+        let search = self.search_result.iter().filter_map(|r| r.tracks.as_ref()).flat_map(|p| p.items.iter());
+        lists.chain(albums).chain(queue).chain(search).chain(self.recent.iter()).find(|x| x.uri == uri)
     }
 
     /// Guarda lo que suena aquí (pista, segundo, contexto, aleatorio, repetición y cola manual).
@@ -6069,6 +7085,70 @@ impl App {
         });
     }
 
+    /// La carga de un contexto cuyas pistas ya tenemos (playlist, álbum, Me gusta) como lista de
+    /// pistas sueltas, en la misma canción: Spirc no tiene que resolver el contexto en Spotify.
+    /// `None` si no es un contexto, no tenemos sus pistas o la canción pedida no está entre ellas.
+    /// Si lo que no llega es el contexto (context-resolve colgado: Spirc empezó la carga y nunca
+    /// lo tuvo), la carga pendiente pasa a ser la lista de pistas sueltas, que no lo necesita: así
+    /// se pide al reintentar y también tras reconectar. Solo si ya tenemos las pistas.
+    fn skip_stuck_context(&mut self) {
+        if self.jam.is_some() {
+            return;
+        }
+        let suspect = librespot_core::ttfs::snapshot().is_some_and(|b| {
+            b.outcome == librespot_core::ttfs::Outcome::Pending && watchdog::context_suspect(b.phases.iter().map(|p| p.name))
+        });
+        if !suspect {
+            return;
+        }
+        if let Some(tracks) = self.pending_load.as_ref().and_then(|c| self.as_track_list(c)) {
+            log::warn!("[vigilante] Spotify no devuelve el contexto: se pide como lista de pistas");
+            self.pending_load = Some(tracks);
+        }
+    }
+
+    /// La carga va lenta (2,5 s): si es de un álbum o una playlist cuyas pistas no tenemos (se
+    /// pulsó desde una tarjeta, sin abrir su página), se piden ya por los metadatos, que no pasan
+    /// por context-resolve. Así, si lo que no llega es el contexto, a los 8 s el vigilante puede
+    /// pedir la carga como lista de pistas (`as_track_list`) en vez de repetir la misma espera.
+    fn prefetch_pending_context(&mut self) {
+        if self.jam.is_some() {
+            return;
+        }
+        let Some(cmd) = self.pending_load.as_ref() else { return };
+        let Cmd::LoadContext { uri, .. } = cmd else { return };
+        if self.as_track_list(cmd).is_some() {
+            return;
+        }
+        let Some((key, kind)) = ctx_list_key(uri) else { return };
+        match kind {
+            CtxKind::Playlist => self.load_playlist(&key, true, false),
+            // La misma clave que la página: una sola petición entre todos.
+            CtxKind::Album => self.request_once(&format!("album:{key}"), Req::Album(key)),
+            CtxKind::Liked => {}
+        }
+    }
+
+    fn as_track_list(&self, cmd: &Cmd) -> Option<Cmd> {
+        let Cmd::LoadContext { uri, track_uri, index, shuffle, resume, first } = cmd else { return None };
+        // La misma correspondencia contexto → lista que la cola del contexto (también «Me
+        // gusta» como `spotify:user:…:collection`; emisoras y artistas no tienen lista propia).
+        let (key, kind) = ctx_list_key(uri)?;
+        let tracks = match kind {
+            CtxKind::Album => self.albums.get(&key).and_then(|a| a.tracks.as_ref()).map(|p| &p.items),
+            CtxKind::Playlist | CtxKind::Liked => self.lists.get(&key).map(|l| &l.tracks),
+        }?;
+        let uris: Vec<String> = tracks.iter().map(|t| t.uri.clone()).collect();
+        let index = match (track_uri, index) {
+            (Some(t), _) => Some(uris.iter().position(|u| u == t)? as u32),
+            // Un índice fuera de lo que tenemos empezaría por otra canción: mejor no convertir.
+            (None, Some(i)) if (*i as usize) >= uris.len() => return None,
+            (None, Some(i)) => Some(*i),
+            (None, None) => None,
+        };
+        (!uris.is_empty()).then_some(Cmd::LoadTracks { uris, index, shuffle: *shuffle, resume: *resume, first: first.clone() })
+    }
+
     /// La canción con la que empezará `t`, si ya la tenemos en pantalla (lista, álbum, cola,
     /// búsqueda o historial). Con aleatorio no se sabe cuál será.
     fn target_track(&self, t: &PlayTarget) -> Option<Track> {
@@ -6087,11 +7167,83 @@ impl App {
             }
             PlayTarget::Tracks { uris, index, .. } => uris.get(index.unwrap_or(0) as usize)?.clone(),
         };
-        let lists = self.lists.values().flat_map(|l| l.tracks.iter());
-        let albums = self.albums.values().filter_map(|a| a.tracks.as_ref()).flat_map(|p| p.items.iter());
-        let queue = self.queue.iter().flat_map(|q| q.queue.iter());
-        let search = self.search_result.iter().filter_map(|r| r.tracks.as_ref()).flat_map(|p| p.items.iter());
-        lists.chain(albums).chain(queue).chain(search).chain(self.recent.iter()).find(|x| x.uri == uri).cloned()
+        self.known_track(&uri).cloned()
+    }
+
+    /// ¿Se puede precargar ahora? Con el ajuste puesto, una cuenta Premium conectada, sonando aquí
+    /// (no en otro dispositivo ni en una Jam, donde la canción la decide otro) y sin una carga en
+    /// curso, a la que no hay que quitarle red ni cupo.
+    fn warm_allowed(&self) -> bool {
+        self.settings.smart_preload
+            && self.logged_in()
+            && !self.not_premium
+            && self.player.remote.is_none()
+            && self.jam.is_none()
+            && self.player.state != PlayState::Loading
+    }
+
+    /// Una fila de canción tiene el ratón encima en este fotograma (`press`: además, su botón de
+    /// reproducir está apretado). Lo recoge `tick_warm`.
+    pub fn report_row_hover(&mut self, uri: &str, press: bool) {
+        if !warm::warmable(uri) {
+            return;
+        }
+        self.warm_hover = Some(uri.to_string());
+        if press {
+            self.warm_press = Some(uri.to_string());
+        }
+    }
+
+    /// Precarga inteligente, al final de cada fotograma: lo que vieron las filas (`report_row_hover`)
+    /// decide si se prepara una canción (`warm::WarmTracker`).
+    fn tick_warm(&mut self, ctx: &egui::Context) {
+        let hover = self.warm_hover.take();
+        let press = self.warm_press.take();
+        let (hover, press) = if self.warm_allowed() { (hover, press) } else { (None, None) };
+        let step = self.warm.frame(hover.as_deref(), press.as_deref(), Instant::now());
+        if let Some(uri) = step.press {
+            log::debug!("[precarga] botón apretado: {uri}");
+            self.backend.send(Cmd::WarmHead(uri));
+        }
+        if let Some(uri) = step.hover {
+            self.backend.send(Cmd::Warm(uri));
+        }
+        if let Some(wait) = step.wait {
+            // Con el ratón quieto no llegan eventos: sin esto no se repintaría a los 150 ms.
+            ctx.request_repaint_after(wait);
+        }
+    }
+
+    /// Precarga de los metadatos de las primeras canciones de una búsqueda (un solo lote): la que
+    /// se pulse ya no los pide.
+    fn warm_search(&mut self, s: &SearchResult) {
+        if !self.warm_allowed() {
+            return;
+        }
+        let uris: Vec<String> = s
+            .tracks
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .map(|t| t.uri.clone())
+            .filter(|u| u.starts_with("spotify:track:"))
+            .take(crate::api::WARM_META_MAX)
+            .collect();
+        if !uris.is_empty() {
+            self.api.send_bg(Req::WarmMeta(uris));
+        }
+    }
+
+    /// La canción con la que empezará `t` según Spirc, aunque no esté en pantalla: la pulsada, la
+    /// de su posición en la lista o la primera. `None` si no se sabe (aleatorio sin una elegida).
+    fn first_uri(&self, t: &PlayTarget) -> Option<String> {
+        match t {
+            PlayTarget::Context { track_uri: Some(u), .. } => Some(u.clone()),
+            PlayTarget::Context { .. } => self.target_track(t).map(|track| track.uri),
+            // Con aleatorio, Spirc empieza igualmente por la elegida (`index`).
+            PlayTarget::Tracks { uris, index: Some(i), .. } => uris.get(*i as usize).cloned(),
+            PlayTarget::Tracks { shuffle: true, .. } => None,
+            PlayTarget::Tracks { uris, .. } => uris.first().cloned(),
+        }
     }
 
     pub fn play(&mut self, t: PlayTarget) {
@@ -6100,8 +7252,14 @@ impl App {
             self.status_err("Inicia sesión para reproducir música");
             return;
         }
+        if self.not_premium && self.player.remote.is_none() {
+            self.show_not_premium();
+            return;
+        }
         self.last_play = Some(t.clone());
         self.last_play_page = Some(self.page().clone());
+        // Algo nuevo que reproducir: lo de la canción que no se pudo cargar ya no aplica.
+        self.forget_failed_load();
         self.restore_wanted = false;
         self.restore_pending = None;
         self.restore_deadline = None;
@@ -6150,10 +7308,16 @@ impl App {
             self.api.send(req);
             self.last_remote_poll = Instant::now() - Duration::from_millis(2000);
         } else {
+            // Carga en paralelo: el reproductor empieza ya con esta canción mientras Spirc resuelve
+            // el contexto (ver `Cmd::LoadContext::first`). En una Jam no: la canción la decide la
+            // sesión compartida.
+            let first = self.first_uri(&t).filter(|_| self.jam.is_none());
             if let Some(track) = self.target_track(&t) {
                 // La barra muestra ya la canción elegida; el reproductor la confirma al cargarla.
                 self.player.now = Some(NowPlaying::from_track(&track));
                 self.player.liked = track.id.as_ref().map(|id| self.liked_set.contains(id));
+                // La etiqueta de calidad era de la canción anterior.
+                self.player.audio = None;
                 self.player.position_ms = 0;
                 self.player.position_at = None;
                 self.now_optimistic = true;
@@ -6172,6 +7336,7 @@ impl App {
                     index,
                     shuffle,
                     resume: None,
+                    first,
                 },
                 PlayTarget::Tracks {
                     uris,
@@ -6182,11 +7347,13 @@ impl App {
                     index,
                     shuffle,
                     resume: None,
+                    first,
                 },
             };
             // Lo recién pedido manda sobre lo que sonaba si la conexión se cae antes de empezar.
             self.pending_load = Some(cmd.clone());
             self.reconnect_resume = None;
+            ttfs_begin("play");
             self.backend.send(cmd);
             self.player.state = PlayState::Loading;
         }
@@ -6226,8 +7393,20 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
     }
 
+    /// El aviso de cuenta sin Premium (al intentar reproducir aquí).
+    fn show_not_premium(&mut self) {
+        self.playback_error = Some(player_bar::PlaybackError::new(
+            player_bar::PlaybackErrorKind::NotPremium,
+            player_bar::NOT_PREMIUM_TEXT.to_string(),
+        ));
+    }
+
     pub fn play_pause(&mut self) {
         self.pause_after_restore = false;
+        if self.not_premium && self.player.remote.is_none() && self.player.state != PlayState::Playing {
+            self.show_not_premium();
+            return;
+        }
         if let Some(point) = self.reconnect_resume.as_mut() {
             // Reconectando: no hay reproductor al que mandar la orden; se decide cómo se
             // retomará (sonando o en pausa) y la barra lo refleja ya.
@@ -6265,28 +7444,74 @@ impl App {
             self.media_dirty = true;
         } else {
             match self.player.state {
-                PlayState::Playing => self.backend.send(Cmd::Pause),
-                PlayState::Paused => self.backend.send(Cmd::Play),
-                _ => self.backend.send(Cmd::PlayPause),
+                PlayState::Playing => {
+                    ttfs_begin("pause");
+                    self.forget_stall();
+                    self.backend.send(Cmd::Pause)
+                }
+                PlayState::Paused => {
+                    ttfs_begin("resume");
+                    self.load_watch = None;
+                    // Reanudar a mano una canción cortada por la red es su reintento: el
+                    // automático ya no hace falta (si aún no hay datos, llega otro corte).
+                    if let Some(stall) = self.stall.as_mut() {
+                        stall.at = None;
+                    }
+                    self.backend.send(Cmd::Play)
+                }
+                _ => {
+                    // Cargando: lo normal es que esto la pause (también el intento de seguir
+                    // tras un corte de red, que entonces ya no se reanuda solo).
+                    self.forget_stall();
+                    self.backend.send(Cmd::PlayPause)
+                }
             }
         }
     }
 
     pub fn next(&mut self) {
+        // Otra canción: el aviso y el reintento de la que no se pudo cargar ya no aplican.
+        let resume = self.failed_load_wanted_play();
+        self.forget_failed_load();
         if self.player.remote.is_some() {
             self.api.send(Req::RemoteNext);
             self.last_remote_poll = Instant::now() - Duration::from_millis(2200);
         } else {
-            self.backend.send(Cmd::Next);
+            ttfs_begin("next");
+            self.backend.send(Cmd::Next { auto: false });
+            self.resume_after_failed_load(resume);
         }
     }
 
     pub fn prev(&mut self) {
+        let resume = self.failed_load_wanted_play();
+        self.forget_failed_load();
         if self.player.remote.is_some() {
             self.api.send(Req::RemotePrev);
             self.last_remote_poll = Instant::now() - Duration::from_millis(2200);
         } else {
+            ttfs_begin("prev");
             self.backend.send(Cmd::Prev);
+            self.resume_after_failed_load(resume);
+        }
+    }
+
+    /// ¿Hay una canción que iba a sonar y no se pudo cargar por algo pasajero (en espera de
+    /// reintento o ya sin reintentos)? Spirc la tiene en pausa aunque nadie la pausó.
+    fn failed_load_wanted_play(&self) -> bool {
+        self.load_retry.is_some()
+            || self.stall.is_some()
+            || self.playback_error.as_ref().is_some_and(|e| e.kind == player_bar::PlaybackErrorKind::Failed)
+    }
+
+    /// Tras «siguiente» o «anterior» desde una carga fallida que iba a sonar: Spirc cargaría la
+    /// otra en pausa (la fallida quedó en pausa) y, con varios «siguiente» seguidos, la música
+    /// acabaría parada sin que nadie la parase. Se pide reproducir detrás, como con [Saltar].
+    fn resume_after_failed_load(&mut self, resume: bool) {
+        if resume {
+            self.backend.send(Cmd::Play);
+            self.player.state = PlayState::Loading;
+            self.media_dirty = true;
         }
     }
 
@@ -6299,7 +7524,19 @@ impl App {
             // Reconectando: se retomará desde aquí.
             point.pos = ms;
         } else {
+            ttfs_begin("seek");
             self.backend.send(Cmd::Seek(ms));
+            // Cortada por la red: seguirá desde el punto nuevo (el reproductor lo apunta sin
+            // esperar a la red), y el aviso lo dice.
+            if let Some(stall) = self.stall.as_mut() {
+                stall.position_ms = ms;
+                if self.playback_error.as_ref().is_some_and(|e| e.kind == player_bar::PlaybackErrorKind::Stalled) {
+                    self.playback_error = Some(player_bar::PlaybackError::new(
+                        player_bar::PlaybackErrorKind::Stalled,
+                        player_bar::stalled_text(ms),
+                    ));
+                }
+            }
         }
         self.media_dirty = true;
     }
@@ -6442,6 +7679,7 @@ impl App {
         } else if let Some(id) = d.id.clone() {
             self.api.send(Req::Transfer { device_id: id });
             self.status(format!("Reproduciendo en {}", d.name));
+            // `local_audio` ya oculta la etiqueta; si el traspaso falla y sigue sonando aquí, vuelve.
             self.player.remote = Some(d);
             self.last_remote_poll = Instant::now() - Duration::from_millis(1500);
         }
@@ -6598,10 +7836,22 @@ impl App {
     }
 
     pub fn save_settings(&mut self, ctx: &egui::Context) {
-        let restart = self.settings.playback_differs(&self.draft);
+        let restart = self.settings.restart_differs(&self.draft);
+        let audio = self.settings.audio_differs(&self.draft);
+        let quality_changed = self.settings.quality != self.draft.quality;
+        let volume_changed = self.settings.normalisation != self.draft.normalisation
+            || self.settings.loudness != self.draft.loudness;
         let media_changed = self.settings.media_keys != self.draft.media_keys;
         self.draft.zoom = self.draft.zoom.clamp(0.7, 2.0);
         self.draft.fps_cap = self.draft.fps_cap.clamp(30, 480);
+        self.draft.crossfade_secs = self.draft.crossfade_secs.clamp(crate::config::CROSSFADE_SECS_MIN, crate::config::CROSSFADE_SECS_MAX);
+        // El interruptor y el deslizador ya lo aplican al instante (`set_crossfade`); esto cubre
+        // el borrador cambiado por otra vía (el modo de control parchea ajustes y guarda).
+        let crossfade_changed = self.settings.crossfade_differs(&self.draft);
+        if quality_changed {
+            // Lo preparado por la precarga inteligente era el fichero de la calidad anterior.
+            self.warm.forget();
+        }
         self.settings = self.draft.clone();
         self.settings.save(&self.paths);
         self.apply_theme(ctx);
@@ -6614,9 +7864,28 @@ impl App {
             self.media_dirty = true;
         }
         if restart && self.logged_in() {
+            // El reinicio arranca con todos los ajustes nuevos, también los de audio.
             self.backend.send(Cmd::Restart(self.settings.clone()));
+            self.status("Ajustes guardados");
+        } else if audio || restart {
+            // Calidad, gapless y volumen se aplican sin cortar la música. Sin sesión (o
+            // reconectando) el backend solo guarda la copia, y la conexión siguiente ya la usa.
+            self.backend.send(Cmd::AudioTuning(self.settings.clone()));
+            self.status(match (quality_changed, volume_changed) {
+                (true, true) => "Calidad aplicada desde la próxima canción que se cargue; el volumen, al instante",
+                (true, false) => "Calidad aplicada desde la próxima canción que se cargue",
+                (false, true) => "Volumen aplicado al instante",
+                (false, false) => "Ajustes guardados",
+            });
+        } else {
+            self.status("Ajustes guardados");
         }
-        self.status("Ajustes guardados");
+        // Tras un `Restart` también: el backend ya crea el reproductor nuevo con el fundido en
+        // vigor, pero así queda garantizado por el orden de las órdenes aunque eso cambie (con el
+        // temporizador «al terminar la canción» puesto debe seguir a 0).
+        if crossfade_changed || (restart && self.logged_in()) {
+            self.sync_crossfade();
+        }
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -6784,6 +8053,7 @@ impl crate::shell::UiApp for App {
                 .show(ui, |ui| self.player_bar(ui));
             self.overlays(&ctx);
             self.apply_actions(&ctx);
+            self.tick_warm(&ctx);
             self.images.end_frame();
             return;
         }
@@ -6858,8 +8128,11 @@ impl crate::shell::UiApp for App {
                     });
             });
 
+        // Encima de la barra del reproductor (no en el miniplayer, que es solo la barra).
+        self.playback_error_banner(&ctx);
         self.overlays(&ctx);
         self.apply_actions(&ctx);
+        self.tick_warm(&ctx);
         self.images.end_frame();
     }
 

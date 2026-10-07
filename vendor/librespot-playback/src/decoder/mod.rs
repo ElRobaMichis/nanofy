@@ -16,6 +16,17 @@ pub enum DecoderError {
     PassthroughDecoder(String),
     #[error("Symphonia Decoder Error: {0}")]
     SymphoniaDecoder(String),
+    /// Nanofy: no se pudo leer el fichero (la CDN dejó de entregar datos a tiempo), no que el
+    /// audio esté mal. El reproductor lo distingue para no saltar la canción por un corte de red.
+    #[error("Decoder I/O Error: {0}")]
+    Io(String),
+}
+
+impl DecoderError {
+    /// Falló la lectura del fichero, no la decodificación (ver `DecoderError::Io`).
+    pub fn is_io(&self) -> bool {
+        matches!(self, DecoderError::Io(_))
+    }
 }
 
 pub type DecoderResult<T> = Result<T, DecoderError>;
@@ -87,6 +98,10 @@ impl From<DecoderError> for librespot_core::error::Error {
 
 impl From<symphonia::core::errors::Error> for DecoderError {
     fn from(err: symphonia::core::errors::Error) -> Self {
-        Self::SymphoniaDecoder(err.to_string())
+        match err {
+            // Una lectura que falló (también al buscar): la red, no el audio.
+            symphonia::core::errors::Error::IoError(e) => Self::Io(e.to_string()),
+            err => Self::SymphoniaDecoder(err.to_string()),
+        }
     }
 }

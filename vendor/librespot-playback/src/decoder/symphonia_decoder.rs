@@ -92,6 +92,17 @@ impl SymphoniaDecoder {
         })
     }
 
+    /// Bits por muestra del original, si el formato los guarda (FLAC, WAV); los comprimidos con
+    /// pérdida no tienen. Para enseñar qué suena (`player::AudioSource`).
+    pub fn bits_per_sample(&self) -> Option<u32> {
+        self.decoder.codec_params().bits_per_sample
+    }
+
+    /// Frecuencia del original (`new` solo acepta 44,1 kHz).
+    pub fn sample_rate(&self) -> Option<u32> {
+        self.decoder.codec_params().sample_rate
+    }
+
     pub fn normalisation_data(&mut self) -> Option<NormalisationData> {
         let metadata = symphonia_util::get_latest_metadata(&mut self.probe_result)?;
         let tags = metadata.current()?.tags();
@@ -227,7 +238,9 @@ impl AudioDecoder for SymphoniaDecoder {
                     if err.kind() == io::ErrorKind::UnexpectedEof {
                         return Ok(None);
                     } else {
-                        return Err(DecoderError::SymphoniaDecoder(err.to_string()));
+                        // Nanofy: con su propia variante, para no tomar un corte de red por un
+                        // fichero roto (el reproductor deja la canción en pausa en vez de saltarla).
+                        return Err(DecoderError::Io(err.to_string()));
                     }
                 }
                 Err(err) => {

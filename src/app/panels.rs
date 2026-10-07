@@ -1189,6 +1189,7 @@ impl App {
                 let mut public = ed.public;
                 if Self::toggle(ui, &mut public, "Playlist pública") {
                     ed.public = public;
+                    ed.public_known = true;
                     if public {
                         ed.collaborative = false;
                     }
@@ -1229,6 +1230,10 @@ impl App {
                     let mut collab = ed.collaborative;
                     if Self::toggle(ui, &mut collab, "Colaborativa (otras personas pueden añadir y quitar canciones)") {
                         ed.collaborative = collab;
+                        // Colaborativa exige privada: lo que se ve pasa a ser lo que se envía.
+                        if collab {
+                            ed.public_known = true;
+                        }
                     }
                 }
                 ui.add_space(10.0);
@@ -1288,7 +1293,7 @@ impl App {
                     id: id.clone(),
                     name: ed.name.trim().to_string(),
                     description: ed.description.trim().to_string(),
-                    public: ed.public,
+                    public: ed.public_known.then_some(ed.public),
                     collaborative: ed.collaborative,
                 }),
                 None => {

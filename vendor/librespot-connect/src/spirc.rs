@@ -1,5 +1,6 @@
 use crate::{
     LoadContextOptions, LoadRequestOptions, PlayContext,
+    cascade::{self, SkipBreaker},
     context_resolver::{ContextAction, ContextResolver, ResolveContext},
     core::{
         Error, Session, SpotifyUri,
@@ -12,12 +13,14 @@ use crate::{
         spclient::TransferRequest,
     },
     model::{LoadRequest, PlayingTrack, SpircPlayStatus},
+    start_index::{self, Wanted},
     playback::{
+        crossfade::{self, FadeOffer},
         mixer::Mixer,
-        player::{Player, PlayerEvent, PlayerEventChannel},
+        player::{Player, PlayerEvent, PlayerEventChannel, Transition},
     },
     protocol::{
-        connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
+        connect::{Cluster, ClusterUpdate, LogoutCommand, PutStateReason, SetVolumeCommand},
         context::Context,
         explicit_content_pubsub::UserAttributesUpdate,
         playlist4_external::PlaylistModificationInfo,
@@ -30,6 +33,7 @@ use crate::{
         provider::IsProvider,
         {ConnectConfig, ConnectState},
     },
+    state_sender::StateSender,
 };
 use futures_util::StreamExt;
 use librespot_protocol::context_page::ContextPage;
@@ -38,10 +42,13 @@ use std::{
     future::Future,
     sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::sleep,
+};
 
 #[derive(Debug, Error)]
 enum SpircError {
@@ -121,6 +128,26 @@ struct SpircTask {
     /// Última cola de la Jam reenviada a la interfaz (current + siguientes), para no repetir.
     jam_last_queue: Vec<String>,
 
+    /// Fundido entre canciones: `play_request_id` de la última canción cuyo fundido se aceptó. Sus
+    /// eventos aún pueden llegar antes que la carga de la siguiente, que ya va de camino, y se
+    /// ignoran: su `EndOfTrack` no debe volver a avanzar (se saltarían dos canciones).
+    crossfade_from_prid: Option<u64>,
+    /// Cómo empieza la próxima canción que cargue `load_track`: un corte, salvo que quien avanza
+    /// pida otra cosa (fundido aceptado, salto automático). La carga lo consume.
+    next_load_transition: Transition,
+    /// La canción con la que se aceptó fundir, mientras se avanza hacia ella: si la que acaba
+    /// cargando es otra, entra con un corte.
+    crossfade_to: Option<SpotifyUri>,
+
+    /// La canción actual no se pudo cargar por un fallo pasajero (Spotify frenando las claves, la
+    /// red): está en pausa pero el reproductor no tiene nada cargado, así que «reproducir» la
+    /// vuelve a cargar en su posición en vez de reanudar.
+    load_failed: bool,
+    /// Detiene la cascada de saltos cuando varias canciones seguidas fallan de verdad.
+    skip_breaker: SkipBreaker,
+    /// Envía el estado a Spotify en segundo plano (`notify`): ninguna orden espera a un PUT.
+    state_sender: StateSender,
+
     spirc_id: usize,
 }
 
@@ -133,6 +160,8 @@ enum SpircCommand {
     Pause,
     Prev,
     Next,
+    /// Como `Next`, pero sin que lo haya pedido el usuario (ver `Spirc::auto_next`).
+    AutoNext,
     VolumeUp,
     VolumeDown,
     Shutdown,
@@ -145,6 +174,30 @@ enum SpircCommand {
     Activate,
     Transfer(Option<TransferRequest>),
     Load(LoadRequest),
+    /// Nanofy: ¿atiende el bucle? Se contesta en cuanto llega su turno, sin tocar nada (ver
+    /// `Spirc::ping`).
+    Ping(oneshot::Sender<()>),
+    /// Nanofy: vuelve a cargar la canción en pausa, en su punto y sonando (ver `Spirc::reload`).
+    Reload,
+}
+
+impl SpircCommand {
+    /// Fase `ttfs` (tiempo hasta el primer sonido) en que Spirc empieza a atender la orden. Va de
+    /// una en una y cada una espera su `notify` (un PUT a connect-state): la distancia entre la
+    /// orden de la interfaz y esta marca es lo que la orden esperó su turno.
+    fn ttfs_phase(&self) -> &'static str {
+        match self {
+            SpircCommand::Activate => "spirc:activate",
+            SpircCommand::SetVolume(_) => "spirc:volume",
+            SpircCommand::Load(_) => "spirc:load",
+            SpircCommand::Next | SpircCommand::AutoNext => "spirc:next",
+            SpircCommand::Prev => "spirc:prev",
+            SpircCommand::Play | SpircCommand::PlayPause | SpircCommand::Reload => "spirc:play",
+            SpircCommand::Pause => "spirc:pause",
+            SpircCommand::SetPosition(_) => "spirc:seek",
+            _ => "spirc",
+        }
+    }
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
@@ -264,6 +317,7 @@ impl Spirc {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let player_events = player.get_player_event_channel();
+        let state_sender = StateSender::new(session.clone());
 
         let mut task = SpircTask {
             player,
@@ -300,6 +354,14 @@ impl Spirc {
             jam_participant: false,
             jam_session_id: None,
             jam_last_queue: Vec::new(),
+
+            crossfade_from_prid: None,
+            next_load_transition: Transition::Cut,
+            crossfade_to: None,
+
+            load_failed: false,
+            skip_breaker: SkipBreaker::new(),
+            state_sender,
 
             spirc_id,
         };
@@ -366,6 +428,18 @@ impl Spirc {
     /// Does nothing if we are not the active device.
     pub fn next(&self) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Next)?)
+    }
+
+    /// Skips to the next track without the user asking for it (e.g. a hidden track that just
+    /// started).
+    ///
+    /// Igual que [Spirc::next], salvo durante un fundido entre canciones: la canción anterior
+    /// sigue apagándose a su ritmo y la nueva entra con lo que le quede de rampa. Con un salto
+    /// normal los segundos que le faltaban a la anterior se perderían en 40 ms.
+    ///
+    /// Does nothing if we are not the active device.
+    pub fn auto_next(&self) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::AutoNext)?)
     }
 
     /// Increases the volume by configured steps of [ConnectConfig].
@@ -440,6 +514,24 @@ impl Spirc {
     /// Does nothing if we are not the active device.
     pub fn disconnect(&self, pause: bool) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Disconnect { pause })?)
+    }
+
+    /// Nanofy: comprueba que el bucle de Spirc sigue atendiendo órdenes. La respuesta llega
+    /// cuando le toca el turno a esta, así que si tarda es que una orden anterior está atascada
+    /// (una petición colgada tras suspender el equipo, por ejemplo) y lo que haya detrás no se
+    /// atenderá: entonces conviene reconectar en vez de repetir la carga.
+    pub fn ping(&self) -> Result<oneshot::Receiver<()>, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.commands.send(SpircCommand::Ping(tx))?;
+        Ok(rx)
+    }
+
+    /// Nanofy: vuelve a cargar desde cero la canción en pausa, en el punto en que está, y la pone
+    /// a sonar. Es lo que hace «reproducir» tras una carga fallida, para cuando el reproductor sí
+    /// tiene la canción pero su fichero ya no sirve: una canción cortada por la red cuyo enlace al
+    /// audio pudo caducar. No toca el contexto, la cola ni el aleatorio. Sin canción en pausa, nada.
+    pub fn reload(&self) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::Reload)?)
     }
 
     /// Acquires the control as active connect device.
@@ -564,7 +656,7 @@ impl SpircTask {
                 _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
                     self.update_state = false;
 
-                    if let Err(why) = self.notify().await {
+                    if let Err(why) = self.notify() {
                         error!("state update: {why}")
                     }
                 },
@@ -572,14 +664,17 @@ impl SpircTask {
                     self.update_volume = false;
 
                     info!("delayed volume update for all devices: volume is now {}", self.connect_state.device_info().volume);
-                    if let Err(why) = self.connect_state.notify_volume_changed(&self.session).await {
-                        error!("error updating connect state for volume update: {why}")
-                    }
+                    // Los dos avisos salen en este orden y ninguno sustituye al otro (el del
+                    // volumen lleva su propio motivo), igual que cuando se esperaba a cada uno.
+                    self.state_sender.send(
+                        self.connect_state
+                            .state_request_with_reason(PutStateReason::VOLUME_CHANGED),
+                    );
 
                     // for some reason the web-player does need two separate updates, so that the
                     // position of the current track is retained, other clients also send a state
                     // update before they send the volume update
-                    if let Err(why) = self.notify().await {
+                    if let Err(why) = self.notify() {
                         error!("error updating connect state for volume update: {why}")
                     }
                 },
@@ -604,7 +699,7 @@ impl SpircTask {
                 }, if allow_context_resolving && self.context_resolver.has_next() => {
                     let update_state = self.handle_next_context(next_context);
                     if update_state {
-                        if let Err(why) = self.notify().await {
+                        if let Err(why) = self.notify() {
                             error!("update after context resolving failed: {why}")
                         }
                     }
@@ -620,6 +715,8 @@ impl SpircTask {
             }
         }
 
+        // Lo que aún esperaba en la cola tiene que llegar antes del borrado, no después.
+        self.flush_state().await;
         // this should clear the active session id, leaving an empty state
         if let Err(why) = self.session.spclient().delete_connect_state_request().await {
             error!("error during connect state deletion: {why}")
@@ -680,7 +777,22 @@ impl SpircTask {
 
     async fn handle_command(&mut self, cmd: SpircCommand) -> Result<(), Error> {
         trace!("Received SpircCommand::{cmd:?}");
+        // Antes que nada y sin marca de `ttfs`: el ping no es parte de ninguna orden, y su marca
+        // haría pasar por avance de la carga lo que solo es el vigilante preguntando.
+        let cmd = match cmd {
+            SpircCommand::Ping(tx) => {
+                let _ = tx.send(());
+                return Ok(());
+            }
+            cmd => cmd,
+        };
+        crate::core::ttfs::mark(cmd.ttfs_phase(), None);
         match cmd {
+            // Ya contestado arriba; aquí solo para que la lista esté completa.
+            SpircCommand::Ping(tx) => {
+                let _ = tx.send(());
+                return Ok(());
+            }
             SpircCommand::Shutdown => {
                 trace!("Received SpircCommand::Shutdown");
                 self.handle_pause();
@@ -701,13 +813,18 @@ impl SpircTask {
             SpircCommand::Activate if !self.connect_state.is_active() => {
                 trace!("Received SpircCommand::{cmd:?}");
                 self.handle_activate();
-                return self.notify().await;
+                return self.notify();
             }
+            // Una orden ignorada no cambia nada que contar a Spotify: sin `notify`. Antes caía al
+            // `notify` del final, un PUT de connect-state (~120 ms) que, como la app activa antes
+            // de cada reproducir/siguiente/pausa, retrasaba en serie la orden de verdad.
             SpircCommand::Transfer(..) | SpircCommand::Activate => {
-                warn!("SpircCommand::{cmd:?} will be ignored while already active")
+                debug!("SpircCommand::{cmd:?} will be ignored while already active");
+                return Ok(());
             }
             _ if !self.connect_state.is_active() => {
-                warn!("SpircCommand::{cmd:?} will be ignored while Not Active")
+                warn!("SpircCommand::{cmd:?} will be ignored while Not Active");
+                return Ok(());
             }
             SpircCommand::Disconnect { pause } => {
                 if pause {
@@ -716,6 +833,7 @@ impl SpircTask {
                 return self.handle_disconnect().await;
             }
             SpircCommand::Play => self.handle_play(),
+            SpircCommand::Reload => self.handle_reload()?,
             SpircCommand::PlayPause => self.handle_play_pause(),
             SpircCommand::Pause => self.handle_pause(),
             SpircCommand::Prev => {
@@ -732,13 +850,26 @@ impl SpircTask {
                 }
                 self.handle_next(None)?
             }
+            SpircCommand::AutoNext => {
+                if self.jam_participant {
+                    self.jam_send(r#"{"command":{"endpoint":"skip_next"}}"#.to_string())
+                        .await;
+                }
+                self.handle_next_with(Transition::AutoSkip)?
+            }
             SpircCommand::VolumeUp => self.handle_volume_up(),
             SpircCommand::VolumeDown => self.handle_volume_down(),
             SpircCommand::Shuffle(shuffle) => self.handle_shuffle(shuffle)?,
             SpircCommand::Repeat(repeat) => self.handle_repeat_context(repeat)?,
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
-            SpircCommand::SetVolume(volume) => self.set_volume(volume),
+            SpircCommand::SetVolume(volume) => {
+                // `set_volume` ya programa, si el valor cambió, el aviso retrasado del volumen
+                // (VOLUME_UPDATE_DELAY), que agrupa los de un arrastre y envía el estado. Avisar
+                // también aquí era un PUT más por cada cambio, o por nada si el valor era el mismo.
+                self.set_volume(volume);
+                return Ok(());
+            }
             SpircCommand::Load(command) => {
                 if self.jam_participant {
                     if let Some(json) = jam_play_json(&command) {
@@ -749,7 +880,9 @@ impl SpircTask {
             }
         };
 
-        self.notify().await
+        // El aviso a Spotify sale aparte (`StateSender`): la orden siguiente (una pausa tras un
+        // «siguiente») ya no espera a este PUT, ni a uno colgado.
+        self.notify()
     }
 
     /// Envía un comando de reproducción a la Jam actual (si somos participante) para que se aplique
@@ -827,6 +960,27 @@ impl SpircTask {
             return Ok(());
         }
 
+        // Fundido aceptado: Spirc ya avanzó a la siguiente, cuya carga va de camino, pero hasta que
+        // llegue su `PlayRequestIdChanged` los eventos de la anterior (que sigue sonando mientras
+        // el reproductor no atiende la carga) aún pasan el filtro de arriba. Son viejos: un
+        // `EndOfTrack` (acabó antes de atender la carga, la siguiente entrará sin hueco) avanzaría
+        // otra vez y se saltarían dos; un `PositionCorrection` daría por sonando la siguiente con
+        // la posición de la anterior.
+        if self.crossfade_from_prid.is_some()
+            && event.get_play_request_id() == self.crossfade_from_prid
+        {
+            if matches!(event, PlayerEvent::EndOfTrack { .. }) {
+                debug!("[fundido] acabó con el fundido ya aceptado: la siguiente ya va de camino");
+            }
+            return Ok(());
+        }
+
+        if let PlayerEvent::Playing { .. } = event {
+            // Algo suena: lo de antes ya no es una cascada de fallos ni una carga fallida.
+            self.skip_breaker.reset();
+            self.load_failed = false;
+        }
+
         match event {
             PlayerEvent::EndOfTrack { .. } => {
                 let next_track = self
@@ -885,7 +1039,14 @@ impl SpircTask {
                     _ => return Ok(()),
                 }
             }
+            // Un corte de la red a media canción (Nanofy): el reproductor la dejó en pausa en el
+            // segundo que se oyó, sin saltar. Para Spotify y para «reproducir» es una pausa: al
+            // reanudar, el reproductor vuelve a ese punto en cuanto hay datos.
             PlayerEvent::Paused {
+                position_ms: new_position_ms,
+                ..
+            }
+            | PlayerEvent::Stalled {
                 position_ms: new_position_ms,
                 ..
             } => {
@@ -921,10 +1082,78 @@ impl SpircTask {
                 self.handle_preload_next_track();
                 return Ok(());
             }
+            PlayerEvent::LoadFailed {
+                track_id,
+                reason,
+                transient: true,
+                ..
+            } => {
+                // Un fallo pasajero (Spotify frenando las claves o las peticiones, la red): ni se
+                // marca como no disponible ni se salta, que era lo que encadenaba una canción tras
+                // otra. Queda en pausa en su posición; el reproductor no tiene nada cargado, así
+                // que el próximo «reproducir» (la interfaz lo reintenta sola) la carga otra vez.
+                let position_ms = self.position();
+                warn!(
+                    "<{track_id}> could not be loaded for now ({reason}); paused at {position_ms} ms to retry"
+                );
+                self.load_failed = true;
+                self.connect_state
+                    .update_position(position_ms, self.now_ms());
+                self.play_status = SpircPlayStatus::Paused {
+                    position_ms,
+                    preloading_of_next_track_triggered: false,
+                };
+            }
+            // Un fallo definitivo: lo atiende el `Unavailable` que llega justo detrás.
+            PlayerEvent::LoadFailed { .. } => return Ok(()),
             PlayerEvent::Unavailable { track_id, .. } => {
-                self.handle_unavailable(&track_id)?;
-                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()? {
-                    self.handle_next(None)?
+                let current = self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()?;
+                if current && self.skip_breaker.trip(Instant::now()) {
+                    // Varias seguidas en poco tiempo: no es esta canción, es la lista (o la
+                    // cuenta). Se detiene en vez de recorrerla entera marcándolo todo, y sin
+                    // precargar la siguiente.
+                    warn!(
+                        "{} tracks in a row could not be played; stopping instead of skipping",
+                        cascade::MAX_FAILURES
+                    );
+                    self.connect_state.mark_unavailable(&track_id)?;
+                    self.handle_stop();
+                    self.player
+                        .emit_skip_cascade_event(cascade::MAX_FAILURES as u32);
+                } else {
+                    self.handle_unavailable(&track_id)?;
+                    if current {
+                        // Un salto que nadie pidió: si la que no se pudo cargar entraba
+                        // fundiéndose, la anterior sigue apagándose a su ritmo en vez de cortarse.
+                        // Se cuenta: una ráfaga de estos es la cascada de «Skipping to next track».
+                        debug!(
+                            "auto-skip ({} of {} before stopping)",
+                            self.skip_breaker.count(Instant::now()),
+                            cascade::MAX_FAILURES
+                        );
+                        crate::core::ttfs::count(crate::core::ttfs::Counter::AutoSkips);
+                        self.handle_next_with(Transition::AutoSkip)?
+                    }
+                }
+            }
+            PlayerEvent::CrossfadeReady {
+                play_request_id,
+                track_id,
+                next_track_id,
+                fade_ms,
+                album_continuation,
+                crossfade_albums,
+            } => {
+                let accepted = self.handle_crossfade_ready(
+                    play_request_id,
+                    track_id,
+                    next_track_id,
+                    fade_ms,
+                    album_continuation,
+                    crossfade_albums,
+                )?;
+                if !accepted {
+                    return Ok(());
                 }
             }
             _ => return Ok(()),
@@ -939,11 +1168,12 @@ impl SpircTask {
         self.session.set_connection_id(&connection_id);
 
         let mut cluster_raw: Option<Vec<u8>> = None;
-        let cluster = match self
+        // Por la misma cola que el resto de avisos, para no adelantar ni quedar detrás de uno que
+        // aún esté de camino; se espera porque hace falta el clúster que devuelve.
+        let new_device = self
             .connect_state
-            .notify_new_device_appeared(&self.session)
-            .await
-        {
+            .state_request_with_reason(PutStateReason::NEW_DEVICE);
+        let cluster = match self.state_sender.send_and_wait(new_device).await {
             Ok(res) => {
                 cluster_raw = Some(res.to_vec());
                 Cluster::parse_from_bytes(&res).ok()
@@ -1067,6 +1297,7 @@ impl SpircTask {
                 self.update_state = true;
             }
         } else if self.connect_state.is_active() {
+            self.flush_state().await;
             self.connect_state.became_inactive(&self.session).await?;
         }
 
@@ -1126,7 +1357,7 @@ impl SpircTask {
             // modification and update of the connect_state
             Transfer(transfer) => {
                 self.handle_transfer(transfer.data.expect("by condition checked"))?;
-                return self.notify().await;
+                return self.notify();
             }
             Play(mut play) => {
                 if !self.connect_state.is_active() {
@@ -1168,6 +1399,7 @@ impl SpircTask {
                             seek_to: play.options.seek_to.unwrap_or_default(),
                             playing_track: play.options.skip_to.and_then(|s| s.try_into().ok()),
                             context_options,
+                            fallback_index: None,
                         },
                     },
                     play.context.pages.pop(),
@@ -1379,7 +1611,10 @@ impl SpircTask {
         self.play_status = SpircPlayStatus::Stopped {};
         self.connect_state
             .update_position_in_relation(self.now_ms());
-        self.notify().await?;
+        self.notify()?;
+        // El último estado (posición incluida, para retomarla) y todo lo anterior, antes de
+        // pasar a inactivo: llegando después lo desharía.
+        self.flush_state().await;
 
         self.connect_state.became_inactive(&self.session).await?;
 
@@ -1390,6 +1625,8 @@ impl SpircTask {
     }
 
     fn handle_stop(&mut self) {
+        // Parada: ya no hay nada que recargar al pulsar «reproducir».
+        self.load_failed = false;
         self.player.stop();
         self.connect_state.update_position(0, self.now_ms());
         self.connect_state.clear_next_tracks();
@@ -1434,6 +1671,8 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
+        // Algo nuevo que reproducir: los fallos de lo anterior ya no cuentan para la cascada.
+        self.skip_breaker.reset();
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                 ResetContext::WhenDifferent(uri)
@@ -1451,6 +1690,9 @@ impl SpircTask {
             }
             PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
         }
+        // Contexto resuelto (context-resolve, o la lista de pistas tal cual): aún no se ha pedido
+        // nada al reproductor.
+        crate::core::ttfs::mark("spirc:context", None);
 
         let cmd_options = cmd.options;
 
@@ -1466,39 +1708,16 @@ impl SpircTask {
 
         debug!("play track <{:?}>", cmd_options.playing_track);
 
+        // Siempre un índice que existe en el contexto: antes, uno fuera de rango (o una canción
+        // que no estaba en la primera página de una lista enorme) hacía fallar la carga entera o
+        // empezaba por la primera canción (ver `start_index`).
         let index = match cmd_options.playing_track {
             None => None,
-            Some(ref playing_track) => Some(match playing_track {
-                // Un índice fuera del contexto hacía fallar la carga entera sin avisar: la
-                // interfaz se quedaba «cargando». Se trata como una canción no encontrada.
-                PlayingTrack::Index(i) => {
-                    let i = *i as usize;
-                    match self.connect_state.get_context(ContextType::Default) {
-                        Ok(ctx) if i >= ctx.tracks.len() => {
-                            Err(crate::StateError::CanNotFindTrackInContext(Some(i), ctx.tracks.len()))
-                        }
-                        _ => Ok(i),
-                    }
-                }
-                PlayingTrack::Uri(uri) => {
-                    let ctx = self.connect_state.get_context(ContextType::Default)?;
-                    ConnectState::find_index_in_context(ctx, |t| &t.uri == uri)
-                }
-                PlayingTrack::Uid(uid) => {
-                    let ctx = self.connect_state.get_context(ContextType::Default)?;
-                    ConnectState::find_index_in_context(ctx, |t| &t.uid == uid)
-                }
-            }),
-        }
-        .map(|i| {
-            i.unwrap_or_else(|why| {
-                warn!(
-                    "Failed to resolve index by {:?}, using fallback index: {:?} (Error: {why})",
-                    cmd_options.playing_track, fallback_index
-                );
-                fallback_index.unwrap_or_default()
-            })
-        });
+            Some(ref playing_track) => Some(
+                self.start_index(playing_track, cmd_options.fallback_index, fallback_index)
+                    .await,
+            ),
+        };
 
         if let Some(LoadContextOptions::Options(ref options)) = cmd_options.context_options {
             debug!(
@@ -1540,6 +1759,77 @@ impl SpircTask {
         }
 
         Ok(())
+    }
+
+    /// Posición del contexto en la que empieza una carga (ver `start_index`). `hint` es la fila
+    /// que pulsó el usuario en Nanofy y `spotify_fallback`, el índice de una orden de otro
+    /// dispositivo. Si la canción pedida aún no está en lo que se tiene del contexto (una lista
+    /// enorme cuya página no ha llegado), se traen más páginas, pocas y con tiempo tasado; si ni
+    /// así aparece, se empieza por el índice de Spotify si existe o por la primera, sin hacer
+    /// fallar la carga.
+    async fn start_index(
+        &mut self,
+        playing_track: &PlayingTrack,
+        hint: Option<u32>,
+        spotify_fallback: Option<usize>,
+    ) -> usize {
+        let wanted = match playing_track {
+            PlayingTrack::Index(i) => Wanted::Index(*i as usize),
+            PlayingTrack::Uri(uri) => Wanted::Uri(uri),
+            PlayingTrack::Uid(uid) => Wanted::Uid(uid),
+        };
+        let hint = hint.map(|i| i as usize);
+        let deadline = tokio::time::Instant::now() + start_index::EXTRA_PAGES_BUDGET;
+        let mut pages = 0;
+        loop {
+            let found = self
+                .connect_state
+                .get_context(ContextType::Default)
+                .ok()
+                .and_then(|ctx| {
+                    start_index::locate(
+                        ctx.tracks.as_slice(),
+                        |t| t.uri.as_str(),
+                        |t| t.uid.as_str(),
+                        wanted,
+                        hint,
+                    )
+                });
+            if let Some(i) = found {
+                if pages > 0 {
+                    info!("found {playing_track:?} at {i} after {pages} more context pages");
+                    crate::core::ttfs::mark("spirc:pages", Some(pages.to_string()));
+                }
+                return i;
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if pages >= start_index::MAX_EXTRA_PAGES
+                || left.is_zero()
+                || !self.context_resolver.next_is_default_page()
+            {
+                break;
+            }
+            pages += 1;
+            match tokio::time::timeout(left, self.context_resolver.get_next_context(Vec::new))
+                .await
+            {
+                Ok(next) => {
+                    self.handle_next_context(next);
+                }
+                // Lo que falta se sigue trayendo en segundo plano, como siempre.
+                Err(_) => break,
+            }
+        }
+        let len = self
+            .connect_state
+            .get_context(ContextType::Default)
+            .map(|ctx| ctx.tracks.len())
+            .unwrap_or(0);
+        let i = start_index::give_up(len, spotify_fallback);
+        warn!(
+            "Failed to find {playing_track:?} in the context ({len} tracks, {pages} more pages); starting at {i}"
+        );
+        i
     }
 
     async fn load_context_from_uri(
@@ -1609,6 +1899,15 @@ impl SpircTask {
 
     fn handle_play(&mut self) {
         match self.play_status {
+            // La carga falló por algo pasajero y el reproductor no tiene nada que reanudar: se
+            // vuelve a cargar, sonando, en el punto en que quedó.
+            SpircPlayStatus::Paused { position_ms, .. } if self.load_failed => {
+                info!("Reloading the track that failed to load, at {position_ms} ms");
+                if let Err(e) = self.load_track(true, position_ms) {
+                    warn!("could not reload the track that failed to load: {e}");
+                    return;
+                }
+            }
             SpircPlayStatus::Paused {
                 position_ms,
                 preloading_of_next_track_triggered,
@@ -1632,6 +1931,15 @@ impl SpircTask {
         // systems that can switch sources from and back to librespot.
         let current_volume = self.mixer.volume();
         self.set_volume(current_volume);
+    }
+
+    /// Ver `Spirc::reload`. La posición es la de la pausa: la que el reproductor dio al cortarse.
+    fn handle_reload(&mut self) -> Result<(), Error> {
+        if let SpircPlayStatus::Paused { position_ms, .. } = self.play_status {
+            info!("Reloading the paused track from scratch, at {position_ms} ms");
+            self.load_track(true, position_ms)?;
+        }
+        Ok(())
     }
 
     fn handle_play_pause(&mut self) {
@@ -1678,6 +1986,18 @@ impl SpircTask {
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
+        if self.load_failed {
+            // Sin nada cargado no hay dónde buscar (el reproductor volvería a cargarla y a
+            // sonar estando en pausa): se apunta la posición para la próxima carga.
+            if let SpircPlayStatus::Paused {
+                position_ms: ref mut position,
+                ..
+            } = self.play_status
+            {
+                *position = position_ms;
+            }
+            return;
+        }
         self.player.seek(position_ms);
         let now = self.now_ms();
         match self.play_status {
@@ -1810,6 +2130,93 @@ impl SpircTask {
             self.handle_stop();
             Ok(())
         }
+    }
+
+    /// `handle_next` diciendo cómo debe empezar la siguiente (fundido aceptado o salto
+    /// automático). Pase lo que pase (sin siguiente, error), lo próximo vuelve a ser un corte:
+    /// la transición no puede quedarse esperando a una carga que llegue más tarde por otro motivo.
+    fn handle_next_with(&mut self, transition: Transition) -> Result<(), Error> {
+        self.next_load_transition = transition;
+        let result = self.handle_next(None);
+        self.next_load_transition = Transition::Cut;
+        result
+    }
+
+    /// El reproductor propone fundir la canción que suena con la siguiente
+    /// (`PlayerEvent::CrossfadeReady`). Decide Spirc, que sabe lo que el reproductor no: el
+    /// contexto (un álbum en orden), la repetición, la Jam y cómo está la cola ahora. Al aceptar
+    /// avanza como al final de la canción, pero la siguiente se carga con
+    /// `Transition::Crossfade`; al rechazar no hace nada: la canción suena hasta el final y la
+    /// siguiente entra sin hueco, como siempre. `true` si aceptó (el estado cambió).
+    fn handle_crossfade_ready(
+        &mut self,
+        play_request_id: u64,
+        track_id: SpotifyUri,
+        next_track_id: SpotifyUri,
+        fade_ms: u32,
+        album_continuation: bool,
+        crossfade_albums: bool,
+    ) -> Result<bool, Error> {
+        let current_matches = SpotifyUri::from_uri(self.connect_state.current_track(|t| &t.uri))
+            .is_ok_and(|current| current == track_id);
+        // La siguiente de verdad es la que sacará `next_track`: ni una marca de fin de contexto ni
+        // una ya no disponible (las salta), que la vista previa sí devolvería.
+        let (next_usable, next_from_context) = self
+            .connect_state
+            .next_tracks()
+            .first()
+            .map_or((false, false), |t| (!t.is_unavailable(), t.is_context()));
+        let next_matches =
+            next_usable && self.connect_state.preview_next_track().as_ref() == Some(&next_track_id);
+
+        // Lo que le queda según la cuenta de Spirc: la propuesta salió antes de una búsqueda
+        // hacia atrás que Spirc ya atendió si ahora queda mucho más.
+        let duration = self.connect_state.player().duration;
+        let remaining_ms = if duration > 0 {
+            let left = duration - i64::from(self.position());
+            Some(u32::try_from(left.max(0)).unwrap_or(u32::MAX))
+        } else {
+            None
+        };
+
+        let offer = FadeOffer {
+            playing: matches!(self.play_status, SpircPlayStatus::Playing { .. }),
+            repeat_track: self.connect_state.repeat_track(),
+            jam_participant: self.jam_participant,
+            already_accepted: self.crossfade_from_prid == Some(play_request_id),
+            queue_matches: current_matches && next_matches,
+            remaining_ms,
+            fade_ms,
+            album_in_order: crossfade::is_album_in_order(
+                self.connect_state.context_uri(),
+                self.connect_state.shuffling_context(),
+                self.connect_state.current_track(|t| t.is_context()),
+                next_from_context,
+            ),
+            album_continuation,
+            crossfade_albums,
+        };
+        if let Err(why) = crossfade::decide_offer(&offer) {
+            info!(
+                "[fundido] {track_id} → {next_track_id}: no se funde ({}); sin hueco al acabar",
+                why.reason()
+            );
+            return Ok(false);
+        }
+
+        info!(
+            "[fundido] aceptado {track_id} → {next_track_id}: {fade_ms} ms (quedan {} ms según Spirc)",
+            remaining_ms.map_or_else(|| "?".to_string(), |ms| ms.to_string())
+        );
+        self.crossfade_from_prid = Some(play_request_id);
+        self.crossfade_to = Some(next_track_id);
+        let result = self.handle_next_with(Transition::Crossfade);
+        self.crossfade_to = None;
+        if result.is_err() {
+            // Sin carga en camino, el final de la canción tiene que avanzar como siempre.
+            self.crossfade_from_prid = None;
+        }
+        result.map(|()| true)
     }
 
     fn handle_prev(&mut self) -> Result<(), Error> {
@@ -1963,6 +2370,12 @@ impl SpircTask {
     }
 
     fn load_track(&mut self, start_playing: bool, position_ms: u32) -> Result<(), Error> {
+        // Cada carga consume la transición pedida (un corte si nadie pidió otra), también cuando
+        // al final no carga nada: no puede pasar a una carga posterior.
+        let transition = std::mem::take(&mut self.next_load_transition);
+        // Una carga nueva (otra canción, o la misma otra vez) deja atrás la que falló.
+        self.load_failed = false;
+
         if self.connect_state.current_track(MessageField::is_none) {
             debug!("current track is none, stopping playback");
             self.handle_stop();
@@ -1971,7 +2384,29 @@ impl SpircTask {
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
-        self.player.load(id, start_playing, position_ms);
+        // Solo se funde con la canción aceptada, desde el principio y sonando. Si la que toca es
+        // otra (la cola cambió entre la decisión y el avance), entra con un corte.
+        let transition = match transition {
+            Transition::Crossfade
+                if !start_playing
+                    || position_ms != 0
+                    || self.crossfade_to.as_ref() != Some(&id) =>
+            {
+                info!("[fundido] {id} no es la carga aceptada (otra, en pausa o a mitad): corte");
+                Transition::Cut
+            }
+            other => other,
+        };
+        // Ganancia de álbum como Spotify: un álbum escuchado en orden se normaliza entero, así
+        // las intros y las baladas no suben respecto al resto. En aleatorio, o con una canción de
+        // la cola o de autoplay (proveedor distinto de «context»), por canción. Va antes de
+        // `load`: el reproductor atiende las órdenes en orden y calcula el factor al empezar.
+        let album = self.connect_state.context_uri().starts_with("spotify:album:")
+            && !self.connect_state.shuffling_context()
+            && self.connect_state.current_track(|t| t.is_context());
+        self.player.set_auto_normalise_as_album(album);
+        self.player
+            .load_with_transition(id, start_playing, position_ms, transition);
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
@@ -1985,7 +2420,10 @@ impl SpircTask {
         Ok(())
     }
 
-    async fn notify(&mut self) -> Result<(), Error> {
+    /// Cuenta a Spotify el estado actual. Se copia aquí mismo y lo envía `StateSender` en
+    /// segundo plano: quien avisa no espera al PUT (~120 ms, o hasta su plazo si no contesta), y
+    /// si se acumulan varios mientras otro va de camino solo sale el último.
+    fn notify(&mut self) -> Result<(), Error> {
         self.emit_jam_queue_if_changed();
         // Si ya se precargó la siguiente y cambió (cola, aleatorio…), se precarga la nueva. El
         // reproductor ignora la petición si ya tiene esa misma.
@@ -2003,10 +2441,16 @@ impl SpircTask {
 
         self.connect_state.set_now(self.now_ms() as u64);
 
-        self.connect_state
-            .send_state(&self.session)
-            .await
-            .map(|_| ())
+        self.state_sender.send(self.connect_state.state_request());
+        Ok(())
+    }
+
+    /// Espera a que Spotify haya recibido todo lo avisado hasta ahora. Con la sesión ya perdida
+    /// no: nada de eso llegaría, y el fin de esta tarea (que pide reconectar) no debe esperarlo.
+    async fn flush_state(&mut self) {
+        if !self.session.is_invalid() {
+            self.state_sender.flush().await;
+        }
     }
 
     fn set_volume(&mut self, volume: u16) {

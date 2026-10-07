@@ -39,6 +39,13 @@ use crate::{
 pub const RATE_LIMIT_INTERVAL: Duration = Duration::from_secs(30);
 pub const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(10);
 pub const RATE_LIMIT_CALLS_PER_INTERVAL: u32 = 300;
+/// Lo que `request` espera su turno en el limitador propio antes de rendirse con
+/// `ResourceExhausted`. Antes fallaba al instante: tras cargar una biblioteca grande (que gasta
+/// el mismo presupuesto de spotify.com), la canción pedida no cargaba, Spirc la daba por no
+/// disponible y saltaba a la siguiente, que tampoco: decenas de saltos en milisegundos. Con el
+/// cupo agotado entra una petición cada 100 ms (300 cada 30 s), así que 3 s dejan pasar la
+/// reproducción en un momento sin colgar mucho rato el bucle de Spirc si el atasco es mayor.
+pub const RATE_LIMIT_QUEUE_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Error)]
 pub enum HttpClientError {
@@ -167,8 +174,12 @@ impl HttpClient {
         };
         let proxy_connector = ProxyConnector::from_proxy(https_connector, proxy)?;
 
+        // Conexiones ociosas durante 5 min en vez de 90 s: tras un rato en pausa, «reproducir»
+        // o «siguiente» ya no paga otra vez TCP + TLS con spclient (y la CDN). Una que el equipo
+        // dejara medio cerrada al suspenderse la corta el plazo de cada intento de spclient.
         let client = Client::builder(TokioExecutor::new())
             .http2_adaptive_window(true)
+            .pool_idle_timeout(Duration::from_secs(300))
             .build(proxy_connector);
         Ok(client)
     }
@@ -181,12 +192,29 @@ impl HttpClient {
     pub async fn request(&self, req: Request<Bytes>) -> Result<Response<Incoming>, Error> {
         debug!("Requesting {}", req.uri());
 
+        // Pruebas (`NANOFY_FAULT=spclient_hang:<endpoint>`): la petición no vuelve, como con un
+        // socket medio cerrado tras suspender el equipo. Va dentro de esta función para que un
+        // tiempo límite puesto alrededor de la petición también la corte.
+        if let Some(hang) = crate::fault::spclient_hang(req.uri().path()) {
+            warn!("NANOFY_FAULT: {} se queda colgada", req.uri().path());
+            match hang {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => std::future::pending::<()>().await,
+            }
+        }
+
         // `Request` does not implement `Clone` because its `Body` may be a single-shot stream.
         // As correct as that may be technically, we now need all this boilerplate to clone it
         // ourselves, as any `Request` is moved in the loop.
         let (parts, body_as_bytes) = req.into_parts();
+        let domain = Self::rate_limit_domain(&parts.uri);
 
         loop {
+            // Un turno del limitador por intento, como antes (también al repetir tras un 429),
+            // pero esperado: ver RATE_LIMIT_QUEUE_WAIT. Después se envía sin volver a mirarlo,
+            // para no gastar dos turnos en una sola petición.
+            self.wait_rate_limit(&domain, RATE_LIMIT_QUEUE_WAIT).await?;
+
             let mut req = Request::builder()
                 .method(parts.method.clone())
                 .uri(parts.uri.clone())
@@ -194,13 +222,13 @@ impl HttpClient {
                 .body(body_as_bytes.clone())?;
             *req.headers_mut() = parts.headers.clone();
 
-            let request = self.request_fut(req)?;
-            let response = request.await;
+            let response = self.send(req).await;
 
             if let Ok(response) = &response {
                 let code = response.status();
 
                 if code == StatusCode::TOO_MANY_REQUESTS {
+                    crate::ttfs::count(crate::ttfs::Counter::Http429);
                     if let Some(duration) = Self::get_retry_after(response.headers()) {
                         warn!(
                             "Rate limited by service, retrying in {} seconds...",
@@ -230,14 +258,68 @@ impl HttpClient {
         Ok(self.request_fut(req)?.into_stream())
     }
 
-    pub fn request_fut(&self, mut req: Request<Bytes>) -> Result<ResponseFuture, Error> {
-        let headers_mut = req.headers_mut();
-        headers_mut.insert(USER_AGENT, self.user_agent.clone());
+    /// La petición tal cual, comprobando antes el limitador sin esperar: lo usan los flujos de la
+    /// CDN (`request_stream`), que llevan su propio presupuesto por dominio y sus reintentos.
+    pub fn request_fut(&self, req: Request<Bytes>) -> Result<ResponseFuture, Error> {
+        let domain = Self::rate_limit_domain(req.uri());
+        self.drain_limiter_for_fault(&domain);
+        self.rate_limiter.check_key(&domain).map_err(|e| {
+            crate::ttfs::count(crate::ttfs::Counter::RateLimited);
+            Error::resource_exhausted(format!(
+                "rate limited for at least another {} seconds",
+                e.wait_time_from(Instant::now()).as_secs()
+            ))
+        })?;
+        Ok(self.send(req))
+    }
 
-        // For rate limiting we cannot *just* depend on Spotify sending us HTTP/429
-        // Retry-After headers. For example, when there is a service interruption
-        // and HTTP/500 is returned, we don't want to DoS the Spotify infrastructure.
-        let domain = match req.uri().host() {
+    /// Espera, como mucho `max_wait`, un turno del limitador propio para `uri` (por dominio, ver
+    /// `rate_limit_domain`) y lo gasta. Si el turno llegaría más tarde, falla ya, sin esperar, con
+    /// el `ResourceExhausted` de siempre («rate limited for at least another N seconds», que
+    /// Nanofy lee para saber cuánto esperar). Es lo que hace `request` antes de cada intento;
+    /// pública para las pruebas de Nanofy.
+    pub async fn acquire_rate_limit(&self, uri: &Uri, max_wait: Duration) -> Result<(), Error> {
+        let domain = Self::rate_limit_domain(uri);
+        self.wait_rate_limit(&domain, max_wait).await
+    }
+
+    async fn wait_rate_limit(&self, domain: &String, max_wait: Duration) -> Result<(), Error> {
+        self.drain_limiter_for_fault(domain);
+        let deadline = Instant::now() + max_wait;
+        let mut waiting_since: Option<Instant> = None;
+        loop {
+            match self.rate_limiter.check_key(domain) {
+                Ok(()) => {
+                    if let Some(t0) = waiting_since {
+                        debug!(
+                            "límite de peticiones a {domain}: turno tras esperar {} ms",
+                            t0.elapsed().as_millis()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(not_until) => {
+                    let now = Instant::now();
+                    let wait = not_until.wait_time_from(now);
+                    if now + wait > deadline {
+                        crate::ttfs::count(crate::ttfs::Counter::RateLimited);
+                        return Err(Error::resource_exhausted(format!(
+                            "rate limited for at least another {} seconds",
+                            wait.as_secs()
+                        )));
+                    }
+                    waiting_since.get_or_insert(now);
+                    // Con varias esperando a la vez, el turno es de una sola: las demás vuelven
+                    // a mirar y esperan el siguiente (al menos 1 ms, para no girar en vacío).
+                    tokio::time::sleep(wait.max(Duration::from_millis(1))).await;
+                }
+            }
+        }
+    }
+
+    /// Clave del limitador: el dominio sin subdominios.
+    fn rate_limit_domain(uri: &Uri) -> String {
+        match uri.host() {
             Some(host) => {
                 // strip the prefix from *.domain.tld (assume rate limit is per domain, not subdomain)
                 let mut parts = host
@@ -248,15 +330,33 @@ impl HttpClient {
                 parts.drain(n..).collect()
             }
             None => String::from(""),
-        };
-        self.rate_limiter.check_key(&domain).map_err(|e| {
-            Error::resource_exhausted(format!(
-                "rate limited for at least another {} seconds",
-                e.wait_time_from(Instant::now()).as_secs()
-            ))
-        })?;
+        }
+    }
 
-        Ok(self.hyper_client().request(req.map(Full::new)))
+    /// Pruebas (`NANOFY_FAULT=limiter_exhaust`): tras una orden de reproducir, el presupuesto
+    /// de spotify.com aparece gastado, como cuando una biblioteca grande acaba de cargarse.
+    fn drain_limiter_for_fault(&self, domain: &String) {
+        if domain == "spotify.com" && crate::fault::take_limiter_drain() {
+            let mut spent = 0;
+            while spent < 2 * RATE_LIMIT_CALLS_PER_INTERVAL
+                && self.rate_limiter.check_key(domain).is_ok()
+            {
+                spent += 1;
+            }
+            warn!("NANOFY_FAULT: presupuesto de peticiones a {domain} agotado ({spent} gastadas)");
+        }
+    }
+
+    /// Envía la petición, que ya pasó por el limitador propio (`request_fut` o `wait_rate_limit`).
+    fn send(&self, mut req: Request<Bytes>) -> ResponseFuture {
+        let headers_mut = req.headers_mut();
+        headers_mut.insert(USER_AGENT, self.user_agent.clone());
+
+        // For rate limiting we cannot *just* depend on Spotify sending us HTTP/429
+        // Retry-After headers. For example, when there is a service interruption
+        // and HTTP/500 is returned, we don't want to DoS the Spotify infrastructure.
+        // (De ahí el limitador propio, que se mira antes de llegar aquí.)
+        self.hyper_client().request(req.map(Full::new))
     }
 
     pub fn get_retry_after(headers: &HeaderMap<HeaderValue>) -> Option<Duration> {

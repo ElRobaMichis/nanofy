@@ -209,15 +209,14 @@ de trabajo de tokio; y a los 4 s se devuelven al sistema las páginas usadas sol
 Lo que queda de memoria privada (~18 MB en la página de ajustes) es estructural: el búfer de la
 ventana (3–8 MB según tamaño), la sesión de Spotify (TLS, websocket, tokio), pilas de hilos, el
 atlas de fuentes (0,5–1 MB) y los datos de la biblioteca. Durante la reproducción se suma el
-archivo de audio de la canción en curso (10 MB a 320 kbps, hasta 40 MB sin pérdida).
+archivo de audio de la canción en curso (unos 10 MB a 320 kbps).
 
 ## Repartirlo
 
 - **Windows**: `dist.cmd` compila en release y deja `dist\Nanofy-<versión>-windows-x64.zip`
   con solo `nanofy.exe` y `LEEME.txt`. No necesita instalador ni runtimes: solo DLLs del
-  propio Windows 10/11. Si defines `NANOFY_CLIENT_ID` antes de compilar, ese Client ID queda
-  como valor por defecto en Ajustes → Web API. Añade el correo de Spotify de cada persona en
-  la app de desarrollador (dashboard → User Management, hasta 25 usuarios).
+  propio Windows 10/11. No hace falta ninguna app de desarrollador: cada persona inicia
+  sesión con su cuenta y listo.
 - **Mac y Linux**: no se pueden compilar desde Windows. `.github/workflows/release.yml` los
   compila en GitHub Actions al subir una etiqueta `v*` (Windows, Linux, macOS Intel y Apple
   Silicon) y publica los zips en una release. Los binarios no van firmados: en Mac hay que
@@ -231,10 +230,23 @@ archivo de audio de la canción en curso (10 MB a 320 kbps, hasta 40 MB sin pér
 
 ## Qué hace
 
-- **Reproduce en este equipo** como dispositivo Spotify Connect (librespot): gapless, hasta
-  320 kbps, salida en flotante de 32 bits sin remuestreo, normalización opcional, caché de audio.
-- **Sin pérdida (experimental)**: la opción «Sin pérdida» pide FLAC a Spotify (parche propio de
-  librespot en `vendor/`). Si tu cuenta o la canción no lo ofrecen, cae a 320 kbps.
+- **Reproduce en este equipo** como dispositivo Spotify Connect (librespot): gapless, Ogg Vorbis
+  hasta 320 kbps («Muy alta», la máxima calidad que Spotify entrega a apps que no son las suyas),
+  salida en flotante de 32 bits y caché de audio. La etiqueta de calidad dice lo que suena de
+  verdad (códec, kbps y frecuencia de salida), sin prometer lo que Spotify no entrega.
+- **Fundido entre canciones** como en Spotify: interruptor y deslizador de 1 a 12 s que se
+  aplican al momento, sin reiniciar el reproductor. Como Spotify, no funde canciones seguidas de
+  un mismo álbum (se puede activar); «Siguiente» durante un fundido salta sin cortes y el
+  temporizador «al terminar la canción» lo suspende.
+- **Volumen como Spotify**: normalización activada de serie con sus tres niveles (Alto, Normal y
+  Bajo: −11, −14 y −19 LUFS) y ganancia de álbum cuando escuchas un disco entero. El cambio de
+  nivel se oye al instante, con una rampa corta para que no haya saltos.
+- **Remuestreo de calidad**: Spotify sirve audio a 44,1 kHz y Windows suele abrir el dispositivo
+  a 48 kHz; Nanofy convierte con un remuestreador sinc polifásico en vez de interpolar, y
+  Ajustes → Reproducción muestra a qué frecuencia sale el audio y cómo evitar la conversión.
+- **Nunca atascado en «cargando»**: un vigilante por etapas detecta una carga que no avanza y
+  la recupera; si una canción no se puede reproducir, el aviso dice por qué, con «Reintentar» y
+  «Saltar», y si no existe o no está disponible en tu país pasa sola a la siguiente.
 - **Controla otros dispositivos** (móvil, altavoz, otro PC) desde el selector: play/pausa,
   siguiente, anterior, posición, volumen, aleatorio y repetir. También trae la música a este equipo.
 - **Letras sincronizadas** con la línea actual resaltada y clic para saltar a ese punto.
@@ -327,31 +339,23 @@ xcode-select --install
 cargo build --release
 ```
 
-## Primer arranque: dos pasos
+## Primer arranque: un solo inicio de sesión
 
-**1. Iniciar sesión con Spotify.** Se abre el navegador con la página de consentimiento de
-Spotify (OAuth 2.0 con PKCE); Nanofy nunca ve tu contraseña. librespot guarda una credencial
-reutilizable y no vuelves a ver el navegador. Con esto ya puedes reproducir, ver la cola, las
-letras y usar Jam.
+Pulsa **Iniciar sesión con Spotify**. Se abre el navegador con la página de consentimiento de
+Spotify (OAuth 2.0 con PKCE); Nanofy nunca ve tu contraseña. Al aceptar, la misma pestaña pasa
+a la autorización de la biblioteca (playlists, Me gusta, seguir); aceptas y ya está todo. No
+hay que crear ninguna app de desarrollador ni copiar ningún Client ID. Si la pestaña se cierra
+a medias, la tarjeta «Conecta tu biblioteca» la vuelve a abrir, y la espera se puede cancelar.
+librespot guarda una credencial reutilizable y no vuelves a ver el navegador.
 
-**2. Configurar tu Client ID (Ajustes → Web API).** Spotify limita globalmente la Web API
-del client id compartido de librespot: responde `429 API rate limit exceeded` a todo. Por eso
-la biblioteca, la búsqueda, las playlists y los perfiles necesitan una app propia, gratuita:
+Muchas cosas no dependen de la cuota compartida de la Web API: la lista de tus playlists sale
+del protocolo interno de Spotify (rootlist), igual que las canciones de una playlist, los
+perfiles, la discografía de un artista y la búsqueda. Si la Web API responde 429, todo eso
+sigue funcionando.
 
-1. Entra en https://developer.spotify.com/dashboard y pulsa **Create app**.
-2. Nombre y descripción libres. En **Redirect URIs** añade exactamente
-   `http://127.0.0.1:8899/callback`. Marca **Web API** y guarda.
-3. Copia el **Client ID**, pégalo en Ajustes → Web API y pulsa **Conectar**. Se abre el
-   navegador una vez para autorizar; el token se guarda y se renueva solo.
-
-Fastpotify resuelve lo mismo con una app compartida registrada por su autor. Nanofy no puede
-distribuir una porque una app en modo desarrollo admite como máximo 25 usuarios.
-
-Además, Spotify prohíbe a las apps en modo desarrollo varios endpoints (responden 403):
-canciones de una playlist, perfiles de usuario, top tracks y discografía de un artista, y las
-comprobaciones de «guardado» y «seguido». Nanofy obtiene esos datos por el protocolo interno
-de librespot, así que funcionan igual; el estado de «Me gusta» y «Siguiendo» se deduce de tus
-listas de Me gusta y de artistas seguidos, que se cargan al iniciar sesión.
+Quien ya tenga una app de desarrollador puede añadirla en Ajustes → Biblioteca → «Avanzado
+(opcional, no hace falta)» para que las lecturas usen su propia cuota (redirección
+`http://127.0.0.1:8899/callback`).
 
 Rutas:
 
@@ -422,10 +426,11 @@ src/media.rs        teclas multimedia y "Reproduciendo ahora" (souvlaki)
 src/images.rs       descarga y caché de portadas, texturas con desalojo LRU
 src/model.rs        modelos de la Web API, letras, Jam, enlaces
 src/config.rs       rutas y settings.json
-vendor/librespot-playback  librespot-playback 0.8 con la opción de pedir FLAC
+vendor/librespot-playback  librespot-playback 0.8 con fundido, remuestreo sinc y fallos de carga tipados
 ```
 
-Hilos: 1 de interfaz, 2 de tokio (librespot), 2 de Web API, 2 de imágenes, más los del audio.
+Hilos: 1 de interfaz, 2 de tokio (librespot), los carriles de la API (2 comunes, reproductor,
+búsqueda, 2 de listas, fondo y letras/géneros), 2 de imágenes, 1 de disco, más los del audio.
 Perfil de release con LTO, `codegen-units = 1`, `panic = "abort"` y símbolos eliminados.
 
 ### Decisiones
@@ -440,13 +445,14 @@ Perfil de release con LTO, `codegen-units = 1`, `panic = "abort"` y símbolos el
 
 ## Limitaciones conocidas
 
-- Sin Client ID propio, la Web API no funciona (429 de Spotify). Reproducción, cola remota,
-  letras y Jam sí.
+- Sin pérdida (FLAC): Spotify lo protege con un DRM que solo pueden usar sus apps y
+  dispositivos certificados, así que Nanofy no lo ofrece. «Muy alta» (320 kbps) es lo máximo.
+- Si la cuota de la Web API se agota (429), lo que solo ella da (guardar en Me gusta, seguir,
+  editar playlists) espera a que pase; reproducción, biblioteca y búsqueda siguen.
 - Letras: Spotify no sirve su endpoint de letras a este tipo de cliente; se usa LRCLIB, que no
   cubre todas las canciones.
-- Jam y «Sin pérdida» dependen de APIs internas de Spotify no documentadas; pueden dejar de
-  funcionar si Spotify las cambia. No se ha podido verificar que Spotify entregue FLAC a esta
-  cuenta.
+- Jam, la búsqueda y la lista de playlists dependen de APIs internas de Spotify no documentadas;
+  pueden dejar de funcionar si Spotify las cambia.
 - Oyentes mensuales, ciudades con más oyentes, reproducciones por canción, «Merch» y «Features
   & more» solo existen en la API privada (GraphQL) del reproductor web de Spotify; ningún
   cliente externo puede obtenerlos, así que la página de artista no los muestra.

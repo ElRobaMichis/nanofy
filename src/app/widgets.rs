@@ -16,6 +16,8 @@ use crate::model::*;
 pub const CARD_W: f32 = 168.0;
 pub const CARD_COVER: f32 = 152.0;
 pub const CARD_H: f32 = 226.0;
+/// Aviso de una fila que seguro no puede sonar (`Track::is_playable`); se puede pulsar igual.
+const UNPLAYABLE_HINT: &str = "Puede que no esté disponible en tu país o que se haya retirado de Spotify";
 
 #[derive(Clone, Copy)]
 pub enum Source<'a> {
@@ -112,6 +114,14 @@ pub struct CardInfo<'a> {
     pub subtitle: &'a str,
     pub count: Option<u32>,
     pub pinned: bool,
+}
+
+/// Fracciones del ancho del título y del subtítulo de la fila `i` de un esqueleto: distintas de
+/// una fila a otra, como los nombres de verdad.
+fn skeleton_widths(i: usize) -> (f32, f32) {
+    const TITLE: [f32; 6] = [0.46, 0.32, 0.40, 0.27, 0.36, 0.42];
+    const SUB: [f32; 6] = [0.24, 0.30, 0.18, 0.26, 0.21, 0.28];
+    (TITLE[i % TITLE.len()], SUB[i % SUB.len()])
 }
 
 /// Sub-`Ui` sobre un rectángulo concreto con un layout dado.
@@ -261,6 +271,60 @@ impl App {
         let weak = ui.visuals().weak_text_color();
         ui.label(RichText::new(format!("{text}{dots}")).color(weak));
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    }
+
+    /// Filas de esqueleto mientras llega una lista que aún no tiene copia: el hueco con la forma
+    /// de lo que va a salir (portada y una o dos líneas de texto), en vez de un «Cargando» que
+    /// salta al llegar. Quietas: sin animación no obligan a repintar (todo se dibuja en la CPU).
+    /// `cover`: lado de la portada (0, sin ella); `indent`: sangría por la izquierda.
+    pub fn skeleton_rows(ui: &mut egui::Ui, rows: usize, row_h: f32, cover: f32, indent: f32) {
+        let p = theme::palette(ui.ctx());
+        let w = ui.available_width();
+        for i in 0..rows {
+            let (rect, _) = ui.allocate_exact_size(vec2(w, row_h), Sense::hover());
+            if !ui.is_rect_visible(rect) {
+                continue;
+            }
+            let mut x = rect.min.x + 8.0 + indent;
+            if cover > 0.0 {
+                let c = Rect::from_min_size(pos2(x, rect.center().y - cover / 2.0), vec2(cover, cover));
+                ui.painter().rect_filled(c, CornerRadius::same(if cover > 24.0 { 6 } else { 4 }), p.hover);
+                x = c.max.x + 12.0;
+            }
+            let text_w = (rect.max.x - 8.0 - x).max(0.0);
+            let (title, sub) = skeleton_widths(i);
+            let painter = ui.painter();
+            if row_h >= 44.0 {
+                let y = rect.center().y;
+                painter.rect_filled(Rect::from_min_size(pos2(x, y - 11.0), vec2(text_w * title, 10.0)), CornerRadius::same(5), p.hover);
+                painter.rect_filled(Rect::from_min_size(pos2(x, y + 4.0), vec2(text_w * sub, 8.0)), CornerRadius::same(4), p.card2);
+            } else {
+                painter.rect_filled(Rect::from_center_size(pos2(x + text_w * title / 2.0, rect.center().y), vec2(text_w * title, 9.0)), CornerRadius::same(4), p.hover);
+            }
+        }
+    }
+
+    /// Tarjetas de esqueleto (la cuadrícula de la biblioteca o de álbumes sin copia), como
+    /// `skeleton_rows`.
+    pub fn skeleton_cards(ui: &mut egui::Ui, n: usize) {
+        let p = theme::palette(ui.ctx());
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 8.0);
+            for i in 0..n {
+                let (rect, _) = ui.allocate_exact_size(vec2(CARD_W, CARD_H), Sense::hover());
+                if !ui.is_rect_visible(rect) {
+                    continue;
+                }
+                let pad = (CARD_W - CARD_COVER) / 2.0;
+                let cover = Rect::from_min_size(pos2(rect.min.x + pad, rect.min.y + pad + 8.0), vec2(CARD_COVER, CARD_COVER));
+                let (title, sub) = skeleton_widths(i);
+                let painter = ui.painter();
+                painter.rect_filled(cover, CornerRadius::same(8), p.hover);
+                let y = cover.max.y + 14.0;
+                painter.rect_filled(Rect::from_min_size(pos2(cover.min.x, y), vec2(CARD_COVER * (title + 0.2), 10.0)), CornerRadius::same(5), p.hover);
+                painter.rect_filled(Rect::from_min_size(pos2(cover.min.x, y + 18.0), vec2(CARD_COVER * (sub + 0.2), 8.0)), CornerRadius::same(4), p.card2);
+            }
+        });
     }
 
     pub fn section_title(ui: &mut egui::Ui, text: &str) {
@@ -895,13 +959,14 @@ impl App {
         for m in [15u64, 30, 45, 60] {
             if Self::menu_item(ui, Some(Icon::Clock), &format!("{m} minutos"), false).clicked() {
                 self.sleep_at = Some(std::time::Instant::now() + Duration::from_secs(m * 60));
-                self.sleep_end_of_track = false;
+                self.set_sleep_end_of_track(false);
                 self.status(format!("Se pausará en {m} minutos"));
                 ui.close();
             }
         }
         if Self::menu_item(ui, Some(Icon::Clock), "Al terminar la canción", false).clicked() {
-            self.sleep_end_of_track = true;
+            // Suspende el fundido hasta que se cumpla (ver `set_sleep_end_of_track`).
+            self.set_sleep_end_of_track(true);
             self.sleep_at = None;
             self.status("Se pausará al terminar la canción");
             ui.close();
@@ -910,7 +975,7 @@ impl App {
             && Self::menu_item(ui, Some(Icon::Close), "Cancelar temporizador", false).clicked()
         {
             self.sleep_at = None;
-            self.sleep_end_of_track = false;
+            self.set_sleep_end_of_track(false);
             ui.close();
         }
     }
@@ -1060,6 +1125,9 @@ impl App {
             }
             let is_now = now_uri.as_deref() == Some(t.uri.as_str());
             let y_range = y..=y + ROW_H;
+            // Botón de reproducir de la fila apretado (aún sin soltar): la precarga inteligente la
+            // prepara entera en ese rato.
+            let mut pressing = false;
 
             // Número / indicador de reproducción
             if !narrow {
@@ -1073,6 +1141,7 @@ impl App {
                     if pr.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
+                    pressing = pr.is_pointer_button_down_on();
                     if pr.clicked() {
                         self.actions.push(Action::Play(opts.target(i, tracks, shuffle)));
                     }
@@ -1100,7 +1169,10 @@ impl App {
                 c.spacing_mut().item_spacing.y = 2.0;
                 c.add_space((ROW_H - 36.0) / 2.0);
                 let hidden = t.id.as_ref().map(|i| self.hidden_tracks.contains(i)).unwrap_or(false);
-                let color = if is_now { GREEN } else if hidden { p.faint } else { p.text };
+                // Una que seguro no puede sonar se ve apagada (como una oculta), pero se puede
+                // pulsar igual: es solo un aviso, quien decide es el reproductor.
+                let unplayable = t.is_playable == Some(false);
+                let color = if is_now { GREEN } else if hidden || unplayable { p.faint } else { p.text };
                 c.add(Label::new(RichText::new(&t.name).font(theme::regular(14.0)).color(color)).truncate());
                 if narrow {
                     let names = t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
@@ -1268,6 +1340,14 @@ impl App {
                 }
             }
 
+            if hov {
+                self.report_row_hover(&t.uri, pressing);
+            }
+            let resp = if t.is_playable == Some(false) {
+                resp.on_hover_text(UNPLAYABLE_HINT)
+            } else {
+                resp
+            };
             if resp.double_clicked() {
                 if list_id.starts_with("queue") {
                     // Desde la cola: saltar dentro de lo que ya suena, sin cambiar el origen.

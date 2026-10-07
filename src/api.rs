@@ -14,12 +14,16 @@ use crate::backend::Shared;
 use crate::bus::{Msg, UiTx};
 use crate::model::*;
 use crate::pathfinder::{PfErr, Pathfinder};
-use crate::webauth::WebAuth;
+use crate::webauth::{WebAuth, WebChain};
+use librespot_core::meta_cache::SEED_ROWS;
 use librespot_core::SpotifyUri;
 use librespot_metadata::Metadata;
 
 const BASE: &str = "https://api.spotify.com/v1";
 const WORKERS: usize = 2;
+/// Hilos del carril interno (`Api::send`): lo que se ve al abrir una página y sale del protocolo
+/// interno de Spotify, no de la Web API.
+const INTERNAL_WORKERS: usize = 3;
 /// Elementos que se piden uno a uno como mucho por llamada (los que un lote de metadatos no
 /// trajo, o un lote pequeño que falló), y cuántos a la vez. Sin tope, un lote fallido de
 /// cientos agotaba el cupo de librespot (300 cada 30 s) y la canción que suena no cargaba.
@@ -32,6 +36,9 @@ const SINGLE_GET_LOAD_MAX: usize = 3 * SINGLE_GET_MAX;
 const BATCH_MAX: usize = 500;
 /// Primer lote de una playlist: pequeño, para que las primeras filas no esperen a uno de 500.
 const PLAYLIST_FIRST_BATCH: usize = 100;
+/// Canciones de una búsqueda cuyos metadatos se adelantan como mucho (`Req::WarmMeta`): las que
+/// se ven sin bajar.
+pub const WARM_META_MAX: usize = 10;
 /// Lotes de una playlist en vuelo a la vez. No más: el otro hilo y la reproducción comparten
 /// el cupo de librespot (300 peticiones cada 30 s).
 const PLAYLIST_BATCH_PARALLEL: usize = 3;
@@ -94,6 +101,72 @@ fn on_player_lane() -> bool {
     PLAYER.with(|p| p.get())
 }
 
+/// Desde cuándo carga aquí una canción (la interfaz está en «cargando»), en ms de
+/// `loading_clock_ms`; 0 si no carga ninguna. Lo pone la interfaz con `set_playback_loading`.
+static PLAYBACK_LOADING_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Una carga frena los lotes de metadatos en segundo plano como mucho durante esto desde que
+/// empezó. Más allá, o la carga está atascada por otra cosa (y la biblioteca no debe esperarla)
+/// o el aviso es viejo (la interfaz no se pintó para quitarlo, p. ej. minimizada).
+const PLAYBACK_YIELD_MAX_MS: u64 = 4_000;
+/// Cada cuánto mira un lote en espera si la canción ya suena.
+const PLAYBACK_YIELD_POLL: Duration = Duration::from_millis(40);
+
+/// La interfaz avisa de que una canción carga aquí (`true`) o ya no (`false`). Se llama en cada
+/// pasada de la interfaz: solo el paso de no cargar a cargar fija el momento de inicio.
+pub fn set_playback_loading(loading: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if loading {
+        let _ = PLAYBACK_LOADING_SINCE.compare_exchange(0, loading_clock_ms(), Relaxed, Relaxed);
+    } else {
+        PLAYBACK_LOADING_SINCE.store(0, Relaxed);
+    }
+}
+
+/// Reloj de `PLAYBACK_LOADING_SINCE`: ms desde la primera consulta, más 1 para que nunca valga
+/// 0 (que es «no carga»).
+fn loading_clock_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// ¿Debe esperar un lote en segundo plano? Solo si hay una carga y empezó hace menos de
+/// PLAYBACK_YIELD_MAX_MS.
+fn playback_gate(since_ms: u64, now_ms: u64) -> bool {
+    since_ms != 0 && now_ms.saturating_sub(since_ms) < PLAYBACK_YIELD_MAX_MS
+}
+
+fn playback_loading() -> bool {
+    playback_gate(PLAYBACK_LOADING_SINCE.load(std::sync::atomic::Ordering::Relaxed), loading_clock_ms())
+}
+
+/// Antes de pedir el siguiente lote de metadatos de una carga larga (una playlist de miles, un
+/// álbum o artista grande): si una canción está cargando aquí, se espera a que suene. Sus
+/// peticiones (metadatos, almacenamiento) van al mismo spclient y al mismo cupo de librespot
+/// que estos lotes, y una respuesta de 500 entidades por delante retrasaba el primer sonido.
+/// Los lotes ya en vuelo siguen; el primero de cada carga (las filas que se ven) no espera.
+async fn yield_to_playback() {
+    if !playback_loading() {
+        return;
+    }
+    let t0 = Instant::now();
+    while playback_loading() {
+        tokio::time::sleep(PLAYBACK_YIELD_POLL).await;
+    }
+    log::debug!("metadatos por lotes: {} ms en espera de la canción que carga", t0.elapsed().as_millis());
+}
+
+/// `yield_to_playback` para los bucles que no van dentro de un `block_on` (hilos de la API).
+fn yield_to_playback_blocking() {
+    if !playback_loading() {
+        return;
+    }
+    let t0 = Instant::now();
+    while playback_loading() {
+        std::thread::sleep(PLAYBACK_YIELD_POLL);
+    }
+    log::debug!("metadatos por lotes: {} ms en espera de la canción que carga", t0.elapsed().as_millis());
+}
+
 /// Trabajo del carril de enriquecimiento (letras y géneros de fuentes externas). No es un canal
 /// porque hay que poder sustituir y descartar lo que espera: las letras de una canción ya
 /// saltada o los géneros de páginas que ya no se ven.
@@ -126,10 +199,36 @@ struct ListCopy {
     country: Option<String>,
 }
 
+/// ¿Va por el carril interno? Lo que abre una página y sale del protocolo interno de Spotify (sin
+/// la Web API, o el álbum, que la prueba sin esperar). Nada que escriba; solo la lista de playlists
+/// cae a la Web API, y únicamente si el rootlist no sirve.
+fn interno(req: &Req) -> bool {
+    matches!(
+        req,
+        Req::PlaylistTracks(_)
+            | Req::Playlists
+            | Req::Album(_)
+            | Req::RadioPlaylist(_)
+            | Req::HomeFeed
+            | Req::ArtistView(_)
+            | Req::User(_)
+            | Req::TrackInfo(_)
+            | Req::ArtistThumbs(_)
+            | Req::JamQueue { .. }
+    )
+}
+
 #[derive(Clone, Debug)]
 pub enum Req {
     Me,
+    /// Playlists de la biblioteca, del rootlist interno (spclient): nombres, orden, tamaño y
+    /// portada subida sin gastar la cuota compartida de la Web API. Solo si el rootlist no
+    /// sirve, de /me/playlists como antes.
     Playlists,
+    /// Lo que el rootlist no trae del listado (mosaicos de portada, nombre visible del
+    /// propietario, privacidad), de /me/playlists. Por el carril de fondo: ante un 429 falla al
+    /// momento y la biblioteca sigue con lo que ya tenía.
+    PlaylistsWeb,
     PlaylistMeta(String),
     PlaylistTracks(String),
     Liked,
@@ -142,6 +241,10 @@ pub enum Req {
     /// Nombre e imagen de varios artistas de una vez (tarjetas de información), por un lote de
     /// metadatos internos: sin cuota de la Web API ni búsqueda de géneros.
     ArtistThumbs(Vec<String>),
+    /// Precarga inteligente: los metadatos de estas canciones (las primeras de una búsqueda) en un
+    /// solo lote, sembrados en la caché del reproductor para que la que se pulse no los pida. Sin
+    /// respuesta para la interfaz (`Resp::Done`) ni aviso si falla.
+    WarmMeta(Vec<String>),
     /// Solo etiqueta los géneros que manda el carril de enriquecimiento (Resp::Genres); enviada
     /// a la API devuelve los ya conocidos, sin red.
     Genres { key: String },
@@ -199,6 +302,10 @@ pub enum Req {
     Rootlist,
     /// Sonda de depuración: GET a un endpoint interno (spclient) y volcado a disco.
     Probe(String),
+    /// Sonda de las mezclas de Spotify (diagnóstico del modo de control, `mix_probe`): pide una
+    /// vez todo lo que podría traer las transiciones de una playlist mezclada y escribe el informe
+    /// en %TEMP%\nanofy_mixprobe_<id>.txt (ver `crate::mixprobe`). Responde `Resp::Done`.
+    MixProbe(String),
     /// Carpetas (rootlist interno, playlist4 «changes»): crear, borrar, renombrar y mover playlists.
     FolderCreate { name: String, playlists: Vec<String> },
     FolderDelete(String),
@@ -229,7 +336,9 @@ pub enum Req {
         id: String,
         name: String,
         description: String,
-        public: bool,
+        /// `None`: privacidad desconocida (el rootlist no la trae y la Web API no la dio); no se
+        /// envía, para no volver pública una privada al cambiarle solo el nombre.
+        public: Option<bool>,
         collaborative: bool,
     },
     SetPlaylistImage {
@@ -277,7 +386,9 @@ pub enum Req {
     ArtistView(String),
     /// Podcast / audiolibro con sus episodios.
     Show(String),
-    /// Conecta la Web API con la app de desarrollador del usuario (abre el navegador).
+    /// Conecta la biblioteca (Web API) con la identidad de primera parte: abre el navegador y
+    /// espera en un hilo de la API. La interfaz usa `Api::begin_web_chain`, que no ocupa ninguno y
+    /// se puede cancelar; sus resultados llegan con esta misma petición.
     WebConnect(String),
     WebDisconnect,
     WebConnectPersonal(String),
@@ -286,7 +397,13 @@ pub enum Req {
 
 pub enum Resp {
     Me(User),
-    Playlists(Vec<Playlist>),
+    /// Listado de la biblioteca. `rootlist`: salió del rootlist (sin nombre visible del
+    /// propietario ni privacidad, y sin portada en las que no tienen una subida: se completan
+    /// con el listado anterior y, en segundo plano, con `Req::PlaylistsWeb`). Si no, de la Web
+    /// API, completo.
+    Playlists { list: Vec<Playlist>, rootlist: bool },
+    /// /me/playlists para completar el listado del rootlist (ver `Req::PlaylistsWeb`).
+    PlaylistsWeb(Vec<Playlist>),
     PlaylistMeta(Playlist),
     /// Metadatos de una playlist sacados de playlist4 (librespot): nombre, portada, descripción,
     /// tamaño y si es colaborativa. No traen el nombre visible del propietario, la privacidad ni
@@ -378,9 +495,12 @@ pub struct Api {
     prio_tx: mpsc::Sender<Req>,
     search_tx: mpsc::Sender<Req>,
     bg_tx: mpsc::Sender<Req>,
+    internal_tx: mpsc::Sender<Req>,
     enrich: Enrich,
     web: Arc<WebAuth>,
     web_personal: Arc<WebAuth>,
+    /// Para las autorizaciones de la biblioteca, que esperan en su propio hilo (`begin_web_chain`).
+    ui: UiTx,
 }
 
 impl Drop for Api {
@@ -412,6 +532,14 @@ impl Api {
         // Carril de fondo: recargas largas que nadie está mirando (Me gusta completa, artistas
         // seguidos). Con su propio hilo no ocupan los dos comunes durante decenas de segundos.
         let (bg_tx, bg_rx) = mpsc::channel::<Req>();
+        // Carril interno: lo que se ve al abrir una página y sale del protocolo interno de Spotify
+        // (playlist4, rootlist, metadatos por lotes, radio, inicio, artista, perfil), no de la Web
+        // API; un álbum, de ella solo si responde sin esperar (`interno`). En los hilos comunes
+        // esperaban detrás de lecturas de la Web API dormidas en un Retry-After (hasta 25 s
+        // cada una): con la cuota compartida limitando, abrir una playlist, un álbum o una radio
+        // en frío tardaba 5-20 s en una petición de 0,3 s.
+        let (internal_tx, internal_rx) = mpsc::channel::<Req>();
+        let internal_rx = Arc::new(Mutex::new(internal_rx));
         // Carril de enriquecimiento: letras y géneros de fuentes externas (LRCLIB, iTunes, Deezer,
         // MusicBrainz), segundos de consultas en serie que antes ocupaban los dos hilos comunes
         // después de dibujar la página. Las letras van primero.
@@ -561,6 +689,25 @@ impl Api {
                 })
                 .expect("no se pudo crear el hilo de la API");
         }
+        for i in 0..INTERNAL_WORKERS {
+            let rx = internal_rx.clone();
+            let client = client.clone();
+            let ui = ui.clone();
+            std::thread::Builder::new()
+                .name(format!("nanofy-api-internal-{i}"))
+                .stack_size(512 * 1024)
+                .spawn(move || loop {
+                    let req = {
+                        let guard = rx.lock().unwrap();
+                        guard.recv()
+                    };
+                    match req {
+                        Ok(req) => run(req, &client, &ui),
+                        Err(_) => break,
+                    }
+                })
+                .expect("no se pudo crear el hilo de la API");
+        }
         {
             let client = client.clone();
             let ui = ui.clone();
@@ -632,7 +779,37 @@ impl Api {
                 })
                 .expect("no se pudo crear el hilo de la API");
         }
-        Self { tx, prio_tx, search_tx, bg_tx, enrich, web, web_personal }
+        Self { tx, prio_tx, search_tx, bg_tx, internal_tx, enrich, web, web_personal, ui }
+    }
+
+    /// Prepara la autorización de la biblioteca (identidad de primera parte) y la deja esperando
+    /// la vuelta del navegador en su propio hilo, no en los carriles de la API: puede tardar
+    /// minutos, y antes ocupaba uno de los dos hilos comunes hasta que volvía (para siempre si se
+    /// cerraba la pestaña). `open`: abrirla ya en el navegador; sin él, la URL se encadena al
+    /// inicio de sesión (`Cmd::Login`). El resultado llega como el de `Req::WebConnect`, salvo si
+    /// la cancela la interfaz (`WebChain::cancel`), que ya lo sabe.
+    pub fn begin_web_chain(&self, open: bool) -> Result<WebChain, String> {
+        let pending = self.web.prepare_connect()?;
+        let chain = pending.handle();
+        let web = self.web.clone();
+        let ui = self.ui.clone();
+        std::thread::Builder::new()
+            .name("nanofy-webauth".into())
+            .spawn(move || {
+                let result = web.finish_connect(pending);
+                if result.as_ref().is_err_and(|e| e == crate::webauth::CONNECT_CANCELLED) {
+                    return;
+                }
+                ui.send(Msg::Api(ApiResult {
+                    req: Req::WebConnect(crate::webauth::WEB_CLIENT_ID.to_string()),
+                    result: result.map(|()| Resp::WebConnected),
+                }));
+            })
+            .map_err(|e| format!("no se pudo crear el hilo de la autorización: {e}"))?;
+        if open {
+            crate::webauth::open_in_browser(&chain.url);
+        }
+        Ok(chain)
     }
 
     /// Envía por el carril prioritario (no espera detrás de la biblioteca). Para la
@@ -665,6 +842,10 @@ impl Api {
                 log::info!("api {:?} descartada: hay unas letras más nuevas", old);
             }
             cv.notify_one();
+            return;
+        }
+        if interno(&req) {
+            let _ = self.internal_tx.send(req);
             return;
         }
         let player = matches!(
@@ -887,6 +1068,11 @@ impl Client {
         // falla ya, quien lo pidió conserva su copia y se reintenta en otro arranque. Así no
         // gasta más cuota mientras Spotify limita ni retiene la espera de las demás lecturas.
         let wait_ok = wait_ok && !on_bg_lane();
+        // Pruebas (`NANOFY_FAKE_429=web`): la cuota compartida, agotada por otros clientes.
+        if fake_429_web() {
+            log::debug!("[fallo] 429 simulado: {method} {url}");
+            return Err(throttle_message(FAKE_429_SECS));
+        }
         if let Some(until) = *self.cooldown_until.lock().unwrap() {
             let now = crate::cache::now_secs();
             if until > now {
@@ -929,8 +1115,9 @@ impl Client {
         let mut read_waited = false;
         // Lecturas: los tokens que acaban de recibir un 429 se saltan hasta que pase su
         // Retry-After. Se filtra DESPUÉS de construir la lista: si se saltaran al construirla y
-        // no quedara ninguno, se usaría el token de login5, que ante un 429 diría «configura tu
-        // Client ID» en vez de «reintenta en N s». Las escrituras tienen su propio presupuesto.
+        // no quedara ninguno, se usaría el token de login5, que ante un 429 diría «conecta tu
+        // biblioteca» (NO_APP_HINT) en vez de «reintenta en N s». Las escrituras tienen su propio
+        // presupuesto.
         // Si se saltó alguno, el último de la lista filtrada no es el último de verdad: un
         // QUOTA_EXCEEDED de la app propia no debe acabar en el enfriamiento largo de toda la API.
         let mut skipped = false;
@@ -1395,8 +1582,13 @@ impl Client {
     /// (con un 429, hasta 25 s de espera) antes de la primera playlist.
     fn tracks_by_ids(&self, ids: &[String]) -> Result<Vec<Track>, String> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(BATCH_MAX) {
-            match self.tracks_via_batch(chunk) {
+        for (i, chunk) in ids.chunks(BATCH_MAX).enumerate() {
+            if i > 0 {
+                yield_to_playback_blocking();
+            }
+            // Las primeras filas (álbum, canciones de un artista) quedan sembradas para el
+            // reproductor; las de lotes posteriores, no.
+            match self.tracks_via_batch(chunk, SEED_ROWS.saturating_sub(i * BATCH_MAX)) {
                 Ok(t) => out.extend(t),
                 // Una a una solo si son pocas. Con un lote de cientos, el error sube: pedirlas
                 // sueltas agotaba el cupo de librespot y aun así se perdían pistas; quien pidió
@@ -1418,7 +1610,7 @@ impl Client {
         let kind = librespot_protocol::extension_kind::ExtensionKind::TRACK_V4;
         let uris: Vec<Option<SpotifyUri>> = ids.iter().map(|id| SpotifyUri::from_uri(&format!("spotify:track:{id}")).ok()).collect();
         let valid: Vec<SpotifyUri> = uris.iter().flatten().cloned().collect();
-        let metas = match self.metadata_batch::<librespot_metadata::Track>(&valid, kind) {
+        let metas = match self.metadata_batch::<librespot_metadata::Track>(&valid, kind, SEED_ROWS) {
             Ok(m) => m,
             // Una a una solo si son pocas, como en tracks_by_ids.
             Err(e) if valid.len() <= SINGLE_GET_MAX => {
@@ -1569,9 +1761,12 @@ impl Client {
             .filter_map(|id| Some((id, SpotifyUri::from_uri(&format!("spotify:artist:{id}")).ok()?)))
             .collect();
         let mut out = Vec::with_capacity(wanted.len());
-        for chunk in wanted.chunks(THUMBS_BATCH) {
+        for (i, chunk) in wanted.chunks(THUMBS_BATCH).enumerate() {
+            if i > 0 {
+                yield_to_playback_blocking();
+            }
             let uris: Vec<SpotifyUri> = chunk.iter().map(|(_, u)| u.clone()).collect();
-            let metas = self.metadata_batch::<librespot_metadata::Artist>(&uris, librespot_protocol::extension_kind::ExtensionKind::ARTIST_V4)?;
+            let metas = self.metadata_batch::<librespot_metadata::Artist>(&uris, librespot_protocol::extension_kind::ExtensionKind::ARTIST_V4, 0)?;
             // Por posición, con el id pedido: la tarjeta lo busca por ese.
             for ((id, _), m) in chunk.iter().zip(metas) {
                 if let Some(a) = m {
@@ -1824,7 +2019,7 @@ impl Client {
     fn albums_from_uri_groups(&self, groups: &[Vec<SpotifyUri>]) -> Vec<Vec<AlbumRef>> {
         let all: Vec<SpotifyUri> = groups.iter().flatten().cloned().collect();
         let mut fetched = self
-            .metadata_batch::<librespot_metadata::Album>(&all, librespot_protocol::extension_kind::ExtensionKind::ALBUM_V4)
+            .metadata_batch::<librespot_metadata::Album>(&all, librespot_protocol::extension_kind::ExtensionKind::ALBUM_V4, 0)
             .unwrap_or_default()
             .into_iter();
         groups
@@ -1933,7 +2128,7 @@ impl Client {
             .map_err(|e| format!("podcast: {e}"))?;
         let ep_uris: Vec<SpotifyUri> = s.episodes.iter().take(50).cloned().collect();
         let fetched = self
-            .metadata_batch::<librespot_metadata::Episode>(&ep_uris, librespot_protocol::extension_kind::ExtensionKind::EPISODE_V4)
+            .metadata_batch::<librespot_metadata::Episode>(&ep_uris, librespot_protocol::extension_kind::ExtensionKind::EPISODE_V4, SEED_ROWS)
             .unwrap_or_default();
         let episodes: Vec<Episode> = fetched
             .into_iter()
@@ -1981,7 +2176,7 @@ impl Client {
             }
         }
         let fetched = self
-            .metadata_batch::<librespot_metadata::Album>(&uris, librespot_protocol::extension_kind::ExtensionKind::ALBUM_V4)
+            .metadata_batch::<librespot_metadata::Album>(&uris, librespot_protocol::extension_kind::ExtensionKind::ALBUM_V4, 0)
             .unwrap_or_default();
         let mut out: Vec<AlbumRef> = fetched
             .into_iter()
@@ -2022,10 +2217,14 @@ impl Client {
     /// canciones para sonar. Lo que el lote no traiga (pocas: ediciones regionales, retiradas)
     /// se pide suelto, con tope. Envoltorio síncrono de batch_chunk para quien no carga una
     /// playlist: lotes uno tras otro, como antes.
+    ///
+    /// `seed`: las primeras filas que se siembran en la caché de metadatos del reproductor (solo
+    /// canciones y episodios, ver `batch_chunk`).
     fn metadata_batch<M: librespot_metadata::Metadata + Clone>(
         &self,
         uris: &[SpotifyUri],
         kind: librespot_protocol::extension_kind::ExtensionKind,
+        seed: usize,
     ) -> Result<Vec<Option<M>>, String> {
         let session = self.session()?;
         let keys: Vec<String> = uris.iter().map(|u| u.to_uri().unwrap_or_default()).collect();
@@ -2033,17 +2232,54 @@ impl Client {
         let singles = std::cell::Cell::new(SINGLE_GET_MAX);
         self.handle.block_on(async {
             let mut out = Vec::with_capacity(keys.len());
-            for chunk in keys.chunks(BATCH_MAX) {
-                let first = batch_chunk::<M>(&session, chunk, kind, &singles).await;
-                out.extend(batch_retry(&session, chunk, kind, &singles, first).await?);
+            for (i, chunk) in keys.chunks(BATCH_MAX).enumerate() {
+                if i > 0 {
+                    yield_to_playback().await;
+                }
+                let seed = seed.saturating_sub(i * BATCH_MAX);
+                let first = batch_chunk::<M>(&session, chunk, kind, &singles, seed).await;
+                out.extend(batch_retry(&session, chunk, kind, &singles, first, seed).await?);
             }
             Ok::<_, String>(out)
         })
     }
 
-    fn tracks_via_batch(&self, ids: &[String]) -> Result<Vec<Track>, String> {
+    /// `Req::WarmMeta`: un lote con las canciones de `uris` cuyos metadatos aún no tiene el
+    /// reproductor (como mucho WARM_META_MAX), sembrado en su caché. Sin sueltos: lo que el lote no
+    /// traiga se pedirá al reproducirlo, como siempre.
+    fn warm_metadata(&self, uris: &[String]) -> Result<(), String> {
+        // Si las semillas no coincidieron con lo del reproductor ya no se guardan: el lote sería
+        // una petición tirada en cada búsqueda.
+        if !librespot_core::spclient::SpClient::seeds_accepted() {
+            return Ok(());
+        }
+        let kind = librespot_protocol::extension_kind::ExtensionKind::TRACK_V4;
+        let session = self.session()?;
+        let spclient = session.spclient();
+        let mut seen = std::collections::HashSet::new();
+        // Lo ya guardado no se vuelve a pedir, aunque sea una semilla aún sin comprobar: el lote
+        // traería los mismos bytes (la comprobación la hace el reproductor al cargarla).
+        let keys: Vec<String> = uris
+            .iter()
+            .filter(|u| u.starts_with("spotify:track:") && seen.insert(u.as_str()) && !spclient.metadata_held(kind, u))
+            .take(WARM_META_MAX)
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let singles = std::cell::Cell::new(0);
+        let n = keys.len();
+        self.block(TIMEOUT_SP_READ, async {
+            batch_chunk::<librespot_metadata::Track>(&session, &keys, kind, &singles, n).await.map_err(|(e, _)| e)
+        })?;
+        log::debug!("[precarga] metadatos de {n} canciones de la búsqueda");
+        Ok(())
+    }
+
+    fn tracks_via_batch(&self, ids: &[String], seed: usize) -> Result<Vec<Track>, String> {
         let uris: Vec<SpotifyUri> = ids.iter().filter_map(|id| SpotifyUri::from_uri(&format!("spotify:track:{id}")).ok()).collect();
-        let tracks = self.metadata_batch::<librespot_metadata::Track>(&uris, librespot_protocol::extension_kind::ExtensionKind::TRACK_V4)?;
+        let tracks = self.metadata_batch::<librespot_metadata::Track>(&uris, librespot_protocol::extension_kind::ExtensionKind::TRACK_V4, seed)?;
         Ok(tracks.into_iter().flatten().map(track_from_meta).collect())
     }
 
@@ -2099,13 +2335,24 @@ impl Client {
     /// Petición protobuf a un endpoint interno (spclient): cuerpo y respuesta en bytes. Con el
     /// plazo de su método (`sp_timeout`).
     fn spclient_pb(&self, method: http::Method, endpoint: &str, body: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        self.spclient_pb_with(method, endpoint, body, &[])
+    }
+
+    /// Como `spclient_pb`, con cabeceras de más (la sonda de mezclas pide la playlist con la
+    /// lente `spotify-apply-lenses`). Los nombres van en minúsculas.
+    fn spclient_pb_with(&self, method: http::Method, endpoint: &str, body: Option<&[u8]>, extra: &[(&'static str, &str)]) -> Result<Vec<u8>, String> {
         let session = self.session()?;
-        let bytes = self.block(sp_timeout(&method), session.spclient().request(&method, endpoint, Some(pb_headers()), body))?;
+        let mut headers = pb_headers();
+        for (name, value) in extra {
+            headers.insert(http::HeaderName::from_static(name), http::HeaderValue::from_str(value).map_err(|e| e.to_string())?);
+        }
+        let bytes = self.block(sp_timeout(&method), session.spclient().request(&method, endpoint, Some(headers), body))?;
         Ok(bytes.to_vec())
     }
 
-    /// Rootlist completo (uris en orden) y su revisión.
-    fn rootlist_raw(&self) -> Result<(Vec<u8>, Vec<String>), String> {
+    /// Rootlist completo tal como llega: entradas en orden, sus metadatos (`decorate`: revisión,
+    /// atributos, tamaño y propietario de cada playlist) y la revisión del propio rootlist.
+    fn rootlist_content(&self) -> Result<librespot_protocol::playlist4_external::SelectedListContent, String> {
         use protobuf::Message;
         let session = self.session()?;
         let bytes = self
@@ -2119,8 +2366,24 @@ impl Client {
         if msg.contents.truncated() || msg.length().max(0) as usize > got {
             log::warn!("[rootlist] llegó truncado: {got} de {} entradas", msg.length());
         }
+        Ok(msg)
+    }
+
+    /// Rootlist completo (uris en orden) y su revisión.
+    fn rootlist_raw(&self) -> Result<(Vec<u8>, Vec<String>), String> {
+        let msg = self.rootlist_content()?;
         let uris = msg.contents.items.iter().map(|i| i.uri().to_string()).collect();
         Ok((msg.revision().to_vec(), uris))
+    }
+
+    /// Las playlists de la biblioteca, del rootlist (ver `library_from_rootlist`): una lectura
+    /// de spclient, sin la cuota compartida de la Web API, que otros clientes también gastan.
+    fn library_via_rootlist(&self) -> Result<Vec<Playlist>, String> {
+        let t0 = Instant::now();
+        let msg = self.rootlist_content()?;
+        let list = library_from_rootlist(&msg.contents)?;
+        log::info!("[biblioteca] {} playlists del rootlist en {} ms", list.len(), t0.elapsed().as_millis());
+        Ok(list)
     }
 
     /// Aplica operaciones al rootlist (playlist4 «changes»). Los índices de cada op se calculan
@@ -2251,10 +2514,284 @@ impl Client {
         String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
     }
 
+    /// `Req::MixProbe`: la sonda de las mezclas de Spotify (ver `crate::mixprobe`). Cada parte va
+    /// por su lado: un fallo se apunta en el informe y se sigue con la siguiente, porque lo que se
+    /// busca es justo saber qué contesta Spotify a una sesión de librespot y qué no. Solo lee: no
+    /// toca la playlist, ni la cola, ni lo que suena. Devuelve el informe y el veredicto.
+    fn mix_probe(&self, id: &str) -> (String, String) {
+        use crate::mixprobe::{self as mp, section};
+        use protobuf::Message;
+        use std::collections::HashMap;
+        use std::fmt::Write as _;
+        let t0 = Instant::now();
+        let head = format!("Nanofy {} · sonda de mezclas de spotify:playlist:{id}", crate::update::current_version());
+        let session = match self.session() {
+            Ok(s) => s,
+            Err(e) => {
+                let verdict = format!("sin datos: {e}");
+                return (format!("{head}\n\n{verdict}\nFIN\n"), verdict);
+            }
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut transitions = std::collections::BTreeSet::new();
+
+        // (a) La playlist4 tal cual llega: sin lente y con las lentes «mix» y «auto», por si la
+        // mezcla solo aparece al pedirla así (Spotify la guarda como una lente de la playlist).
+        // Se compara el resumen, no los bytes: la respuesta lleva la hora y nunca sería igual.
+        let endpoint = format!("/playlist/v2/playlist/{id}");
+        let mut list = mp::ListFindings::default();
+        let mut base: Option<Vec<String>> = None;
+        for lens in [None, Some("mix"), Some("auto")] {
+            out.push(section(&match lens {
+                None => "(a) playlist4 sin cabecera (GET /playlist/v2/playlist/<id>)".to_string(),
+                Some(l) => format!("(a) playlist4 con spotify-apply-lenses: {l}"),
+            }));
+            let extra: Vec<(&'static str, &str)> = lens.map(|l| vec![("spotify-apply-lenses", l)]).unwrap_or_default();
+            let bytes = match self.spclient_pb_with(http::Method::GET, &endpoint, None, &extra) {
+                Ok(b) => b,
+                Err(e) => {
+                    out.push(format!("error: {e}"));
+                    continue;
+                }
+            };
+            let msg = match librespot_protocol::playlist4_external::SelectedListContent::parse_from_bytes(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    out.push(format!("no se pudo leer ({} bytes): {e}", bytes.len()));
+                    continue;
+                }
+            };
+            let mut lines = Vec::new();
+            let found = mp::describe_list(&msg, &mut lines, &mut transitions);
+            out.push(format!("{} bytes", bytes.len()));
+            if lens.is_some() && base.as_ref() == Some(&lines) {
+                out.push("lo mismo que sin cabecera".into());
+                continue;
+            }
+            out.extend(lines.iter().cloned());
+            // La primera que se pudo leer es la de referencia (normalmente la que va sin lente).
+            if base.is_none() {
+                list = found;
+                base = Some(lines);
+            }
+        }
+
+        // (b) context-resolve, el mismo que pide Spirc al reproducir la playlist: ahí van los
+        // metadatos de cada pista (audio.fade_*, automix.*) si Spotify los manda.
+        out.push(section("(b) context-resolve (GET /context-resolve/v1/spotify:playlist:<id>, como Spirc)"));
+        let ctx = match self.block(TIMEOUT_SP_READ, session.spclient().get_context_raw(&format!("spotify:playlist:{id}"))) {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(v) => {
+                    out.push(format!("{} bytes", bytes.len()));
+                    mp::describe_context(&v, &list.items, &mut out, &mut transitions)
+                }
+                Err(e) => {
+                    out.push(format!("no es JSON ({} bytes): {e}", bytes.len()));
+                    mp::ContextFindings::default()
+                }
+            },
+            Err(e) => {
+                out.push(format!("error: {e}"));
+                mp::ContextFindings::default()
+            }
+        };
+
+        // (c) extended-metadata con los tipos de las mezclas, por número: el estado de mezcla de
+        // la playlist, el análisis de dos canciones y los datos de las transiciones encontradas.
+        out.push(section("(c) extended-metadata (tipos de las mezclas, pedidos por número)"));
+        let mut tracks = list.track_uris();
+        if tracks.is_empty() {
+            tracks = ctx.tracks.iter().filter(|u| u.starts_with("spotify:track:")).cloned().collect();
+        }
+        let sample: Vec<String> = tracks.iter().take(2).cloned().collect();
+        let playlist_uri = vec![format!("spotify:playlist:{id}")];
+        let mut with_data: Vec<String> = Vec::new();
+        let mut note = |kind: i32, name: &str, n: usize| {
+            if n > 0 {
+                with_data.push(format!("{kind} {name} ×{n}"));
+            }
+        };
+        let (k, name) = mp::KIND_MIX_STATE;
+        note(k, name, self.mix_probe_kind(&session, &playlist_uri, k, name, mp::DETAIL, &mut out).len());
+        if sample.is_empty() {
+            out.push("la playlist no tiene canciones: no se piden los tipos de canción".into());
+        } else {
+            for &(k, name) in mp::TRACK_KINDS {
+                note(k, name, self.mix_probe_kind(&session, &sample, k, name, mp::DETAIL, &mut out).len());
+            }
+        }
+        let transition_uris: Vec<String> = transitions.iter().take(mp::TRANSITIONS_MAX).cloned().collect();
+        out.push(format!("uris de transición encontradas en (a) y (b): {}", transitions.len()));
+        let (td_kind, td_name) = mp::KIND_TRANSITION_DATA;
+        let mut transition_data = 0;
+        if transition_uris.is_empty() {
+            // Sin uris no hay a quién pedirle la transición; con la de la playlist se ve al menos
+            // si el tipo existe para esta sesión (y qué estado devuelve).
+            out.push("ninguna: se prueba TRANSITION_DATA con la uri de la playlist".into());
+            let n = self.mix_probe_kind(&session, &playlist_uri, td_kind, td_name, mp::DETAIL, &mut out).len();
+            note(td_kind, td_name, n);
+        } else {
+            for &(k, name) in mp::TRANSITION_KINDS {
+                let n = self.mix_probe_kind(&session, &transition_uris, k, name, mp::DETAIL, &mut out).len();
+                note(k, name, n);
+                if k == td_kind {
+                    transition_data = n;
+                }
+            }
+        }
+
+        // (d) El BPM de cada canción, como lo enseña el editor de mezclas de Spotify: del tipo 222
+        // en un lote y de cualquier metadato con pinta de tempo de (a) y (b).
+        out.push(section("(d) BPM y tonalidad por canción (AUDIO_ATTRIBUTES_V2 y claves con pinta de tempo)"));
+        let bpm_tracks: Vec<String> = tracks.iter().take(mp::BPM_MAX).cloned().collect();
+        let (k, name) = mp::KIND_AUDIO_ATTRIBUTES;
+        let attrs: HashMap<String, Vec<u8>> = if bpm_tracks.is_empty() {
+            HashMap::new()
+        } else {
+            self.mix_probe_kind(&session, &bpm_tracks, k, name, 0, &mut out).into_iter().map(|(u, _, b)| (u, b)).collect()
+        };
+        let with_tempo_keys = bpm_tracks.iter().any(|u| list.tempo.contains_key(u) || ctx.tempo.contains_key(u));
+        let with_bpm = bpm_tracks.iter().filter(|u| attrs.get(*u).and_then(|b| mp::bpm_guess(b)).is_some()).count();
+        if attrs.is_empty() && !with_tempo_keys {
+            out.push("ninguna canción trae BPM: ni AUDIO_ATTRIBUTES_V2 ni claves con pinta de tempo".into());
+        } else {
+            // Nombres para cotejar con lo que enseña el teléfono; sin sembrar la caché del
+            // reproductor (es un diagnóstico, no una precarga).
+            let ids: Vec<String> = bpm_tracks.iter().filter_map(|u| u.strip_prefix("spotify:track:")).map(str::to_string).collect();
+            let names: HashMap<String, String> = match self.tracks_via_batch(&ids, 0) {
+                Ok(found) => found.into_iter().map(|t| (t.uri.clone(), format!("{} — {}", t.artists_str(), t.name))).collect(),
+                Err(e) => {
+                    out.push(format!("sin los nombres de las canciones: {e}"));
+                    HashMap::new()
+                }
+            };
+            for (i, uri) in bpm_tracks.iter().enumerate() {
+                let mut line = format!("  {:>3}. {} [{uri}]", i + 1, mp::clip(names.get(uri).map(String::as_str).unwrap_or("?")));
+                match attrs.get(uri) {
+                    Some(b) => {
+                        if let Some(bpm) = mp::bpm_guess(b) {
+                            let _ = write!(line, " · BPM probable {bpm:.1}");
+                        }
+                        let _ = write!(line, " · 222 {}", mp::compact(b, 160));
+                    }
+                    None => line.push_str(" · 222 sin datos"),
+                }
+                for t in list.tempo.get(uri).into_iter().chain(ctx.tempo.get(uri)).flatten() {
+                    let _ = write!(line, " · {t}");
+                }
+                out.push(line);
+            }
+        }
+
+        // (e) El análisis de audio por spclient (la Web API lo cerró a las apps nuevas): la otra
+        // fuente posible de tempo, pulsos y secciones para las mezclas propias.
+        out.push(section("(e) audio-analysis (GET /audio-attributes/v1/audio-analysis/<id>?format=json)"));
+        let mut analysis_ok = 0;
+        for uri in &sample {
+            let tid = uri.trim_start_matches("spotify:track:");
+            match self.spclient(http::Method::GET, &format!("/audio-attributes/v1/audio-analysis/{tid}?format=json")) {
+                Ok(text) => match serde_json::from_str::<Value>(&text) {
+                    Ok(v) => {
+                        if v["track"]["tempo"].is_number() {
+                            analysis_ok += 1;
+                        }
+                        out.push(format!("  {uri}: {} bytes", text.len()));
+                        out.extend(mp::describe_analysis(&v).into_iter().map(|l| format!("    {l}")));
+                    }
+                    Err(e) => out.push(format!("  {uri}: no es JSON ({} bytes): {e}", text.len())),
+                },
+                Err(e) => out.push(format!("  {uri}: error: {e}")),
+            }
+        }
+        if sample.is_empty() {
+            out.push("sin canciones".into());
+        }
+
+        // Resumen arriba, con el veredicto del plan.
+        let code = mp::decide(ctx.with_transition_keys > 0, transition_data > 0);
+        let verdict = format!("{code}: {}", mp::explain(code));
+        let flags = list.mix_flags();
+        let n_tracks = ctx.tracks.len().max(list.items.len());
+        let summary = [
+            format!("veredicto: {verdict}"),
+            format!("marca de mezcla de la playlist (atributos de formato): {}", if flags.is_empty() { "ninguna".to_string() } else { flags.join("; ") }),
+            format!(
+                "claves de mezcla del contexto: {}",
+                if ctx.context_mix.is_empty() { "ninguna".to_string() } else { ctx.context_mix.join("; ") }
+            ),
+            format!("pistas con claves de transición en context-resolve: {} de {n_tracks}", ctx.with_transition_keys),
+            format!("pistas con alguna clave de mezcla en context-resolve: {} de {n_tracks}", ctx.with_mix_keys),
+            if ctx.uid_compared > 0 {
+                format!("uid de context-resolve == item_id de playlist4: {} de {}", ctx.uid_equal, ctx.uid_compared)
+            } else {
+                "uid de context-resolve == item_id de playlist4: no se pudo comparar".to_string()
+            },
+            format!("uris de transición: {} · TRANSITION_DATA con datos: {transition_data}", transitions.len()),
+            format!("extensiones con datos: {}", if with_data.is_empty() { "ninguna".to_string() } else { with_data.join(", ") }),
+            format!("BPM (222): {with_bpm} de {} canciones · audio-analysis: {analysis_ok} de {}", bpm_tracks.len(), sample.len()),
+            format!("duración de la sonda: {} ms", t0.elapsed().as_millis()),
+        ];
+        let mut report = String::new();
+        let _ = writeln!(report, "{head}");
+        let _ = writeln!(report, "Solo nombres de claves y valores de hasta {} caracteres; las cabeceras de las peticiones no se escriben.", mp::MAX_VALUE);
+        let _ = writeln!(report, "{}", section("RESUMEN"));
+        for l in summary.iter().chain(out.iter()) {
+            let _ = writeln!(report, "{l}");
+        }
+        let _ = writeln!(report, "\nFIN");
+        (report, verdict)
+    }
+
+    /// Una petición de extended-metadata de la sonda de mezclas: un tipo, por número, para estas
+    /// entidades, con su resumen en el informe (`detail`: entidades con volcado). Devuelve las que
+    /// traen datos.
+    fn mix_probe_kind(
+        &self,
+        session: &librespot_core::Session,
+        keys: &[String],
+        kind: i32,
+        name: &str,
+        detail: usize,
+        out: &mut Vec<String>,
+    ) -> Vec<(String, i32, Vec<u8>)> {
+        out.push(format!("-- {kind} {name} · {} entidades", keys.len()));
+        let body = match build_batch_body_raw(session, keys, kind) {
+            Ok(b) => b,
+            Err(e) => {
+                out.push(format!("   no se pudo armar la petición: {e}"));
+                return Vec::new();
+            }
+        };
+        let bytes = match self.block(TIMEOUT_SP_READ, fetch_batch(session, &body)) {
+            Ok(b) => b,
+            Err(e) => {
+                out.push(format!("   error: {e}"));
+                return Vec::new();
+            }
+        };
+        match crate::mixprobe::describe_batch(&bytes, detail, out) {
+            Ok(found) => found,
+            Err(e) => {
+                out.push(format!("   respuesta ilegible ({} bytes): {e}", bytes.len()));
+                Vec::new()
+            }
+        }
+    }
+
     fn exec(&self, req: &Req, ui: &UiTx) -> Result<Resp, String> {
         match req {
             Req::Me => Ok(Resp::Me(self.get_json(&format!("{BASE}/me"))?)),
-            Req::Playlists => Ok(Resp::Playlists(
+            Req::Playlists => match self.library_via_rootlist() {
+                Ok(list) => Ok(Resp::Playlists { list, rootlist: true }),
+                // Sin rootlist (o con metadatos que no casan con sus entradas): la Web API, como
+                // antes. Su error es el que se enseña; el del rootlist queda en el registro.
+                Err(e) => {
+                    log::warn!("[biblioteca] sin listado del rootlist ({e}); se pide a la Web API");
+                    let list = self.all_pages::<Playlist>(&format!("{BASE}/me/playlists?limit=50"), 40)?;
+                    Ok(Resp::Playlists { list, rootlist: false })
+                }
+            },
+            Req::PlaylistsWeb => Ok(Resp::PlaylistsWeb(
                 self.all_pages::<Playlist>(&format!("{BASE}/me/playlists?limit=50"), 40)?,
             )),
             Req::PlaylistMeta(id) => {
@@ -2335,9 +2872,23 @@ impl Client {
                     // El reintento de un lote va dentro de su futuro, no aquí: mientras se espera
                     // aquí a otra cosa, los lotes en vuelo no avanzan, y su plazo (que corre igual)
                     // vencería sin que hubieran tenido ocasión de terminar.
-                    let mut batches = futures::stream::iter(chunks.iter().map(|&c| async move {
-                        let first = batch_chunk::<librespot_metadata::Track>(session, c, kind, singles).await;
-                        batch_retry(session, c, kind, singles, first).await
+                    // Cada lote, salvo el primero, cede antes el paso a una canción que esté
+                    // cargando (`yield_to_playback`); la espera va fuera del plazo del lote.
+                    // Cuántas filas de cada lote se siembran para el reproductor: solo las primeras
+                    // SEED_ROWS de la lista (ver `seed_metadata`).
+                    let offsets: Vec<usize> = chunks.iter().scan(0, |at, c| {
+                        let start = *at;
+                        *at += c.len();
+                        Some(start)
+                    }).collect();
+                    let offsets = &offsets;
+                    let mut batches = futures::stream::iter(chunks.iter().enumerate().map(|(i, &c)| async move {
+                        if i > 0 {
+                            yield_to_playback().await;
+                        }
+                        let seed = SEED_ROWS.saturating_sub(offsets[i]);
+                        let first = batch_chunk::<librespot_metadata::Track>(session, c, kind, singles, seed).await;
+                        batch_retry(session, c, kind, singles, first, seed).await
                     }))
                     .buffered(PLAYLIST_BATCH_PARALLEL);
                     let mut offset = 0;
@@ -2470,7 +3021,9 @@ impl Client {
                 Ok(Resp::FollowedArtists(out))
             }
             Req::Album(id) => {
-                let mut album: Album = match self.get_json(&format!("{BASE}/albums/{id}")) {
+                // Sin esperar un Retry-After: con Spotify limitando, los metadatos internos traen
+                // el álbum en una petición (antes se esperaba hasta 25 s para luego caer a ellos).
+                let mut album: Album = match self.get_json_nowait(&format!("{BASE}/albums/{id}")) {
                     Ok(a) => a,
                     Err(e) => {
                         log::info!("/albums/{id} no disponible ({e}); usando metadatos de librespot");
@@ -2512,6 +3065,10 @@ impl Client {
                 Ok(Resp::Artist(a))
             }
             Req::ArtistThumbs(ids) => Ok(Resp::ArtistThumbs(self.artist_thumbs(ids)?)),
+            Req::WarmMeta(uris) => {
+                self.warm_metadata(uris)?;
+                Ok(Resp::Done)
+            }
             Req::Genres { key } => Ok(Resp::Genres {
                 key: key.clone(),
                 genres: self.cached_genres(key).unwrap_or_default(),
@@ -2973,6 +3530,15 @@ impl Client {
                 log::info!("[probe] {endpoint}: {} bytes: {}", text.len(), text.chars().take(300).collect::<String>());
                 Ok(Resp::Done)
             }
+            Req::MixProbe(id) => {
+                let (report, verdict) = self.mix_probe(id);
+                let path = crate::mixprobe::report_path(id);
+                match crate::mixprobe::write_report(&path, &report) {
+                    Ok(()) => log::info!("[mezcla] sonda de {id}: {verdict}; informe en {}", path.display()),
+                    Err(e) => log::warn!("[mezcla] sonda de {id}: {verdict}; no se pudo escribir {}: {e}", path.display()),
+                }
+                Ok(Resp::Done)
+            }
             Req::SavedShows => {
                 let items: Vec<Value> = self.all_pages(&format!("{BASE}/me/shows?limit=50"), 10)?;
                 Ok(Resp::SavedShows(
@@ -3015,7 +3581,8 @@ impl Client {
                             // Las subcarpetas cuentan como carpetas propias; la madre solo lista playlists.
                             folders.push(f);
                         }
-                    } else if let Some(pid) = uri.strip_prefix("spotify:playlist:") {
+                    } else if let Some(pid) = rootlist_playlist_id(uri) {
+                        // Mismo criterio que el listado de la biblioteca (library_from_rootlist).
                         if let Some(f) = stack.last_mut() {
                             f.playlists.push(pid.to_string());
                         }
@@ -3087,16 +3654,19 @@ impl Client {
                 public,
                 collaborative,
             } => {
-                self.send_json(
-                    "PUT",
-                    &format!("{BASE}/playlists/{id}"),
-                    Some(json!({
-                        "name": name,
-                        "description": description,
-                        "public": public,
-                        "collaborative": *collaborative && !public,
-                    })),
-                )?;
+                let mut body = json!({
+                    "name": name,
+                    "description": description,
+                });
+                match public {
+                    Some(public) => {
+                        body["public"] = json!(public);
+                        body["collaborative"] = json!(*collaborative && !public);
+                    }
+                    // Sin saber si es pública no se toca: colaborativa ya implica privada.
+                    None => body["collaborative"] = json!(*collaborative),
+                }
+                self.send_json("PUT", &format!("{BASE}/playlists/{id}"), Some(body))?;
                 Ok(Resp::PlaylistChanged(id.clone()))
             }
             Req::SetPlaylistImage { id, path } => {
@@ -3415,30 +3985,17 @@ impl Client {
     }
 }
 
-pub const NO_APP_HINT: &str = "Spotify limita la Web API del cliente compartido (429). Configura tu Client ID en Ajustes.";
+/// Lectura de la Web API sin la biblioteca conectada (el token de login5 recibió un 429). No es
+/// pasajero: hasta conectar la biblioteca seguirá igual, así que no promete reintentar. Se compara
+/// por valor (`Req::PlaylistMeta`) y la barra lateral le añade «Conectar con Spotify».
+pub const NO_APP_HINT: &str = "Conecta tu biblioteca con Spotify (no hace falta crear ninguna app).";
 
 /// Metadatos de una playlist a partir de su playlist4 (la misma descarga que trae las pistas).
 /// Sin nombre visible del propietario, privacidad ni seguidores (solo los da la Web API); el
 /// id del propietario sí, para que «Tu playlist» y el menú de edición funcionen sin ella.
 fn meta_from_playlist4(pl: &librespot_metadata::Playlist, id: &str) -> Playlist {
     let a = &pl.attributes;
-    let images = if a.picture.is_empty() {
-        // Radios y mixes: la portada generada viene en las variantes por tamaño.
-        a.picture_sizes
-            .iter()
-            .max_by_key(|p| match p.target_name.as_str() {
-                "xlarge" => 4,
-                "large" => 3,
-                "default" => 2,
-                _ => 1,
-            })
-            .filter(|p| !p.url.is_empty())
-            .map(|p| vec![Image { url: p.url.clone(), width: Some(300), height: Some(300) }])
-            .unwrap_or_default()
-    } else {
-        let hex: String = a.picture.iter().map(|b| format!("{b:02x}")).collect();
-        vec![Image { url: format!("https://i.scdn.co/image/{hex}"), width: Some(300), height: Some(300) }]
-    };
+    let images = playlist4_images(&a.picture, a.picture_sizes.iter().map(|p| (p.target_name.as_str(), p.url.as_str())));
     // Las playlists algorítmicas de Spotify comparten prefijo de id.
     let spotify_made = id.starts_with("37i9dQZ");
     // librespot guarda el usuario propietario (owner_username) en el uri de la playlist.
@@ -3463,6 +4020,108 @@ fn meta_from_playlist4(pl: &librespot_metadata::Playlist, id: &str) -> Playlist 
         followers: None,
         snapshot_id: None,
     }
+}
+
+/// Portada según los atributos de playlist4: la subida por el usuario (`picture`, id de
+/// imagen) o, en radios y mixes, la generada, que viene en variantes por tamaño (la mayor con
+/// URL). Vacía si no hay ninguna: las playlists sin imagen subida no traen su mosaico.
+fn playlist4_images<'a>(picture: &[u8], sizes: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<Image> {
+    if picture.is_empty() {
+        sizes
+            .into_iter()
+            .filter(|(_, url)| !url.is_empty())
+            .max_by_key(|(target, _)| match *target {
+                "xlarge" => 4,
+                "large" => 3,
+                "default" => 2,
+                _ => 1,
+            })
+            .map(|(_, url)| vec![Image { url: url.to_string(), width: Some(300), height: Some(300) }])
+            .unwrap_or_default()
+    } else {
+        let hex: String = picture.iter().map(|b| format!("{b:02x}")).collect();
+        vec![Image { url: format!("https://i.scdn.co/image/{hex}"), width: Some(300), height: Some(300) }]
+    }
+}
+
+/// Id de la playlist de una entrada del rootlist: `spotify:playlist:<id>` o la forma antigua
+/// `spotify:user:<usuario>:playlist:<id>`. `None` para las marcas de carpeta y lo demás.
+fn rootlist_playlist_id(uri: &str) -> Option<&str> {
+    let id = uri
+        .strip_prefix("spotify:playlist:")
+        .or_else(|| uri.strip_prefix("spotify:user:")?.split_once(":playlist:").map(|(_, id)| id))?;
+    (!id.is_empty() && !id.contains(':')).then_some(id)
+}
+
+/// Marca de inicio o fin de carpeta en el rootlist.
+fn rootlist_group(uri: &str) -> bool {
+    uri.starts_with("spotify:start-group:") || uri.starts_with("spotify:end-group:")
+}
+
+/// Las playlists de la biblioteca a partir del rootlist (`decorate=revision,attributes,length,
+/// owner`), en el orden del usuario (el de sus carpetas aplanadas): nombre, descripción,
+/// portada subida, tamaño, id del propietario (no su nombre visible), si es colaborativa y la
+/// revisión como snapshot_id. Privacidad y seguidores no vienen.
+///
+/// `meta_items` va por índice junto a `items`: o una entrada por cada una (también las marcas
+/// de carpeta) o solo por las que no son marcas. Si las cuentas no casan con ninguna de las dos,
+/// no se adivina (cada playlist podría llevarse el nombre de otra): error, y quien llama usa la
+/// Web API. Lo mismo si ninguna trae nombre (no vinieron los atributos).
+fn library_from_rootlist(contents: &librespot_protocol::playlist4_external::ListItems) -> Result<Vec<Playlist>, String> {
+    use librespot_protocol::playlist4_external::{Item, MetaItem};
+    let (items, metas) = (&contents.items, &contents.meta_items);
+    let groups = items.iter().filter(|i| rootlist_group(i.uri())).count();
+    let pairs: Vec<(&Item, &MetaItem)> = if metas.len() == items.len() {
+        items.iter().zip(metas.iter()).filter(|(i, _)| !rootlist_group(i.uri())).collect()
+    } else if metas.len() == items.len() - groups {
+        items.iter().filter(|i| !rootlist_group(i.uri())).zip(metas.iter()).collect()
+    } else {
+        return Err(format!("rootlist: {} metadatos para {} entradas ({groups} de carpetas)", metas.len(), items.len()));
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(pairs.len());
+    for (item, meta) in pairs {
+        let Some(id) = rootlist_playlist_id(item.uri()) else { continue };
+        if !seen.insert(id) {
+            continue;
+        }
+        let attrs = meta.attributes.as_ref();
+        // Sin atributos y con un código de error propio (`decorate=…,status_code`: borrada por
+        // su dueño, ya no accesible): Spotify no la enseña y la Web API tampoco la listaba. Sin
+        // esto saldría una fila sin nombre que nada completa. Sin código se conserva: el nombre
+        // puede llegar del listado anterior o de la Web API.
+        if attrs.is_none_or(|a| a.name().is_empty()) && meta.has_status_code() && !matches!(meta.status_code(), 0 | 200) {
+            log::debug!("[biblioteca] rootlist: {id} no disponible (código {})", meta.status_code());
+            continue;
+        }
+        let owner = Some(meta.owner_username()).filter(|o| !o.is_empty()).map(str::to_string);
+        // Las de Spotify (radios, Descubrimiento semanal…) se ven «De Spotify» sin preguntar.
+        let display_name = (owner.as_deref() == Some("spotify")).then(|| "Spotify".to_string());
+        let images = attrs
+            .map(|a| playlist4_images(a.picture(), a.picture_size.iter().map(|p| (p.target_name(), p.url()))))
+            .filter(|v| !v.is_empty());
+        out.push(Playlist {
+            id: id.to_string(),
+            name: attrs.map(|a| a.name().to_string()).unwrap_or_default(),
+            uri: format!("spotify:playlist:{id}"),
+            description: attrs.map(|a| a.description()).filter(|d| !d.is_empty()).map(str::to_string),
+            images,
+            owner: Owner { display_name, id: owner },
+            tracks: meta.has_length().then(|| TracksRef { total: meta.length().max(0) as u32 }),
+            public: None,
+            collaborative: attrs.map(|a| a.collaborative()),
+            followers: None,
+            // La revisión de la playlist en base64, la forma del snapshot_id de la Web API: sirve
+            // igual para saber si su copia en disco sigue al día (ver App::list_unchanged).
+            snapshot_id: Some(meta.revision())
+                .filter(|r| !r.is_empty())
+                .map(|r| base64::engine::general_purpose::STANDARD.encode(r)),
+        });
+    }
+    if !out.is_empty() && out.iter().all(|p| p.name.is_empty()) {
+        return Err(format!("rootlist: {} playlists sin atributos", out.len()));
+    }
+    Ok(out)
 }
 
 fn image_from_meta(im: &librespot_metadata::image::Image) -> Image {
@@ -3501,7 +4160,12 @@ fn track_from_meta(t: librespot_metadata::Track) -> Track {
         }),
         is_local: false,
         track_number: Some(t.number.max(0) as u32),
-        is_playable: None,
+        // Solo lo que seguro no puede sonar: sin ficheros ni otra edición que los tenga, o aún sin
+        // publicar. Es un aviso (la fila se ve apagada), nunca impide pulsarla: las reglas de país
+        // y catálogo las aplica el reproductor, que es quien de verdad sabe.
+        is_playable: ((t.files.is_empty() && t.alternatives.is_empty())
+            || librespot_core::date::Date::now_utc() < t.earliest_live_timestamp)
+            .then_some(false),
         kind: Some("track".to_string()),
         added_by: None,
         added_at: None,
@@ -3566,6 +4230,13 @@ fn build_batch_body(
     keys: &[String],
     kind: librespot_protocol::extension_kind::ExtensionKind,
 ) -> Result<Vec<u8>, String> {
+    use protobuf::Enum;
+    build_batch_body_raw(session, keys, kind.value())
+}
+
+/// Como `build_batch_body`, con el tipo por número: el enum de librespot 0.8 acaba en la 195 y los
+/// de las mezclas (217 en adelante) solo se pueden pedir así (la sonda de mezclas).
+fn build_batch_body_raw(session: &librespot_core::Session, keys: &[String], kind: i32) -> Result<Vec<u8>, String> {
     use librespot_protocol::extended_metadata::{BatchedEntityRequest, EntityRequest, ExtensionQuery};
     use protobuf::{EnumOrUnknown, Message};
     let mut req = BatchedEntityRequest::new();
@@ -3574,7 +4245,7 @@ fn build_batch_body(
     header.catalogue = "premium".to_string();
     for uri in keys {
         let mut q = ExtensionQuery::new();
-        q.extension_kind = EnumOrUnknown::new(kind);
+        q.extension_kind = EnumOrUnknown::from_i32(kind);
         let mut e = EntityRequest::new();
         e.entity_uri = uri.clone();
         e.query.push(q);
@@ -3584,20 +4255,32 @@ fn build_batch_body(
 }
 
 /// Lo que trae una respuesta de extended-metadata, por uri. Lo que no se puede leer se omite
-/// (cuenta como que falta).
-fn parse_batch<M: librespot_metadata::Metadata>(bytes: &[u8]) -> Result<std::collections::HashMap<String, M>, String> {
+/// (cuenta como que falta). `raw` recibe los bytes de cada entidad leída (los mismos que pediría
+/// el reproductor), para sembrarlos en su caché.
+fn parse_batch<M: librespot_metadata::Metadata>(
+    bytes: &[u8],
+    mut raw: impl FnMut(&str, Vec<u8>),
+) -> Result<std::collections::HashMap<String, M>, String> {
     use librespot_protocol::extended_metadata::BatchedExtensionResponse;
     use protobuf::Message;
     let resp = BatchedExtensionResponse::parse_from_bytes(bytes).map_err(|e| e.to_string())?;
     let mut found = std::collections::HashMap::new();
-    for data in resp.extended_metadata.iter().flat_map(|a| a.extension_data.iter()) {
-        let Some(any) = data.extension_data.as_ref() else { continue };
+    for data in resp.extended_metadata.into_iter().flat_map(|a| a.extension_data.into_iter()) {
+        let Some(any) = data.extension_data.0 else { continue };
         let (Ok(msg), Ok(uri)) = (M::Message::parse_from_bytes(&any.value), SpotifyUri::from_uri(&data.entity_uri)) else { continue };
         if let Ok(m) = M::parse(&msg, &uri) {
-            found.insert(data.entity_uri.clone(), m);
+            raw(&data.entity_uri, any.value);
+            found.insert(data.entity_uri, m);
         }
     }
     Ok(found)
+}
+
+/// ¿Son metadatos que pide el reproductor al cargar (canciones y episodios)? Los demás (álbumes,
+/// artistas) no se siembran.
+fn seedable(kind: librespot_protocol::extension_kind::ExtensionKind) -> bool {
+    use librespot_protocol::extension_kind::ExtensionKind;
+    matches!(kind, ExtensionKind::TRACK_V4 | ExtensionKind::EPISODE_V4)
 }
 
 /// La petición de un lote, sin bloquear: se espera dentro de un `block_on` que ya está en
@@ -3616,11 +4299,15 @@ type BatchErr = (String, Option<Duration>);
 /// (pocas: ediciones regionales, retiradas), peticiones sueltas con tope por lote y del
 /// presupuesto común `singles`; lo que quede sin pedir se omite, como lo que Spotify no tiene.
 /// Si falla la petición del lote no se pide nada suelto: eso decide batch_retry.
+///
+/// `seed`: las primeras entidades del lote que se siembran en la caché de metadatos del
+/// reproductor (`SpClient::seed_metadata`), así la canción en la que se hace clic ya no los pide.
 async fn batch_chunk<M: librespot_metadata::Metadata + Clone>(
     session: &librespot_core::Session,
     keys: &[String],
     kind: librespot_protocol::extension_kind::ExtensionKind,
     singles: &std::cell::Cell<usize>,
+    seed: usize,
 ) -> Result<Vec<Option<M>>, BatchErr> {
     use librespot_core::error::ErrorKind;
     let body = build_batch_body(session, keys, kind).map_err(|e| (e, None))?;
@@ -3641,7 +4328,18 @@ async fn batch_chunk<M: librespot_metadata::Metadata + Clone>(
         };
         (e.to_string(), retry)
     })?;
-    let mut found = parse_batch::<M>(&bytes).map_err(|e| (e, Some(Duration::ZERO)))?;
+    let seed: std::collections::HashSet<&str> = if seedable(kind) {
+        keys.iter().take(seed).map(String::as_str).collect()
+    } else {
+        Default::default()
+    };
+    let spclient = session.spclient();
+    let mut found = parse_batch::<M>(&bytes, |uri, value| {
+        if seed.contains(uri) {
+            spclient.seed_metadata(kind, uri, value);
+        }
+    })
+    .map_err(|e| (e, Some(Duration::ZERO)))?;
     // Una vez por uri: la misma canción dos veces en una playlist es una sola petición.
     let mut seen = std::collections::HashSet::new();
     let missing: Vec<usize> = (0..keys.len()).filter(|&i| !found.contains_key(&keys[i]) && seen.insert(&keys[i])).collect();
@@ -3672,6 +4370,7 @@ async fn batch_retry<M: librespot_metadata::Metadata + Clone>(
     kind: librespot_protocol::extension_kind::ExtensionKind,
     singles: &std::cell::Cell<usize>,
     first: Result<Vec<Option<M>>, BatchErr>,
+    seed: usize,
 ) -> Result<Vec<Option<M>>, String> {
     match first {
         Ok(v) => Ok(v),
@@ -3679,7 +4378,7 @@ async fn batch_retry<M: librespot_metadata::Metadata + Clone>(
             let wait = wait.clamp(Duration::from_millis(400), Duration::from_secs(10));
             log::warn!("metadatos por lotes: {e}; se reintenta en {} ms", wait.as_millis());
             tokio::time::sleep(wait).await;
-            batch_chunk(session, keys, kind, singles).await.map_err(|(e, _)| format!("metadatos por lotes: {e}"))
+            batch_chunk(session, keys, kind, singles, seed).await.map_err(|(e, _)| format!("metadatos por lotes: {e}"))
         }
         Err((e, None)) => Err(format!("metadatos por lotes: {e}")),
     }
@@ -3768,6 +4467,28 @@ fn encode_cover(path: &PathBuf) -> Result<Vec<u8>, String> {
     Err("la imagen es demasiado grande incluso reducida".to_string())
 }
 
+/// Retry-After del 429 simulado: el que da Spotify cuando la cuota compartida está saturada.
+const FAKE_429_SECS: u64 = 30;
+
+/// `NANOFY_FAKE_429=web` (pruebas): toda llamada a la Web API falla al momento como cuando la
+/// cuota compartida del id de primera parte la han agotado otros clientes (429), sin salir a la
+/// red. Comprueba que la biblioteca no depende de ella. Se lee una sola vez.
+fn fake_429_web() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = fake_429_parse(std::env::var("NANOFY_FAKE_429").ok().as_deref());
+        if on {
+            log::warn!("[fallo] NANOFY_FAKE_429=web: la Web API responde 429 a todo");
+        }
+        on
+    })
+}
+
+/// Lista separada por comas; de momento solo se entiende `web`.
+fn fake_429_parse(v: Option<&str>) -> bool {
+    v.is_some_and(|v| v.split(',').any(|p| p.trim().eq_ignore_ascii_case("web")))
+}
+
 fn cooldown_message(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
@@ -3776,7 +4497,9 @@ fn cooldown_message(secs: u64) -> String {
     } else {
         format!("{} min", m.max(1))
     };
-    format!("Spotify ha agotado la cuota de tu app; la Web API vuelve en {when}. La reproducción sigue funcionando.")
+    // Sin «tu app»: la cuota es la de la conexión de la biblioteca, nadie ha creado ninguna app.
+    // El principio («Spotify ha agotado la cuota») lo buscan la interfaz y `Req::PlaylistMeta`.
+    format!("Spotify ha agotado la cuota de la biblioteca; vuelve en {when}. La reproducción sigue funcionando.")
 }
 
 /// Lectura limitada con los segundos que faltan; `retry_secs` los vuelve a leer para que la
@@ -3835,8 +4558,6 @@ fn download_track(
     episode: bool,
     quality: crate::config::Quality,
 ) -> Result<(), String> {
-    use crate::config::Quality;
-    use librespot_metadata::audio::AudioFileFormat as F;
     // Metadatos con plazo largo (el hilo es solo de la descarga): uno colgado ya no deja sin
     // descargar el resto de la tanda. Abrir el audio no lo lleva: puede tardar de verdad.
     let files: librespot_metadata::audio::AudioFiles = if episode {
@@ -3857,19 +4578,15 @@ fn download_track(
         track.files.clone()
     };
     let track = TrackFiles { files };
-    let order: &[F] = match quality {
-        Quality::Lossless => &[F::FLAC_FLAC_24BIT, F::FLAC_FLAC, F::OGG_VORBIS_320, F::OGG_VORBIS_160, F::OGG_VORBIS_96],
-        Quality::High => &[F::OGG_VORBIS_320, F::OGG_VORBIS_160, F::OGG_VORBIS_96],
-        Quality::Normal => &[F::OGG_VORBIS_160, F::OGG_VORBIS_320, F::OGG_VORBIS_96],
-        Quality::Low => &[F::OGG_VORBIS_96, F::OGG_VORBIS_160, F::OGG_VORBIS_320],
-    };
-    let (fmt, file_id) = order
-        .iter()
-        .find_map(|f| track.files.0.get(f).map(|fid| (*f, *fid)))
+    // El mismo orden de formatos que el reproductor: lo descargado es lo que luego suena sin red.
+    // Sin preferir lo que ya está en la caché (el reproductor sí): quien descarga en una calidad
+    // la quiere, y el reproductor elige ese fichero porque va primero en su orden.
+    let order = librespot_playback::player::format_order(quality.bitrate());
+    let (_, file_id) = librespot_playback::player::pick_audio_file(order, &track.files, |_| false)
         .ok_or("sin formato de audio compatible")?;
-    let bps = if matches!(fmt, F::FLAC_FLAC | F::FLAC_FLAC_24BIT) { 200_000 } else { 40_000 };
+    // Ritmo estimado (bytes/s) para el primer tramo; la descarga sigue entera de todos modos.
     let mut file = handle
-        .block_on(librespot_audio::AudioFile::open(session, file_id, bps))
+        .block_on(librespot_audio::AudioFile::open(session, file_id, 40_000))
         .map_err(|e| format!("audio: {e}"))?;
     if matches!(file, librespot_audio::AudioFile::Cached(_)) {
         return Ok(());
@@ -3971,5 +4688,335 @@ fn like_error(e: String) -> String {
             .to_string()
     } else {
         e
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lo que abre una página por el protocolo interno no espera detrás de la Web API limitada;
+    /// las lecturas y escrituras de la Web API siguen en los hilos comunes.
+    #[test]
+    fn carril_interno() {
+        for req in [
+            Req::PlaylistTracks("p".into()),
+            Req::Playlists,
+            Req::Album("a".into()),
+            Req::RadioPlaylist("t".into()),
+            Req::HomeFeed,
+            Req::ArtistView("a".into()),
+            Req::User("u".into()),
+            Req::TrackInfo("t".into()),
+        ] {
+            assert!(interno(&req), "{req:?}");
+        }
+        for req in [
+            Req::Me,
+            Req::Recent,
+            Req::LikedRecent,
+            Req::PlaylistMeta("p".into()),
+            Req::PlaylistsWeb,
+            Req::AddToPlaylist { id: "p".into(), uris: vec![] },
+            Req::CreatePlaylist { user_id: "u".into(), name: "n".into(), description: String::new(), public: false, collaborative: false },
+            Req::Search("q".into()),
+            Req::Queue,
+        ] {
+            assert!(!interno(&req), "{req:?}");
+        }
+    }
+
+    /// Un lote espera solo si hay una carga en curso que empezó hace menos de 4 s.
+    #[test]
+    fn espera_de_lotes_acotada() {
+        assert!(!playback_gate(0, 0));
+        assert!(!playback_gate(0, 123_456));
+        assert!(playback_gate(1_000, 1_000));
+        assert!(playback_gate(1_000, 1_000 + PLAYBACK_YIELD_MAX_MS - 1));
+        // Pasado el tope, la carga ya no frena nada aunque la interfaz no lo haya quitado.
+        assert!(!playback_gate(1_000, 1_000 + PLAYBACK_YIELD_MAX_MS));
+        assert!(!playback_gate(1_000, 1_000 + 60_000));
+        // Una lectura anterior al inicio (no debería darse) cuenta como recién empezada.
+        assert!(playback_gate(5, 1));
+    }
+
+    /// El aviso de la interfaz: solo el paso a «cargando» fija el inicio, y los lotes en
+    /// espera siguen en cuanto se quita. (Una sola prueba: el estado es global.)
+    #[test]
+    fn aviso_de_carga_y_espera_de_los_lotes() {
+        use std::sync::atomic::Ordering::Relaxed;
+        set_playback_loading(false);
+        assert!(!playback_loading());
+        // Sin carga, ceder no espera nada.
+        let t0 = Instant::now();
+        yield_to_playback_blocking();
+        assert!(t0.elapsed() < Duration::from_millis(30));
+
+        set_playback_loading(true);
+        let since = PLAYBACK_LOADING_SINCE.load(Relaxed);
+        assert_ne!(since, 0);
+        assert!(playback_loading());
+        std::thread::sleep(Duration::from_millis(5));
+        // Las pasadas siguientes de la interfaz no mueven el inicio.
+        set_playback_loading(true);
+        assert_eq!(PLAYBACK_LOADING_SINCE.load(Relaxed), since);
+
+        // Un lote espera hasta que la canción suena (aquí, 150 ms después).
+        let clear = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            set_playback_loading(false);
+        });
+        let t1 = Instant::now();
+        yield_to_playback_blocking();
+        let waited = t1.elapsed();
+        clear.join().unwrap();
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(waited < Duration::from_millis(1_500), "{waited:?}");
+        assert_eq!(PLAYBACK_LOADING_SINCE.load(Relaxed), 0);
+        assert!(!playback_loading());
+
+        // La versión asíncrona hace lo mismo dentro de un runtime.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        set_playback_loading(true);
+        let clear = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            set_playback_loading(false);
+        });
+        let t2 = Instant::now();
+        rt.block_on(yield_to_playback());
+        let waited = t2.elapsed();
+        clear.join().unwrap();
+        assert!(waited >= Duration::from_millis(60), "{waited:?}");
+        assert!(waited < Duration::from_millis(1_500), "{waited:?}");
+    }
+
+    /// El limitador propio de librespot (300 peticiones cada 30 s por dominio): agotado, una
+    /// petición espera su turno (uno cada 100 ms) en vez de fallar al instante; si el turno
+    /// llegaría después del plazo, falla ya, sin esperar, con el error que `limiter_wait` lee.
+    #[test]
+    fn limitador_espera_su_turno() {
+        use librespot_core::error::ErrorKind;
+        use librespot_core::http_client::{HttpClient, RATE_LIMIT_CALLS_PER_INTERVAL, RATE_LIMIT_QUEUE_WAIT};
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let client = HttpClient::new(None);
+        let spclient: http::Uri = "https://spclient.wg.spotify.com/metadata/4/track/x".parse().unwrap();
+        // Otro subdominio de spotify.com: comparte el presupuesto.
+        let login5: http::Uri = "https://login5.spotify.com/v3/login".parse().unwrap();
+        // La CDN es otro dominio, con su propio presupuesto.
+        let cdn: http::Uri = "https://audio-fa.scdn.co/audio/x".parse().unwrap();
+        rt.block_on(async {
+            // La ráfaga entera pasa al momento.
+            let t0 = Instant::now();
+            for _ in 0..RATE_LIMIT_CALLS_PER_INTERVAL {
+                client.acquire_rate_limit(&spclient, Duration::ZERO).await.unwrap();
+            }
+            assert!(t0.elapsed() < Duration::from_millis(500));
+
+            // Agotado y con menos plazo que el próximo turno: falla sin esperar.
+            let t1 = Instant::now();
+            let e = client.acquire_rate_limit(&login5, Duration::from_millis(20)).await.unwrap_err();
+            assert!(t1.elapsed() < Duration::from_millis(80), "{:?}", t1.elapsed());
+            assert_eq!(e.kind, ErrorKind::ResourceExhausted);
+            assert!(e.error.to_string().starts_with("rate limited for at least another "), "{e}");
+            assert!(limiter_wait(&e) <= Duration::from_secs(1));
+
+            // Con el plazo de `request`, espera su turno y pasa.
+            let t2 = Instant::now();
+            client.acquire_rate_limit(&spclient, RATE_LIMIT_QUEUE_WAIT).await.unwrap();
+            let waited = t2.elapsed();
+            assert!(waited >= Duration::from_millis(40), "{waited:?}");
+            assert!(waited < Duration::from_millis(1_000), "{waited:?}");
+
+            // Varias a la vez: cada una con su turno, una tras otra, y ninguna falla.
+            let t3 = Instant::now();
+            let all = futures::future::join_all(
+                (0..3).map(|_| client.acquire_rate_limit(&spclient, RATE_LIMIT_QUEUE_WAIT)),
+            )
+            .await;
+            assert!(all.iter().all(|r| r.is_ok()));
+            let waited = t3.elapsed();
+            assert!(waited >= Duration::from_millis(200), "{waited:?}");
+            assert!(waited < Duration::from_millis(2_000), "{waited:?}");
+
+            // La CDN no espera por lo gastado en spotify.com.
+            let t4 = Instant::now();
+            client.acquire_rate_limit(&cdn, Duration::ZERO).await.unwrap();
+            assert!(t4.elapsed() < Duration::from_millis(50));
+        });
+    }
+
+    mod rootlist {
+        use super::super::*;
+        use librespot_protocol::playlist4_external::{Item, ListAttributes, ListItems, MetaItem, PictureSize};
+        use protobuf::MessageField;
+
+        fn item(uri: &str) -> Item {
+            let mut i = Item::new();
+            i.set_uri(uri.to_string());
+            i
+        }
+
+        /// Metadatos de una playlist como los trae `decorate=revision,attributes,length,owner`.
+        fn meta(name: &str, length: i32, owner: &str) -> MetaItem {
+            let mut a = ListAttributes::new();
+            a.set_name(name.to_string());
+            let mut m = MetaItem::new();
+            m.attributes = MessageField::some(a);
+            m.set_length(length);
+            m.set_owner_username(owner.to_string());
+            m.set_revision(vec![0, 0, 0, 2, 1, 2, 3]);
+            m
+        }
+
+        /// Lo que viene en una marca de carpeta, si viene algo: nada.
+        fn blank() -> MetaItem {
+            MetaItem::new()
+        }
+
+        fn list(uris: &[&str], metas: Vec<MetaItem>) -> ListItems {
+            let mut l = ListItems::new();
+            l.items = uris.iter().map(|u| item(u)).collect();
+            l.meta_items = metas;
+            l
+        }
+
+        const URIS: [&str; 6] = [
+            "spotify:playlist:aaa",
+            "spotify:start-group:f1:Mis%20cosas",
+            "spotify:playlist:bbb",
+            "spotify:playlist:ccc",
+            "spotify:end-group:f1",
+            "spotify:playlist:ddd",
+        ];
+
+        fn names(v: &[Playlist]) -> Vec<(&str, &str)> {
+            v.iter().map(|p| (p.id.as_str(), p.name.as_str())).collect()
+        }
+
+        /// Con un metadato por entrada (también las marcas de carpeta), por índice; el orden es
+        /// el del rootlist, con las carpetas aplanadas.
+        #[test]
+        fn una_meta_por_entrada() {
+            let metas = vec![meta("A", 3, "yo"), blank(), meta("B", 10, "otra"), meta("C", 0, "yo"), blank(), meta("D", 7, "spotify")];
+            let out = library_from_rootlist(&list(&URIS, metas)).unwrap();
+            assert_eq!(names(&out), [("aaa", "A"), ("bbb", "B"), ("ccc", "C"), ("ddd", "D")]);
+            assert_eq!(out[1].tracks.as_ref().map(|t| t.total), Some(10));
+            assert_eq!(out[2].tracks.as_ref().map(|t| t.total), Some(0));
+            assert_eq!(out[0].uri, "spotify:playlist:aaa");
+            // El propietario es su id de usuario; el nombre visible solo se sabe de Spotify.
+            assert_eq!(out[0].owner.id.as_deref(), Some("yo"));
+            assert_eq!(out[0].owner.display_name, None);
+            assert_eq!(out[3].owner.display_name.as_deref(), Some("Spotify"));
+            // La privacidad no viene en el rootlist: desconocida, no «pública».
+            assert!(out.iter().all(|p| p.public.is_none()));
+            assert_eq!(out[0].collaborative, Some(false));
+        }
+
+        /// Con metadatos solo de las playlists (sin las marcas), saltándose las marcas.
+        #[test]
+        fn metas_sin_las_marcas_de_carpeta() {
+            let metas = vec![meta("A", 3, "yo"), meta("B", 10, "otra"), meta("C", 0, "yo"), meta("D", 7, "yo")];
+            let out = library_from_rootlist(&list(&URIS, metas)).unwrap();
+            assert_eq!(names(&out), [("aaa", "A"), ("bbb", "B"), ("ccc", "C"), ("ddd", "D")]);
+            assert_eq!(out[1].tracks.as_ref().map(|t| t.total), Some(10));
+        }
+
+        /// Si las cuentas no casan no se adivina: cada playlist podría llevarse los datos de otra.
+        #[test]
+        fn cuentas_que_no_casan() {
+            let metas = vec![meta("A", 3, "yo"), meta("B", 10, "otra")];
+            assert!(library_from_rootlist(&list(&URIS, metas)).is_err());
+            // Sin metadatos (no se atendió `decorate`): tampoco.
+            assert!(library_from_rootlist(&list(&URIS, Vec::new())).is_err());
+            // Ni con metadatos vacíos para todas.
+            let metas = (0..URIS.len()).map(|_| blank()).collect();
+            assert!(library_from_rootlist(&list(&URIS, metas)).is_err());
+        }
+
+        /// Biblioteca vacía, o solo con carpetas vacías: lista vacía, no un error.
+        #[test]
+        fn biblioteca_vacia() {
+            assert!(library_from_rootlist(&list(&[], Vec::new())).unwrap().is_empty());
+            let only_folder = ["spotify:start-group:f1:x", "spotify:end-group:f1"];
+            assert!(library_from_rootlist(&list(&only_folder, Vec::new())).unwrap().is_empty());
+        }
+
+        /// Forma antigua del uri, repetidas y entradas que no son playlists.
+        #[test]
+        fn uris_antiguos_repetidas_y_otras() {
+            let uris = ["spotify:user:pepe:playlist:aaa", "spotify:playlist:aaa", "spotify:artist:xyz", "spotify:playlist:bbb"];
+            let metas = vec![meta("A", 1, "pepe"), meta("A bis", 1, "pepe"), blank(), meta("B", 2, "yo")];
+            let out = library_from_rootlist(&list(&uris, metas)).unwrap();
+            assert_eq!(names(&out), [("aaa", "A"), ("bbb", "B")]);
+        }
+
+        /// Las que ya no existen (sin atributos y con código de error) no salen como filas sin
+        /// nombre; sin código, o con atributos, sí.
+        #[test]
+        fn no_disponibles_fuera() {
+            let uris = ["spotify:playlist:a", "spotify:playlist:gone", "spotify:playlist:bare", "spotify:playlist:ok"];
+            let mut gone = blank();
+            gone.set_status_code(404);
+            let mut ok = meta("OK", 2, "yo");
+            ok.set_status_code(200);
+            let out = library_from_rootlist(&list(&uris, vec![meta("A", 1, "yo"), gone, blank(), ok])).unwrap();
+            assert_eq!(names(&out), [("a", "A"), ("bare", ""), ("ok", "OK")]);
+        }
+
+        /// Portada: la subida (id de imagen en hex), la generada por tamaños (la mayor) o ninguna.
+        #[test]
+        fn portadas() {
+            let uris = ["spotify:playlist:a", "spotify:playlist:b", "spotify:playlist:c"];
+            let mut with_pic = meta("A", 1, "yo");
+            with_pic.attributes.mut_or_insert_default().set_picture(vec![0xab, 0x01, 0xff]);
+            let mut with_sizes = meta("B", 1, "spotify");
+            for (target, url) in [("default", "https://x/default"), ("xlarge", "https://x/xlarge"), ("large", "https://x/large"), ("small", "")] {
+                let mut s = PictureSize::new();
+                s.set_target_name(target.to_string());
+                s.set_url(url.to_string());
+                with_sizes.attributes.mut_or_insert_default().picture_size.push(s);
+            }
+            let out = library_from_rootlist(&list(&uris, vec![with_pic, with_sizes, meta("C", 1, "yo")])).unwrap();
+            assert_eq!(out[0].cover(300), Some("https://i.scdn.co/image/ab01ff"));
+            assert_eq!(out[1].cover(300), Some("https://x/xlarge"));
+            // Sin imagen subida: sin portada (la pone el listado anterior, la Web API o el mosaico).
+            assert!(out[2].images.is_none());
+            // La mayor variante con URL, aunque la de más rango venga vacía.
+            let sizes = [("xlarge", ""), ("large", "https://x/l"), ("default", "https://x/d")];
+            assert_eq!(playlist4_images(&[], sizes)[0].url, "https://x/l");
+            assert!(playlist4_images(&[], []).is_empty());
+        }
+
+        /// La revisión en base64, como el snapshot_id de la Web API; sin revisión, ninguno.
+        #[test]
+        fn revision_como_snapshot_id() {
+            let uris = ["spotify:playlist:a", "spotify:playlist:b"];
+            let mut no_rev = meta("B", 1, "yo");
+            no_rev.clear_revision();
+            let out = library_from_rootlist(&list(&uris, vec![meta("A", 1, "yo"), no_rev])).unwrap();
+            assert_eq!(out[0].snapshot_id.as_deref(), Some("AAAAAgECAw=="));
+            assert_eq!(out[1].snapshot_id, None);
+        }
+
+        #[test]
+        fn ids_del_rootlist() {
+            assert_eq!(rootlist_playlist_id("spotify:playlist:37i9dQZF1"), Some("37i9dQZF1"));
+            assert_eq!(rootlist_playlist_id("spotify:user:pepe:playlist:abc"), Some("abc"));
+            assert_eq!(rootlist_playlist_id("spotify:start-group:abc:Nombre"), None);
+            assert_eq!(rootlist_playlist_id("spotify:end-group:abc"), None);
+            assert_eq!(rootlist_playlist_id("spotify:playlist:"), None);
+            assert_eq!(rootlist_playlist_id("spotify:user:pepe:collection"), None);
+            assert!(rootlist_group("spotify:start-group:abc:x") && rootlist_group("spotify:end-group:abc"));
+            assert!(!rootlist_group("spotify:playlist:abc"));
+        }
+
+        #[test]
+        fn variable_del_429_simulado() {
+            assert!(fake_429_parse(Some("web")));
+            assert!(fake_429_parse(Some(" pathfinder , WEB ")));
+            assert!(!fake_429_parse(Some("pathfinder")));
+            assert!(!fake_429_parse(Some("")));
+            assert!(!fake_429_parse(None));
+        }
     }
 }

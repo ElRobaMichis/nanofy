@@ -7,10 +7,10 @@ use egui::{pos2, vec2, Align, Button, Color32, CornerRadius, Label, Layout, Rect
 use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
 use super::widgets::{child_in, keyed_child, uri_to_link, CardInfo, CardKind, RowOpts, Source, CARD_H, CARD_W};
-use super::{fmt_thousands, strip_html, Action, App, Auth, FolderDialog, Page, PlayTarget, ERROR_RED, LIKED};
+use super::{fmt_thousands, strip_html, Action, App, Auth, FolderDialog, Page, PlayTarget, ERROR_RED, LIKED, ROW_H};
 use super::panels::{about_view, Tone};
 use crate::api::Req;
-use crate::config::{Quality, Theme};
+use crate::config::{Loudness, Quality, Theme};
 use crate::model::*;
 
 /// Ancho de la columna derecha de información en playlists y álbumes.
@@ -59,23 +59,37 @@ impl App {
             if logging {
                 ui.add_space(8.0);
                 Self::loading(ui, "Completa el inicio de sesión en el navegador");
+                // Si se cerró la pestaña o se cambió de idea: antes no había salida y la espera
+                // no acababa nunca.
+                ui.add_space(6.0);
+                let cancelling = self.login_cancelling();
+                if Self::secondary_button(ui, if cancelling { "Cancelando…" } else { "Cancelar" }, !cancelling).clicked() {
+                    self.cancel_login();
+                }
             }
             ui.add_space(16.0);
-            ui.label(
-                RichText::new(
-                    "El inicio de sesión se hace en la web de Spotify (OAuth con PKCE); \
-                     Nanofy nunca ve tu contraseña. Para reproducir música hace falta Premium.",
-                )
-                .small()
-                .color(p.weak),
-            );
+            // Si la autorización de la biblioteca va a encadenarse, se dice antes: la segunda
+            // pantalla de permisos no debe parecer un bucle.
+            let chained = !self.api.web_configured() && !self.settings.library_consent_asked;
+            let note = if chained {
+                "El inicio de sesión se hace en la web de Spotify (OAuth con PKCE); Nanofy nunca ve tu \
+                 contraseña. Spotify te pedirá permiso dos veces seguidas: para reproducir y para leer tu \
+                 biblioteca (no hace falta crear ninguna app). Para reproducir música hace falta Premium."
+            } else {
+                "El inicio de sesión se hace en la web de Spotify (OAuth con PKCE); \
+                 Nanofy nunca ve tu contraseña. Para reproducir música hace falta Premium."
+            };
+            ui.label(RichText::new(note).small().color(p.weak));
         });
     }
 
     // ------------------------------------------------------------ utilidades
 
     pub(super) fn playlist_card(&mut self, ui: &mut egui::Ui, pl: &Playlist) -> egui::Response {
-        let owner = format!("De {}", pl.owner_name());
+        let owner = match pl.owner_name() {
+            "" => "Playlist".to_string(),
+            owner => format!("De {owner}"),
+        };
         let pinned = self.settings.pinned.contains(&pl.id);
         let r = self.card(
             ui,
@@ -977,6 +991,18 @@ impl App {
             pls.sort_by_key(|&i| !pinned.contains(self.playlists[i].id.as_str()));
         }
         let liked = matches("canciones que te gustan");
+        // Primer arranque sin copia: el hueco de la biblioteca mientras llega el rootlist, en vez
+        // de una página vacía (con copia se ve ella al instante y se sustituye al llegar). Solo si
+        // tampoco hay álbumes ni artistas que enseñar: alguien sin playlists, sin red, vería el
+        // hueco para siempre en vez de su copia de lo demás.
+        if !self.playlists_loaded && self.playlists.is_empty() && self.saved_albums.is_empty() && self.followed_artists.is_empty() {
+            if self.library_grid {
+                Self::skeleton_cards(ui, 8);
+            } else {
+                Self::skeleton_rows(ui, 8, 56.0, 40.0, 0.0);
+            }
+            return;
+        }
 
         if self.library_grid {
             ui.horizontal_wrapped(|ui| {
@@ -1037,7 +1063,11 @@ impl App {
                 let k = row - lead;
                 if let Some(&i) = pls.get(k) {
                     let pl = self.playlists[i].clone();
-                    let sub = format!("Playlist · {}", pl.owner_name());
+                    // Sin nombre del propietario todavía (del rootlist, sin la Web API): solo «Playlist».
+                    let sub = match pl.owner_name() {
+                        "" => "Playlist".to_string(),
+                        owner => format!("Playlist · {owner}"),
+                    };
                     let mut c = keyed_child(ui, rect, ("lib_pl", i, &pl.id));
                     let r = self.list_entry(&mut c, pl.cover(64), CardKind::Playlist, &pl.name, &sub);
                     if r.clicked() {
@@ -1615,7 +1645,10 @@ impl App {
                     app.collection_bar(ui, LIKED, &tracks, None, None, |_, _| {}, None);
                     ui.add_space(8.0);
                 }
-                if loading {
+                if loading && tracks.is_empty() {
+                    // Primer arranque sin copia: el hueco de las filas mientras llegan.
+                    Self::skeleton_rows(ui, 8, ROW_H, 40.0, 42.0);
+                } else if loading {
                     Self::loading(ui, &format!("Cargando {} de {}", tracks.len(), total));
                 }
                 let shown = app.filter_tracks(LIKED, Some(gen), &tracks);
@@ -1703,7 +1736,8 @@ impl App {
         self.request_once("albums", Req::SavedAlbums);
         Self::page_title(ui, "", "Álbumes guardados", &format!("{} álbumes", self.saved_albums.len()));
         if self.saved_albums.is_empty() {
-            Self::loading(ui, "Cargando");
+            // Sin copia: el hueco de las tarjetas mientras llegan.
+            Self::skeleton_cards(ui, 8);
             return;
         }
         let albums = std::mem::take(&mut self.saved_albums);
@@ -1879,7 +1913,10 @@ impl App {
                 });
             }
             for pl in &pls {
-                let sub = format!("De {}", pl.owner_name());
+                let sub = match pl.owner_name() {
+                    "" => "Playlist".to_string(),
+                    owner => format!("De {owner}"),
+                };
                 let r = self.list_entry(ui, pl.cover(64), CardKind::Playlist, &pl.name, &sub);
                 if r.clicked() {
                     self.actions.push(Action::Go(Page::Playlist(pl.id.clone())));
@@ -2102,10 +2139,11 @@ impl App {
                 // Vacía cuenta aunque no se sepa el total (falló el primer lote sin metadatos).
                 let partial = app.list_retry.contains_key(&id) && (tracks.is_empty() || tracks.len() < total as usize);
                 let retrying = partial && app.list_retry_busy(&id);
-                if loading {
+                // Sin ninguna fila aún (ni copia): el hueco de las filas, no un «Cargando».
+                if (loading || retrying) && tracks.is_empty() {
+                    Self::skeleton_rows(ui, 8, ROW_H, 40.0, 42.0);
+                } else if loading {
                     Self::loading(ui, &format!("Cargando {} de {}", tracks.len(), total));
-                } else if retrying && tracks.is_empty() {
-                    Self::loading(ui, "Cargando");
                 } else if partial {
                     ui.horizontal(|ui| {
                         let shown = if tracks.is_empty() {
@@ -2129,7 +2167,7 @@ impl App {
                     });
                 } else if tracks.is_empty() && (total > 0 || app.warming.contains_key(&id)) {
                     // También mientras se lee su copia en disco (sin total aún): no está vacía.
-                    Self::loading(ui, "Cargando");
+                    Self::skeleton_rows(ui, 8, ROW_H, 40.0, 42.0);
                 } else if tracks.is_empty() {
                     ui.label(RichText::new("Esta playlist está vacía. Añade canciones con el botón + de cualquier fila.").color(p.weak));
                 }
@@ -2403,16 +2441,32 @@ impl App {
             .corner_radius(CornerRadius::same(8))
             .inner_margin(12)
             .show(ui, |ui| {
-                ui.label(RichText::new("Falta un paso para ver tu biblioteca").strong());
-                ui.label(
-                    "Spotify limita la Web API del cliente compartido, así que Nanofy necesita \
-                     un Client ID propio (gratis, dos minutos). Con él cargan tus playlists, \
-                     la búsqueda, los perfiles y todo lo demás. La reproducción no lo necesita.",
-                );
-                ui.add_space(4.0);
-                if ui.button("Configurar en Ajustes").clicked() {
-                    self.draft = self.settings.clone();
-                    self.actions.push(Action::Go(Page::Settings));
+                if self.web_busy {
+                    // Esperando a que se acepte en el navegador (encadenada al iniciar sesión o con
+                    // «Conectar con Spotify»): por si la pestaña se cerró o se quiere dejar.
+                    ui.label(RichText::new("Un último paso en el navegador").strong());
+                    ui.label("Permite que Nanofy lea tu biblioteca (no tienes que crear nada). En cuanto aceptes, aparece aquí.");
+                    ui.add_space(4.0);
+                    let url = self.web_chain.as_ref().map(|c| c.url.clone());
+                    ui.horizontal(|ui| {
+                        if let Some(url) = url {
+                            if ui.button("Abrir de nuevo en el navegador").clicked() {
+                                crate::webauth::open_in_browser(&url);
+                            }
+                            if ui.button("Cancelar").clicked() {
+                                self.cancel_web_chain();
+                            }
+                        }
+                        Self::loading(ui, "Esperando");
+                    });
+                } else {
+                    // Sin desvío a Ajustes: la autorización se abre desde aquí mismo.
+                    ui.label(RichText::new("Conecta tu biblioteca").strong());
+                    ui.label("Solo tienes que autorizar tu cuenta en la web de Spotify; no hace falta crear ninguna app.");
+                    ui.add_space(4.0);
+                    if Self::primary_button(ui, "Conectar con Spotify", true).clicked() {
+                        self.connect_library();
+                    }
                 }
             });
         ui.add_space(6.0);
@@ -2475,15 +2529,26 @@ impl App {
                 }
                 let label = if configured { "Reconectar" } else { "Conectar con Spotify" };
                 if Self::primary_button(ui, label, !self.web_busy).clicked() {
-                    self.web_busy = true;
-                    self.status("Se ha abierto el navegador para autorizar Nanofy en Spotify…");
-                    self.api.send(Req::WebConnect(crate::webauth::WEB_CLIENT_ID.to_string()));
+                    self.connect_library();
                 }
                 if self.web_busy {
                     Self::loading(ui, "");
                 }
             });
         });
+        // Esperando al navegador: por si la pestaña se cerró.
+        if let Some(url) = self.web_chain.as_ref().map(|c| c.url.clone()) {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("¿No se abrió o la cerraste?").small().color(p.weak));
+                if ui.link(RichText::new("Abrir de nuevo").small()).clicked() {
+                    crate::webauth::open_in_browser(&url);
+                }
+                if ui.link(RichText::new("Cancelar").small()).clicked() {
+                    self.cancel_web_chain();
+                }
+            });
+        }
         ui.add_space(8.0);
         ui.label(
             RichText::new(
@@ -2494,60 +2559,126 @@ impl App {
             .color(p.weak),
         );
 
-        // Opcional (avanzado): app propia del usuario solo para LECTURAS, con su propia cuota.
-        // Las escrituras (corazón, seguir) siguen yendo por la conexión de arriba.
-        ui.add_space(14.0);
+        // Opcional y plegado: app de desarrollador propia solo para LECTURAS, con su propia cuota.
+        // Las escrituras (corazón, seguir) siguen yendo por la conexión de arriba. Nadie la
+        // necesita, así que no está a la vista ni se vende como «más rápida».
+        ui.add_space(10.0);
         let personal = self.api.personal_configured();
-        ui.horizontal(|ui| {
-            let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-            ui.painter().circle_filled(dot.center(), 5.0, if personal { GREEN } else { p.weak });
-            ui.label(RichText::new("Lecturas rápidas con tu propia app (opcional)").strong());
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if personal && Self::secondary_button(ui, "Quitar", !self.web_busy).clicked() {
-                    self.web_busy = true;
-                    self.api.send(Req::WebDisconnectPersonal);
-                }
-                let label = if personal { "Reconectar app" } else { "Conectar mi app" };
-                let can = !self.web_busy && self.draft.client_id.trim().len() >= 16;
-                if Self::primary_button(ui, label, can).clicked() {
-                    self.settings.client_id = self.draft.client_id.trim().to_string();
-                    self.settings.save(&self.paths);
-                    self.web_busy = true;
-                    self.status("Se ha abierto el navegador para autorizar tu app…");
-                    self.api.send(Req::WebConnectPersonal(self.settings.client_id.clone()));
-                }
-                if self.web_busy {
-                    Self::loading(ui, "");
-                }
+        egui::CollapsingHeader::new(RichText::new("Avanzado (opcional, no hace falta)").color(p.weak))
+            .id_salt("web_api_avanzado")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 5.0, if personal { GREEN } else { p.weak });
+                    ui.label(RichText::new("Tu propia app de desarrollador").strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if personal && Self::secondary_button(ui, "Quitar", !self.web_busy).clicked() {
+                            self.web_busy = true;
+                            self.api.send(Req::WebDisconnectPersonal);
+                        }
+                        let label = if personal { "Reconectar app" } else { "Conectar mi app" };
+                        let can = !self.web_busy && self.draft.client_id.trim().len() >= 16;
+                        if Self::primary_button(ui, label, can).clicked() {
+                            self.settings.client_id = self.draft.client_id.trim().to_string();
+                            self.settings.save(&self.paths);
+                            self.web_busy = true;
+                            self.status("Se ha abierto el navegador para autorizar tu app…");
+                            self.api.send(Req::WebConnectPersonal(self.settings.client_id.clone()));
+                        }
+                        if self.web_busy {
+                            Self::loading(ui, "");
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "No hace falta: Nanofy funciona entero sin ella. Solo si ya tienes una app en \
+                         developer.spotify.com y quieres que las lecturas usen su cuota, añádele esta \
+                         Redirect URI y pega aquí su Client ID:",
+                    )
+                    .small()
+                    .color(p.weak),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(RichText::new(crate::webauth::PERSONAL_REDIRECT_URI).monospace().color(GREEN));
+                    if icons::button(ui, Icon::Share, 20.0, p.weak).on_hover_text("Copiar la URI").clicked() {
+                        self.actions.push(Action::CopyText(crate::webauth::PERSONAL_REDIRECT_URI.to_string(), "URI"));
+                    }
+                });
+                Self::field_label(ui, "CLIENT ID DE TU APP");
+                let w = (ui.available_width() - 40.0).max(220.0);
+                Self::field_box_fill(ui, p.card, |ui| ui.add(egui::TextEdit::singleline(&mut self.draft.client_id).hint_text("32 caracteres").frame(egui::Frame::NONE).desired_width(w)));
             });
-        });
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "Da la máxima velocidad de carga: las lecturas usan tu cuota, no el límite \
-                 compartido. Crea una app en developer.spotify.com/dashboard, añade esta Redirect URI \
-                 y pega el Client ID:",
-            )
-            .small()
-            .color(p.weak),
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(RichText::new(crate::webauth::PERSONAL_REDIRECT_URI).monospace().color(GREEN));
-            if icons::button(ui, Icon::Share, 20.0, p.weak).on_hover_text("Copiar la URI").clicked() {
-                self.actions.push(Action::CopyText(crate::webauth::PERSONAL_REDIRECT_URI.to_string(), "URI"));
+    }
+
+    /// Fundido entre canciones. Va fuera del borrador: se aplica y se guarda al instante, sin
+    /// «Guardar» ni reiniciar el reproductor (`set_crossfade`), por eso lee de `settings`.
+    fn crossfade_settings(&mut self, ui: &mut egui::Ui) {
+        let mut on = self.settings.crossfade;
+        if Self::toggle_pad(ui, &mut on, "Fundido entre canciones", 0.0) {
+            self.set_crossfade(on, self.settings.crossfade_secs, self.settings.crossfade_albums, true);
+            self.status(if on { "Fundido activado" } else { "Fundido desactivado" });
+        }
+        // Apagado, sus opciones se ven atenuadas (como el nivel de volumen sin normalización).
+        ui.add_enabled_ui(self.settings.crossfade, |ui| {
+            Self::setting_row(
+                ui,
+                "Duración del fundido",
+                Some(
+                    "La siguiente canción entra mientras la anterior se apaga. No se aplica al cambiar de \
+                     canción a mano, al repetir una canción ni en podcasts.",
+                ),
+                |ui| {
+                    let p = theme::palette(ui.ctx());
+                    // El raíl del deslizador debe verse sobre la tarjeta (mismo color que su fondo por defecto).
+                    ui.visuals_mut().widgets.inactive.bg_fill = p.hover;
+                    let (min, max) = (crate::config::CROSSFADE_SECS_MIN, crate::config::CROSSFADE_SECS_MAX);
+                    let mut secs = self.settings.crossfade_secs;
+                    ui.label(RichText::new(format!("{min} s")).small().color(p.weak));
+                    let r = ui.add_sized(vec2(200.0, 22.0), egui::Slider::new(&mut secs, min..=max).step_by(1.0).show_value(false));
+                    ui.label(RichText::new(format!("{max} s")).small().color(p.weak));
+                    ui.label(RichText::new(format!("{secs} s")).strong().color(p.text));
+                    // Mientras se arrastra ya suena con el valor nuevo; se guarda al soltar (o al
+                    // cambiarlo con clic o teclado, que no arrastran).
+                    let persist = r.drag_stopped() || (r.changed() && !r.dragged());
+                    if r.changed() || persist {
+                        self.set_crossfade(true, secs, self.settings.crossfade_albums, persist);
+                    }
+                },
+            );
+            let mut albums = self.settings.crossfade_albums;
+            if Self::toggle_pad(ui, &mut albums, "Fundir también canciones seguidas de un mismo álbum", 0.0) {
+                self.set_crossfade(true, self.settings.crossfade_secs, albums, true);
             }
+            let p = theme::palette(ui.ctx());
+            ui.label(
+                RichText::new("Spotify no funde temas consecutivos de un álbum para respetar las transiciones del artista.")
+                    .small()
+                    .color(p.weak),
+            );
         });
-        Self::field_label(ui, "CLIENT ID DE TU APP");
-        let w = (ui.available_width() - 40.0).max(220.0);
-        Self::field_box_fill(ui, p.card, |ui| ui.add(egui::TextEdit::singleline(&mut self.draft.client_id).hint_text("32 caracteres").frame(egui::Frame::NONE).desired_width(w)));
+        // Con «al terminar la canción» puesto, la canción acaba entera (ver `set_sleep_end_of_track`).
+        if self.settings.crossfade && self.sleep_end_of_track {
+            ui.label(
+                RichText::new("Fundido suspendido mientras el temporizador «al terminar la canción» está puesto.")
+                    .small()
+                    .color(theme::palette(ui.ctx()).weak),
+            );
+        }
     }
 
     pub fn settings_page(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let p = theme::palette(&ctx);
         ui.label(RichText::new("Ajustes").font(theme::bold(28.0)));
-        ui.label(RichText::new("Los cambios de reproducción se aplican al guardar; el resto, al instante.").small().color(p.weak));
+        ui.label(
+            RichText::new("El fundido entre canciones se aplica al instante; los demás cambios de reproducción, al guardar; el resto, al instante.")
+                .small()
+                .color(p.weak),
+        );
 
         Self::settings_card(ui, "Reproducción", |ui| {
             Self::setting_row(ui, "Nombre en Spotify Connect", Some("Así aparece Nanofy en la lista de dispositivos."), |ui| {
@@ -2555,30 +2686,86 @@ impl App {
                 ui.set_max_width(260.0);
                 Self::field_box_fill(ui, p.card, |ui| ui.add(egui::TextEdit::singleline(&mut self.draft.device_name).frame(egui::Frame::NONE).desired_width(240.0)));
             });
+            // Sin opción «sin pérdida»: los FLAC de Spotify van tras su DRM y nunca podían sonar.
+            // Tampoco se promete «sin remuestreo»: en Windows la salida va a la frecuencia del
+            // dispositivo, que suele ser 48 kHz.
             Self::setting_row(
                 ui,
                 "Calidad de audio",
-                Some("Sin pérdida pide FLAC; si tu cuenta o la canción no lo ofrecen, suena a 320 kbps. Salida en 32 bits flotantes sin remuestreo."),
+                Some(
+                    "Ogg Vorbis, el mismo formato que la app de escritorio de Spotify. «Muy alta» es la \
+                     máxima calidad que Spotify entrega a apps que no son las suyas.",
+                ),
                 |ui| {
-                    for q in [Quality::Low, Quality::Normal, Quality::High, Quality::Lossless] {
+                    for q in [Quality::Low, Quality::Normal, Quality::High] {
                         if Self::pill(ui, q.label(), self.draft.quality == q).clicked() {
                             self.draft.quality = q;
                         }
                     }
                 },
             );
+            ui.label(
+                RichText::new("Sin pérdida (FLAC): Spotify solo la entrega a sus apps y dispositivos certificados.")
+                    .small()
+                    .color(theme::palette(ui.ctx()).weak),
+            );
+            // Solo lectura: a qué frecuencia abre el sistema el dispositivo no lo elige Nanofy (en
+            // Windows manda el formato compartido del dispositivo, casi siempre 48 kHz).
+            let out = crate::backend::audio_output();
+            let out_hint = match out.resampling() {
+                Some(Resampling::None) => "El dispositivo ya está a 44,1 kHz: el audio llega sin convertir.",
+                _ if cfg!(windows) => {
+                    "Para evitar el remuestreo, pon el dispositivo en 44100 Hz: Configuración → Sistema → \
+                     Sonido → (dispositivo) → Formato."
+                }
+                _ => "Para evitar el remuestreo, pon el dispositivo de salida en 44100 Hz.",
+            };
+            Self::setting_row(ui, "Salida de audio", Some(out_hint), |ui| {
+                let p = theme::palette(ui.ctx());
+                match out.summary(true) {
+                    Some(text) => ui.label(RichText::new(text).color(p.text)),
+                    None => ui.label(RichText::new("Se sabrá al reproducir la primera canción").color(p.weak)),
+                };
+            });
+            ui.add_space(4.0);
             let mut v = self.draft.normalisation;
-            if Self::toggle_pad(ui, &mut v, "Normalizar volumen entre canciones", 0.0) {
+            if Self::toggle_pad(ui, &mut v, "Normalizar volumen", 0.0) {
                 self.draft.normalisation = v;
             }
+            ui.label(
+                RichText::new("Como en Spotify: todas las canciones suenan a un volumen parecido.")
+                    .small()
+                    .color(theme::palette(ui.ctx()).weak),
+            );
+            // Los tres niveles de Spotify. Sin normalización no hacen nada: se ven apagados.
+            let loudness_hint = self.draft.loudness.hint();
+            ui.add_enabled_ui(self.draft.normalisation, |ui| {
+                Self::setting_row(ui, "Nivel de volumen", Some(loudness_hint), |ui| {
+                    for l in [Loudness::Loud, Loudness::Normal, Loudness::Quiet] {
+                        if Self::pill(ui, l.label(), self.draft.loudness == l).on_hover_text(l.hint()).clicked() {
+                            self.draft.loudness = l;
+                        }
+                    }
+                });
+            });
             let mut v = self.draft.gapless;
             if Self::toggle_pad(ui, &mut v, "Reproducción sin pausas (gapless)", 0.0) {
                 self.draft.gapless = v;
             }
+            self.crossfade_settings(ui);
             let mut v = self.draft.autoplay;
             if Self::toggle_pad(ui, &mut v, "Autoplay al terminar una lista", 0.0) {
                 self.draft.autoplay = v;
             }
+            let mut v = self.draft.smart_preload;
+            if Self::toggle_pad(ui, &mut v, "Precarga inteligente", 0.0) {
+                self.draft.smart_preload = v;
+            }
+            ui.label(
+                RichText::new("Prepara la canción sobre la que pasas el ratón para que suene al instante.")
+                    .small()
+                    .color(theme::palette(ui.ctx()).weak),
+            );
             let mut v = self.draft.media_keys;
             if Self::toggle_pad(ui, &mut v, "Teclas multimedia del sistema", 0.0) {
                 self.draft.media_keys = v;
@@ -2624,12 +2811,13 @@ impl App {
             if Self::secondary_button(ui, "Descartar", changed).clicked() {
                 self.draft = self.settings.clone();
             }
-            if self.settings.playback_differs(&self.draft) {
+            // La calidad, gapless y el volumen se aplican sin reiniciar; solo esto corta la música.
+            if self.settings.restart_differs(&self.draft) {
                 ui.label(RichText::new("Al guardar se reinicia el reproductor.").small().color(p.weak));
             }
         });
 
-        Self::settings_card(ui, "Web API · biblioteca, búsqueda, playlists y perfiles", |ui| {
+        Self::settings_card(ui, "Biblioteca · playlists, búsqueda, Me gusta y perfiles", |ui| {
             self.web_api_settings(ui);
         });
 
@@ -2669,7 +2857,15 @@ impl App {
                     ui.label(RichText::new("Con una cuenta gratuita Spotify no permite reproducir música en clientes externos.").small().color(ERROR_RED));
                 }
             }
-            Auth::LoggingIn => Self::loading(ui, "Conectando"),
+            Auth::LoggingIn => {
+                ui.horizontal(|ui| {
+                    Self::loading(ui, "Completa el inicio de sesión en el navegador");
+                    let cancelling = self.login_cancelling();
+                    if Self::secondary_button(ui, if cancelling { "Cancelando…" } else { "Cancelar" }, !cancelling).clicked() {
+                        self.cancel_login();
+                    }
+                });
+            }
             Auth::Connecting { .. } => Self::loading(ui, "Conectando con Spotify"),
             Auth::LoggedOut => {
                 if Self::primary_button(ui, "Iniciar sesión con Spotify", true).clicked() {

@@ -206,6 +206,14 @@ impl ContextResolver {
         self.find_next().is_some()
     }
 
+    /// ¿Lo siguiente por resolver es otra página del contexto principal? (Nanofy: Spirc las trae
+    /// enseguida cuando la canción pedida aún no ha aparecido, ver `start_index`).
+    pub fn next_is_default_page(&self) -> bool {
+        self.find_next().is_some_and(|(next, _, _)| {
+            next.update == ContextType::Default && next.action == ContextAction::Append
+        })
+    }
+
     pub async fn get_next_context(
         &self,
         recent_track_uri: impl Fn() -> Vec<String>,

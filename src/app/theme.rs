@@ -27,6 +27,8 @@ pub struct Palette {
     pub text: Color32,
     pub weak: Color32,
     pub faint: Color32,
+    /// Ámbar de aviso suave (p. ej. una canción que suena por debajo de la calidad pedida).
+    pub warn: Color32,
 }
 
 impl Palette {
@@ -42,6 +44,7 @@ impl Palette {
                 text: Color32::from_rgb(242, 242, 242),
                 weak: Color32::from_rgb(160, 160, 160),
                 faint: Color32::from_rgb(100, 100, 100),
+                warn: Color32::from_rgb(240, 170, 60),
             }
         } else {
             Self {
@@ -54,6 +57,8 @@ impl Palette {
                 text: Color32::from_rgb(20, 20, 20),
                 weak: Color32::from_rgb(105, 105, 110),
                 faint: Color32::from_rgb(170, 170, 175),
+                // Más oscuro: el ámbar claro apenas se lee sobre blanco.
+                warn: Color32::from_rgb(176, 108, 0),
             }
         }
     }

@@ -202,8 +202,8 @@ impl App {
             ui.painter().rect_filled(rect, CornerRadius::same(TAB_BG_RADIUS), st.tab_bg);
         }
         let color = st.color(active, resp.hovered());
-        // La lupa (con el mango abajo a la derecha) va 1 px arriba a la izquierda.
-        let ic = if icon == Icon::Search { c - vec2(1.0, 2.0) } else { c };
+        // La lupa, donde en la referencia: 30,5 px a la izquierda del texto.
+        let ic = if icon == Icon::Search { c + vec2(2.0, -0.4) } else { c };
         let icon = if active && icon == Icon::Home { Icon::HomeFilled } else { icon };
         icons::paint(ui.painter(), Rect::from_center_size(ic, vec2(size, size)), st.icon_of(color), icon);
         let g = ui.painter().layout_no_wrap(text.to_string(), theme::regular(TOP_FONT), color);
@@ -235,13 +235,16 @@ impl App {
         resp
     }
 
-    /// Buscar en su página: la lupa en su sitio y el campo de texto a su derecha, sobre una
-    /// píldora tenue.
+    /// Buscar en su página (referencia 10.png): un rectángulo de esquinas redondeadas con el gris
+    /// de la pestaña elegida (339,4 × 45,7, desde 34,2 px a la izquierda de la lupa), la lupa en
+    /// blanco y el campo de texto donde va «Buscar».
     fn search_field(&mut self, ui: &mut egui::Ui, c: egui::Pos2, st: &TopStyle, p: &theme::Palette) {
-        let pill = Rect::from_min_max(pos2(c.x - 22.0, c.y - 19.0), pos2(c.x + 330.0, c.y + 19.0));
-        ui.painter().rect_filled(pill, CornerRadius::same(19), p.hover.gamma_multiply(0.8));
-        icons::paint(ui.painter(), Rect::from_center_size(c - vec2(1.0, 2.0), vec2(29.0, 29.0)), st.icon_of(st.active), Icon::Search);
-        let field = Rect::from_min_max(pos2(c.x + 31.0, c.y - 13.0), pos2(pill.max.x - 14.0, c.y + 13.0));
+        let _ = p;
+        let lupa = c + vec2(2.0, -0.4);
+        let pill = Rect::from_min_max(pos2(lupa.x - 34.2, c.y - 23.4), pos2(lupa.x - 34.2 + 339.4, c.y + 22.3));
+        ui.painter().rect_filled(pill, CornerRadius::same(TAB_BG_RADIUS), st.tab_bg);
+        icons::paint(ui.painter(), Rect::from_center_size(lupa, vec2(29.0, 29.0)), st.icon_of(st.active), Icon::Search);
+        let field = Rect::from_min_max(pos2(c.x + 31.0, c.y - 15.0), pos2(pill.max.x - 14.0, c.y + 11.0));
         let mut f = child_in(ui, field, Layout::left_to_right(Align::Center));
         let edit = egui::TextEdit::singleline(&mut self.search_query)
             .id(egui::Id::new(SEARCH_ID))

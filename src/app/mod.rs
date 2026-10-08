@@ -8224,7 +8224,7 @@ impl crate::shell::UiApp for App {
                 // 1 px, como en la referencia; la del artista, de borde a borde (su cabecera ocupa
                 // el panel entero).
                 let page_now = self.page().clone();
-                let black = matches!(page_now, Page::Artist(_) | Page::Home);
+                let black = matches!(page_now, Page::Artist(_) | Page::Home | Page::Search);
                 if black && p.dark {
                     ui.painter().rect_filled(panel, egui::CornerRadius::same(8), bg);
                     ui.painter().rect_stroke(panel, egui::CornerRadius::same(8), egui::Stroke::new(1.0, ARTIST_PANEL_EDGE), egui::StrokeKind::Inside);
@@ -8233,7 +8233,7 @@ impl crate::shell::UiApp for App {
                 }
                 let (pad_l, pad_r, pad_t) = match page_now {
                     Page::Artist(_) => (0.0, 0.0, 0.0),
-                    Page::Home => (HOME_PAD_LEFT, HOME_PAD_RIGHT, HOME_PAD_TOP),
+                    Page::Home | Page::Search => (HOME_PAD_LEFT, HOME_PAD_RIGHT, HOME_PAD_TOP),
                     _ => (CONTENT_PAD_LEFT, CONTENT_PAD_RIGHT, CONTENT_PAD_TOP),
                 };
                 let inner = egui::Rect::from_min_max(

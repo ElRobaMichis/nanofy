@@ -805,6 +805,12 @@ impl App {
     /// Estantería del inicio: título, flechas para desplazar, menú (fijar / ocultar) y tarjetas.
     /// Chip de filtro del inicio en `at` (esquina de arriba a la izquierda).
     fn home_chip(ui: &mut egui::Ui, at: egui::Pos2, label: &str, selected: bool) -> egui::Response {
+        Self::chip(ui, at, label, selected, 36)
+    }
+
+    /// Chip de filtro de la referencia: rectángulo de 36 px con esquinas de 6 y 16 px de relleno;
+    /// el elegido, claro con el texto negro; los demás, gris `rest` (Inicio 36, Buscar 24).
+    fn chip(ui: &mut egui::Ui, at: egui::Pos2, label: &str, selected: bool, rest: u8) -> egui::Response {
         let p = theme::palette(ui.ctx());
         let font = theme::regular(HOME_CHIP_FONT);
         let g = ui.painter().layout_no_wrap(label.to_string(), font.clone(), Color32::WHITE);
@@ -813,7 +819,7 @@ impl App {
         let (fill, color) = match (selected, p.dark) {
             (true, true) => (Color32::from_gray(225), Color32::BLACK),
             (true, false) => (p.text, p.card),
-            (false, true) => (if resp.hovered() { Color32::from_gray(46) } else { Color32::from_gray(36) }, Color32::from_gray(222)),
+            (false, true) => (if resp.hovered() { Color32::from_gray(rest + 10) } else { Color32::from_gray(rest) }, Color32::from_gray(224)),
             (false, false) => (if resp.hovered() { p.hover.lerp_to_gamma(p.text, 0.08) } else { p.hover }, p.text),
         };
         ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
@@ -1410,15 +1416,35 @@ impl App {
         }
         let p = theme::palette(ui.ctx());
         const FILTERS: [&str; 9] = ["Todo", "Canciones", "Artistas", "Álbumes", "Playlists", "Podcasts", "Episodios", "Audiolibros", "Perfiles"];
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-            for (i, label) in FILTERS.iter().enumerate() {
-                if Self::pill(ui, label, self.search_filter == i as u8).clicked() {
-                    self.set_search_filter(i as u8);
-                }
+        // Chips como los de Inicio (referencia 10.png), con el gris más oscuro de la búsqueda; si
+        // no caben en una fila, siguen en la de abajo.
+        let width = ui.available_width();
+        let widths: Vec<f32> = FILTERS
+            .iter()
+            .map(|l| (ui.painter().layout_no_wrap(l.to_string(), theme::regular(HOME_CHIP_FONT), Color32::WHITE).size().x + 32.0).round())
+            .collect();
+        let mut rows = 1;
+        let mut x = 0.0;
+        for w in &widths {
+            if x > 0.0 && x + w > width {
+                rows += 1;
+                x = 0.0;
             }
-        });
-        ui.add_space(6.0);
+            x += w + 9.5;
+        }
+        let (area, _) = ui.allocate_exact_size(vec2(width, rows as f32 * (HOME_CHIP_H + 9.5) - 9.5), Sense::hover());
+        let (mut x, mut y) = (area.min.x, area.min.y);
+        for (i, (label, w)) in FILTERS.iter().zip(&widths).enumerate() {
+            if x > area.min.x && x + w > area.max.x {
+                x = area.min.x;
+                y += HOME_CHIP_H + 9.5;
+            }
+            if Self::chip(ui, pos2(x, y), label, self.search_filter == i as u8, 24).clicked() {
+                self.set_search_filter(i as u8);
+            }
+            x += w + 9.5;
+        }
+        ui.add_space(14.0);
         let f = self.search_filter;
         if f == 8 {
             let q = self.search_query.trim().to_string();

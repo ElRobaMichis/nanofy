@@ -32,6 +32,12 @@ const HOME_CARD_TITLE_FONT: f32 = 14.75;
 const HOME_CARD_SUB_FONT: f32 = 12.75;
 /// Chincheta de una sección fijada (verde menta, como en la referencia).
 const HOME_PIN: Color32 = Color32::from_rgb(118, 202, 150);
+/// Panel «Personalizar inicio»: ancho, centro de la primera fila desde arriba, alto de las filas y
+/// verde de la chincheta de una sección fijada.
+const CUST_W: f32 = 432.0;
+const CUST_FIRST_ROW: f32 = 159.0;
+const CUST_ROW_H: f32 = 53.4;
+const CUST_PIN: Color32 = Color32::from_rgb(85, 200, 130);
 
 impl App {
     pub fn page_ui(&mut self, ui: &mut egui::Ui) {
@@ -544,14 +550,19 @@ impl App {
             }
             x = r.rect.max.x + 9.5;
         }
-        let b = Self::slot_button(ui, egui::Id::new("home_customize_btn"), pos2(row.max.x - 24.7, row.center().y - 1.7), Icon::Customize, 28.0, Color32::from_gray(143))
-            .on_hover_text("Personalizar el inicio");
-        let pid = egui::Id::new("home_customize");
+        let b = Self::slot_button(ui, egui::Id::new("home_customize_btn"), pos2(row.max.x - 24.7, row.center().y - 1.7), Icon::Customize, 28.0, Color32::from_gray(143));
+        let b = if self.home_customize_open { b } else { b.on_hover_text("Personalizar el inicio") };
+        if b.clicked() {
+            self.home_customize_open = !self.home_customize_open;
+        }
         if self.home_customize_once {
             self.home_customize_once = false;
-            egui::Popup::open_id(ui.ctx(), pid);
+            self.home_customize_open = true;
         }
-        egui::Popup::menu(&b).id(pid).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| self.home_customize_panel(ui));
+        if self.home_customize_open {
+            let ctx = ui.ctx().clone();
+            self.home_customize_panel(&ctx, b.rect);
+        }
         if !self.api.web_configured() {
             ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
             ui.add_space(12.0);
@@ -687,118 +698,197 @@ impl App {
         all
     }
 
-    /// Panel «Personalizar inicio»: añadir playlists, fijar, reordenar arrastrando y ocultar.
-    fn home_customize_panel(&mut self, ui: &mut egui::Ui) {
-        let p = theme::palette(ui.ctx());
-        ui.set_min_width(340.0);
-        ui.set_max_width(340.0);
-        ui.label(RichText::new("Personalizar inicio").font(theme::bold(16.0)));
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(6.0);
-        let mine: Vec<(String, String)> = self
-            .playlists
-            .iter()
-            .filter(|pl| !self.settings.home_custom.contains(&pl.id))
-            .map(|pl| (pl.id.clone(), pl.name.clone()))
-            .collect();
-        let r = Self::menu_item(ui, Some(Icon::Plus), "Seleccionar de la biblioteca", true);
-        egui::containers::menu::SubMenu::default().show(ui, &r, |ui| {
-            ui.set_min_width(220.0);
-            if mine.is_empty() {
-                ui.label(RichText::new("Todas tus playlists ya están en el inicio.").small().color(p.weak));
-            }
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                for (pid, name) in &mine {
-                    if Self::menu_item(ui, Some(Icon::Playlist), name, false).clicked() {
-                        self.settings.home_custom.push(pid.clone());
-                        self.settings.save(&self.paths);
-                        ui.close();
+    /// Panel «Personalizar inicio» (referencia 11.webp): cristal desenfocado de 432 px anclado al
+    /// botón, con la cabecera, «Seleccionar de la biblioteca», una fila por sección (chincheta,
+    /// nombre, asa para reordenar arrastrando y ojo para ocultar) cada 53,4 px y, abajo, el
+    /// interruptor de las filas recomendadas. Se cierra al pulsar fuera o con Escape.
+    fn home_customize_panel(&mut self, ctx: &egui::Context, button: Rect) {
+        let p = theme::palette(ctx);
+        let bc = button.center();
+        let sections = self.home_sections();
+        let screen = ctx.content_rect();
+        let top = bc.y + 32.0;
+        let natural = CUST_FIRST_ROW + (sections.len().max(1) as f32 - 1.0) * CUST_ROW_H + 41.5 + 56.5;
+        let h = natural.min(screen.max.y - 16.0 - top).max(300.0);
+        let rect = Rect::from_min_size(pos2(bc.x + 28.0 - CUST_W, top), vec2(CUST_W, h));
+        let (l, r) = (rect.min.x, rect.max.x);
+        let dark = p.dark;
+        let ink = |v: u8| if dark { Color32::from_gray(v) } else { p.text.gamma_multiply(v as f32 / 255.0 + 0.2) };
+        let sub_id = egui::Id::new("home_customize_pick");
+        egui::Area::new(egui::Id::new("home_customize_panel"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                // Todo el panel recoge el puntero: lo de debajo no reacciona.
+                ui.allocate_rect(rect, Sense::click_and_drag());
+                let painter = ui.painter().clone();
+                painter.add(egui::Shape::Callback(egui::epaint::PaintCallback {
+                    rect,
+                    callback: std::sync::Arc::new(crate::raster::BackdropBlur { sigma: 28.0, corner: 9.0 }),
+                }));
+                let glass = if dark { Color32::from_rgba_unmultiplied(35, 35, 35, 191) } else { Color32::from_rgba_unmultiplied(250, 250, 250, 225) };
+                painter.rect_filled(rect, CornerRadius::same(9), glass);
+                let line = if dark { Color32::from_white_alpha(28) } else { p.border };
+
+                // Cabecera
+                let g = painter.layout_no_wrap("Personalizar inicio".into(), theme::regular(15.0), ink(231));
+                text_on_baseline(&painter, pos2(l + 22.5, rect.min.y + 33.0), g, ink(231));
+                painter.line_segment([pos2(l, rect.min.y + 52.5), pos2(r, rect.min.y + 52.5)], egui::Stroke::new(1.0, line));
+
+                // Seleccionar de la biblioteca (lista de playlists que aún no están en el inicio)
+                let sy = rect.min.y + 99.0;
+                let srow = Rect::from_min_max(pos2(l + 8.0, sy - 24.0), pos2(r - 8.0, sy + 24.0));
+                let sr = ui.interact(srow, egui::Id::new("home_customize_select"), Sense::click());
+                if sr.hovered() {
+                    painter.rect_filled(srow, CornerRadius::same(6), Color32::from_white_alpha(8));
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let pc = ink(234);
+                painter.line_segment([pos2(l + 44.0, sy - 7.5), pos2(l + 44.0, sy + 7.5)], egui::Stroke::new(1.6, pc));
+                painter.line_segment([pos2(l + 36.5, sy), pos2(l + 51.5, sy)], egui::Stroke::new(1.6, pc));
+                let g = painter.layout_no_wrap("Seleccionar de la biblioteca".into(), theme::regular(17.5), pc);
+                text_on_baseline(&painter, pos2(l + 74.0, sy + 6.0), g, pc);
+                let mine: Vec<(String, String)> = self
+                    .playlists
+                    .iter()
+                    .filter(|pl| !self.settings.home_custom.contains(&pl.id))
+                    .map(|pl| (pl.id.clone(), pl.name.clone()))
+                    .collect();
+                egui::Popup::menu(&sr).id(sub_id).show(|ui| {
+                    ui.set_min_width(240.0);
+                    if mine.is_empty() {
+                        ui.label(RichText::new("Todas tus playlists ya están en el inicio.").small().color(p.weak));
                     }
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for (pid, name) in &mine {
+                            if Self::menu_item(ui, Some(Icon::Playlist), name, false).clicked() {
+                                self.settings.home_custom.push(pid.clone());
+                                self.settings.save(&self.paths);
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+
+                // Filas de las secciones (con scroll si no caben)
+                let rows_rect = Rect::from_min_max(pos2(l, rect.min.y + CUST_FIRST_ROW - CUST_ROW_H / 2.0), pos2(r, rect.max.y - 56.5 - 41.5 + CUST_ROW_H / 2.0));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rows_rect));
+                egui::ScrollArea::vertical().id_salt("home_customize_rows").max_height(rows_rect.height()).show(&mut child, |ui| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                    for sec in &sections {
+                        let pinned = self.settings.home_pinned.contains(&sec.id);
+                        let hidden = self.settings.home_hidden.contains(&sec.id);
+                        let dragging = self.home_drag.as_deref() == Some(sec.id.as_str());
+                        let (row, rr) = ui.allocate_exact_size(vec2(CUST_W, CUST_ROW_H), Sense::hover());
+                        let rc = row.center().y;
+                        let pnt = ui.painter().clone();
+                        if dragging || rr.hovered() {
+                            pnt.rect_filled(row.shrink2(vec2(8.0, 3.0)), CornerRadius::same(6), Color32::from_white_alpha(if dragging { 14 } else { 8 }));
+                        }
+                        // Chincheta
+                        let pin_c = pos2(l + 45.0, rc - 2.5);
+                        let pin_col = if pinned { CUST_PIN } else if hidden { ink(90) } else { ink(144) };
+                        let pr = Self::slot_button(ui, ui.id().with(("cust_pin", &sec.id)), pin_c, Icon::Pin, 30.0, pin_col)
+                            .on_hover_text(if pinned { "Desfijar" } else { "Fijar arriba" });
+                        if pr.clicked() {
+                            self.settings.home_pinned.retain(|x| x != &sec.id);
+                            if !pinned {
+                                self.settings.home_pinned.insert(0, sec.id.clone());
+                            }
+                            self.settings.save(&self.paths);
+                        }
+                        // Nombre
+                        let custom = sec.id.starts_with("custom:");
+                        let tc = if hidden { ink(142) } else { ink(245) };
+                        let text_w = if custom { 322.0 - 14.0 - 74.0 } else { 347.0 - 20.0 - 74.0 };
+                        let g = galley_truncated(&pnt, &sec.title, theme::regular(14.5), tc, text_w);
+                        text_on_baseline(&pnt, pos2(l + 74.0, rc + 5.0), g, tc);
+                        if custom {
+                            let xr = Self::slot_button(ui, ui.id().with(("cust_rm", &sec.id)), pos2(l + 322.0, rc), Icon::Close, 14.0, ink(142)).on_hover_text("Quitar del inicio");
+                            if xr.clicked() {
+                                let pid = sec.id.trim_start_matches("custom:").to_string();
+                                self.settings.home_custom.retain(|x| x != &pid);
+                                self.settings.save(&self.paths);
+                            }
+                        }
+                        // Asa para arrastrar
+                        let hr = Rect::from_center_size(pos2(l + 347.0, rc - 1.5), vec2(26.0, 34.0));
+                        let hh = ui.interact(hr, ui.id().with(("cust_drag", &sec.id)), Sense::drag());
+                        let hc = if hh.hovered() || dragging { ink(220) } else if hidden { ink(90) } else { ink(142) };
+                        icons::paint(&pnt, Rect::from_center_size(pos2(l + 347.0, rc - 1.5), vec2(28.0, 28.0)), hc, Icon::DragHandle);
+                        if hh.hovered() || dragging {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                        }
+                        if hh.drag_started() {
+                            self.home_drag = Some(sec.id.clone());
+                        }
+                        // Ojo: ocultar o mostrar
+                        let (eye, ec, ey) = if hidden { (Icon::EyeOff, ink(91), rc + 3.0) } else { (Icon::Eye, ink(144), rc - 2.0) };
+                        let er = Self::slot_button(ui, ui.id().with(("cust_eye", &sec.id)), pos2(l + 393.5, ey), eye, 28.0, ec)
+                            .on_hover_text(if hidden { "Mostrar" } else { "Ocultar" });
+                        if er.clicked() {
+                            if hidden {
+                                self.settings.home_hidden.retain(|x| x != &sec.id);
+                            } else {
+                                self.settings.home_hidden.push(sec.id.clone());
+                            }
+                            self.settings.save(&self.paths);
+                        }
+                    }
+                });
+
+                // Pie: filas recomendadas
+                let fy = rect.max.y;
+                painter.line_segment([pos2(l, fy - 56.5), pos2(r, fy - 56.5)], egui::Stroke::new(1.0, line));
+                let g = painter.layout_no_wrap("Permitir filas recomendadas".into(), theme::regular(14.5), ink(226));
+                text_on_baseline(&painter, pos2(l + 30.5, fy - 22.0), g, ink(226));
+                let on = self.settings.home_recs;
+                let track = Rect::from_min_max(pos2(l + 352.0, fy - 28.5 - 12.0), pos2(l + 399.5, fy - 28.5 + 12.0));
+                let tr = ui.interact(Rect::from_min_max(pos2(l + 8.0, fy - 52.0), pos2(r - 8.0, fy - 6.0)), egui::Id::new("home_customize_recs"), Sense::click());
+                painter.rect_filled(track, CornerRadius::same(12), if dark { Color32::from_gray(17) } else { p.hover });
+                let knob_x = if on { l + 388.5 } else { l + 364.0 };
+                painter.circle_filled(pos2(knob_x, fy - 28.5), 10.0, if on { GREEN } else { Color32::from_gray(150) });
+                if tr.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if tr.clicked() {
+                    self.settings.home_recs = !on;
+                    self.settings.save(&self.paths);
                 }
             });
-        });
-        ui.add_space(4.0);
-        let sections = self.home_sections();
-        let mut rows: Vec<(String, Rect)> = Vec::new();
-        egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
-            for sec in &sections {
-                let pinned = self.settings.home_pinned.contains(&sec.id);
-                let hidden = self.settings.home_hidden.contains(&sec.id);
-                let dragging = self.home_drag.as_deref() == Some(sec.id.as_str());
-                let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
-                if dragging {
-                    ui.painter().rect_filled(row, CornerRadius::same(8), p.hover);
-                }
-                rows.push((sec.id.clone(), row));
-                let mut c = child_in(ui, row, Layout::left_to_right(Align::Center));
-                c.spacing_mut().item_spacing.x = 8.0;
-                let (icon, color) = if pinned { (Icon::PinFilled, GREEN) } else { (Icon::Pin, p.weak) };
-                if icons::button(&mut c, icon, 26.0, color).on_hover_text(if pinned { "Desfijar" } else { "Fijar arriba" }).clicked() {
-                    self.settings.home_pinned.retain(|x| x != &sec.id);
-                    if !pinned {
-                        self.settings.home_pinned.insert(0, sec.id.clone());
-                    }
-                    self.settings.save(&self.paths);
-                }
-                let text_color = if hidden { p.faint } else { p.text };
-                let title_w = row.width() - 26.0 * 3.0 - 8.0 * 4.0;
-                let (tr, _) = c.allocate_exact_size(vec2(title_w, 26.0), Sense::hover());
-                let mut t = child_in(&mut c, tr, Layout::left_to_right(Align::Center));
-                t.add(Label::new(RichText::new(&sec.title).color(text_color)).truncate());
-                let (hr, _) = c.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
-                let h = c.interact(hr, c.id().with(("drag", &sec.id)), Sense::drag());
-                icons::paint(c.painter(), hr.shrink(5.0), if h.hovered() || dragging { p.text } else { p.weak }, Icon::DragHandle);
-                if h.hovered() || dragging {
-                    c.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-                }
-                if h.drag_started() {
-                    self.home_drag = Some(sec.id.clone());
-                }
-                let (icon, color) = if hidden { (Icon::EyeOff, p.faint) } else { (Icon::Eye, p.weak) };
-                if icons::button(&mut c, icon, 26.0, color).on_hover_text(if hidden { "Mostrar" } else { "Ocultar" }).clicked() {
-                    if hidden {
-                        self.settings.home_hidden.retain(|x| x != &sec.id);
-                    } else {
-                        self.settings.home_hidden.push(sec.id.clone());
-                    }
-                    self.settings.save(&self.paths);
-                }
-                if sec.id.starts_with("custom:") {
-                    let r = c.add(Label::new(RichText::new("×").color(p.weak)).sense(Sense::click())).on_hover_text("Quitar del inicio");
-                    if r.clicked() {
-                        let pid = sec.id.trim_start_matches("custom:").to_string();
-                        self.settings.home_custom.retain(|x| x != &pid);
-                        self.settings.save(&self.paths);
-                    }
-                }
-            }
-        });
+
         // Arrastre: la sección arrastrada toma el sitio de la fila bajo el puntero.
         if let Some(d) = self.home_drag.clone() {
-            let released = ui.input(|i| i.pointer.any_released());
-            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
-                if let Some((target, _)) = rows.iter().find(|(id, r)| id != &d && r.y_range().contains(pos.y)) {
-                    let order = &mut self.settings.home_order;
-                    if let (Some(from), Some(to)) = (order.iter().position(|x| x == &d), order.iter().position(|x| x == target)) {
-                        let item = order.remove(from);
-                        order.insert(to, item);
-                        self.settings.save(&self.paths);
+            let released = ctx.input(|i| i.pointer.any_released());
+            if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                // La fila bajo el puntero, por su posición (todas miden lo mismo).
+                let first = rect.min.y + CUST_FIRST_ROW - CUST_ROW_H / 2.0;
+                let k = ((pos.y - first) / CUST_ROW_H).floor();
+                if k >= 0.0 {
+                    if let Some(target) = sections.get(k as usize).map(|s| s.id.clone()) {
+                        if target != d {
+                            let order = &mut self.settings.home_order;
+                            if let (Some(from), Some(to)) = (order.iter().position(|x| x == &d), order.iter().position(|x| x == &target)) {
+                                let item = order.remove(from);
+                                order.insert(to, item);
+                                self.settings.save(&self.paths);
+                            }
+                        }
                     }
                 }
             }
             if released {
                 self.home_drag = None;
             }
-            ui.ctx().request_repaint();
+            ctx.request_repaint();
         }
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(4.0);
-        let mut recs = self.settings.home_recs;
-        if Self::toggle(ui, &mut recs, "Permitir filas recomendadas") {
-            self.settings.home_recs = recs;
-            self.settings.save(&self.paths);
+
+        // Cerrar al pulsar fuera (salvo en la lista de playlists) o con Escape.
+        let pressed_outside = ctx.input(|i| {
+            i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|q| !rect.contains(q) && !button.contains(q))
+        });
+        if (pressed_outside && !egui::Popup::is_id_open(ctx, sub_id)) || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.home_customize_open = false;
         }
     }
 

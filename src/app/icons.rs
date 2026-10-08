@@ -676,18 +676,32 @@ fn build(icon: Icon, d: &mut Draw) {
             d.stroke(bottom);
             d.ring((6.4, 17.0), 2.4);
         }
-        Icon::Eye | Icon::EyeOff => {
-            d.quad((2.6, 12.0), (12.0, 3.6), (21.4, 12.0));
-            d.quad((2.6, 12.0), (12.0, 20.4), (21.4, 12.0));
-            d.ring((12.0, 12.0), 3.3);
-            if icon == Icon::EyeOff {
-                d.erase(Prim::Path(vec![pos2(4.0, 4.0), pos2(20.0, 20.0)], d.sw / 2.0 + 1.3));
-                d.line((4.0, 4.0), (20.0, 20.0));
-            }
+        Icon::Eye => {
+            // Referencia (rejilla de 28): almendra de 23,5 de ancho y el iris relleno.
+            d.grid = BAR_GRID;
+            d.sw = 2.0;
+            d.quad((2.25, 14.0), (14.0, 0.0), (25.75, 14.0));
+            d.quad((2.25, 14.0), (14.0, 28.0), (25.75, 14.0));
+            d.dot((14.0, 14.0), 4.4);
+        }
+        Icon::EyeOff => {
+            // Ojo cerrado de la referencia: el párpado de abajo con las puntas hacia arriba y tres
+            // pestañas colgando.
+            d.grid = BAR_GRID;
+            d.sw = 1.9;
+            let mut lid = vec![pos2(4.6, 8.4), pos2(2.6, 12.4)];
+            lid.extend(cubic_pts(pos2(2.6, 12.4), pos2(6.2, 17.2), pos2(21.8, 17.2), pos2(25.4, 12.4)));
+            lid.push(pos2(23.4, 8.4));
+            d.stroke(lid);
+            d.line((7.6, 16.1), (6.9, 18.6));
+            d.line((14.0, 16.8), (14.0, 19.2));
+            d.line((20.4, 16.1), (21.1, 18.6));
         }
         Icon::DragHandle => {
-            for (x, y) in [(9.0, 7.0), (15.0, 7.0), (9.0, 12.0), (15.0, 12.0), (9.0, 17.0), (15.0, 17.0)] {
-                d.dot((x, y), 1.5);
+            // Asa de la referencia: 2 × 3 puntos de 3,5 px cada 7,5 (rejilla de 28).
+            d.grid = BAR_GRID;
+            for (x, y) in [(10.25, 6.5), (17.75, 6.5), (10.25, 14.0), (17.75, 14.0), (10.25, 21.5), (17.75, 21.5)] {
+                d.dot((x, y), 1.75);
             }
         }
         Icon::Folder => d.rpoly(&[(3.0, 3.2), (9.6, 3.2), (11.6, 5.3), (21.0, 5.3), (21.0, 18.5), (3.0, 18.5)], 2.0, true),

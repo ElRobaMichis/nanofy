@@ -888,6 +888,8 @@ pub struct App {
     /// Secciones del inicio ya ordenadas (clave de invalidación, lista).
     pub home_cache: Option<(HomeCacheKey, Vec<HomeSection>)>,
     pub home_customize_once: bool,
+    /// Panel «Personalizar inicio» abierto.
+    pub home_customize_open: bool,
     /// Instancia de prueba: no guarda ajustes al salir.
     pub ephemeral: bool,
     /// Botones de la miniatura de la barra de tareas (Windows): instalación diferida y estado.
@@ -1278,6 +1280,7 @@ impl App {
             home_drag: None,
             home_cache: None,
             home_customize_once: false,
+            home_customize_open: false,
             ephemeral: false,
             taskbar_at: Instant::now(),
             taskbar_ready: false,

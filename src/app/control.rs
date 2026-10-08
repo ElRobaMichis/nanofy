@@ -835,6 +835,11 @@ impl App {
                 }
                 ok()
             }
+            // Abrir o cerrar el panel «Personalizar inicio».
+            "home_customize" => {
+                self.home_customize_open = b(cmd, "on", !self.home_customize_open);
+                ok()
+            }
             // Desplegar o plegar Fijados y Playlists en la barra lateral.
             "sidebar_sections" => {
                 self.sidebar_pins_open = b(cmd, "pins", self.sidebar_pins_open);

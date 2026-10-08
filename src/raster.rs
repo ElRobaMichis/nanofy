@@ -86,6 +86,15 @@ pub struct Raster {
     textures: HashMap<TextureId, Texture>,
 }
 
+/// Efecto «cristal» de un panel: en un `egui::epaint::PaintCallback` con esto dentro,
+/// `Raster::paint` desenfoca lo ya pintado bajo el rectángulo del callback (en puntos), con las
+/// esquinas redondeadas de `corner` puntos, antes de seguir con lo que va encima. El desenfoque
+/// es casi gaussiano, de desviación `sigma` puntos.
+pub struct BackdropBlur {
+    pub sigma: f32,
+    pub corner: f32,
+}
+
 impl Raster {
     /// Aplica las texturas nuevas o modificadas. Llamar antes de pintar.
     pub fn update_textures(&mut self, delta: &TexturesDelta) {
@@ -155,14 +164,32 @@ impl Raster {
         primitives: &[ClippedPrimitive],
         clear: Color32,
     ) {
+        // Por tramos: cada `BackdropBlur` desenfoca lo pintado hasta él antes de seguir.
         let clear_px = pack(clear.to_array());
+        let mut start = 0;
+        let mut cleared = false;
+        for (i, p) in primitives.iter().enumerate() {
+            let Primitive::Callback(cb) = &p.primitive else { continue };
+            let Some(blur) = cb.callback.downcast_ref::<BackdropBlur>() else { continue };
+            self.paint_pass(buf, w, h, ppp, &primitives[start..i], (!cleared).then_some(clear_px));
+            cleared = true;
+            backdrop_blur(buf, w, h, ppp, cb.rect.intersect(p.clip_rect), blur);
+            start = i + 1;
+        }
+        self.paint_pass(buf, w, h, ppp, &primitives[start..], (!cleared).then_some(clear_px));
+    }
+
+    /// Un tramo de primitivas; con `clear`, empieza borrando el búfer de ese color.
+    fn paint_pass(&self, buf: &mut [u32], w: usize, h: usize, ppp: f32, primitives: &[ClippedPrimitive], clear: Option<u32>) {
         let threads = if w * h >= 400_000 {
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8)
         } else {
             1
         };
         if threads == 1 {
-            buf.fill(clear_px);
+            if let Some(c) = clear {
+                buf.fill(c);
+            }
             self.paint_rows(buf, w, 0, h, ppp, primitives);
             return;
         }
@@ -176,7 +203,9 @@ impl Raster {
                 s.spawn(move || loop {
                     let Some((y0, band)) = bands.lock().unwrap().pop() else { break };
                     let y1 = y0 + band.len() / w;
-                    band.fill(clear_px);
+                    if let Some(c) = clear {
+                        band.fill(c);
+                    }
                     self.paint_rows(band, w, y0, y1, ppp, primitives);
                 });
             }
@@ -210,6 +239,115 @@ impl Raster {
                 let v2 = &mesh.vertices[tri[2] as usize];
                 triangle(band, w, y0 as i32, &clip, tex, is_font, v0, v1, v2, ppp);
             }
+        }
+    }
+}
+
+/// Desenfoca `buf` dentro de `rect` (puntos): a un cuarto de resolución, tres pasadas de caja en
+/// cada dirección (casi gaussiano) que leen también lo que hay alrededor del rectángulo, y de
+/// vuelta con interpolación bilineal, solo dentro de las esquinas redondeadas. Los tres canales y
+/// la vuelta se reparten entre hilos.
+fn backdrop_blur(buf: &mut [u32], w: usize, h: usize, ppp: f32, rect: egui::Rect, b: &BackdropBlur) {
+    let x0 = (rect.min.x * ppp).floor().max(0.0) as usize;
+    let y0 = (rect.min.y * ppp).floor().max(0.0) as usize;
+    let x1 = ((rect.max.x * ppp).ceil().max(0.0) as usize).min(w);
+    let y1 = ((rect.max.y * ppp).ceil().max(0.0) as usize).min(h);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let s = if b.sigma * ppp >= 12.0 { 4usize } else { 2 };
+    let r = ((b.sigma * ppp) / s as f32).round().max(1.0) as usize;
+    let m = 3 * r * s;
+    let (sx0, sy0) = (x0.saturating_sub(m), y0.saturating_sub(m));
+    let (sx1, sy1) = ((x1 + m).min(w), (y1 + m).min(h));
+    let (dw, dh) = ((sx1 - sx0).div_ceil(s), (sy1 - sy0).div_ceil(s));
+    // Planos R, G, B reducidos (×16 para no perder precisión entre pasadas).
+    let src: &[u32] = buf;
+    let mut planes: [Vec<u32>; 3] = std::array::from_fn(|_| vec![0u32; dw * dh]);
+    std::thread::scope(|sc| {
+        for (c, plane) in planes.iter_mut().enumerate() {
+            sc.spawn(move || {
+                let shift = 16 - 8 * c as u32;
+                for dy in 0..dh {
+                    for dx in 0..dw {
+                        let (mut acc, mut n) = (0u32, 0u32);
+                        for yy in (sy0 + dy * s)..(sy0 + dy * s + s).min(sy1) {
+                            for xx in (sx0 + dx * s)..(sx0 + dx * s + s).min(sx1) {
+                                acc += (src[yy * w + xx] >> shift) & 0xff;
+                                n += 1;
+                            }
+                        }
+                        plane[dy * dw + dx] = acc * 16 / n.max(1);
+                    }
+                }
+                let mut tmp = vec![0u32; dw * dh];
+                for _ in 0..3 {
+                    box_pass(plane, &mut tmp, dw, dh, r, dw, 1);
+                    box_pass(&tmp, plane, dh, dw, r, 1, dw);
+                }
+            });
+        }
+    });
+    // De vuelta, dentro del rectángulo con esquinas redondeadas, por bandas de filas.
+    let cr = b.corner * ppp;
+    let (fx0, fy0, fx1, fy1) = (rect.min.x * ppp, rect.min.y * ppp, rect.max.x * ppp, rect.max.y * ppp);
+    let planes = &planes;
+    let sample = move |plane: &[u32], fx: f32, fy: f32| -> u32 {
+        let fx = fx.clamp(0.0, (dw - 1) as f32);
+        let fy = fy.clamp(0.0, (dh - 1) as f32);
+        let (ix, iy) = (fx.floor() as usize, fy.floor() as usize);
+        let (ix1, iy1) = ((ix + 1).min(dw - 1), (iy + 1).min(dh - 1));
+        let (tx, ty) = (fx - ix as f32, fy - iy as f32);
+        let a = plane[iy * dw + ix] as f32 * (1.0 - tx) + plane[iy * dw + ix1] as f32 * tx;
+        let c = plane[iy1 * dw + ix] as f32 * (1.0 - tx) + plane[iy1 * dw + ix1] as f32 * tx;
+        ((a * (1.0 - ty) + c * ty) / 16.0).round().clamp(0.0, 255.0) as u32
+    };
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
+    let rows_per = (y1 - y0).div_ceil(threads).max(1);
+    std::thread::scope(|sc| {
+        for (k, chunk) in buf[y0 * w..y1 * w].chunks_mut(rows_per * w).enumerate() {
+            sc.spawn(move || {
+                let first = y0 + k * rows_per;
+                for (j, row) in chunk.chunks_mut(w).enumerate() {
+                    let py = (first + j) as f32 + 0.5;
+                    let fy = (py - sy0 as f32) / s as f32 - 0.5;
+                    for x in x0..x1 {
+                        let px = x as f32 + 0.5;
+                        // Fuera de una esquina redondeada: se deja como estaba.
+                        let qx = if px < fx0 + cr { fx0 + cr - px } else if px > fx1 - cr { px - (fx1 - cr) } else { 0.0 };
+                        let qy = if py < fy0 + cr { fy0 + cr - py } else if py > fy1 - cr { py - (fy1 - cr) } else { 0.0 };
+                        if qx > 0.0 && qy > 0.0 && qx * qx + qy * qy > cr * cr {
+                            continue;
+                        }
+                        let fx = (px - sx0 as f32) / s as f32 - 0.5;
+                        let rr = sample(&planes[0], fx, fy);
+                        let gg = sample(&planes[1], fx, fy);
+                        let bb = sample(&planes[2], fx, fy);
+                        row[x] = (rr << 16) | (gg << 8) | bb;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Una pasada de media móvil de radio `r` a lo largo de `n` elementos (paso `step`) en cada una
+/// de `lines` líneas (separadas `stride`), con los bordes repetidos.
+fn box_pass(src: &[u32], dst: &mut [u32], n: usize, lines: usize, r: usize, stride: usize, step: usize) {
+    let div = (2 * r + 1) as u32;
+    let at = |line: usize, i: isize| -> u32 {
+        let i = i.clamp(0, n as isize - 1) as usize;
+        src[line * stride + i * step]
+    };
+    for line in 0..lines {
+        let mut acc: u32 = 0;
+        for i in -(r as isize)..=(r as isize) {
+            acc += at(line, i);
+        }
+        for i in 0..n {
+            dst[line * stride + i * step] = (acc + div / 2) / div;
+            acc += at(line, i as isize + r as isize + 1);
+            acc -= at(line, i as isize - r as isize);
         }
     }
 }
@@ -489,5 +627,34 @@ fn triangle(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// El desenfoque deja igual un fondo liso, suaviza un borde (también en vertical, por toda la
+    /// altura del panel) y no toca nada fuera del rectángulo.
+    #[test]
+    fn desenfoque_del_fondo() {
+        let (w, h) = (240usize, 400usize);
+        // Mitad de arriba negra, mitad de abajo blanca; una columna roja fuera del panel.
+        let mut buf: Vec<u32> = (0..w * h).map(|i| if i / w < h / 2 { 0x000000 } else { 0xffffff }).collect();
+        for y in 0..h {
+            buf[y * w + 5] = 0xff0000;
+        }
+        let rect = egui::Rect::from_min_max(egui::pos2(40.0, 20.0), egui::pos2(200.0, 380.0));
+        backdrop_blur(&mut buf, w, h, 1.0, rect, &BackdropBlur { sigma: 12.0, corner: 0.0 });
+        let px = |x: usize, y: usize| buf[y * w + x] & 0xff;
+        // Lejos del borde, igual que antes; en el borde, un gris intermedio; a lo largo, suave.
+        assert!(px(120, 40) < 4 && px(120, 360) > 250, "{} {}", px(120, 40), px(120, 360));
+        let mid = px(120, h / 2);
+        assert!((90..=165).contains(&mid), "{mid}");
+        assert!(px(120, h / 2 - 10) < mid && px(120, h / 2 + 10) > mid);
+        // Fuera del rectángulo, nada cambia.
+        assert_eq!(buf[200 * w + 5], 0xff0000);
+        assert_eq!(buf[(h / 2 - 1) * w + 20] & 0xff, 0);
+        assert_eq!(buf[(h / 2) * w + 20] & 0xff, 0xff);
     }
 }

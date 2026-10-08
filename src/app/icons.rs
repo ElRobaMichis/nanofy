@@ -66,7 +66,9 @@ pub enum Icon {
     Settings,
     Grid,
     List,
+    #[allow(dead_code)]
     Back,
+    #[allow(dead_code)]
     Forward,
     Close,
     Check,
@@ -82,6 +84,7 @@ pub enum Icon {
     Sort,
     Filter,
     Episode,
+    #[allow(dead_code)]
     Sliders,
     Eye,
     EyeOff,
@@ -99,6 +102,13 @@ pub enum Icon {
     /// «›» y «⌄» de las secciones plegables de la barra lateral.
     ChevronRight,
     ChevronDown,
+    /// Inicio elegido: la casa rellena con la puerta recortada.
+    HomeFilled,
+    /// Personalizar el inicio: dos interruptores (barra y aro).
+    Customize,
+    /// Flechas con asta de las estanterías del inicio.
+    ArrowLeft,
+    ArrowRight,
 }
 
 /// Grosor del trazo en unidades de la rejilla de 24.
@@ -730,6 +740,32 @@ fn build(icon: Icon, d: &mut Draw) {
             }
             d.line((8.0, 14.4), (16.0, 14.4));
         }
+        Icon::HomeFilled => {
+            // Copiada de la referencia (rejilla de 28): el borde de fuera de la casa, relleno, con
+            // la puerta como un hueco en la base.
+            d.grid = BAR_GRID;
+            d.fill(
+                &[(14.5, 3.4), (25.9, 12.8), (25.9, 24.4), (16.4, 24.4), (16.4, 16.3), (12.6, 16.3), (12.6, 24.4), (3.1, 24.4), (3.1, 12.8)],
+                1.4,
+            );
+        }
+        Icon::Customize => {
+            // Referencia (rejilla de 28): arriba una barra y un aro; abajo, al revés.
+            d.grid = BAR_GRID;
+            d.sw = 1.9;
+            d.rrect((6.9, 6.9), (14.5, 11.6), 2.3);
+            d.ring((21.6, 9.25), 3.0);
+            d.ring((8.3, 18.75), 3.0);
+            d.rrect((14.5, 17.3), (23.0, 21.1), 1.9);
+        }
+        Icon::ArrowLeft => {
+            d.line((5.0, 12.0), (19.5, 12.0));
+            d.poly(&[(11.2, 5.8), (5.0, 12.0), (11.2, 18.2)]);
+        }
+        Icon::ArrowRight => {
+            d.line((4.5, 12.0), (19.0, 12.0));
+            d.poly(&[(12.8, 5.8), (19.0, 12.0), (12.8, 18.2)]);
+        }
         Icon::ChevronRight => d.poly(&[(9.5, 5.5), (15.0, 12.0), (9.5, 18.5)]),
         Icon::ChevronDown => d.poly(&[(5.5, 9.5), (12.0, 15.0), (18.5, 9.5)]),
         Icon::Hourglass => {
@@ -1012,7 +1048,7 @@ mod tests {
         Icon::Bookmark, Icon::BookmarkFilled, Icon::Sort, Icon::Filter, Icon::Episode, Icon::Sliders, Icon::Eye,
         Icon::EyeOff, Icon::DragHandle, Icon::Folder, Icon::Book, Icon::Radio, Icon::Clock, Icon::Fullscreen,
         Icon::Miniplayer, Icon::NewTab, Icon::Trash, Icon::Edit, Icon::Keyboard, Icon::ChevronRight,
-        Icon::ChevronDown,
+        Icon::ChevronDown, Icon::HomeFilled, Icon::Customize, Icon::ArrowLeft, Icon::ArrowRight,
     ];
 
     /// Todos se ven (tienen tinta) y caben en su cuadro: el marco exterior queda casi vacío, así

@@ -188,13 +188,22 @@ impl App {
     }
 
     /// Inicio o Buscar: icono centrado en `c` (de lado `size`) y el texto 31 px a su derecha.
+    /// Elegida, sobre el rectángulo redondeado de la referencia y, la casa, rellena.
     fn top_item(&mut self, ui: &mut egui::Ui, c: egui::Pos2, icon: Icon, size: f32, text: &str, active: bool, st: &TopStyle) -> egui::Response {
         let g = ui.painter().layout_no_wrap(text.to_string(), theme::regular(TOP_FONT), st.text);
-        let rect = Rect::from_min_max(pos2(c.x - 18.0, c.y - 18.0), pos2(c.x + 31.0 + g.size().x + 10.0, c.y + 18.0));
+        let rect = if active {
+            tab_bg_rect(c, TAB_BG_W)
+        } else {
+            Rect::from_min_max(pos2(c.x - 18.0, c.y - 18.0), pos2(c.x + 31.0 + g.size().x + 10.0, c.y + 18.0))
+        };
         let resp = ui.interact(rect, ui.id().with(("top_item", text)), Sense::click());
+        if active {
+            ui.painter().rect_filled(rect, CornerRadius::same(TAB_BG_RADIUS), st.tab_bg);
+        }
         let color = st.color(active, resp.hovered());
         // La lupa (con el mango abajo a la derecha) va 1 px arriba a la izquierda.
         let ic = if icon == Icon::Search { c - vec2(1.0, 2.0) } else { c };
+        let icon = if active && icon == Icon::Home { Icon::HomeFilled } else { icon };
         icons::paint(ui.painter(), Rect::from_center_size(ic, vec2(size, size)), st.icon_of(color), icon);
         let g = ui.painter().layout_no_wrap(text.to_string(), theme::regular(TOP_FONT), color);
         text_on_baseline(ui.painter(), pos2(c.x + 31.0, c.y + 6.0), g, color);
@@ -208,6 +217,11 @@ impl App {
     fn top_tab(&mut self, ui: &mut egui::Ui, c: egui::Pos2, icon: Icon, title: &str, text_w: f32, selected: bool, st: &TopStyle) -> egui::Response {
         let rect = Rect::from_min_max(pos2(c.x - 18.0, c.y - 18.0), pos2(c.x + 31.0 + text_w + 34.0, c.y + 18.0));
         let resp = ui.interact(rect, ui.id().with(("top_tab", title, c.x as i32)), Sense::click());
+        if selected {
+            // Como Inicio elegida: el rectángulo redondeado detrás (más corto si no cabe).
+            let w = (rect.max.x - (c.x - TAB_BG_LEFT) + 4.0).min(TAB_BG_W);
+            ui.painter().rect_filled(tab_bg_rect(c, w), CornerRadius::same(TAB_BG_RADIUS), st.tab_bg);
+        }
         let color = st.color(selected, resp.hovered());
         icons::paint(ui.painter(), Rect::from_center_size(c, vec2(26.0, 26.0)), st.icon_of(color), icon);
         if text_w > 8.0 {
@@ -1484,6 +1498,16 @@ const TOP_TABS_MIN_W: f32 = 340.0;
 
 /// Texto de la barra superior.
 const TOP_FONT: f32 = 14.0;
+/// Fondo de la pestaña elegida (referencia 9.png): empieza 31 px a la izquierda del centro del
+/// icono, mide 196,8 × 46,6 y va de 22,9 px por encima del centro a 23,7 por debajo.
+const TAB_BG_LEFT: f32 = 31.0;
+const TAB_BG_W: f32 = 196.8;
+const TAB_BG_RADIUS: u8 = 7;
+
+/// Rectángulo del fondo de una pestaña elegida cuyo icono va centrado en `c`.
+fn tab_bg_rect(c: egui::Pos2, w: f32) -> Rect {
+    Rect::from_min_max(pos2(c.x - TAB_BG_LEFT, c.y - 22.9), pos2(c.x - TAB_BG_LEFT + w, c.y + 23.7))
+}
 /// Distancia entre las pestañas de páginas abiertas (de icono a icono), como de Inicio a Buscar.
 const TAB_PITCH: f32 = 210.0;
 /// Centro de la primera fila de la barra lateral desde su borde de arriba, alto de las filas,
@@ -1510,6 +1534,8 @@ struct TopStyle {
     /// Texto de una sección desplegada y de las playlists de su lista.
     open: Color32,
     child: Color32,
+    /// Fondo de la pestaña elegida.
+    tab_bg: Color32,
 }
 
 impl TopStyle {
@@ -1522,9 +1548,10 @@ impl TopStyle {
                 active: p.text,
                 open: Color32::from_gray(189),
                 child: Color32::from_gray(118),
+                tab_bg: Color32::from_gray(17),
             }
         } else {
-            Self { icon: p.weak, text: p.weak, hover: p.text, active: p.text, open: p.text, child: p.weak }
+            Self { icon: p.weak, text: p.weak, hover: p.text, active: p.text, open: p.text, child: p.weak, tab_bg: p.hover }
         }
     }
 

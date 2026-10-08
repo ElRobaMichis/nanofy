@@ -20,6 +20,18 @@ const INFO_GAP: f32 = 46.0;
 /// Título de las páginas y su línea de metadatos.
 const TITLE_FONT: f32 = 35.5;
 const META_FONT: f32 = 14.5;
+/// Inicio (referencia 9.png): chips, estanterías y tarjetas.
+const HOME_CHIP_H: f32 = 36.0;
+const HOME_CHIP_FONT: f32 = 14.5;
+const HOME_SHELF_H: f32 = 343.0;
+const HOME_TITLE_FONT: f32 = 20.0;
+const HOME_CARD: f32 = 171.0;
+const CARD_PITCH: f32 = 181.5;
+const HOME_TILE_H: f32 = 262.0;
+const HOME_CARD_TITLE_FONT: f32 = 14.75;
+const HOME_CARD_SUB_FONT: f32 = 12.75;
+/// Chincheta de una sección fijada (verde menta, como en la referencia).
+const HOME_PIN: Color32 = Color32::from_rgb(118, 202, 150);
 
 impl App {
     pub fn page_ui(&mut self, ui: &mut egui::Ui) {
@@ -520,27 +532,34 @@ impl App {
             return;
         }
         let p = theme::palette(ui.ctx());
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            for (i, label) in ["Todo", "Música", "Podcasts", "Audiolibros"].iter().enumerate() {
-                if Self::pill(ui, label, self.home_filter == i as u8).clicked() {
-                    self.home_filter = i as u8;
-                }
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        // Chips (referencia 9.png): rectángulos de 36 px con esquinas de 6, 16 px de relleno y 9,5
+        // entre ellos; el elegido, claro con el texto negro. A la derecha, personalizar.
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), HOME_CHIP_H), Sense::hover());
+        let mut x = row.min.x;
+        for (i, label) in ["Todo", "Música", "Podcasts", "Audiolibros"].iter().enumerate() {
+            let r = Self::home_chip(ui, pos2(x, row.min.y), label, self.home_filter == i as u8);
+            if r.clicked() {
+                self.home_filter = i as u8;
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let b = icons::button(ui, Icon::Sliders, 30.0, p.weak).on_hover_text("Personalizar el inicio");
-                let pid = egui::Id::new("home_customize");
-                if self.home_customize_once {
-                    self.home_customize_once = false;
-                    egui::Popup::open_id(ui.ctx(), pid);
-                }
-                egui::Popup::menu(&b).id(pid).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| self.home_customize_panel(ui));
-            });
-        });
+            x = r.rect.max.x + 9.5;
+        }
+        let b = Self::slot_button(ui, egui::Id::new("home_customize_btn"), pos2(row.max.x - 24.7, row.center().y - 1.7), Icon::Customize, 28.0, Color32::from_gray(143))
+            .on_hover_text("Personalizar el inicio");
+        let pid = egui::Id::new("home_customize");
+        if self.home_customize_once {
+            self.home_customize_once = false;
+            egui::Popup::open_id(ui.ctx(), pid);
+        }
+        egui::Popup::menu(&b).id(pid).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| self.home_customize_panel(ui));
         if !self.api.web_configured() {
+            ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+            ui.add_space(12.0);
             self.web_api_banner(ui);
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         }
         if self.home_feed.is_empty() {
+            ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
             ui.add_space(8.0);
             Self::loading(ui, "Preparando tu inicio");
             self.home_page_legacy(ui);
@@ -570,7 +589,7 @@ impl App {
             self.home_shelf(ui, sec, pinned.contains(&sec.id));
         }
         if shown == 0 {
-            ui.add_space(12.0);
+            ui.add_space(24.0);
             let msg = match f {
                 2 => "Spotify todavía no te recomienda podcasts; escucha alguno y aparecerán aquí.",
                 3 => "Spotify todavía no te recomienda audiolibros; escucha alguno y aparecerán aquí.",
@@ -784,58 +803,87 @@ impl App {
     }
 
     /// Estantería del inicio: título, flechas para desplazar, menú (fijar / ocultar) y tarjetas.
+    /// Chip de filtro del inicio en `at` (esquina de arriba a la izquierda).
+    fn home_chip(ui: &mut egui::Ui, at: egui::Pos2, label: &str, selected: bool) -> egui::Response {
+        let p = theme::palette(ui.ctx());
+        let font = theme::regular(HOME_CHIP_FONT);
+        let g = ui.painter().layout_no_wrap(label.to_string(), font.clone(), Color32::WHITE);
+        let rect = Rect::from_min_size(at, vec2((g.size().x + 32.0).round(), HOME_CHIP_H));
+        let resp = ui.interact(rect, ui.id().with(("home_chip", label)), Sense::click());
+        let (fill, color) = match (selected, p.dark) {
+            (true, true) => (Color32::from_gray(225), Color32::BLACK),
+            (true, false) => (p.text, p.card),
+            (false, true) => (if resp.hovered() { Color32::from_gray(46) } else { Color32::from_gray(36) }, Color32::from_gray(222)),
+            (false, false) => (if resp.hovered() { p.hover.lerp_to_gamma(p.text, 0.08) } else { p.hover }, p.text),
+        };
+        ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+        let g = ui.painter().layout_no_wrap(label.to_string(), font, color);
+        let x = rect.center().x - g.size().x / 2.0;
+        text_on_baseline(ui.painter(), pos2(x, rect.center().y + 5.7), g, color);
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp
+    }
+
+    /// Estantería del inicio (referencia 9.png): bloque de 343 px con el título en negrita de 20 y
+    /// la línea base a 53 del borde de arriba, la chincheta verde detrás del título si está fijada
+    /// y, a la derecha, ← → y «⋯»; debajo, las tarjetas en una tira con scroll lateral.
     fn home_shelf(&mut self, ui: &mut egui::Ui, sec: &HomeSection, pinned: bool) {
         let p = theme::palette(ui.ctx());
-        ui.add_space(14.0);
         let (offset, max) = self.home_offsets.get(&sec.id).copied().unwrap_or((0.0, 0.0));
-        let page = (ui.available_width() - CARD_W).max(CARD_W);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if pinned {
-                let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                icons::paint(ui.painter(), r, GREEN, Icon::PinFilled);
+        let width = ui.available_width();
+        let (block, _) = ui.allocate_exact_size(vec2(width, HOME_SHELF_H), Sense::hover());
+        let base = block.min.y + 52.0;
+        let title_color = if p.dark { Color32::from_gray(241) } else { p.text };
+        let g = galley_truncated(ui.painter(), &sec.title, theme::bold(HOME_TITLE_FONT), title_color, (width - 220.0).max(80.0));
+        let tr = text_on_baseline(ui.painter(), pos2(block.min.x, base), g, title_color);
+        if pinned {
+            icons::paint(ui.painter(), Rect::from_center_size(pos2(tr.max.x + 35.0, base - 8.1), vec2(27.0, 27.0)), HOME_PIN, Icon::Pin);
+        }
+        let page = (width - CARD_PITCH).max(CARD_PITCH);
+        let can_next = offset + 1.0 < max;
+        let can_prev = offset > 1.0;
+        let arrow = |on: bool| if on { Color32::from_gray(146) } else { Color32::from_gray(75) };
+        let id = ui.id().with(("home_shelf", &sec.id));
+        let ay = base - 8.0;
+        if Self::slot_button(ui, id.with("prev"), pos2(block.max.x - 112.4, ay), Icon::ArrowLeft, 24.0, arrow(can_prev)).clicked() && can_prev {
+            self.home_scroll.insert(sec.id.clone(), (offset - page).max(0.0));
+        }
+        if Self::slot_button(ui, id.with("next"), pos2(block.max.x - 67.8, ay), Icon::ArrowRight, 24.0, arrow(can_next)).clicked() && can_next {
+            self.home_scroll.insert(sec.id.clone(), (offset + page).min(max));
+        }
+        let more = Self::slot_button(ui, id.with("more"), pos2(block.max.x - 22.6, ay), Icon::More, 29.0, Color32::from_gray(149)).on_hover_text("Opciones de la sección");
+        egui::Popup::menu(&more).show(|ui| {
+            ui.set_min_width(190.0);
+            let pin_label = if pinned { "Desfijar del inicio" } else { "Fijar arriba del inicio" };
+            if Self::menu_item(ui, Some(Icon::Pin), pin_label, false).clicked() {
+                self.settings.home_pinned.retain(|x| x != &sec.id);
+                if !pinned {
+                    self.settings.home_pinned.insert(0, sec.id.clone());
+                }
+                self.settings.save(&self.paths);
+                ui.close();
             }
-            ui.label(RichText::new(&sec.title).font(theme::bold(20.0)));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                let more = icons::button(ui, Icon::More, 28.0, p.weak).on_hover_text("Opciones de la sección");
-                egui::Popup::menu(&more).show(|ui| {
-                    ui.set_min_width(190.0);
-                    let pin_label = if pinned { "Desfijar del inicio" } else { "Fijar arriba del inicio" };
-                    if Self::menu_item(ui, Some(Icon::Pin), pin_label, false).clicked() {
-                        self.settings.home_pinned.retain(|x| x != &sec.id);
-                        if !pinned {
-                            self.settings.home_pinned.insert(0, sec.id.clone());
-                        }
-                        self.settings.save(&self.paths);
-                        ui.close();
-                    }
-                    if Self::menu_item(ui, Some(Icon::EyeOff), "Ocultar esta sección", false).clicked() {
-                        if !self.settings.home_hidden.contains(&sec.id) {
-                            self.settings.home_hidden.push(sec.id.clone());
-                        }
-                        self.settings.save(&self.paths);
-                        ui.close();
-                    }
-                });
-                let can_next = offset + 1.0 < max;
-                let can_prev = offset > 1.0;
-                if icons::button(ui, Icon::Forward, 28.0, if can_next { p.text } else { p.faint }).clicked() && can_next {
-                    self.home_scroll.insert(sec.id.clone(), (offset + page).min(max));
+            if Self::menu_item(ui, Some(Icon::EyeOff), "Ocultar esta sección", false).clicked() {
+                if !self.settings.home_hidden.contains(&sec.id) {
+                    self.settings.home_hidden.push(sec.id.clone());
                 }
-                if icons::button(ui, Icon::Back, 28.0, if can_prev { p.text } else { p.faint }).clicked() && can_prev {
-                    self.home_scroll.insert(sec.id.clone(), (offset - page).max(0.0));
-                }
-            });
+                self.settings.save(&self.paths);
+                ui.close();
+            }
         });
-        ui.add_space(4.0);
+
+        // Tira de tarjetas desde 25,6 px bajo la línea base del título.
+        let strip = Rect::from_min_max(pos2(block.min.x, base + 26.6), block.max);
+        let mut c = ui.new_child(egui::UiBuilder::new().max_rect(strip).layout(Layout::left_to_right(Align::Min)));
         let mut area = egui::ScrollArea::horizontal().id_salt(&sec.id).auto_shrink([false, true]);
         if let Some(t) = self.home_scroll.remove(&sec.id) {
             area = area.horizontal_scroll_offset(t);
         }
-        let out = area.show(ui, |ui| {
+        let out = area.show(&mut c, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing = vec2(CARD_PITCH - HOME_CARD, 0.0);
                 for item in &sec.items {
                     self.home_card(ui, item);
                 }
@@ -845,11 +893,64 @@ impl App {
         self.home_offsets.insert(sec.id.clone(), (out.state.offset.x, max_off));
     }
 
+    /// Tarjeta del inicio de 171 px de ancho (referencia 9.png): las playlists con dos hojas
+    /// detrás (tonos oscuros de su portada), los álbumes con una y los artistas en círculo; debajo,
+    /// el título (14,75) y el subtítulo en dos líneas (12,75).
+    fn home_tile(&mut self, ui: &mut egui::Ui, shape: CardKind, cover: Option<&str>, title: &str, subtitle: &str) -> egui::Response {
+        let p = theme::palette(ui.ctx());
+        let (rect, resp) = ui.allocate_exact_size(vec2(HOME_CARD, HOME_TILE_H), Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return resp;
+        }
+        let x = rect.min.x.round();
+        let t = rect.min.y;
+        let hovered = resp.hovered();
+        let stack = cover.and_then(|u| self.images.stack(u)).unwrap_or(Color32::from_gray(40));
+        let cover_rect = if shape == CardKind::Artist {
+            Rect::from_min_size(pos2(x, t.round()), vec2(HOME_CARD, HOME_CARD))
+        } else {
+            let top = (t + 14.4).round();
+            if matches!(shape, CardKind::Playlist | CardKind::Liked) {
+                let back = Color32::from_rgb((stack.r() as f32 * 0.55) as u8, (stack.g() as f32 * 0.55) as u8, (stack.b() as f32 * 0.55) as u8);
+                ui.painter().rect_filled(Rect::from_min_max(pos2(x + 18.5, t + 2.6), pos2(x + HOME_CARD - 18.5, t + 4.8)), CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, back);
+            }
+            ui.painter().rect_filled(Rect::from_min_max(pos2(x + 8.0, t + 6.4), pos2(x + HOME_CARD - 8.0, top - 1.8)), CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, stack);
+            Rect::from_min_size(pos2(x, top), vec2(HOME_CARD, HOME_CARD))
+        };
+        match shape {
+            CardKind::Artist => self.cover_in(ui, cover, cover_rect, (HOME_CARD / 2.0) as u8),
+            CardKind::Liked => {
+                ui.painter().rect_filled(cover_rect, CornerRadius::same(6), theme::GREEN_DARK);
+                icons::paint(ui.painter(), cover_rect.shrink(HOME_CARD * 0.3), GREEN, Icon::HeartFilled);
+            }
+            _ => self.cover_in(ui, cover, cover_rect, 6),
+        }
+        if hovered {
+            let r = if shape == CardKind::Artist { (HOME_CARD / 2.0) as u8 } else { 6 };
+            ui.painter().rect_filled(cover_rect, CornerRadius::same(r), Color32::from_white_alpha(14));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let title_color = if p.dark { if hovered { Color32::WHITE } else { Color32::from_gray(241) } } else { p.text };
+        let g = galley_truncated(ui.painter(), title, theme::regular(HOME_CARD_TITLE_FONT), title_color, HOME_CARD);
+        text_on_baseline(ui.painter(), pos2(x, cover_rect.max.y + 21.0), g, title_color);
+        if !subtitle.is_empty() {
+            let sub_color = if p.dark { Color32::from_gray(133) } else { p.weak };
+            let mut job = egui::text::LayoutJob::single_section(
+                subtitle.to_string(),
+                egui::TextFormat { font_id: theme::regular(HOME_CARD_SUB_FONT), color: sub_color, line_height: Some(16.2), ..Default::default() },
+            );
+            job.wrap = egui::text::TextWrapping { max_width: HOME_CARD, max_rows: 2, break_anywhere: false, overflow_character: Some('…') };
+            let g = ui.painter().layout_job(job);
+            text_on_baseline(ui.painter(), pos2(x, cover_rect.max.y + 46.2), g, sub_color);
+        }
+        resp
+    }
+
     fn home_card(&mut self, ui: &mut egui::Ui, item: &HomeItem) {
         let kind = item.kind();
         if kind == "track" {
             let sub = item.subtitle.clone();
-            let r = self.card(ui, CardInfo { kind: CardKind::Album, cover: item.image.as_deref(), title: &item.title, subtitle: &sub, count: None, pinned: false });
+            let r = self.home_tile(ui, CardKind::Album, item.image.as_deref(), &item.title, &sub);
             let (uri, ctx) = (item.uri.clone(), item.context.clone());
             if r.clicked() {
                 let shuffle = self.player.shuffle;
@@ -895,10 +996,7 @@ impl App {
         } else {
             item.subtitle.clone()
         };
-        let r = self.card(
-            ui,
-            CardInfo { kind: card_kind, cover: item.image.as_deref(), title: &item.title, subtitle: &subtitle, count: None, pinned: false },
-        );
+        let r = self.home_tile(ui, card_kind, item.image.as_deref(), &item.title, &subtitle);
         let Some(page) = page else { return };
         if kind == "playlist" && (r.clicked() || r.secondary_clicked()) {
             // Lo que ya sabemos por la tarjeta (nombre, portada generada, autor Spotify) se ve al

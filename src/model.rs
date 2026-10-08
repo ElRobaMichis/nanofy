@@ -548,6 +548,8 @@ impl Audiobook {
 /// Vista completa de un artista por los metadatos internos.
 #[derive(Clone, Debug, Default)]
 pub struct ArtistView {
+    /// Nombre (por si la Web API no responde: la cabecera no se queda en «Artista»).
+    pub name: String,
     pub header: Option<String>,
     pub biography: String,
     pub related: Vec<Artist>,

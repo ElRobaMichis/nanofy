@@ -56,12 +56,14 @@ enum Slot {
     Failed { at: Instant, retry: bool },
 }
 
-/// Tamaño pedido: lado máximo (miniaturas) o encaje exacto con recorte centrado (cabeceras
-/// grandes, que así se dibujan 1:1 sin remuestrear cada fotograma).
+/// Tamaño pedido: lado máximo (miniaturas), encaje exacto con recorte centrado (cabeceras
+/// grandes, que así se dibujan 1:1 sin remuestrear cada fotograma) o cabecera de artista
+/// compuesta a partir de su retrato (`hero_compose`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Size {
     Max(u32),
     Fit(u32, u32),
+    Hero(u32, u32),
 }
 
 struct Job {
@@ -138,6 +140,8 @@ pub struct Images {
     waiting_now: usize,
     /// Color dominante por URL de portada, para el degradado de la página de esa portada.
     colors: HashMap<String, egui::Color32>,
+    /// Color medio por URL de portada (la «pila» de las tarjetas de álbum).
+    means: HashMap<String, egui::Color32>,
 }
 
 impl Drop for Images {
@@ -226,6 +230,7 @@ impl Images {
             waiting: None,
             waiting_now: 0,
             colors: HashMap::new(),
+            means: HashMap::new(),
         }
     }
 
@@ -237,6 +242,11 @@ impl Images {
     /// Textura recortada y escalada exactamente a `w`×`h` píxeles.
     pub fn texture_fit(&mut self, url: &str, w: u32, h: u32) -> Option<SizedTexture> {
         self.texture_sized(url, Size::Fit(w.max(1), h.max(1)))
+    }
+
+    /// Cabecera de artista de `w`×`h` píxeles compuesta a partir de su retrato (`hero_compose`).
+    pub fn texture_hero(&mut self, url: &str, w: u32, h: u32) -> Option<SizedTexture> {
+        self.texture_sized(url, Size::Hero(w.max(1), h.max(1)))
     }
 
     fn texture_sized(&mut self, url: &str, size: Size) -> Option<SizedTexture> {
@@ -303,6 +313,11 @@ impl Images {
         })
     }
 
+    /// Color de la «pila» de la tarjeta de esta portada (ver `stack_color`), si ya llegó.
+    pub fn stack(&self, url: &str) -> Option<egui::Color32> {
+        self.means.get(url).copied().map(stack_color)
+    }
+
     pub fn tint(&self, url: &str) -> Option<egui::Color32> {
         let c = self.colors.get(url).copied()?;
         let (r, g, b) = (c.r() as f32, c.g() as f32, c.b() as f32);
@@ -325,6 +340,7 @@ impl Images {
             Some(img) => {
                 let bytes = img.pixels.len() * 4;
                 if let Some(url) = key.split_once('|').map(|(_, u)| u.to_string()) {
+                    self.means.entry(url.clone()).or_insert_with(|| mean_color(&img));
                     self.colors.entry(url).or_insert_with(|| dominant_color(&img));
                 }
                 Slot::Ready {
@@ -478,6 +494,7 @@ fn key(url: &str, size: Size) -> String {
     match size {
         Size::Max(s) => format!("{s}|{url}"),
         Size::Fit(w, h) => format!("{w}x{h}|{url}"),
+        Size::Hero(w, h) => format!("hero{w}x{h}|{url}"),
     }
 }
 
@@ -506,7 +523,7 @@ fn load(agent: &ureq::Agent, dir: &Path, url: &str, size: Size, stale: impl Fn()
     // la ventana se pide una por fotograma y las anteriores no vuelven a pedirse. Decodificar y
     // escalar cada una a hasta 1280 px cuesta decenas de ms y una textura de varios MB que solo
     // iría a desalojarse.
-    if matches!(size, Size::Fit(..)) && stale() {
+    if matches!(size, Size::Fit(..) | Size::Hero(..)) && stale() {
         return Loaded::Dropped;
     }
     let file = dir.join(cache_name(url));
@@ -561,15 +578,8 @@ fn load(agent: &ureq::Agent, dir: &Path, url: &str, size: Size, stale: impl Fn()
                 img
             }
         }
-        Size::Fit(w, h) => {
-            // Recorte centrado a la proporción pedida y escalado exacto.
-            let (sw, sh) = (img.width() as f64, img.height() as f64);
-            let target = w as f64 / h as f64;
-            let (cw, ch) = if sw / sh > target { (sh * target, sh) } else { (sw, sw / target) };
-            let (cx, cy) = (((sw - cw) / 2.0) as u32, ((sh - ch) / 2.0) as u32);
-            img.crop_imm(cx, cy, cw.max(1.0) as u32, ch.max(1.0) as u32)
-                .resize_exact(w, h, image::imageops::FilterType::Triangle)
-        }
+        Size::Fit(w, h) => fit_crop(&img, w, h),
+        Size::Hero(w, h) => hero_compose(&img, w, h),
     };
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -577,6 +587,111 @@ fn load(agent: &ureq::Agent, dir: &Path, url: &str, size: Size, stale: impl Fn()
         [w as usize, h as usize],
         rgba.as_raw(),
     ))
+}
+
+/// Recorte centrado a la proporción de `w`×`h` y escalado exacto.
+fn fit_crop(img: &image::DynamicImage, w: u32, h: u32) -> image::DynamicImage {
+    let (sw, sh) = (img.width() as f64, img.height() as f64);
+    let target = w as f64 / h as f64;
+    let (cw, ch) = if sw / sh > target { (sh * target, sh) } else { (sw, sw / target) };
+    let (cx, cy) = (((sw - cw) / 2.0) as u32, ((sh - ch) / 2.0) as u32);
+    img.crop_imm(cx, cy, cw.max(1.0) as u32, ch.max(1.0) as u32)
+        .resize_exact(w, h, image::imageops::FilterType::Triangle)
+}
+
+/// Cabecera de artista de `w`×`h` a partir de un retrato, como la composición de la referencia:
+/// la foto entera ajustada al alto y centrada; a los lados, sus bordes prolongados (el color medio
+/// de cada fila en la franja del borde, suavizado en vertical) con un fundido sobre la foto para
+/// que no se note la costura. Si la foto ya es más ancha que la cabecera, un recorte centrado.
+fn hero_compose(img: &image::DynamicImage, w: u32, h: u32) -> image::DynamicImage {
+    let scaled_w = ((img.width() as f64 * h as f64 / img.height().max(1) as f64).round() as u32).max(1);
+    if scaled_w >= w {
+        return fit_crop(img, w, h);
+    }
+    let photo = img.resize_exact(scaled_w, h, image::imageops::FilterType::Triangle).to_rgba8();
+    let band = (scaled_w / 25).max(2);
+    let edge = |from: u32| -> Vec<[f32; 3]> {
+        let rows: Vec<[f32; 3]> = (0..h)
+            .map(|y| {
+                let mut acc = [0.0f32; 3];
+                for x in from..(from + band).min(scaled_w) {
+                    let p = photo.get_pixel(x, y);
+                    for c in 0..3 {
+                        acc[c] += p[c] as f32;
+                    }
+                }
+                acc.map(|v| v / band as f32)
+            })
+            .collect();
+        // Media móvil vertical: sin ella, cada fila del borde haría una raya.
+        let r = (h / 24).max(1) as i64;
+        (0..h as i64)
+            .map(|y| {
+                let (a, b) = ((y - r).max(0), (y + r).min(h as i64 - 1));
+                let mut acc = [0.0f32; 3];
+                for k in a..=b {
+                    for c in 0..3 {
+                        acc[c] += rows[k as usize][c];
+                    }
+                }
+                acc.map(|v| v / (b - a + 1) as f32)
+            })
+            .collect()
+    };
+    let left = edge(0);
+    let right = edge(scaled_w.saturating_sub(band));
+    let x0 = (w - scaled_w) / 2;
+    let feather = (scaled_w as f32 * 0.12).max(8.0);
+    let mut out = image::RgbaImage::new(w, h);
+    for y in 0..h {
+        let (l, r) = (left[y as usize], right[y as usize]);
+        for x in 0..w {
+            let px = if x < x0 {
+                l
+            } else if x >= x0 + scaled_w {
+                r
+            } else {
+                let dx = x - x0;
+                let p = photo.get_pixel(dx, y);
+                let p = [p[0] as f32, p[1] as f32, p[2] as f32];
+                // Fundido de la foto con el color de su borde cerca de cada lado.
+                let dl = dx as f32 / feather;
+                let dr = (scaled_w - 1 - dx) as f32 / feather;
+                let (t, side) = if dl < dr { (dl, l) } else { (dr, r) };
+                let t = t.clamp(0.0, 1.0);
+                let t = t * t * (3.0 - 2.0 * t);
+                [side[0] + (p[0] - side[0]) * t, side[1] + (p[1] - side[1]) * t, side[2] + (p[2] - side[2]) * t]
+            };
+            out.put_pixel(x, y, image::Rgba([px[0].round() as u8, px[1].round() as u8, px[2].round() as u8, 255]));
+        }
+    }
+    image::DynamicImage::ImageRgba8(out)
+}
+
+/// Color medio de la imagen (una muestra de ~4096 píxeles).
+fn mean_color(img: &ColorImage) -> egui::Color32 {
+    let step = (img.pixels.len() / 4096).max(1);
+    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+    for px in img.pixels.iter().step_by(step) {
+        r += px.r() as u64;
+        g += px.g() as u64;
+        b += px.b() as u64;
+        n += 1;
+    }
+    let n = n.max(1);
+    egui::Color32::from_rgb((r / n) as u8, (g / n) as u8, (b / n) as u8)
+}
+
+/// Color de la «pila» de una tarjeta cuya portada tiene el color medio `mean`: el mismo tono con
+/// la luminancia 68·(1 − e^(−L/60)), la curva medida en la referencia (portada blanca → gris 66;
+/// oscuras → 20-35).
+pub fn stack_color(mean: egui::Color32) -> egui::Color32 {
+    let (r, g, b) = (mean.r() as f32, mean.g() as f32, mean.b() as f32);
+    let l = (0.2126 * r + 0.7152 * g + 0.0722 * b).max(1.0);
+    let target = 68.0 * (1.0 - (-l / 60.0).exp());
+    let k = target / l;
+    let c = |v: f32| (v * k).round().clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgb(c(r), c(g), c(b))
 }
 
 /// Media de los píxeles ponderada por saturación (los colores vivos mandan); como mucho 4096

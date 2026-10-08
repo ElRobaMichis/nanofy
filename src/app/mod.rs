@@ -50,6 +50,8 @@ pub const TOPBAR_H: f32 = 59.0;
 pub const CONTENT_PAD_LEFT: f32 = 36.0;
 pub const CONTENT_PAD_RIGHT: f32 = 49.0;
 pub const CONTENT_PAD_TOP: f32 = 22.0;
+/// Filo del panel en la página de un artista (fondo de la ventana con un borde de 1 px).
+const ARTIST_PANEL_EDGE: egui::Color32 = egui::Color32::from_gray(26);
 
 /// Fondo del panel de contenido: sin `tint`, del color `card`; con él, el degradado de la
 /// referencia (plano 26 px y de ahí lineal hasta `bottom` 8 px antes del borde de abajo).
@@ -8173,11 +8175,23 @@ impl crate::shell::UiApp for App {
                 // Panel de contenido con esquinas de 8 px. En playlists y álbumes, degradado del
                 // tono de la portada (plano los primeros 26 px) hasta el fondo de la ventana.
                 let panel = ui.max_rect();
-                paint_content_panel(ui.painter(), panel, tint, p.card, bg);
-                let inner = egui::Rect::from_min_max(
-                    egui::pos2(panel.min.x + CONTENT_PAD_LEFT, panel.min.y + CONTENT_PAD_TOP),
-                    egui::pos2(panel.max.x - CONTENT_PAD_RIGHT, panel.max.y),
-                );
+                // La página de un artista va de borde a borde (su cabecera ocupa el panel entero)
+                // sobre el fondo de la ventana, con un filo de 1 px, como en la referencia.
+                let artist = matches!(self.page(), Page::Artist(_));
+                if artist && p.dark {
+                    ui.painter().rect_filled(panel, egui::CornerRadius::same(8), bg);
+                    ui.painter().rect_stroke(panel, egui::CornerRadius::same(8), egui::Stroke::new(1.0, ARTIST_PANEL_EDGE), egui::StrokeKind::Inside);
+                } else {
+                    paint_content_panel(ui.painter(), panel, tint, p.card, bg);
+                }
+                let inner = if artist {
+                    panel
+                } else {
+                    egui::Rect::from_min_max(
+                        egui::pos2(panel.min.x + CONTENT_PAD_LEFT, panel.min.y + CONTENT_PAD_TOP),
+                        egui::pos2(panel.max.x - CONTENT_PAD_RIGHT, panel.max.y),
+                    )
+                };
                 let mut c = ui.new_child(egui::UiBuilder::new().max_rect(inner));
                 c.set_clip_rect(panel.shrink(1.0));
                 egui::ScrollArea::vertical()

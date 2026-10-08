@@ -356,28 +356,6 @@ impl App {
         resp
     }
 
-    /// Pestaña con subrayado verde (páginas de artista).
-    pub fn tab(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
-        let p = theme::palette(ui.ctx());
-        let color = if selected { p.text } else { p.weak };
-        let galley = ui.painter().layout_no_wrap(text.to_string(), theme::regular(14.0), color);
-        let size = vec2(galley.size().x + 8.0, 34.0);
-        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-        let pos = pos2(rect.min.x + 4.0, rect.center().y - galley.size().y / 2.0 - 3.0);
-        ui.painter().galley(pos, galley, color);
-        if selected {
-            let y = rect.max.y - 2.0;
-            ui.painter().line_segment(
-                [pos2(rect.min.x + 4.0, y), pos2(rect.max.x - 4.0, y)],
-                Stroke::new(2.0, GREEN),
-            );
-        }
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        resp
-    }
-
     /// Tarjeta de biblioteca. La forma distingue el tipo: playlist con "pila" arriba, álbum
     /// cuadrado, artista redondo, Me gusta verde. Pin y contador opcionales.
     pub fn card(&mut self, ui: &mut egui::Ui, info: CardInfo) -> egui::Response {

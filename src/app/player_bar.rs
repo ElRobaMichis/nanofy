@@ -317,6 +317,7 @@ impl App {
                 self.artists
                     .get(id)
                     .and_then(|pg| pg.artist.as_ref().map(|a| a.name.clone()))
+                    .or_else(|| self.artist_views.get(id).map(|v| v.name.clone()).filter(|n| !n.is_empty()))
                     .unwrap_or_else(|| "Artista".into()),
             ),
             Page::User(id) => (

@@ -2108,6 +2108,7 @@ impl Client {
             })
             .collect();
         Ok(ArtistView {
+            name: a.name.clone(),
             header: pick_image(&header, 1000).map(|s| s.to_string()),
             biography: a.biographies.first().map(|b| crate::app::strip_html(&b.text)).unwrap_or_default(),
             related,

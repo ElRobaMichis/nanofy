@@ -90,14 +90,20 @@ impl App {
             self.go(Page::Home);
         }
         let search_c = pos2((x0 + 511.5).min(tabs_end - 90.0).max(home_c.x + 130.0), cy);
-        if page == Page::Search {
-            self.search_field(ui, search_c, &st, &p);
-        } else if self.top_item(ui, search_c, Icon::Search, 29.0, "Buscar", false, &st).clicked() {
-            self.focus_search = true;
-            self.go(Page::Search);
-        }
+        // Hasta dónde llega Buscar: su recuadro en su página (más corto si no cabe); si no, el texto.
+        let search_right = if page == Page::Search {
+            self.search_field(ui, search_c, (tabs_end - 8.0).max(search_c.x + 140.0), &st, &p)
+        } else {
+            let r = self.top_item(ui, search_c, Icon::Search, 29.0, "Buscar", false, &st);
+            if r.clicked() {
+                self.focus_search = true;
+                self.go(Page::Search);
+            }
+            r.rect.max.x
+        };
 
-        // Una pestaña por página abierta, cada 210 px detrás de Buscar (más juntas si no caben).
+        // Una pestaña por página abierta: huecos de 210 px desde 210 detrás de Buscar o, con su
+        // recuadro abierto, desde 16 px detrás de él (más estrechos si no caben).
         let tabs: Vec<(usize, Icon, String)> = self
             .tabs
             .iter()
@@ -108,29 +114,19 @@ impl App {
                 (i, icon, title)
             })
             .collect();
-        let first = search_c.x + TAB_PITCH;
-        let room = (tabs_end - (first - 16.0)).max(0.0);
-        let pitch = if tabs.is_empty() { TAB_PITCH } else { (room / tabs.len() as f32).clamp(56.0, TAB_PITCH) };
+        let first = (search_c.x + TAB_PITCH - TAB_BG_LEFT).max(search_right + 16.0);
+        let room = (tabs_end - first).max(0.0);
+        let pitch = if tabs.is_empty() { TAB_PITCH } else { (room / tabs.len() as f32).clamp(TAB_MIN, TAB_PITCH) };
         for (k, (i, icon, title)) in tabs.into_iter().enumerate() {
-            let c = pos2(first + k as f32 * pitch, cy);
-            if c.x + 40.0 > tabs_end {
+            let left = first + k as f32 * pitch;
+            let w = (pitch - 13.2).min(TAB_BG_W);
+            if left + w > tabs_end + 1.0 {
                 break;
             }
+            let slot = Rect::from_min_max(pos2(left, cy - 22.9), pos2(left + w, cy + 23.7));
             let selected = self.active == super::ActiveTab::Tab(i);
-            let text_w = (pitch - 30.5 - 40.0).max(0.0);
-            let r = self.top_tab(ui, c, icon, &title, text_w, selected, &st);
-            // Cerrar: × al pasar el ratón o botón central
-            let close = Rect::from_center_size(pos2(c.x + pitch - 34.0, cy), vec2(20.0, 20.0));
-            let hovered = r.hovered() || ui.rect_contains_pointer(close);
-            if hovered {
-                let cr = ui.interact(close, ui.id().with(("close_tab", i)), Sense::click());
-                icons::paint(ui.painter(), close.shrink(5.0), if cr.hovered() { p.text } else { st.text }, Icon::Close);
-                if cr.clicked() {
-                    self.actions.push(Action::CloseTab(i));
-                    continue;
-                }
-            }
-            if r.middle_clicked() {
+            let (r, close) = self.top_tab(ui, slot, i, icon, &title, selected, &st, &p);
+            if close || r.middle_clicked() {
                 self.actions.push(Action::CloseTab(i));
             } else if r.clicked() && !selected {
                 self.actions.push(Action::ActivateTab(i));
@@ -215,33 +211,63 @@ impl App {
     }
 
     /// Pestaña de una página abierta: como Inicio y Buscar, con el texto recortado a `text_w`.
-    fn top_tab(&mut self, ui: &mut egui::Ui, c: egui::Pos2, icon: Icon, title: &str, text_w: f32, selected: bool, st: &TopStyle) -> egui::Response {
-        let rect = Rect::from_min_max(pos2(c.x - 18.0, c.y - 18.0), pos2(c.x + 31.0 + text_w + 34.0, c.y + 18.0));
-        let resp = ui.interact(rect, ui.id().with(("top_tab", title, c.x as i32)), Sense::click());
+    /// Pestaña de una página abierta en `slot` (el fondo de la elegida): icono y título como Inicio
+    /// y, a la derecha dentro del mismo fondo, la × de cerrar (siempre en la elegida; en las demás,
+    /// al pasar el ratón). El título se corta con «…» antes de la ×. Devuelve la respuesta de la
+    /// pestaña y si se pulsó la ×.
+    #[allow(clippy::too_many_arguments)]
+    fn top_tab(&mut self, ui: &mut egui::Ui, slot: Rect, i: usize, icon: Icon, title: &str, selected: bool, st: &TopStyle, p: &theme::Palette) -> (egui::Response, bool) {
+        let resp = ui.interact(slot, ui.id().with(("top_tab", i)), Sense::click());
+        let hovered = resp.hovered() || ui.rect_contains_pointer(slot);
         if selected {
-            // Como Inicio elegida: el rectángulo redondeado detrás (más corto si no cabe).
-            let w = (rect.max.x - (c.x - TAB_BG_LEFT) + 4.0).min(TAB_BG_W);
-            ui.painter().rect_filled(tab_bg_rect(c, w), CornerRadius::same(TAB_BG_RADIUS), st.tab_bg);
+            ui.painter().rect_filled(slot, CornerRadius::same(TAB_BG_RADIUS), st.tab_bg);
+        } else if hovered {
+            ui.painter().rect_filled(slot, CornerRadius::same(TAB_BG_RADIUS), st.tab_hover);
         }
-        let color = st.color(selected, resp.hovered());
-        icons::paint(ui.painter(), Rect::from_center_size(c, vec2(26.0, 26.0)), st.icon_of(color), icon);
-        if text_w > 8.0 {
-            let g = galley_truncated(ui.painter(), title, theme::regular(TOP_FONT), color, text_w);
-            text_on_baseline(ui.painter(), pos2(c.x + 31.0, c.y + 6.0), g, color);
+        let cy = slot.center().y - 0.4;
+        let color = st.color(selected, hovered);
+        let show_close = selected || hovered;
+        let close_c = pos2(slot.max.x - 20.0, cy);
+        // Estrecha: solo el icono (centrado); al pasar el ratón, la × en su lugar.
+        let narrow = slot.width() < 96.0;
+        let icon_c = if narrow { pos2(slot.center().x, cy) } else { pos2(slot.min.x + TAB_BG_LEFT, cy) };
+        if !(narrow && show_close) {
+            icons::paint(ui.painter(), Rect::from_center_size(icon_c, vec2(26.0, 26.0)), st.icon_of(color), icon);
+        }
+        if !narrow {
+            let text_x = icon_c.x + 31.0;
+            let text_w = (close_c.x - 16.0 - text_x).max(0.0);
+            if text_w > 12.0 {
+                let g = galley_truncated(ui.painter(), title, theme::regular(TOP_FONT), color, text_w);
+                text_on_baseline(ui.painter(), pos2(text_x, cy + 6.4), g, color);
+            }
+        }
+        let mut close = false;
+        if show_close {
+            let c = if narrow { icon_c } else { close_c };
+            let area = Rect::from_center_size(c, vec2(26.0, 26.0));
+            let cr = ui.interact(area, ui.id().with(("close_tab", i)), Sense::click()).on_hover_text("Cerrar pestaña");
+            if cr.hovered() {
+                ui.painter().circle_filled(c, 13.0, st.close_hover);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let xc = if cr.hovered() { p.text } else { color };
+            icons::paint(ui.painter(), Rect::from_center_size(c, vec2(14.0, 14.0)), xc, Icon::Close);
+            close = cr.clicked();
         }
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        resp
+        (resp, close)
     }
 
     /// Buscar en su página (referencia 10.png): un rectángulo de esquinas redondeadas con el gris
     /// de la pestaña elegida (339,4 × 45,7, desde 34,2 px a la izquierda de la lupa), la lupa en
     /// blanco y el campo de texto donde va «Buscar».
-    fn search_field(&mut self, ui: &mut egui::Ui, c: egui::Pos2, st: &TopStyle, p: &theme::Palette) {
+    fn search_field(&mut self, ui: &mut egui::Ui, c: egui::Pos2, max_right: f32, st: &TopStyle, p: &theme::Palette) -> f32 {
         let _ = p;
         let lupa = c + vec2(2.0, -0.4);
-        let pill = Rect::from_min_max(pos2(lupa.x - 34.2, c.y - 23.4), pos2(lupa.x - 34.2 + 339.4, c.y + 22.3));
+        let pill = Rect::from_min_max(pos2(lupa.x - 34.2, c.y - 23.4), pos2((lupa.x - 34.2 + 339.4).min(max_right), c.y + 22.3));
         ui.painter().rect_filled(pill, CornerRadius::same(TAB_BG_RADIUS), st.tab_bg);
         icons::paint(ui.painter(), Rect::from_center_size(lupa, vec2(29.0, 29.0)), st.icon_of(st.active), Icon::Search);
         let field = Rect::from_min_max(pos2(c.x + 31.0, c.y - 15.0), pos2(pill.max.x - 14.0, c.y + 11.0));
@@ -268,6 +294,7 @@ impl App {
         if r.lost_focus() && f.input(|i| i.key_pressed(egui::Key::Enter)) {
             self.run_search();
         }
+        pill.max.x
     }
 
     /// Píldora verde «Reiniciar para actualizar» de la barra superior (o solo su icono si no cabe).
@@ -1507,6 +1534,8 @@ const TOP_FONT: f32 = 14.0;
 const TAB_BG_LEFT: f32 = 31.0;
 const TAB_BG_W: f32 = 196.8;
 const TAB_BG_RADIUS: u8 = 7;
+/// Ancho mínimo del hueco de una pestaña abierta (con muchas, se estrechan hasta aquí).
+const TAB_MIN: f32 = 60.0;
 
 /// Rectángulo del fondo de una pestaña elegida cuyo icono va centrado en `c`.
 fn tab_bg_rect(c: egui::Pos2, w: f32) -> Rect {
@@ -1538,8 +1567,10 @@ struct TopStyle {
     /// Texto de una sección desplegada y de las playlists de su lista.
     open: Color32,
     child: Color32,
-    /// Fondo de la pestaña elegida.
+    /// Fondo de la pestaña elegida, de una pestaña bajo el ratón y de la × de cerrar al pasar.
     tab_bg: Color32,
+    tab_hover: Color32,
+    close_hover: Color32,
 }
 
 impl TopStyle {
@@ -1553,9 +1584,21 @@ impl TopStyle {
                 open: Color32::from_gray(189),
                 child: Color32::from_gray(118),
                 tab_bg: Color32::from_gray(17),
+                tab_hover: Color32::from_gray(12),
+                close_hover: Color32::from_gray(44),
             }
         } else {
-            Self { icon: p.weak, text: p.weak, hover: p.text, active: p.text, open: p.text, child: p.weak, tab_bg: p.hover }
+            Self {
+                icon: p.weak,
+                text: p.weak,
+                hover: p.text,
+                active: p.text,
+                open: p.text,
+                child: p.weak,
+                tab_bg: p.hover,
+                tab_hover: p.card2,
+                close_hover: p.border,
+            }
         }
     }
 

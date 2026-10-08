@@ -126,11 +126,13 @@ pub enum Repeat {
     Track,
 }
 
-/// Una pestaña de contenido con su propio historial.
+/// Una pestaña de contenido con su propio historial. `hidden`: la vista principal, donde se
+/// navega desde la barra lateral, Inicio o Buscar; no sale en la barra superior (solo hay una).
 #[derive(Clone, Debug)]
 pub struct Tab {
     pub history: Vec<Page>,
     pub idx: usize,
+    pub hidden: bool,
 }
 
 impl Tab {
@@ -1917,9 +1919,9 @@ impl App {
         }
     }
 
-    /// Navega: Inicio y Buscar son pestañas fijas; el resto de páginas viven en pestañas de
-    /// contenido. Desde Inicio o Buscar se abre (o se reutiliza) una pestaña; dentro de una
-    /// pestaña se avanza en su historial.
+    /// Navega: Inicio y Buscar son pestañas fijas; el resto de páginas se abren en la vista
+    /// principal (sin pestaña visible) o, dentro de una pestaña abierta con «Abrir en una nueva
+    /// pestaña», en su historial, como en un navegador.
     pub fn go(&mut self, page: Page) {
         if *self.page() == page {
             return;
@@ -1940,27 +1942,62 @@ impl App {
                         return;
                     }
                 }
-                if let Some(i) = self.tabs.iter().position(|t| *t.page() == page) {
-                    self.active = ActiveTab::Tab(i);
-                } else {
-                    let i = self.open_tab(page);
-                    self.active = ActiveTab::Tab(i);
-                }
+                self.go_main_push(page);
             }
         }
     }
 
-    /// Abre una pestaña nueva (en segundo plano) y devuelve su índice.
+    /// Navegación de la barra lateral (y de «Tu biblioteca», Ajustes y el perfil): siempre en la
+    /// vista principal, sin abrir ni cambiar ninguna pestaña visible.
+    pub fn go_main(&mut self, page: Page) {
+        if *self.page() == page {
+            return;
+        }
+        match page {
+            Page::Home | Page::Search => self.go(page),
+            page => {
+                self.selected = None;
+                self.go_main_push(page);
+            }
+        }
+    }
+
+    /// Lleva `page` a la vista principal (creándola si hace falta) y la activa.
+    fn go_main_push(&mut self, page: Page) {
+        const MAX_HISTORY: usize = 50;
+        let i = match self.tabs.iter().position(|t| t.hidden) {
+            Some(i) => {
+                let t = &mut self.tabs[i];
+                if *t.page() != page {
+                    t.history.truncate(t.idx + 1);
+                    t.history.push(page);
+                    if t.history.len() > MAX_HISTORY {
+                        t.history.remove(0);
+                    }
+                    t.idx = t.history.len() - 1;
+                }
+                i
+            }
+            None => {
+                self.tabs.push(Tab { history: vec![page], idx: 0, hidden: true });
+                self.tabs.len() - 1
+            }
+        };
+        self.active = ActiveTab::Tab(i);
+    }
+
+    /// Abre una pestaña visible nueva (en segundo plano) y devuelve su índice; si ya hay una
+    /// visible con esa página, la suya.
     pub fn open_tab(&mut self, page: Page) -> usize {
-        if let Some(i) = self.tabs.iter().position(|t| *t.page() == page) {
+        if let Some(i) = self.tabs.iter().position(|t| !t.hidden && *t.page() == page) {
             return i;
         }
         const MAX_TABS: usize = 8;
-        if self.tabs.len() >= MAX_TABS {
-            let victim = (0..self.tabs.len()).find(|&i| self.active != ActiveTab::Tab(i)).unwrap_or(0);
+        if self.tabs.iter().filter(|t| !t.hidden).count() >= MAX_TABS {
+            let victim = (0..self.tabs.len()).find(|&i| !self.tabs[i].hidden && self.active != ActiveTab::Tab(i)).unwrap_or(0);
             self.close_tab(victim);
         }
-        self.tabs.push(Tab { history: vec![page], idx: 0 });
+        self.tabs.push(Tab { history: vec![page], idx: 0, hidden: false });
         self.tabs.len() - 1
     }
 
@@ -1968,8 +2005,10 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(i);
+        let hidden = self.tabs.remove(i).hidden;
         self.active = match self.active {
+            // Cerrar la vista principal (Ctrl+W en una página de la barra lateral) vuelve a Inicio.
+            ActiveTab::Tab(a) if a == i && hidden => ActiveTab::Home,
             ActiveTab::Tab(a) if a == i => {
                 if self.tabs.is_empty() {
                     ActiveTab::Home
@@ -3054,7 +3093,7 @@ impl App {
         self.open_tab(page.clone());
         if self.tabs.len() > before {
             self.active = ActiveTab::Tab(self.tabs.len() - 1);
-        } else if let Some(i) = self.tabs.iter().position(|t| t.page() == &page) {
+        } else if let Some(i) = self.tabs.iter().position(|t| !t.hidden && t.page() == &page) {
             self.active = ActiveTab::Tab(i);
         }
     }

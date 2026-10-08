@@ -1438,7 +1438,7 @@ impl App {
             "device_id": self.device_id,
             "page": page_spec(self.page()),
             "active": match self.active { ActiveTab::Home => "home".to_string(), ActiveTab::Search => "search".to_string(), ActiveTab::Tab(i) => i.to_string() },
-            "tabs": self.tabs.iter().map(|t| json!({"page": page_spec(t.page()), "history": t.history.len(), "idx": t.idx})).collect::<Vec<_>>(),
+            "tabs": self.tabs.iter().map(|t| json!({"page": page_spec(t.page()), "history": t.history.len(), "idx": t.idx, "hidden": t.hidden})).collect::<Vec<_>>(),
             "can_back": self.can_back(),
             "can_forward": self.can_forward(),
             "status": self.status.as_ref().map(|(t, at, e)| json!({"text": t, "error": e, "age_ms": at.elapsed().as_millis() as u64})),

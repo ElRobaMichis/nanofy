@@ -39,7 +39,7 @@ impl App {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             if resp.clicked() {
-                self.go(Page::Library);
+                self.go_main(Page::Library);
             }
         }
 
@@ -57,7 +57,7 @@ impl App {
         }
         if gr.clicked() {
             self.draft = self.settings.clone();
-            self.go(Page::Settings);
+            self.go_main(Page::Settings);
         }
         let mut tabs_end = gear.min.x - 24.0;
         let ready = match &self.update_stage {
@@ -102,6 +102,7 @@ impl App {
             .tabs
             .iter()
             .enumerate()
+            .filter(|(_, t)| !t.hidden)
             .map(|(i, t)| {
                 let (icon, title) = self.page_label(t.page());
                 (i, icon, title)
@@ -179,7 +180,7 @@ impl App {
         let logged = self.logged_in();
         if resp.clicked() {
             if let Some(id) = self.my_id().map(|s| s.to_string()) {
-                self.go(Page::User(id));
+                self.go_main(Page::User(id));
             } else if !logged {
                 self.login();
             }
@@ -377,7 +378,7 @@ impl App {
                 let sel = matches!(&page, Page::Playlist(id) if *id == pl.id);
                 let r = Self::side_child(ui, &pl.name, sel, &st);
                 if r.clicked() {
-                    self.go(Page::Playlist(pl.id.clone()));
+                    self.go_main(Page::Playlist(pl.id.clone()));
                 }
                 self.playlist_context_menu(&r, &pl);
             }
@@ -425,7 +426,7 @@ impl App {
                         let key = ui.id().with(("sb_pl", i, &pl.id));
                         let r = ui.scope_builder(UiBuilder::new().id(key), |ui| Self::side_child(ui, &pl.name, sel, &st)).inner;
                         if r.clicked() {
-                            self.go(Page::Playlist(pl.id.clone()));
+                            self.go_main(Page::Playlist(pl.id.clone()));
                         }
                         self.playlist_context_menu(&r, &pl);
                     }
@@ -445,7 +446,7 @@ impl App {
         ];
         for (icon, label, pg) in items {
             if Self::side_row(ui, icon, label, page == pg, false, &st).clicked() {
-                self.go(pg);
+                self.go_main(pg);
             }
         }
 

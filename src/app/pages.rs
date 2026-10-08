@@ -37,6 +37,8 @@ const HOME_PIN: Color32 = Color32::from_rgb(118, 202, 150);
 const CUST_W: f32 = 432.0;
 const CUST_FIRST_ROW: f32 = 159.0;
 const CUST_ROW_H: f32 = 53.4;
+/// Alto del panel en la referencia (con 11 secciones): con más, las filas se desplazan.
+const CUST_MAX_H: f32 = 791.0;
 const CUST_PIN: Color32 = Color32::from_rgb(85, 200, 130);
 
 impl App {
@@ -709,7 +711,10 @@ impl App {
         let screen = ctx.content_rect();
         let top = bc.y + 32.0;
         let natural = CUST_FIRST_ROW + (sections.len().max(1) as f32 - 1.0) * CUST_ROW_H + 41.5 + 56.5;
-        let h = natural.min(screen.max.y - 16.0 - top).max(300.0);
+        // Como mucho la altura de la referencia (11 filas) y siempre 16,5 px por encima del
+        // reproductor; las filas que no caben se desplazan dentro del panel.
+        let bottom_limit = screen.max.y - super::PLAYER_PANEL_H - 16.5;
+        let h = natural.min(CUST_MAX_H).min(bottom_limit - top).max(260.0);
         let rect = Rect::from_min_size(pos2(bc.x + 28.0 - CUST_W, top), vec2(CUST_W, h));
         let (l, r) = (rect.min.x, rect.max.x);
         let dark = p.dark;

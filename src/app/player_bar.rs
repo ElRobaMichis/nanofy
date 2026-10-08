@@ -82,13 +82,14 @@ impl App {
             }
         }
 
-        // Inicio y Buscar en las posiciones de la referencia (con la ventana estrecha, Buscar se
-        // acerca a Inicio); Buscar se vuelve un campo de texto en su página.
+        // Inicio y Buscar en las posiciones de la referencia: Buscar donde su «Discover», con la
+        // «B» donde empieza la «D» (con la ventana estrecha, se acerca a Inicio). Buscar se vuelve
+        // un campo de texto en su página.
         let home_c = pos2(x0 + 303.0, cy);
         if self.top_item(ui, home_c, Icon::Home, 28.0, "Inicio", self.active == super::ActiveTab::Home, &st).clicked() {
             self.go(Page::Home);
         }
-        let search_c = pos2((x0 + 722.5).min(tabs_end - 90.0).max(home_c.x + 130.0), cy);
+        let search_c = pos2((x0 + 511.5).min(tabs_end - 90.0).max(home_c.x + 130.0), cy);
         if page == Page::Search {
             self.search_field(ui, search_c, &st, &p);
         } else if self.top_item(ui, search_c, Icon::Search, 29.0, "Buscar", false, &st).clicked() {
@@ -1475,9 +1476,9 @@ const PILL_H: f32 = 32.0;
 const PILL_PAD: f32 = 14.0;
 /// Ancho de la zona de la derecha sin la píldora (ajustes y perfil).
 const TOP_RIGHT_W: f32 = 110.0;
-/// Lo que se deja como mínimo a Inicio y Buscar (hasta el final de «Buscar» en la referencia)
-/// antes de encoger la píldora a solo el icono.
-const TOP_TABS_MIN_W: f32 = 540.0;
+/// Lo que se deja como mínimo a Inicio y Buscar (hasta el final de «Buscar», que empieza donde
+/// el «Discover» de la referencia) antes de encoger la píldora a solo el icono.
+const TOP_TABS_MIN_W: f32 = 340.0;
 
 // ------------------------------------------------------------ medidas de la barra superior y la lateral
 
@@ -1729,9 +1730,9 @@ mod tests {
         assert_eq!(w, TOP_RIGHT_W + 6.0 + pw);
         assert!(pw >= 160.0 + 18.0 + 2.0 * PILL_PAD);
         assert!(1280.0 - SIDEBAR_W - w >= TOP_TABS_MIN_W);
-        // Interfaz al 200 % (560 puntos de ancho), la ventana mínima o una algo mayor: solo el
-        // icono, sin montarse sobre Buscar.
-        for full in [560.0, 760.0, 1000.0] {
+        // Interfaz al 200 % (560 puntos de ancho) o la ventana mínima: solo el icono, sin
+        // montarse sobre Buscar.
+        for full in [560.0, 760.0] {
             let (w, pill) = top_right_layout(full, Some(160.0));
             assert_eq!(pill, Some(UpdatePill::Icon), "{full}");
             assert_eq!(w, TOP_RIGHT_W + 6.0 + PILL_H);

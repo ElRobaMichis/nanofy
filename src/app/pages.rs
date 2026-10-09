@@ -2113,6 +2113,7 @@ impl App {
                 let link = uri_to_link(&uri2);
                 let id_m = id2.clone();
                 let meta_m = full_meta2.clone();
+                let tracks_m = &tracks;
                 let menu: Option<Box<dyn FnOnce(&mut Self, &mut egui::Ui) + '_>> = Some(Box::new(move |app: &mut Self, ui: &mut egui::Ui| {
                     if Self::menu_item(ui, Some(Icon::Pin), if pinned { "Desfijar de la biblioteca" } else { "Fijar en la biblioteca" }, false).clicked() {
                         app.actions.push(Action::Pin(id_m.clone(), !pinned));
@@ -2128,9 +2129,16 @@ impl App {
                             ui.close();
                         }
                         app.invite_menu_item(ui, &id_m);
-                    } else if Self::menu_item(ui, Some(Icon::PlusCircle), if in_library { "Quitar de tu biblioteca" } else { "Guardar en tu biblioteca" }, false).clicked() {
-                        app.actions.push(Action::FollowPlaylist(id_m.clone(), !in_library));
-                        ui.close();
+                    } else {
+                        if Self::menu_item(ui, Some(Icon::PlusCircle), if in_library { "Quitar de tu biblioteca" } else { "Guardar en tu biblioteca" }, false).clicked() {
+                            app.actions.push(Action::FollowPlaylist(id_m.clone(), !in_library));
+                            ui.close();
+                        }
+                        // Su botón de la barra es el de guardarla: copiar sus canciones, desde aquí.
+                        if Self::menu_item(ui, Some(Icon::PlusSquare), "Añadir todas a una playlist", false).clicked() {
+                            app.open_add_dialog(tracks_m.iter().map(|t| t.uri.clone()).collect());
+                            ui.close();
+                        }
                     }
                     if in_library || mine {
                         app.folder_menu(ui, &id_m);
@@ -2148,10 +2156,24 @@ impl App {
                     Some(&link),
                     |app, ui, at| {
                         let ink = theme::ink(&theme::palette(ui.ctx()));
-                        // Los uris solo al pulsar: copiarlos todos en cada fotograma costaba con miles.
-                        let r = Self::slot_button(ui, ui.id().with("add_all"), at, Icon::PlusCircle, 24.0, ink.dim);
-                        if r.on_hover_text("Añadir todas a una playlist").clicked() {
-                            app.open_add_dialog(tracks.iter().map(|t| t.uri.clone()).collect());
+                        if mine {
+                            // Ya es de tu biblioteca: sus canciones a otra playlist, con el icono de
+                            // añadir a playlist del reproductor. Los uris solo al pulsar: copiarlos
+                            // todos en cada fotograma costaba con miles.
+                            let r = Self::slot_button(ui, ui.id().with("add_all"), at, Icon::PlusSquare, 29.0, ink.dim);
+                            if r.on_hover_text("Añadir todas a una playlist").clicked() {
+                                app.open_add_dialog(tracks.iter().map(|t| t.uri.clone()).collect());
+                            }
+                        } else {
+                            // De otra persona, mix o radio: como un álbum, guardarla en tu biblioteca.
+                            let (icon, color, tip) = if in_library {
+                                (Icon::CheckCircle, GREEN, "Quitar de tu biblioteca")
+                            } else {
+                                (Icon::PlusCircle, ink.dim, "Guardar en tu biblioteca")
+                            };
+                            if Self::slot_button(ui, ui.id().with("save_playlist"), at, icon, 24.0, color).on_hover_text(tip).clicked() {
+                                app.actions.push(Action::FollowPlaylist(id.clone(), !in_library));
+                            }
                         }
                         true
                     },

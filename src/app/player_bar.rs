@@ -980,8 +980,26 @@ impl App {
                 }
             }
             if let Some(x) = lay.add {
-                if self.bar_icon(ui, boxed(x, 0.0), Icon::PlusSquare, st.icon, "Añadir a playlist").clicked() {
-                    self.open_add_dialog(vec![np.uri.clone()]);
+                // Abre (o cierra) el panel de cristal encima del botón (`add_panel.rs`); en blanco
+                // mientras está abierto, como en la referencia.
+                let open_here = self.add_dialog.as_ref().is_some_and(|d| d.bar_x.is_some());
+                let color = if open_here { Color32::WHITE } else { st.icon };
+                let r = self.bar_icon(ui, boxed(x, 0.0), Icon::PlusSquare, color, "Añadir a playlist");
+                // Abierto aquí, sigue al botón aunque cambie el tamaño de la ventana.
+                if let Some(d) = self.add_dialog.as_mut().filter(|d| d.bar_x.is_some()) {
+                    d.bar_x = Some(r.rect.center().x);
+                    d.button = Some(r.rect);
+                }
+                if r.clicked() || std::mem::take(&mut self.add_from_bar) {
+                    if open_here {
+                        self.add_dialog = None;
+                    } else {
+                        self.open_add_dialog(vec![np.uri.clone()]);
+                        if let Some(d) = self.add_dialog.as_mut() {
+                            d.bar_x = Some(r.rect.center().x);
+                            d.button = Some(r.rect);
+                        }
+                    }
                 }
             }
         }

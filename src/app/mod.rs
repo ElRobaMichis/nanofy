@@ -11,6 +11,7 @@ mod icons;
 mod library;
 mod library_masks;
 mod menu_masks;
+mod add_panel;
 mod pages;
 mod panels;
 mod player_bar;
@@ -176,6 +177,10 @@ pub struct AddDialog {
     pub open_folders: HashSet<String>,
     /// Playlist recién pedida: al crearse se marca seleccionada.
     pub pending_new: Option<String>,
+    /// Abierto desde el botón del reproductor: el centro x de ese botón (el panel sale encima de
+    /// él) y su rectángulo (pulsarlo otra vez lo cierra). Sin ellos, en el centro de la ventana.
+    pub bar_x: Option<f32>,
+    pub button: Option<egui::Rect>,
 }
 
 #[derive(Default)]
@@ -1029,6 +1034,8 @@ pub struct App {
     /// El panel de los tres puntos del reproductor, abierto, y la fila cuyo submenú se ve.
     pub player_more_open: bool,
     pub player_more_sub: Option<usize>,
+    /// El modo de control pide abrir «Añadir a una playlist» como el botón del reproductor.
+    pub add_from_bar: bool,
     /// Carpeta abierta dentro de la biblioteca (su id).
     pub library_folder: Option<String>,
     /// Última vez que sonó cada cosa de la biblioteca (clave de `library::library_key`), en
@@ -1389,6 +1396,7 @@ impl App {
             library_search_open: false,
             player_more_open: false,
             player_more_sub: None,
+            add_from_bar: false,
             library_folder: None,
             library_recent,
             library_recent_path,

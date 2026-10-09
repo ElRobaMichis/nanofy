@@ -694,6 +694,12 @@ impl App {
                 self.open_add_dialog(uris);
                 ok()
             }
+            // Como pulsar el botón de añadir del reproductor (el panel sale encima de él).
+            "add_dialog_bar" => {
+                self.add_dialog = None;
+                self.add_from_bar = true;
+                ok()
+            }
             "add_dialog_close" => {
                 self.add_dialog = None;
                 ok()

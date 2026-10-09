@@ -1003,8 +1003,16 @@ impl App {
             }
             egui::Popup::menu(&r).width(280.0).show(|ui| self.devices_menu(ui));
         }
+        // Los tres puntos: el panel de cristal de `player_menu.rs`.
         let more = self.bar_icon(ui, boxed(lay.more, 0.0), Icon::More, st.icon, "Más");
-        egui::Popup::menu(&more).show(|ui| self.player_more_menu(ui));
+        if more.clicked() {
+            self.player_more_open = !self.player_more_open;
+            self.player_more_sub = None;
+        }
+        if self.player_more_open {
+            let ctx = ui.ctx().clone();
+            self.player_more_panel(&ctx, more.rect);
+        }
         if let Some(x) = lay.separator {
             let sx = xr - x;
             ui.painter().line_segment([pos2(sx, cy - 19.0), pos2(sx, cy + 18.0)], egui::Stroke::new(1.3, st.separator));
@@ -1052,39 +1060,6 @@ impl App {
         painter.add(egui::Shape::closed_line(ring, egui::Stroke::new(1.9, Color32::from_rgb(84, 208, 232))));
         if resp.clicked() {
             self.dj_button();
-        }
-    }
-
-    fn player_more_menu(&mut self, ui: &mut egui::Ui) {
-        match self.player.now.clone() {
-            Some(np) => {
-                let t = super::track_from_now(&np);
-                self.song_menu(ui, &t, MenuKind::PlayerMore, &RowOpts::tracks(false, false));
-            }
-            None => {
-                if Self::menu_item(ui, Some(Icon::Miniplayer), if self.miniplayer { "Salir del miniplayer" } else { "Miniplayer" }, false).clicked() {
-                    let ctx = ui.ctx().clone();
-                    self.toggle_miniplayer(&ctx);
-                    ui.close();
-                }
-                if Self::menu_item(ui, Some(Icon::Fullscreen), if self.fullscreen { "Salir de pantalla completa" } else { "Pantalla completa" }, false).clicked() {
-                    let ctx = ui.ctx().clone();
-                    self.toggle_fullscreen(&ctx);
-                    ui.close();
-                }
-                if Self::menu_item(ui, Some(Icon::Radio), "DJ", false).clicked() {
-                    self.dj_button();
-                    ui.close();
-                }
-                if Self::menu_item(ui, Some(Icon::People), "Iniciar una Jam", false).clicked() {
-                    self.jam_open = true;
-                    ui.close();
-                }
-                if Self::menu_item(ui, Some(Icon::Keyboard), "Atajos de teclado", false).clicked() {
-                    self.show_shortcuts = true;
-                    ui.close();
-                }
-            }
         }
     }
 

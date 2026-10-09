@@ -38,6 +38,12 @@ const SEMIBOLD: &[&str] = &[
     "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
 ];
 
+/// Semiligera (el menú de los tres puntos del reproductor). Sin ninguna, se usa la regular.
+#[cfg(target_os = "windows")]
+const SEMILIGHT: &[&str] = &["C:/Windows/Fonts/segoeuisl.ttf"];
+#[cfg(not(target_os = "windows"))]
+const SEMILIGHT: &[&str] = &[];
+
 #[cfg(target_os = "windows")]
 const FALLBACKS: &[&str] = &[
     "C:/Windows/Fonts/YuGothM.ttc",  // japonés (kana + kanji)
@@ -78,6 +84,7 @@ fn family(name: &str) -> FontFamily {
 pub fn install_system_fonts(ctx: &egui::Context) {
     let bold = family("bold");
     let semibold = family("semibold");
+    let semilight = family("semilight");
     let mut primary_ok = false;
     for (reg, bld) in PRIMARY {
         let (Some(r), Some(b)) = (map(reg), map(bld)) else {
@@ -100,8 +107,22 @@ pub fn install_system_fonts(ctx: &egui::Context) {
                     family: semibold.clone(),
                     priority: FontPriority::Lowest,
                 },
+                InsertFontFamily {
+                    family: semilight.clone(),
+                    priority: FontPriority::Lowest,
+                },
             ],
         ));
+        if let Some(sl) = SEMILIGHT.iter().find_map(|p| map(p)) {
+            ctx.add_font(FontInsert::new(
+                "nanofy-semilight",
+                FontData::from_static(sl),
+                vec![InsertFontFamily {
+                    family: semilight.clone(),
+                    priority: FontPriority::Highest,
+                }],
+            ));
+        }
         let semi = SEMIBOLD.iter().find_map(|p| map(p));
         let mut bold_families = vec![InsertFontFamily {
             family: bold.clone(),
@@ -146,6 +167,14 @@ pub fn install_system_fonts(ctx: &egui::Context) {
                         },
                     ],
                 ));
+                ctx.add_font(FontInsert::new(
+                    "nanofy-semilight",
+                    (**data).clone(),
+                    vec![InsertFontFamily {
+                        family: semilight.clone(),
+                        priority: FontPriority::Highest,
+                    }],
+                ));
             }
         }
     }
@@ -174,6 +203,10 @@ pub fn install_system_fonts(ctx: &egui::Context) {
                 },
                 InsertFontFamily {
                     family: semibold.clone(),
+                    priority: FontPriority::Lowest,
+                },
+                InsertFontFamily {
+                    family: semilight.clone(),
                     priority: FontPriority::Lowest,
                 },
             ],

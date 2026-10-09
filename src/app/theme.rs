@@ -112,6 +112,11 @@ pub fn semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("semibold".into()))
 }
 
+/// Semiligera (Segoe UI Semilight): el menú de los tres puntos del reproductor.
+pub fn semilight(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("semilight".into()))
+}
+
 pub fn regular(size: f32) -> FontId {
     FontId::new(size, FontFamily::Proportional)
 }

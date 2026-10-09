@@ -212,7 +212,7 @@ thread_local! {
 
 /// Pinta la máscara `m` con su esquina a (`ox`, `oy`) píxeles del ancla `anchor` (en píxeles de
 /// pantalla ya redondeados). Con la interfaz ampliada se escala.
-fn paint_mask(painter: &egui::Painter, name: &'static str, m: &LibMask, anchor: (f32, f32), color: Color32) {
+pub(super) fn paint_mask(painter: &egui::Painter, name: &'static str, m: &LibMask, anchor: (f32, f32), color: Color32) {
     if color.a() == 0 {
         return;
     }
@@ -259,7 +259,7 @@ fn paint_mask(painter: &egui::Painter, name: &'static str, m: &LibMask, anchor: 
 }
 
 /// Un punto en píxeles de pantalla redondeados (el ancla de una máscara).
-fn px(painter: &egui::Painter, p: egui::Pos2) -> (f32, f32) {
+pub(super) fn px(painter: &egui::Painter, p: egui::Pos2) -> (f32, f32) {
     let ppp = painter.pixels_per_point();
     ((p.x * ppp).round(), (p.y * ppp).round())
 }

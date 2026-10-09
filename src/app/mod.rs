@@ -10,9 +10,11 @@ mod icon_masks;
 mod icons;
 mod library;
 mod library_masks;
+mod menu_masks;
 mod pages;
 mod panels;
 mod player_bar;
+mod player_menu;
 mod theme;
 mod warm;
 mod watchdog;
@@ -1024,6 +1026,9 @@ pub struct App {
     pub library_filter: String,
     /// La lupa de la biblioteca abierta (con su campo para filtrar).
     pub library_search_open: bool,
+    /// El panel de los tres puntos del reproductor, abierto, y la fila cuyo submenú se ve.
+    pub player_more_open: bool,
+    pub player_more_sub: Option<usize>,
     /// Carpeta abierta dentro de la biblioteca (su id).
     pub library_folder: Option<String>,
     /// Última vez que sonó cada cosa de la biblioteca (clave de `library::library_key`), en
@@ -1382,6 +1387,8 @@ impl App {
             library_grid: settings_library_grid,
             library_filter: String::new(),
             library_search_open: false,
+            player_more_open: false,
+            player_more_sub: None,
             library_folder: None,
             library_recent,
             library_recent_path,

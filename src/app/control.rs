@@ -870,6 +870,12 @@ impl App {
                 self.settings.library_grid = self.library_grid;
                 ok()
             }
+            // El panel de los tres puntos del reproductor.
+            "player_more" => {
+                self.player_more_open = b(cmd, "on", !self.player_more_open);
+                self.player_more_sub = n(cmd, "sub").map(|v| v as usize);
+                ok()
+            }
             "library_oldest" => {
                 self.settings.library_oldest = b(cmd, "on", !self.settings.library_oldest);
                 ok()

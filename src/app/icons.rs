@@ -98,6 +98,7 @@ pub enum Icon {
     NewTab,
     Trash,
     Edit,
+    #[allow(dead_code)]
     Keyboard,
     /// «›» y «⌄» de las secciones plegables de la barra lateral.
     ChevronRight,

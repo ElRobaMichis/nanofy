@@ -49,7 +49,6 @@ impl std::ops::Deref for Shown<'_> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MenuKind {
     NowPlaying,
-    PlayerMore,
     Row,
 }
 
@@ -801,8 +800,9 @@ impl App {
         self.song_menu(ui, t, MenuKind::Row, opts);
     }
 
-    /// Menú de canción compartido por el clic derecho en filas (`Row`), el clic derecho en la
-    /// portada del reproductor (`NowPlaying`) y los tres puntos del reproductor (`PlayerMore`).
+    /// Menú de canción compartido por el clic derecho en filas (`Row`) y en la portada del
+    /// reproductor (`NowPlaying`). Los tres puntos del reproductor tienen su panel propio
+    /// (`player_menu.rs`).
     pub fn song_menu(&mut self, ui: &mut egui::Ui, t: &Track, kind: MenuKind, opts: &RowOpts) {
         let id = t.id.clone();
         let is_episode = t.kind.as_deref() == Some("episode");
@@ -919,21 +919,6 @@ impl App {
             if Self::menu_item(ui, Some(Icon::Fullscreen), if self.fullscreen { "Salir de pantalla completa" } else { "Pantalla completa" }, false).clicked() {
                 let ctx = ui.ctx().clone();
                 self.toggle_fullscreen(&ctx);
-                ui.close();
-            }
-        }
-        if kind == MenuKind::PlayerMore {
-            let dj = if self.dj_active() { "DJ: cambiar de estilo" } else { "DJ" };
-            if Self::menu_item(ui, Some(Icon::Radio), dj, false).clicked() {
-                self.dj_button();
-                ui.close();
-            }
-            if Self::menu_item(ui, Some(Icon::People), if self.jam.is_some() { "Jam" } else { "Iniciar una Jam" }, false).clicked() {
-                self.jam_open = true;
-                ui.close();
-            }
-            if Self::menu_item(ui, Some(Icon::Keyboard), "Atajos de teclado", false).clicked() {
-                self.show_shortcuts = true;
                 ui.close();
             }
         }

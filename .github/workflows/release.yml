@@ -39,11 +39,17 @@ jobs:
             target: x86_64-pc-windows-msvc
             name: windows-x64
             bin: nanofy.exe
-          - os: ubuntu-22.04
+          # Linux se compila dentro de un contenedor de Ubuntu 22.04 (glibc 2.35, OpenSSL 3): el
+          # binario sigue funcionando en distribuciones de hace unos años, aunque GitHub retire su
+          # runner de 22.04 (abril de 2027).
+          - os: ubuntu-24.04
+            container: ubuntu:22.04
             target: x86_64-unknown-linux-gnu
             name: linux-x64
             bin: nanofy
-          - os: macos-14
+          # macOS 14 deja de estar disponible en noviembre de 2026. El binario sigue pidiendo
+          # macOS 11 o posterior (el mínimo de Rust para Apple Silicon y el del Info.plist).
+          - os: macos-15
             target: aarch64-apple-darwin
             name: macos-arm64
             bin: nanofy
@@ -52,9 +58,21 @@ jobs:
             name: macos-x64
             bin: nanofy
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     env:
       NANOFY_CLIENT_ID: ${{ secrets.NANOFY_CLIENT_ID }}
     steps:
+      # Antes que nada en Linux: el contenedor viene vacío y sin git ni curl la descarga del
+      # código y la instalación de Rust no funcionarían (o lo harían con avisos).
+      - name: Dependencias de Linux (compilador, ALSA, OpenSSL, teclado)
+        if: runner.os == 'Linux'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git zip \
+            pkg-config libasound2-dev libssl-dev libxkbcommon-dev libdbus-1-dev
+
       # Lanzado a mano con una etiqueta se compila esa etiqueta y no la rama desde la que se lanzó:
       # lo que se publica bajo vX.Y.Z tiene que ser el código de vX.Y.Z.
       - uses: actions/checkout@v7
@@ -65,14 +83,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Dependencias de Linux (ALSA, OpenSSL, teclado)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libssl-dev pkg-config libxkbcommon-dev libdbus-1-dev
-
       - name: Compilar
         run: cargo build --release --target ${{ matrix.target }}
+
+      # El binario de Linux no debe pedir una glibc más nueva que la de Ubuntu 22.04.
+      - name: Comprobar glibc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          need=$(objdump -T target/${{ matrix.target }}/release/nanofy | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "El binario necesita $need"
+          if [ "$(printf '%s\n' GLIBC_2.35 "$need" | sort -V | tail -1)" != GLIBC_2.35 ]; then
+            echo "::error::El binario de Linux necesita $need (más nueva que la 2.35 de Ubuntu 22.04)"
+            exit 1
+          fi
 
       - name: Empaquetar (Windows)
         if: runner.os == 'Windows'
@@ -140,7 +163,8 @@ jobs:
     # comprueba abajo); con `needs: build` a secas, un solo fallo dejaba a todos sin versión. No
     # `always()`: ese también corre si se cancela la ejecución, y cancelar debe no publicar nada.
     if: ${{ !cancelled() && needs.build.result != 'cancelled' && (startsWith(github.ref, 'refs/tags/') || inputs.tag != '') }}
-    runs-on: ubuntu-latest
+    # Fijo y no `ubuntu-latest`: el cambio de imagen (Ubuntu 26.04) no llega sin avisar.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: write

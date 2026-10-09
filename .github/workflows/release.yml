@@ -57,7 +57,7 @@ jobs:
     steps:
       # Lanzado a mano con una etiqueta se compila esa etiqueta y no la rama desde la que se lanzó:
       # lo que se publica bajo vX.Y.Z tiene que ser el código de vX.Y.Z.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
@@ -127,7 +127,7 @@ jobs:
 
       # Aquí ya no se publica nada: el zip solo queda como artefacto para `publish`. Con
       # `overwrite` relanzar un trabajo fallido sustituye su artefacto en vez de chocar con él.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Nanofy-${{ matrix.name }}
           path: dist/Nanofy-${{ matrix.name }}.zip
@@ -152,7 +152,7 @@ jobs:
       TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
@@ -186,7 +186,7 @@ jobs:
           echo "Etiqueta $TAG, versión $VERSION, pre-release: $PRERELEASE"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: Nanofy-*
           path: dist
@@ -270,7 +270,7 @@ jobs:
       # Borrador: /releases/latest no lo devuelve mientras se suben los archivos.
       - name: Subir a un borrador
         id: draft
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           draft: true

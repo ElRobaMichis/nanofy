@@ -923,6 +923,11 @@ impl App {
             }
         }
         if kind == MenuKind::PlayerMore {
+            let dj = if self.dj_active() { "DJ: cambiar de estilo" } else { "DJ" };
+            if Self::menu_item(ui, Some(Icon::Radio), dj, false).clicked() {
+                self.dj_button();
+                ui.close();
+            }
             if Self::menu_item(ui, Some(Icon::People), if self.jam.is_some() { "Jam" } else { "Iniciar una Jam" }, false).clicked() {
                 self.jam_open = true;
                 ui.close();

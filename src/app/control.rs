@@ -237,6 +237,11 @@ impl App {
                 self.next();
                 ok()
             }
+            // El botón del DJ de la barra.
+            "dj" => {
+                self.dj_button();
+                ok()
+            }
             // Los botones del aviso de reproducción ([Reintentar], [Saltar], ×).
             "playback_retry" => {
                 self.retry_failed_load();
@@ -1308,6 +1313,10 @@ impl App {
         });
         // Aparte del json! de arriba, por su límite de recursión.
         player["transition"] = transition_json(self.player.transitions, self.player.last_transition.as_ref(), Instant::now());
+        player["dj"] = json!({
+            "active": self.dj_active(),
+            "speaking": self.player.dj.as_ref().map(|d| json!({"title": d.title, "artist": d.artist})),
+        });
         // Tiempo hasta el primer sonido de la última orden (por fases), el último fallo de carga y
         // los contadores de fallos: lo que mide qa/latency.py en cada reproducción.
         player["ttfs"] = ttfs_json(librespot_core::ttfs::snapshot().as_ref());

@@ -86,6 +86,9 @@ fn paint_content_panel(painter: &egui::Painter, panel: egui::Rect, tint: Option<
 }
 pub const LIKED: &str = "liked";
 pub const SEARCH_ID: &str = "nanofy_search_box";
+/// La sesión del DJ de Spotify: una playlist especial que la Web API no da; sus canciones y las
+/// frases del locutor salen de su propio servicio (ver `context_resolver` en librespot-connect).
+pub const DJ_URI: &str = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -190,6 +193,9 @@ pub struct PlayerState {
     /// para el modo de control.
     pub transitions: u32,
     pub last_transition: Option<LastTransition>,
+    /// El locutor del DJ está hablando antes (o después) de la canción: la barra lo enseña a él y
+    /// la posición no avanza (`Event::Narration`).
+    pub dj: Option<crate::backend::Narration>,
 }
 
 /// Un fundido que empezó: de qué canción a cuál (uris), cuánto dura y cuándo empezó.
@@ -1755,6 +1761,7 @@ impl App {
                 let (_, kind, id) = (parts.next()?, parts.next()?, parts.next()?);
                 let id = id.to_string();
                 Some(match kind {
+                    "playlist" if uri == DJ_URI => ("DJ".into(), None),
                     "playlist" => {
                         let name = self
                             .playlist_meta
@@ -3695,6 +3702,8 @@ impl App {
                 if self.stall.as_ref().is_some_and(|s| !s.is(&np.uri)) {
                     self.stall = None;
                 }
+                // Si el locutor del DJ la presenta, llega justo detrás (`Event::Narration`).
+                self.player.dj = None;
                 self.set_now_playing(np);
             }
             Event::Playing { position_ms } if self.pause_after_restore => {
@@ -3716,7 +3725,8 @@ impl App {
                 self.player.remote = None;
                 self.player.state = PlayState::Playing;
                 self.player.position_ms = position_ms;
-                self.player.position_at = Some(Instant::now());
+                // Mientras habla el locutor del DJ, la canción no avanza.
+                self.player.position_at = self.player.dj.is_none().then(Instant::now);
                 self.media_dirty = true;
                 self.playback_recovered();
             }
@@ -3747,6 +3757,7 @@ impl App {
             Event::Stopped => {
                 self.player.state = PlayState::Stopped;
                 self.player.position_at = None;
+                self.player.dj = None;
                 self.media_dirty = true;
                 // Parada (fin de la lista, otro dispositivo): nada que reanudar.
                 self.stall = None;
@@ -3923,6 +3934,20 @@ impl App {
                 // cuenta para el modo de control.
                 self.player.transitions = self.player.transitions.saturating_add(1);
                 self.player.last_transition = Some(LastTransition { from, to, ms, at: Instant::now() });
+            }
+            Event::Narration(speaking) => {
+                let ended = speaking.is_none() && self.player.dj.is_some();
+                if let Some(n) = &speaking {
+                    log::info!("[dj] habla {} ({})", n.artist, n.title);
+                }
+                self.player.dj = speaking;
+                if self.player.dj.is_some() {
+                    self.player.position_at = None;
+                } else if ended && self.player.state == PlayState::Playing {
+                    // Termina de hablar: la canción empieza (o, tras la de salida, sigue la otra).
+                    self.player.position_at = Some(Instant::now());
+                }
+                self.media_dirty = true;
             }
         }
     }
@@ -7502,6 +7527,31 @@ impl App {
             player_bar::PlaybackErrorKind::NotPremium,
             player_bar::NOT_PREMIUM_TEXT.to_string(),
         ));
+    }
+
+    /// ¿Hay aquí una sesión del DJ cargada (sonando o en pausa)?
+    pub fn dj_active(&self) -> bool {
+        self.player.remote.is_none()
+            && self.player.state != PlayState::Stopped
+            && matches!(&self.last_play, Some(PlayTarget::Context { uri, .. }) if uri == DJ_URI)
+    }
+
+    /// El botón del DJ, como en Spotify: sin el DJ, lo pone a sonar (el locutor se presenta); con
+    /// el DJ ya aquí, salta al siguiente bloque de la sesión, que el locutor presenta («Elige tú»).
+    pub fn dj_button(&mut self) {
+        if self.dj_active() {
+            if self.player.state == PlayState::Paused {
+                self.backend.send(Cmd::Play);
+            }
+            self.backend.send(Cmd::DjJump);
+        } else {
+            self.actions.push(Action::Play(PlayTarget::Context {
+                uri: DJ_URI.to_string(),
+                track_uri: None,
+                index: None,
+                shuffle: false,
+            }));
+        }
     }
 
     pub fn play_pause(&mut self) {

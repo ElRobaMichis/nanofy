@@ -178,8 +178,9 @@ impl ConnectState {
                 supports_external_episodes: false,
                 supports_set_backend_metadata: false,
                 supports_hifi: MessageField::none(),
-                // that "AI" dj thingy only available to specific regions/users
-                supports_dj: false,
+                // Nanofy reproduce el DJ con su locutor (ver `narration` en el reproductor): sin
+                // esto, los demás dispositivos avisan de que aquí no se oye su voz.
+                supports_dj: true,
                 supports_rooms: false,
                 // AudioQuality::HIFI is available, further investigation necessary
                 supported_audio_quality: EnumOrUnknown::new(AudioQuality::VERY_HIGH),

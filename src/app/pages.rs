@@ -1098,6 +1098,18 @@ impl App {
             item.subtitle.clone()
         };
         let r = self.home_tile(ui, card_kind, item.image.as_deref(), &item.title, &subtitle);
+        // El DJ no es una playlist que se pueda abrir (la Web API no la da): como en Spotify,
+        // pulsarlo lo pone a sonar.
+        if item.uri == super::DJ_URI {
+            if r.clicked() {
+                if !self.dj_active() {
+                    self.dj_button();
+                } else if self.player.state == super::PlayState::Paused {
+                    self.play_pause();
+                }
+            }
+            return;
+        }
         let Some(page) = page else { return };
         if kind == "playlist" && (r.clicked() || r.secondary_clicked()) {
             // Lo que ya sabemos por la tarjeta (nombre, portada generada, autor Spotify) se ve al

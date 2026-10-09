@@ -871,6 +871,22 @@ impl App {
             text_on_baseline(&painter, pos2(cover.min.x, cy + 5.0), g, st.dim);
             return;
         };
+        // Mientras habla el locutor del DJ, la barra lo enseña a él, como Spotify: su imagen, su
+        // nombre y qué presenta.
+        if let Some(dj) = self.player.dj.clone() {
+            self.cover_in(ui, Some(dj.image.as_str()).filter(|u| !u.is_empty()), cover, COVER_RADIUS);
+            let what = match dj.title.as_str() {
+                "Up next" => "A continuación".to_string(),
+                "" => "DJ".to_string(),
+                other => other.to_string(),
+            };
+            let name = if dj.artist.is_empty() { "DJ".to_string() } else { dj.artist };
+            for (text, size, color, base) in [(name, TITLE_FONT, st.title, cy - 13.0), (what, ARTIST_FONT, st.dim, cy + 5.0)] {
+                let galley = galley_truncated(&painter, &text, theme::regular(size), color, text_w);
+                text_on_baseline(&painter, pos2(text_x, base), galley, color);
+            }
+            return;
+        }
         self.cover_in(ui, np.cover_url.as_deref(), cover, COVER_RADIUS);
         let r = ui.interact(cover, ui.id().with("np_cover"), Sense::click());
         if r.hovered() {
@@ -991,8 +1007,8 @@ impl App {
             let sx = xr - x;
             ui.painter().line_segment([pos2(sx, cy - 19.0), pos2(sx, cy + 18.0)], egui::Stroke::new(1.3, st.separator));
         }
-        if let Some(x) = lay.jam {
-            self.jam_orb(ui, pos2(xr - x, cy - 1.5));
+        if let Some(x) = lay.dj {
+            self.dj_orb(ui, pos2(xr - x, cy - 1.5));
         }
         let q_color = if self.side == Some(SideTab::Queue) { GREEN } else { st.icon };
         if self.bar_icon(ui, boxed(lay.queue, 0.0), Icon::Queue, q_color, "Cola (Q)").clicked() {
@@ -1001,9 +1017,10 @@ impl App {
     }
 
     /// Botón de Jam: un orbe azul con un aro cian irregular. Abre la ventana de Jam.
-    fn jam_orb(&mut self, ui: &mut egui::Ui, c: egui::Pos2) {
+    fn dj_orb(&mut self, ui: &mut egui::Ui, c: egui::Pos2) {
         let rect = Rect::from_center_size(c, vec2(36.0, 36.0));
-        let resp = ui.interact(rect, ui.id().with("jam_orb"), Sense::click()).on_hover_text("Jam (Ctrl+J)");
+        let tip = if self.dj_active() { "DJ: cambiar de estilo" } else { "DJ" };
+        let resp = ui.interact(rect, ui.id().with("dj_orb"), Sense::click()).on_hover_text(tip);
         let hover = resp.hovered();
         if hover {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1032,7 +1049,7 @@ impl App {
         painter.add(egui::Shape::closed_line(ring.clone(), egui::Stroke::new(3.6, Color32::from_rgb(0, 72, 150))));
         painter.add(egui::Shape::closed_line(ring, egui::Stroke::new(1.9, Color32::from_rgb(84, 208, 232))));
         if resp.clicked() {
-            self.jam_open = !self.jam_open;
+            self.dj_button();
         }
     }
 
@@ -1051,6 +1068,10 @@ impl App {
                 if Self::menu_item(ui, Some(Icon::Fullscreen), if self.fullscreen { "Salir de pantalla completa" } else { "Pantalla completa" }, false).clicked() {
                     let ctx = ui.ctx().clone();
                     self.toggle_fullscreen(&ctx);
+                    ui.close();
+                }
+                if Self::menu_item(ui, Some(Icon::Radio), "DJ", false).clicked() {
+                    self.dj_button();
                     ui.close();
                 }
                 if Self::menu_item(ui, Some(Icon::People), "Iniciar una Jam", false).clicked() {
@@ -1437,7 +1458,7 @@ struct BarLayout {
     devices: f32,
     more: f32,
     separator: Option<f32>,
-    jam: Option<f32>,
+    dj: Option<f32>,
     queue: f32,
     right_w: f32,
 }
@@ -1486,18 +1507,18 @@ fn bar_layout(w: f32) -> BarLayout {
         devices: 222.0,
         more: 176.0,
         separator: Some(127.5),
-        jam: Some(88.5),
+        dj: Some(88.5),
         queue: 52.0,
         right_w: 360.0,
     };
-    let no_jam = BarLayout { heart: Some(282.0), add: Some(236.0), lyrics: Some(190.0), devices: 144.0, more: 98.0, separator: None, jam: None, right_w: 282.0, ..full };
-    let compact = BarLayout { heart: Some(190.0), add: None, lyrics: None, right_w: 190.0, ..no_jam };
+    let no_dj = BarLayout { heart: Some(282.0), add: Some(236.0), lyrics: Some(190.0), devices: 144.0, more: 98.0, separator: None, dj: None, right_w: 282.0, ..full };
+    let compact = BarLayout { heart: Some(190.0), add: None, lyrics: None, right_w: 190.0, ..no_dj };
     let tiny = BarLayout { shuffle_repeat: false, prog_x: 182.0, ..compact };
     // La más estrecha (ventana mínima con la interfaz ampliada): sin duración a la derecha ni
     // altavoz, y a la derecha solo más y cola (el corazón y la letra siguen en «Más» y con L).
     let micro = BarLayout { tail: false, heart: None, devices: 98.0, more: 98.0, queue: 52.0, right_w: 98.0, ..tiny };
     let avail = |l: &BarLayout| w - l.prog_x - l.after_progress() - l.right_w - 12.0;
-    for l in [full, no_jam, compact] {
+    for l in [full, no_dj, compact] {
         let a = avail(&l);
         if a >= PROG_MIN + TEXT_MIN {
             let text = (a - PROG_MIN).min(TEXT_MAX);
@@ -1663,7 +1684,7 @@ mod tests {
         assert_eq!((l.prog_x, l.prog_w), (268.0, 320.0));
         assert_eq!(l.text_x(), 762.0);
         assert_eq!((l.heart, l.add, l.lyrics), (Some(360.0), Some(315.0), Some(268.0)));
-        assert_eq!((l.devices, l.more, l.separator, l.jam, l.queue), (222.0, 176.0, Some(127.5), Some(88.5), 52.0));
+        assert_eq!((l.devices, l.more, l.separator, l.dj, l.queue), (222.0, 176.0, Some(127.5), Some(88.5), 52.0));
     }
 
     /// A cualquier ancho nada se monta: el texto acaba antes de lo de la derecha, el progreso
@@ -1682,7 +1703,7 @@ mod tests {
                 assert!(l.prog_x + l.prog_w <= w - l.right_w - 12.0 + 0.01, "{w}: {l:?}");
             }
             assert!(l.prog_w <= w, "{w}");
-            if l.jam.is_some() {
+            if l.dj.is_some() {
                 assert!(l.lyrics.is_some() && l.add.is_some() && l.separator.is_some(), "{w}");
             }
             if !l.tail {
@@ -1695,7 +1716,7 @@ mod tests {
                 // Al estrechar, nada que se había quitado vuelve.
                 assert!(!(!p.tail && l.tail), "{w}");
                 assert!(!(!p.cover && l.cover), "{w}");
-                assert!(!(p.jam.is_none() && l.jam.is_some()), "{w}");
+                assert!(!(p.dj.is_none() && l.dj.is_some()), "{w}");
                 assert!(!(p.lyrics.is_none() && l.lyrics.is_some()), "{w}");
                 assert!(!(!p.shuffle_repeat && l.shuffle_repeat), "{w}");
             }

@@ -134,6 +134,9 @@ pub enum Cmd {
     /// Vuelve a cargar desde cero la canción en pausa, en su punto, y la pone a sonar (una
     /// canción cortada por la red cuyo enlace al audio pudo caducar; ver `Spirc::reload`).
     Reload,
+    /// El botón del DJ con el DJ sonando: salta al siguiente bloque de la sesión, que el locutor
+    /// presenta (ver `Spirc::dj_jump`).
+    DjJump,
     /// Siguiente canción. `auto`: un salto que no pidió el usuario (la canción que entra está
     /// oculta). Durante un fundido, la anterior sigue apagándose a su ritmo en vez de cortarse en
     /// 40 ms como con un «siguiente» a mano.
@@ -262,6 +265,17 @@ pub enum Event {
     /// Empezó un fundido: `to` ya es la canción que suena (llegaron `TrackChanged` y `Playing`) y
     /// `from` se apaga durante `ms`.
     Crossfade { from: String, to: String, ms: u32 },
+    /// El locutor del DJ empieza a hablar antes (o después) de la canción, o termina (`None`).
+    Narration(Option<Narration>),
+}
+
+/// Lo que se enseña mientras habla el locutor del DJ, como en la app de Spotify: su nombre
+/// («DJ Livi»), qué presenta («Up next») y su imagen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Narration {
+    pub title: String,
+    pub artist: String,
+    pub image: String,
 }
 
 /// Resumen del `PlayerState` del clúster.
@@ -347,6 +361,7 @@ fn is_playback(cmd: &Cmd) -> bool {
         Cmd::PlayPause
             | Cmd::Play
             | Cmd::Reload
+            | Cmd::DjJump
             | Cmd::Next { .. }
             | Cmd::Prev
             | Cmd::Seek(_)
@@ -960,7 +975,13 @@ async fn run(
                     continue;
                 }
                 let result = match other {
-                    Cmd::PlayPause | Cmd::Play | Cmd::Pause | Cmd::Reload | Cmd::Next { .. } | Cmd::Prev => {
+                    Cmd::PlayPause
+                    | Cmd::Play
+                    | Cmd::Pause
+                    | Cmd::Reload
+                    | Cmd::DjJump
+                    | Cmd::Next { .. }
+                    | Cmd::Prev => {
                         // Tras mucho tiempo en pausa Spotify deja de tenernos como dispositivo
                         // activo y Spirc ignora estas órdenes: se reactiva antes (si ya lo
                         // estaba, la activación se ignora sin efecto).
@@ -970,6 +991,7 @@ async fn run(
                             Cmd::Play => a.spirc.play(),
                             Cmd::Pause => a.spirc.pause(),
                             Cmd::Reload => a.spirc.reload(),
+                            Cmd::DjJump => a.spirc.dj_jump(),
                             Cmd::Next { auto: false } => a.spirc.next(),
                             Cmd::Next { auto: true } => a.spirc.auto_next(),
                             _ => a.spirc.prev(),
@@ -1726,6 +1748,11 @@ fn map_event(ev: PlayerEvent) -> Option<Event> {
             to: to.to_string(),
             ms: fade_ms,
         },
+        Narration { speaking, .. } => Event::Narration(speaking.map(|r| crate::backend::Narration {
+            title: r.title,
+            artist: r.artist,
+            image: r.image,
+        })),
         _ => return None,
     })
 }
@@ -2189,6 +2216,7 @@ mod tests {
         for c in [
             Cmd::Play,
             Cmd::Reload,
+            Cmd::DjJump,
             Cmd::PlayPause,
             Cmd::Next { auto: false },
             Cmd::Prev,

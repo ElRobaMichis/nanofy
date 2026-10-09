@@ -17,6 +17,7 @@ use crate::{
     playback::{
         crossfade::{self, FadeOffer},
         mixer::Mixer,
+        narration::{self, NarrationRequest},
         player::{Player, PlayerEvent, PlayerEventChannel, Transition},
     },
     protocol::{
@@ -145,6 +146,11 @@ struct SpircTask {
     load_failed: bool,
     /// Detiene la cascada de saltos cuando varias canciones seguidas fallan de verdad.
     skip_breaker: SkipBreaker,
+    /// La próxima carga es un salto (el botón del DJ o una canción elegida): el locutor del DJ
+    /// la presenta con su frase de salto, si la tiene, en vez de la de llegar en orden.
+    dj_jump: bool,
+    /// Última página siguiente del DJ pedida: la misma no se pide dos veces.
+    dj_last_page: Option<String>,
     /// Envía el estado a Spotify en segundo plano (`notify`): ninguna orden espera a un PUT.
     state_sender: StateSender,
 
@@ -179,6 +185,8 @@ enum SpircCommand {
     Ping(oneshot::Sender<()>),
     /// Nanofy: vuelve a cargar la canción en pausa, en su punto y sonando (ver `Spirc::reload`).
     Reload,
+    /// Nanofy: el botón del DJ con el DJ sonando (ver `Spirc::dj_jump`).
+    DjJump,
 }
 
 impl SpircCommand {
@@ -190,7 +198,7 @@ impl SpircCommand {
             SpircCommand::Activate => "spirc:activate",
             SpircCommand::SetVolume(_) => "spirc:volume",
             SpircCommand::Load(_) => "spirc:load",
-            SpircCommand::Next | SpircCommand::AutoNext => "spirc:next",
+            SpircCommand::Next | SpircCommand::AutoNext | SpircCommand::DjJump => "spirc:next",
             SpircCommand::Prev => "spirc:prev",
             SpircCommand::Play | SpircCommand::PlayPause | SpircCommand::Reload => "spirc:play",
             SpircCommand::Pause => "spirc:pause",
@@ -201,6 +209,10 @@ impl SpircCommand {
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
+/// Canciones por delante con las que se pide la página siguiente del DJ: un bloque son cinco.
+const DJ_FETCH_THRESHOLD: usize = 6;
+/// Metadato de la canción que empieza un bloque de la sesión del DJ.
+const DJ_JUMP_TARGET: &str = "dj.jump_target";
 
 // delay to update volume after a certain amount of time, instead on each update request
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
@@ -361,6 +373,8 @@ impl Spirc {
 
             load_failed: false,
             skip_breaker: SkipBreaker::new(),
+            dj_jump: false,
+            dj_last_page: None,
             state_sender,
 
             spirc_id,
@@ -532,6 +546,12 @@ impl Spirc {
     /// audio pudo caducar. No toca el contexto, la cola ni el aleatorio. Sin canción en pausa, nada.
     pub fn reload(&self) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Reload)?)
+    }
+
+    /// Nanofy: el botón del DJ con una sesión del DJ sonando («Elige tú» en la app de Spotify):
+    /// salta al principio del siguiente bloque de la sesión, que el locutor presenta.
+    pub fn dj_jump(&self) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::DjJump)?)
     }
 
     /// Acquires the control as active connect device.
@@ -857,6 +877,7 @@ impl SpircTask {
                 }
                 self.handle_next_with(Transition::AutoSkip)?
             }
+            SpircCommand::DjJump => self.handle_dj_jump()?,
             SpircCommand::VolumeUp => self.handle_volume_up(),
             SpircCommand::VolumeDown => self.handle_volume_down(),
             SpircCommand::Shuffle(shuffle) => self.handle_shuffle(shuffle)?,
@@ -1752,6 +1773,8 @@ impl SpircTask {
         }
 
         if self.connect_state.current_track(MessageField::is_some) {
+            // Una canción elegida dentro del DJ es un salto (ver `dj_jump`).
+            self.dj_jump = index.is_some_and(|i| i > 0);
             self.load_track(cmd_options.start_playing, cmd_options.seek_to)?;
         } else {
             info!("No active track, stopping");
@@ -2053,6 +2076,15 @@ impl SpircTask {
         }
 
         if let Some(track_id) = self.connect_state.preview_next_track() {
+            // Las frases del locutor del DJ se piden con la canción, para que estén al llegar.
+            let next = if self.connect_state.repeat_track() {
+                None
+            } else {
+                self.connect_state.next_tracks().first()
+            };
+            if let Some((intro, outro)) = next.and_then(|t| narrations(&t.metadata, false)) {
+                self.player.narrate(track_id.clone(), intro, outro);
+            }
             self.player.preload(track_id);
         }
     }
@@ -2066,6 +2098,20 @@ impl SpircTask {
     }
 
     fn add_autoplay_resolving_when_required(&mut self) {
+        // El DJ no se acaba: con menos de un bloque por delante se pide su página siguiente, en
+        // vez de rellenar con autoplay. Así el bloque siguiente (y su salto) ya está.
+        if let Some(url) = self.connect_state.dj_next_page() {
+            if !self.connect_state.has_next_tracks(Some(DJ_FETCH_THRESHOLD))
+                && self.dj_last_page.as_deref() != Some(url)
+            {
+                debug!("se pide la página siguiente del DJ");
+                let url = url.to_string();
+                self.dj_last_page = Some(url.clone());
+                self.context_resolver.add(ResolveContext::next_page(url));
+            }
+            return;
+        }
+
         let require_load_new = !self
             .connect_state
             .has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
@@ -2100,6 +2146,21 @@ impl SpircTask {
         );
 
         self.context_resolver.add(resolve);
+    }
+
+    /// El botón del DJ con el DJ sonando: salta a la canción que empieza el siguiente bloque de la
+    /// sesión (`dj.jump_target`), que el locutor presenta con su frase de salto. Si ese bloque aún
+    /// no ha llegado, a la siguiente canción.
+    fn handle_dj_jump(&mut self) -> Result<(), Error> {
+        let target = self
+            .connect_state
+            .next_tracks()
+            .iter()
+            .find(|t| t.metadata.get(DJ_JUMP_TARGET).is_some_and(|v| v == "true"))
+            .map(|t| t.uri.clone());
+        info!("[dj] salto al siguiente bloque: {target:?}");
+        self.dj_jump = target.is_some();
+        self.handle_next(target)
     }
 
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
@@ -2405,6 +2466,16 @@ impl SpircTask {
             && !self.connect_state.shuffling_context()
             && self.connect_state.current_track(|t| t.is_context());
         self.player.set_auto_normalise_as_album(album);
+        // Las frases del locutor del DJ de esta canción, antes de cargarla. A media canción no
+        // hay presentación.
+        let jump = std::mem::take(&mut self.dj_jump);
+        if let Some((intro, outro)) = self
+            .connect_state
+            .current_track(|t| narrations(&t.metadata, jump))
+        {
+            let intro = intro.filter(|_| position_ms == 0);
+            self.player.narrate(id.clone(), intro, outro);
+        }
         self.player
             .load_with_transition(id, start_playing, position_ms, transition);
 
@@ -2495,4 +2566,22 @@ fn jam_play_json(command: &LoadRequest) -> Option<String> {
     Some(format!(
         r#"{{"command":{{"endpoint":"play","context":{{"uri":"{ctx}"}},"options":{{"seek_to":{seek}{skip_to}}},"play_origin":{{"feature_identifier":"harmony"}}}}}}"#
     ))
+}
+
+/// Las frases del locutor del DJ de una canción (de sus metadatos en el contexto): la de entrada
+/// (la de salto con `jump`, si la tiene) y la de salida. `None` si no tiene ninguna: casi siempre,
+/// fuera del DJ.
+fn narrations(
+    metadata: &std::collections::HashMap<String, String>,
+    jump: bool,
+) -> Option<(Option<NarrationRequest>, Option<NarrationRequest>)> {
+    if !metadata.keys().any(|k| k.starts_with("narration.")) {
+        return None;
+    }
+    let intro = jump
+        .then(|| NarrationRequest::from_metadata(metadata, narration::JUMP))
+        .flatten()
+        .or_else(|| NarrationRequest::from_metadata(metadata, narration::INTRO));
+    let outro = NarrationRequest::from_metadata(metadata, narration::OUTRO);
+    Some((intro, outro))
 }

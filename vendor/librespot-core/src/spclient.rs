@@ -22,6 +22,7 @@ use crate::{
         },
         connect::PutStateRequest,
         context::Context,
+        context_page::ContextPage,
         extended_metadata::BatchedEntityRequest,
         extended_metadata::{BatchedExtensionResponse, EntityRequest, ExtensionQuery},
         extension_kind::ExtensionKind,
@@ -122,6 +123,20 @@ const ONE_ITEM_METADATA: RequestOptions = RequestOptions {
     base_url: None,
     fast: true,
 };
+
+/// JSON de un mensaje de protobuf sin fallar por campos que el modelo no conoce (los de las
+/// sesiones del DJ, por ejemplo).
+fn parse_lenient<M: MessageFull>(json: &str) -> Result<M, protobuf_json_mapping::ParseError> {
+    let options = protobuf_json_mapping::ParseOptions {
+        ignore_unknown_fields: true,
+        ..Default::default()
+    };
+    let parsed = protobuf_json_mapping::parse_from_str_with_options::<M>(json, &options);
+    if parsed.is_err() {
+        trace!("failed parsing: {json}")
+    }
+    parsed
+}
 
 #[derive(Debug, Error)]
 pub enum SpClientError {
@@ -1129,6 +1144,125 @@ impl SpClient {
         let uri = format!("/context-resolve/v1/{uri}");
         self.request_with_options(&Method::GET, &uri, None, None, &NO_METRICS_AND_SALT)
             .await
+    }
+
+    /// Un contexto pedido por la URL `hm://` que lo nombra. El DJ llega de context-resolve con una
+    /// página vacía y `lexicon_context_url` en los metadatos; sus canciones (y los textos del
+    /// locutor) salen de ahí. Los campos que el modelo no conoce se ignoran.
+    pub async fn get_context_from_url(&self, hm_url: &str) -> Result<Context, Error> {
+        let res = self.get_next_page(hm_url).await?;
+        let ctx_json = String::from_utf8(res.to_vec())?;
+        if ctx_json.is_empty() {
+            Err(SpClientError::NoData)?
+        }
+        debug!("contexto de {hm_url}: {} bytes", ctx_json.len());
+        trace!("{ctx_json}");
+        Ok(parse_lenient::<Context>(&ctx_json)?)
+    }
+
+    /// La página siguiente de un contexto (`next_page_url`), como `ContextPage`.
+    pub async fn get_context_page(&self, hm_url: &str) -> Result<ContextPage, Error> {
+        let res = self.get_next_page(hm_url).await?;
+        let page_json = String::from_utf8(res.to_vec())?;
+        if page_json.is_empty() {
+            Err(SpClientError::NoData)?
+        }
+        debug!("página de {hm_url}: {} bytes", page_json.len());
+        trace!("{page_json}");
+        Ok(parse_lenient::<ContextPage>(&page_json)?)
+    }
+
+    /// El MP3 de una frase del locutor del DJ (ver `narration_audio_url`), bajado sin
+    /// credenciales: la dirección ya va firmada. Como mucho 8 MB (una frase pesa unos cientos de
+    /// KB) y 8 s.
+    pub async fn narration_audio(
+        &self,
+        ssml: &str,
+        voice: i32,
+        provider: i32,
+        sample_rate: i32,
+    ) -> Result<Vec<u8>, Error> {
+        const MAX_BYTES: usize = 8 << 20;
+        let url = self
+            .narration_audio_url(ssml, voice, provider, sample_rate)
+            .await?;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(url)
+            .body(Bytes::new())?;
+        let body = tokio::time::timeout(
+            Duration::from_secs(8),
+            self.session().http_client().request_body(request),
+        )
+        .await
+        .map_err(|_| Error::deadline_exceeded("audio del DJ: sin respuesta en 8 s"))??;
+        if body.is_empty() || body.len() > MAX_BYTES {
+            return Err(Error::unavailable(format!(
+                "audio del DJ de {} bytes",
+                body.len()
+            )));
+        }
+        Ok(body.to_vec())
+    }
+
+    /// URL del MP3 de una frase del locutor del DJ. `POST /client-tts/v1/fulfill` con un
+    /// `TtsRequest` (sin modelo en librespot-protocol, se escribe a mano: 2 texto SSML, 3 formato
+    /// = MP3, 5 voz, 6 motor, 7 frecuencia) y la respuesta es una redirección (303) cuya
+    /// `Location` es el audio ya sintetizado.
+    async fn narration_audio_url(
+        &self,
+        ssml: &str,
+        voice: i32,
+        provider: i32,
+        sample_rate: i32,
+    ) -> Result<String, Error> {
+        const MP3: i32 = 5;
+        let mut body = Vec::new();
+        {
+            let mut os = protobuf::CodedOutputStream::vec(&mut body);
+            os.write_string(2, ssml)?;
+            os.write_int32(3, MP3)?;
+            os.write_int32(5, voice)?;
+            os.write_int32(6, provider)?;
+            os.write_int32(7, sample_rate)?;
+            os.flush()?;
+        }
+
+        let url = format!("{}/client-tts/v1/fulfill", self.base_url().await?);
+        let token = self.session().login5().auth_token().await?;
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(url)
+            .header(CONTENT_LENGTH, body.len())
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/x-protobuf"))
+            .header(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("{} {}", token.token_type, token.access_token))?,
+            )
+            .body(Bytes::from(body))?;
+        if let Ok(client_token) = self.client_token().await {
+            request
+                .headers_mut()
+                .insert(CLIENT_TOKEN, HeaderValue::from_str(&client_token)?);
+        }
+
+        // La redirección no se sigue (el cliente HTTP no lo hace): se lee aquí.
+        let send = self.session().http_client().request_fut(request)?;
+        let response = tokio::time::timeout(Duration::from_secs(8), send)
+            .await
+            .map_err(|_| Error::deadline_exceeded("client-tts: sin respuesta en 8 s"))??;
+        let status = response.status();
+        let location = response
+            .headers()
+            .get(hyper::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        match location {
+            Some(url) if status.is_redirection() => Ok(url),
+            _ => Err(Error::unavailable(format!(
+                "client-tts respondió {status} sin dirección del audio"
+            ))),
+        }
     }
 
     pub async fn get_autoplay_context(

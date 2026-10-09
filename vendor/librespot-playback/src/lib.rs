@@ -14,6 +14,7 @@ pub mod dither;
 pub mod gain;
 mod local_file;
 pub mod mixer;
+pub mod narration;
 pub mod player;
 mod symphonia_util;
 

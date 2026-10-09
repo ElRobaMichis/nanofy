@@ -28,6 +28,14 @@ pub struct StateContext {
     pub restrictions: Option<Restrictions>,
     /// is used to keep track which tracks are already loaded into the next_tracks
     pub index: ContextIndex,
+    /// Nanofy: página siguiente de una sesión del DJ, que no se acaba (ver `dj_next_page`).
+    pub next_page_url: Option<String>,
+}
+
+/// Solo se siguen las páginas siguientes de las sesiones del DJ: el resto de contextos se
+/// resuelve como siempre en librespot.
+fn dj_page(url: Option<String>) -> Option<String> {
+    url.filter(|u| u.starts_with("hm://lexicon-session-provider/"))
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Hash, Eq)]
@@ -353,6 +361,7 @@ impl ConnectState {
         provider: Option<Provider>,
     ) -> StateContext {
         let new_context_uri = new_context_uri.unwrap_or(self.context_uri());
+        let next_page_url = dj_page(page.next_page_url.clone());
 
         let tracks = page
             .tracks
@@ -380,6 +389,7 @@ impl ConnectState {
             restrictions,
             metadata,
             index: ContextIndex::new(),
+            next_page_url,
         }
     }
 
@@ -514,7 +524,13 @@ impl ConnectState {
         for t in context.tracks {
             ctx.tracks.push(t)
         }
+        ctx.next_page_url = context.next_page_url;
 
         Ok(())
+    }
+
+    /// La página siguiente de la sesión del DJ que suena, si la hay.
+    pub fn dj_next_page(&self) -> Option<&str> {
+        self.context.as_ref()?.next_page_url.as_deref()
     }
 }

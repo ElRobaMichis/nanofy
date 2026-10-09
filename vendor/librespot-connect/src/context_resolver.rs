@@ -20,6 +20,8 @@ use tokio::time::Instant;
 enum Resolve {
     Uri(String),
     Context(Context),
+    /// Nanofy: la página siguiente de una sesión del DJ (`next_page_url`), que se añade al final.
+    Page(String),
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -40,6 +42,16 @@ impl ResolveContext {
     fn append_context(uri: impl Into<String>) -> Self {
         Self {
             resolve: Resolve::Uri(uri.into()),
+            fallback: None,
+            update: ContextType::Default,
+            action: ContextAction::Append,
+        }
+    }
+
+    /// La página siguiente de la sesión del DJ que suena.
+    pub fn next_page(url: impl Into<String>) -> Self {
+        Self {
+            resolve: Resolve::Page(url.into()),
             fallback: None,
             update: ContextType::Default,
             action: ContextAction::Append,
@@ -79,6 +91,7 @@ impl ResolveContext {
             Resolve::Context(ref ctx) => {
                 ConnectState::find_valid_uri(ctx.uri.as_deref(), ctx.pages.first())
             }
+            Resolve::Page(ref url) => Some(url.as_str()),
         }
         .or(self.fallback.as_deref())
     }
@@ -86,7 +99,7 @@ impl ResolveContext {
     /// the actual context uri
     fn context_uri(&self) -> &str {
         match self.resolve {
-            Resolve::Uri(ref uri) => uri,
+            Resolve::Uri(ref uri) | Resolve::Page(ref uri) => uri,
             Resolve::Context(ref ctx) => ctx.uri.as_deref().unwrap_or_default(),
         }
     }
@@ -128,6 +141,9 @@ pub struct ContextResolver {
 
 // time after which an unavailable context is retried
 const RETRY_UNAVAILABLE: Duration = Duration::from_secs(3600);
+
+/// Metadato de un contexto que no se resuelve por context-resolve (el DJ).
+const LEXICON_CONTEXT_URL: &str = "lexicon_context_url";
 
 impl ContextResolver {
     pub fn new(session: Session) -> Self {
@@ -220,12 +236,50 @@ impl ContextResolver {
     ) -> Result<Context, Error> {
         let (next, resolve_uri, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
+        if let Resolve::Page(ref url) = next.resolve {
+            let page = self.session.spclient().get_context_page(url).await?;
+            debug!(
+                "página siguiente del DJ: {} canciones",
+                page.tracks.len()
+            );
+            return Ok(Context {
+                pages: vec![page],
+                ..Default::default()
+            });
+        }
+
         match next.update {
             ContextType::Default => {
-                let mut ctx = self.session.spclient().get_context(resolve_uri).await;
+                let spclient = self.session.spclient();
+                let mut ctx = spclient.get_context(resolve_uri).await;
+                // El DJ: context-resolve da una página sin canciones ni URL y nombra en los
+                // metadatos la sesión de la que salen de verdad (con los textos del locutor).
+                let lexicon = ctx.as_ref().ok().and_then(|c| {
+                    let empty = c.pages.iter().all(|p| {
+                        p.tracks.is_empty() && p.page_url.as_deref().unwrap_or_default().is_empty()
+                    });
+                    c.metadata
+                        .get(LEXICON_CONTEXT_URL)
+                        .filter(|url| empty && url.starts_with("hm://"))
+                        .cloned()
+                });
+                if let Some(url) = lexicon {
+                    debug!("<{resolve_uri}> llega vacío; sus canciones se piden a {url}");
+                    let first = ctx.expect("comprobado arriba");
+                    ctx = spclient.get_context_from_url(&url).await.map(|mut real| {
+                        for (key, value) in first.metadata {
+                            real.metadata.entry(key).or_insert(value);
+                        }
+                        real
+                    });
+                }
                 if let Ok(ctx) = ctx.as_mut() {
                     ctx.uri = Some(next.context_uri().to_string());
-                    ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
+                    // La sesión del DJ conserva su URL hm://: así la reconocen los demás
+                    // dispositivos de Connect.
+                    if !ctx.url.as_deref().is_some_and(|u| u.starts_with("hm://")) {
+                        ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
+                    }
                 }
 
                 ctx

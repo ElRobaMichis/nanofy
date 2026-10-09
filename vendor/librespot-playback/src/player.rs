@@ -39,6 +39,7 @@ use crate::{
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
+    narration::{NarrationRequest, Narrations, Step},
 };
 use futures_util::{
     FutureExt, StreamExt, future::FusedFuture,
@@ -146,6 +147,8 @@ struct PlayerInternal {
     ttfs_seq: u64,
     /// La canción en pausa porque la red se cortó a media reproducción (`PlayerEvent::Stalled`).
     stalled: Option<StallState>,
+    /// Frases del locutor del DJ por canción y la que suena (ver `narration.rs`).
+    narration: Narrations,
 
     player_id: usize,
     play_request_id_generator: SeqGenerator<u64>,
@@ -444,6 +447,12 @@ enum PlayerCommand {
     EmitAutoPlayChangedEvent(bool),
     /// Spirc se detuvo tras varios fallos seguidos (ver `PlayerEvent::SkipCascade`).
     EmitSkipCascadeEvent(u32),
+    /// Frases del locutor del DJ de una canción (ver `Player::narrate`).
+    Narrate {
+        track_id: SpotifyUri,
+        intro: Option<NarrationRequest>,
+        outro: Option<NarrationRequest>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -643,6 +652,13 @@ pub enum PlayerEvent {
         to: SpotifyUri,
         fade_ms: u32,
     },
+    /// El locutor del DJ habla antes (o después) de `track_id`, o deja de hacerlo
+    /// (`speaking: None`). Mientras habla, la canción está en su principio (o en su final).
+    Narration {
+        play_request_id: u64,
+        track_id: SpotifyUri,
+        speaking: Option<NarrationRequest>,
+    },
 }
 
 /// De dónde sale el audio de la canción cargada: el fichero elegido y por qué. Viaja con la
@@ -707,6 +723,9 @@ impl PlayerEvent {
                 play_request_id, ..
             }
             | Stalled {
+                play_request_id, ..
+            }
+            | Narration {
                 play_request_id, ..
             } => Some(*play_request_id),
             _ => None,
@@ -974,6 +993,7 @@ impl Player {
                 loading_hidden: false,
                 ttfs_seq: 0,
                 stalled: None,
+                narration: Narrations::default(),
 
                 player_id,
                 play_request_id_generator: SeqGenerator::new(0),
@@ -1179,6 +1199,22 @@ impl Player {
     /// reproducir; llega a la interfaz como `PlayerEvent::SkipCascade`.
     pub fn emit_skip_cascade_event(&self, failed: u32) {
         self.command(PlayerCommand::EmitSkipCascadeEvent(failed));
+    }
+
+    /// Frases del locutor del DJ de `track_id` (de sus metadatos en el contexto): la de entrada
+    /// suena antes de la canción si empieza desde el principio y la de salida al terminar. Spirc
+    /// lo dice antes de cargarla o al precargarla, para que la frase se pida a la vez.
+    pub fn narrate(
+        &self,
+        track_id: SpotifyUri,
+        intro: Option<NarrationRequest>,
+        outro: Option<NarrationRequest>,
+    ) {
+        self.command(PlayerCommand::Narrate {
+            track_id,
+            intro,
+            outro,
+        });
     }
 }
 
@@ -2346,7 +2382,7 @@ impl Future for PlayerInternal {
                 self.handle_pause();
             }
 
-            if self.state.is_playing() {
+            if self.state.is_playing() && !self.narration_step(cx) {
                 if let PlayerState::Playing {
                     ref track_id,
                     play_request_id,
@@ -2453,7 +2489,11 @@ impl Future for PlayerInternal {
                                 }
                             }
 
-                            self.handle_packet(result, normalisation_factor);
+                            // Al terminar, la frase de salida del locutor del DJ (si tiene) suena
+                            // antes de dar la canción por acabada (`narration_step`).
+                            if result.is_some() || !self.begin_narration(true) {
+                                self.handle_packet(result, normalisation_factor);
+                            }
                         }
                         Err(e) => {
                             // Nanofy: si lo que falló es la lectura y al fichero aún le faltan
@@ -2654,6 +2694,7 @@ impl PlayerInternal {
     fn handle_player_stop(&mut self) {
         // Parada: la canción cortada por la red, si la había, ya no se reanuda.
         self.stalled = None;
+        self.stop_narration();
         // Parar quita también el fundido: nada de la canción que se iba debe sonar al volver.
         self.clear_crossfade("parar");
         self.crossfade_plan = None;
@@ -3175,6 +3216,110 @@ impl PlayerInternal {
         }
     }
 
+    /// Empieza la frase del locutor del DJ de la canción que suena: la de entrada (al empezar desde
+    /// el principio) o, con `outro`, la de salida (al terminar). `false` si no tiene.
+    fn begin_narration(&mut self, outro: bool) -> bool {
+        let PlayerState::Playing {
+            ref track_id,
+            play_request_id,
+            ..
+        } = self.state
+        else {
+            return false;
+        };
+        let track_id = track_id.clone();
+        let request = if outro {
+            self.narration.begin_outro(&track_id, play_request_id)
+        } else {
+            self.narration.begin_intro(&track_id, play_request_id)
+        }
+        .cloned();
+        let Some(request) = request else {
+            return false;
+        };
+        info!(
+            "[dj] el locutor habla {} de {track_id}",
+            if outro { "después" } else { "antes" }
+        );
+        self.send_event(PlayerEvent::Narration {
+            play_request_id,
+            track_id,
+            speaking: Some(request),
+        });
+        true
+    }
+
+    /// Calla al locutor del DJ si hablaba (buscar, parar).
+    fn stop_narration(&mut self) {
+        let Some(speaking) = self.narration.speaking.take() else {
+            return;
+        };
+        if let PlayerState::Playing { ref track_id, .. } | PlayerState::Paused { ref track_id, .. } =
+            self.state
+        {
+            let track_id = track_id.clone();
+            self.send_event(PlayerEvent::Narration {
+                play_request_id: speaking.play_request_id,
+                track_id,
+                speaking: None,
+            });
+        }
+    }
+
+    /// Un paso de la frase del locutor del DJ, si suena una, en lugar de un paquete de la canción.
+    /// `false` si no hay frase: sigue la canción.
+    fn narration_step(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(speaking) = self.narration.speaking.as_ref() else {
+            return false;
+        };
+        let PlayerState::Playing {
+            ref track_id,
+            play_request_id,
+            ..
+        } = self.state
+        else {
+            return false;
+        };
+        if speaking.play_request_id != play_request_id {
+            // Era de otra carga.
+            self.narration.speaking = None;
+            return false;
+        }
+        let track_id = track_id.clone();
+        let gain = speaking.request.gain(
+            self.config.normalisation,
+            self.config.normalisation_pregain_db,
+        );
+        match self.narration.step(cx) {
+            Step::Chunk(samples) | Step::Wait(samples) => {
+                let position = AudioPacketPosition {
+                    position_ms: 0,
+                    skipped: false,
+                };
+                self.handle_packet(Some((position, AudioPacket::Samples(samples))), gain);
+            }
+            Step::Done { outro } => {
+                self.send_event(PlayerEvent::Narration {
+                    play_request_id,
+                    track_id,
+                    speaking: None,
+                });
+                if outro {
+                    // La canción ya había terminado: ahora sí se da por acabada.
+                    self.handle_packet(None, 1.0);
+                } else if let PlayerState::Playing {
+                    ref mut reported_nominal_start_time,
+                    ..
+                } = self.state
+                {
+                    // La canción empieza ahora: su primer paquete corrige la posición.
+                    *reported_nominal_start_time = None;
+                }
+            }
+        }
+        true
+    }
+
     /// Pasos 1-8 del limitador del nivel «Alto» sobre una muestra que ya lleva su ganancia, y el
     /// volumen al final. Es el bucle de siempre separado del paso 0 (la ganancia), para pasar por
     /// él también la suma de un fundido: mismas operaciones en el mismo orden, mismo resultado.
@@ -3387,8 +3532,13 @@ impl PlayerInternal {
         else {
             return;
         };
-        // Repetir la canción o un pódcast a cualquiera de los dos lados: nunca.
-        if next == track_id || is_episode(track_id) || is_episode(next) {
+        // Repetir la canción o un pódcast a cualquiera de los dos lados: nunca. Tampoco si el
+        // locutor del DJ tiene algo que decir al terminar esta: el fundido se lo comería.
+        if next == track_id
+            || is_episode(track_id)
+            || is_episode(next)
+            || self.narration.has_outro(track_id)
+        {
             return;
         }
         let remaining_ms = duration_ms.saturating_sub(stream_position_ms);
@@ -3656,7 +3806,14 @@ impl PlayerInternal {
             if let (IncomingStart::Fading(ramp), Some(to)) = (fade, fading_to) {
                 self.announce_crossfade(&to, ramp, fade_log);
             }
+            // Desde el principio, el locutor del DJ la presenta antes (si tiene frase).
+            if position_ms == 0 {
+                self.begin_narration(false);
+            } else {
+                self.narration.speaking = None;
+            }
         } else {
+            self.narration.speaking = None;
             self.ensure_sink_stopped(false);
             // `paused_queue_ms` ya es 0 (la carga vació la cola o la dejó sonar hasta el final),
             // salvo con la misma canción recargada en pausa en su mismo punto: entonces su cola
@@ -4296,6 +4453,8 @@ impl PlayerInternal {
     }
 
     fn handle_command_seek(&mut self, position_ms: u32) -> PlayerResult {
+        // Buscar en la canción corta al locutor del DJ: se quiere la música.
+        self.stop_narration();
         // Medida de una búsqueda; también de un «anterior» pasados unos segundos de canción, que
         // Spirc convierte en volver al principio.
         let ttfs_seq = ttfs::pending_of(&["seek", "prev"]);
@@ -4515,6 +4674,12 @@ impl PlayerInternal {
             PlayerCommand::EmitSkipCascadeEvent(failed) => {
                 self.send_event(PlayerEvent::SkipCascade { failed })
             }
+
+            PlayerCommand::Narrate {
+                track_id,
+                intro,
+                outro,
+            } => self.narration.set(&self.session, track_id, intro, outro),
 
             PlayerCommand::EmitSessionClientChangedEvent {
                 client_id,
@@ -4816,6 +4981,16 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::EmitSkipCascadeEvent(failed) => f
                 .debug_tuple("EmitSkipCascadeEvent")
                 .field(&failed)
+                .finish(),
+            PlayerCommand::Narrate {
+                track_id,
+                intro,
+                outro,
+            } => f
+                .debug_tuple("Narrate")
+                .field(&track_id)
+                .field(&intro.is_some())
+                .field(&outro.is_some())
                 .finish(),
         }
     }

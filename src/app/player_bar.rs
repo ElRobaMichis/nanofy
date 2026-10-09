@@ -270,15 +270,21 @@ impl App {
         let pill = Rect::from_min_max(pos2(lupa.x - 34.2, c.y - 23.4), pos2((lupa.x - 34.2 + 339.4).min(max_right), c.y + 22.3));
         ui.painter().rect_filled(pill, CornerRadius::same(TAB_BG_RADIUS), st.tab_bg);
         icons::paint(ui.painter(), Rect::from_center_size(lupa, vec2(29.0, 29.0)), st.icon_of(st.active), Icon::Search);
-        let field = Rect::from_min_max(pos2(c.x + 31.0, c.y - 15.0), pos2(pill.max.x - 14.0, c.y + 11.0));
+        // El texto (y el de ayuda) en la misma línea base que la etiqueta «Buscar» con el campo cerrado.
+        let field = Rect::from_min_max(pos2(c.x + 31.0, c.y - 14.0), pos2(pill.max.x - 14.0, c.y + 12.0));
         let mut f = child_in(ui, field, Layout::left_to_right(Align::Center));
         let edit = egui::TextEdit::singleline(&mut self.search_query)
             .id(egui::Id::new(SEARCH_ID))
             .frame(egui::Frame::NONE)
             .font(theme::regular(TOP_FONT))
-            .hint_text("Buscar…")
             .desired_width(field.width());
         let r = f.add(edit);
+        // Texto de ayuda pintado aquí, en la línea base de la etiqueta del campo cerrado (el de
+        // egui quedaba 1 px más alto y el texto saltaba al abrir Buscar).
+        if self.search_query.is_empty() {
+            let g = ui.painter().layout_no_wrap("Buscar…".into(), theme::regular(TOP_FONT), st.text);
+            text_on_baseline(ui.painter(), pos2(c.x + 31.0, c.y + 6.0), g, st.text);
+        }
         if self.focus_search {
             self.focus_search = false;
             r.request_focus();

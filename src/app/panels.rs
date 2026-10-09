@@ -223,6 +223,7 @@ impl App {
         self.jam_window(ctx);
         self.editor_window(ctx);
         self.folder_window(ctx);
+        self.song_more_panel(ctx);
         self.add_panel(ctx);
         self.notes_window(ctx);
         self.update_window(ctx);

@@ -4,11 +4,10 @@
 //! rectángulos explícitos: `allocate_ui_with_layout` encoge la zona a su contenido y no sirve
 //! para alinear columnas.
 
-use std::time::Duration;
-
 use egui::{pos2, vec2, Align, Color32, CornerRadius, Label, Layout, Rect, RichText, Sense, Stroke, UiBuilder};
 
 use super::icons::{self, Icon};
+use super::player_menu::{Anchor, SongMenu};
 use super::theme::{self, GREEN};
 use super::{Action, App, Page, PlayTarget, ROW_H};
 use crate::model::*;
@@ -43,13 +42,6 @@ impl std::ops::Deref for Shown<'_> {
             Shown::Filtered(t) => t,
         }
     }
-}
-
-/// Dónde se abre el menú de canción.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum MenuKind {
-    NowPlaying,
-    Row,
 }
 
 #[derive(Clone, Copy)]
@@ -795,158 +787,19 @@ impl App {
         changed
     }
 
-    /// Menú contextual de una canción (clic derecho en una fila). Misma lista que el reproductor.
-    pub fn track_menu(&mut self, ui: &mut egui::Ui, t: &Track, _target: PlayTarget, opts: &RowOpts) {
-        self.song_menu(ui, t, MenuKind::Row, opts);
-    }
-
-    /// Menú de canción compartido por el clic derecho en filas (`Row`) y en la portada del
-    /// reproductor (`NowPlaying`). Los tres puntos del reproductor tienen su panel propio
-    /// (`player_menu.rs`).
-    pub fn song_menu(&mut self, ui: &mut egui::Ui, t: &Track, kind: MenuKind, opts: &RowOpts) {
-        let id = t.id.clone();
-        let is_episode = t.kind.as_deref() == Some("episode");
-        // Descargar
-        if let Some(id) = &id {
-            let dl = self.downloaded.contains(id);
-            let label = if dl { "Descargada" } else if is_episode { "Descargar episodio" } else { "Descargar canción" };
-            if Self::menu_item_enabled(ui, Some(Icon::Download), label, false, !dl).clicked() {
-                if is_episode {
-                    self.actions.push(Action::DownloadEpisodes(vec![id.clone()]));
-                } else {
-                    self.actions.push(Action::Download(vec![id.clone()]));
-                }
-                ui.close();
-            }
-        }
-        // Temporizador de apagado (submenú al pasar el ratón)
-        let timer_label = match (self.sleep_at, self.sleep_end_of_track) {
-            (Some(at), _) => format!("Temporizador ({} min)", (at.saturating_duration_since(std::time::Instant::now()).as_secs() + 59) / 60),
-            (None, true) => "Temporizador (al terminar)".to_string(),
-            _ => "Temporizador de apagado".to_string(),
-        };
-        let r = Self::menu_item(ui, Some(Icon::Clock), &timer_label, true);
-        egui::containers::menu::SubMenu::default().show(ui, &r, |ui| self.sleep_timer_items(ui));
-        // Ocultar
-        if let Some(id) = &id {
-            let hidden = self.hidden_tracks.contains(id);
-            let (icon, label) = if hidden { (Icon::Eye, "Mostrar canción") } else { (Icon::EyeOff, "Ocultar canción") };
-            if Self::menu_item(ui, Some(icon), label, false).clicked() {
-                self.toggle_hidden(id);
-                ui.close();
-            }
-        }
-        // Compartir
-        if !t.uri.is_empty() && Self::menu_item(ui, Some(Icon::Share), "Compartir canción", false).clicked() {
-            self.actions.push(Action::CopyText(uri_to_link(&t.uri), "Enlace"));
-            ui.close();
-        }
-        // Agregar a la biblioteca (submenú: Me gusta / playlist)
-        let r = Self::menu_item(ui, Some(Icon::PlusSquare), "Agregar a la biblioteca", true);
-        let uri = t.uri.clone();
-        let liked = id.as_ref().map(|i| self.liked_set.contains(i)).unwrap_or(false);
-        egui::containers::menu::SubMenu::default().show(ui, &r, |ui| {
-            if let Some(id) = &id {
-                let (icon, label) = if liked { (Icon::HeartFilled, "Quitar de Canciones que te gustan") } else { (Icon::Heart, "Canciones que te gustan") };
-                if Self::menu_item(ui, Some(icon), label, false).clicked() {
-                    self.actions.push(Action::Like(id.clone(), !liked));
-                    ui.close();
-                }
-            }
-            if Self::menu_item(ui, Some(Icon::Playlist), "Añadir a una playlist…", false).clicked() {
-                self.open_add_dialog(vec![uri.clone()]);
-                ui.close();
-            }
-        });
-        // Cola
-        if Self::menu_item(ui, Some(Icon::Queue), "Agregar canción a la cola", false).clicked() {
-            self.actions.push(Action::AddToQueue(t.uri.clone()));
-            ui.close();
-        }
-        if let Some(pl) = opts.editable_playlist {
-            if Self::menu_item(ui, Some(Icon::Trash), if pl == "queue" { "Quitar de la cola" } else { "Quitar de esta playlist" }, false).clicked() {
-                self.actions.push(Action::RemoveFromPlaylist { playlist_id: pl.to_string(), uri: t.uri.clone() });
-                ui.close();
-            }
-        }
-        // Radio
-        if let Some(id) = &id {
-            if !is_episode && Self::menu_item(ui, Some(Icon::Radio), "Ir a la radio de la canción", false).clicked() {
-                self.actions.push(Action::OpenRadio(id.clone()));
-                ui.close();
-            }
-        }
-        // Álbum
-        // Las pistas de un álbum no traen su álbum: se toma del contexto de la página.
-        let album_id = t.album.as_ref().and_then(|a| a.id.clone()).or_else(|| match opts.source {
-            Source::Context(u) => u.strip_prefix("spotify:album:").map(|s| s.to_string()),
-            Source::Tracks => None,
-        });
-        if Self::menu_item_enabled(ui, Some(Icon::Album), "Ver álbum", false, album_id.is_some()).clicked() {
-            if let Some(aid) = album_id {
-                self.actions.push(Action::Go(Page::Album(aid)));
-            }
-            ui.close();
-        }
-        // Artista(s)
-        let artists: Vec<(String, String)> = t.artists.iter().filter_map(|a| a.id.clone().map(|id| (a.name.clone(), id))).collect();
-        match artists.len() {
-            0 => {}
-            1 => {
-                if Self::menu_item(ui, Some(Icon::Artist), &format!("Ver {}", artists[0].0), false).clicked() {
-                    self.actions.push(Action::Go(Page::Artist(artists[0].1.clone())));
-                    ui.close();
-                }
-            }
-            _ => {
-                let r = Self::menu_item(ui, Some(Icon::Artist), "Ver artista", true);
-                egui::containers::menu::SubMenu::default().show(ui, &r, |ui| {
-                    for (name, aid) in &artists {
-                        if Self::menu_item(ui, Some(Icon::Artist), name, false).clicked() {
-                            self.actions.push(Action::Go(Page::Artist(aid.clone())));
-                            ui.close();
-                        }
-                    }
-                });
-            }
-        }
-        if kind != MenuKind::Row {
-            if Self::menu_item(ui, Some(Icon::Miniplayer), if self.miniplayer { "Salir del miniplayer" } else { "Miniplayer" }, false).clicked() {
-                let ctx = ui.ctx().clone();
-                self.toggle_miniplayer(&ctx);
-                ui.close();
-            }
-            if Self::menu_item(ui, Some(Icon::Fullscreen), if self.fullscreen { "Salir de pantalla completa" } else { "Pantalla completa" }, false).clicked() {
-                let ctx = ui.ctx().clone();
-                self.toggle_fullscreen(&ctx);
-                ui.close();
-            }
-        }
-    }
-
-    /// Opciones del temporizador de apagado.
-    pub fn sleep_timer_items(&mut self, ui: &mut egui::Ui) {
-        for m in [15u64, 30, 45, 60] {
-            if Self::menu_item(ui, Some(Icon::Clock), &format!("{m} minutos"), false).clicked() {
-                self.sleep_at = Some(std::time::Instant::now() + Duration::from_secs(m * 60));
-                self.set_sleep_end_of_track(false);
-                self.status(format!("Se pausará en {m} minutos"));
-                ui.close();
-            }
-        }
-        if Self::menu_item(ui, Some(Icon::Clock), "Al terminar la canción", false).clicked() {
-            // Suspende el fundido hasta que se cumpla (ver `set_sleep_end_of_track`).
-            self.set_sleep_end_of_track(true);
-            self.sleep_at = None;
-            self.status("Se pausará al terminar la canción");
-            ui.close();
-        }
-        if (self.sleep_at.is_some() || self.sleep_end_of_track)
-            && Self::menu_item(ui, Some(Icon::Close), "Cancelar temporizador", false).clicked()
-        {
-            self.sleep_at = None;
-            self.set_sleep_end_of_track(false);
-            ui.close();
+    /// Menú de cristal de la canción `t`, la fila `i` de `list_id` (`player_menu.rs`).
+    fn song_menu_for(t: &Track, opts: &RowOpts, list_id: &str, i: usize, anchor: Anchor) -> SongMenu {
+        SongMenu {
+            track: t.clone(),
+            // Las pistas de un álbum no traen su álbum: se toma del contexto de la página.
+            album_id: match opts.source {
+                Source::Context(u) => u.strip_prefix("spotify:album:").map(|s| s.to_string()),
+                Source::Tracks => None,
+            },
+            remove_from: opts.editable_playlist.map(|s| s.to_string()),
+            row: (list_id.to_string(), i),
+            anchor,
+            sub: None,
         }
     }
 
@@ -1093,8 +946,7 @@ impl App {
             // al pasar sobre uno, la fila dejaría de estar "hovered" y sus botones desaparecerían.
             // Con el menú «más» abierto la fila sigue "en hover": si no, al mover el ratón al
             // menú el botón desaparecería y el menú con él.
-            let more_id = ui.id().with(("more", list_id, i));
-            let hov = resp.hovered() || resp.contains_pointer() || egui::Popup::is_id_open(ui.ctx(), more_id);
+            let hov = resp.hovered() || resp.contains_pointer() || self.song_menu_on(list_id, i);
             if selected || hov {
                 ui.painter().rect_filled(row.shrink2(vec2(4.0, 1.0)), CornerRadius::same(10), p.hover);
             }
@@ -1273,12 +1125,9 @@ impl App {
                             }
                         }
                         let more = icons::button(&mut c, Icon::More, 28.0, p.weak).on_hover_text("Más");
-                        // El destino solo con el menú abierto: sin contexto copia todos los uris de
-                        // la lista, y la fila bajo el ratón lo hacía en cada fotograma.
-                        egui::Popup::menu(&more).id(more_id).show(|ui| {
-                            let target = opts.target(i, tracks, shuffle);
-                            self.track_menu(ui, t, target, &opts)
-                        });
+                        if more.clicked() {
+                            self.toggle_song_menu(Self::song_menu_for(t, &opts, list_id, i, Anchor::Dots(more.rect)));
+                        }
                     }
                 }
             } else {
@@ -1333,10 +1182,11 @@ impl App {
             } else if resp.clicked() {
                 self.selected = Some((list_id.to_string(), i));
             }
-            resp.context_menu(|ui| {
-                let target = opts.target(i, tracks, shuffle);
-                self.track_menu(ui, t, target, &opts);
-            });
+            if resp.secondary_clicked() {
+                if let Some(at) = resp.interact_pointer_pos() {
+                    self.song_more = Some(Self::song_menu_for(t, &opts, list_id, i, Anchor::Pointer(at)));
+                }
+            }
         }
     }
 }
@@ -1403,7 +1253,9 @@ impl App {
             let selected = self.selected.as_ref().is_some_and(|s| s.0 == list_id && s.1 == i);
             // Como en `track_rows`: los botones de la fila y su menú abierto la mantienen «en hover».
             let more_id = ui.id().with(("more", list_id, i));
-            let hov = resp.hovered() || resp.contains_pointer() || egui::Popup::is_id_open(ui.ctx(), more_id);
+            // Pedido por el modo de control: como si se pulsaran sus tres puntos.
+            let want_menu = self.song_more_req.as_ref().is_some_and(|(l, k, _)| *k == i && l.as_deref().is_none_or(|l| l == list_id));
+            let hov = resp.hovered() || resp.contains_pointer() || self.song_menu_on(list_id, i) || want_menu;
             if selected || hov {
                 ui.painter().rect_filled(row.expand2(vec2(8.0, 0.0)).shrink2(vec2(0.0, 2.0)), CornerRadius::same(6), ink.hover);
             }
@@ -1525,12 +1377,15 @@ impl App {
                     }
                     if n_fit >= 2 {
                         let more = Self::slot_button(ui, more_id.with("btn"), at(k), Icon::More, 30.0, ink.dim).on_hover_text("Más");
-                        // El destino solo con el menú abierto: sin contexto copia todos los uris
-                        // de la lista, y la fila bajo el ratón lo hacía en cada fotograma.
-                        egui::Popup::menu(&more).id(more_id).show(|ui| {
-                            let target = opts.target(i, tracks, shuffle);
-                            self.track_menu(ui, t, target, &opts)
-                        });
+                        if more.clicked() || want_menu {
+                            let mut m = Self::song_menu_for(t, &opts, list_id, i, Anchor::Dots(more.rect));
+                            if want_menu {
+                                m.sub = self.song_more_req.take().and_then(|r| r.2);
+                                self.song_more = Some(m);
+                            } else {
+                                self.toggle_song_menu(m);
+                            }
+                        }
                     }
                 }
             }
@@ -1572,10 +1427,11 @@ impl App {
             } else if resp.clicked() {
                 self.selected = Some((list_id.to_string(), i));
             }
-            resp.context_menu(|ui| {
-                let target = opts.target(i, tracks, shuffle);
-                self.track_menu(ui, t, target, &opts);
-            });
+            if resp.secondary_clicked() {
+                if let Some(at) = resp.interact_pointer_pos() {
+                    self.song_more = Some(Self::song_menu_for(t, &opts, list_id, i, Anchor::Pointer(at)));
+                }
+            }
         }
     }
 

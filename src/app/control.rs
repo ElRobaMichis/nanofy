@@ -882,6 +882,23 @@ impl App {
                 self.player_more_sub = n(cmd, "sub").map(|v| v as usize);
                 ok()
             }
+            // El menú de cristal de una canción, como sus tres puntos: la fila `i` de la lista `list`
+            // (o de la primera que la tenga), con el submenú `sub`; `on: false` lo cierra.
+            "song_menu" => {
+                if b(cmd, "on", true) {
+                    match n(cmd, "i") {
+                        Some(i) => {
+                            self.song_more_req = Some((s(cmd, "list").map(|l| l.to_string()), i as usize, n(cmd, "sub").map(|v| v as usize)));
+                            ok()
+                        }
+                        None => err("falta i"),
+                    }
+                } else {
+                    self.song_more = None;
+                    self.song_more_req = None;
+                    ok()
+                }
+            }
             "library_oldest" => {
                 self.settings.library_oldest = b(cmd, "on", !self.settings.library_oldest);
                 ok()
@@ -1528,6 +1545,7 @@ impl App {
             "library_oldest": self.settings.library_oldest,
             "library_grouped": self.settings.library_grouped,
             "library_kind": self.settings.library_kind,
+            "song_menu": self.song_more.as_ref().map(|m| json!({"list": m.row.0, "i": m.row.1, "uri": m.track.uri, "sub": m.sub, "remove_from": m.remove_from})),
             "library_filter": self.library_filter,
             "library_folder": self.library_folder,
             "home_filter": self.home_filter,

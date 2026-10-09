@@ -91,10 +91,6 @@ pub enum Icon {
     DragHandle,
     Folder,
     Book,
-    Radio,
-    Clock,
-    Fullscreen,
-    Miniplayer,
     NewTab,
     Trash,
     Edit,
@@ -711,27 +707,6 @@ fn build(icon: Icon, d: &mut Draw) {
             d.rpoly(&[(12.0, 5.2), (8.0, 3.8), (3.8, 4.2), (3.8, 19.2), (8.0, 18.8), (12.0, 20.2)], 1.6, true);
             d.rpoly(&[(12.0, 5.2), (16.0, 3.8), (20.2, 4.2), (20.2, 19.2), (16.0, 18.8), (12.0, 20.2)], 1.6, true);
         }
-        Icon::Radio => {
-            d.dot((12.0, 12.0), 1.9);
-            d.arc((12.0, 12.0), 5.0, 140.0, 220.0);
-            d.arc((12.0, 12.0), 5.0, -40.0, 40.0);
-            d.arc((12.0, 12.0), 8.8, 145.0, 215.0);
-            d.arc((12.0, 12.0), 8.8, -35.0, 35.0);
-        }
-        Icon::Clock => {
-            d.ring((12.0, 12.0), 8.6);
-            d.poly(&[(12.0, 7.4), (12.0, 12.4), (15.6, 12.4)]);
-        }
-        Icon::Fullscreen => {
-            d.rpoly(&[(4.0, 9.0), (4.0, 4.0), (9.0, 4.0)], 1.5, false);
-            d.rpoly(&[(15.0, 4.0), (20.0, 4.0), (20.0, 9.0)], 1.5, false);
-            d.rpoly(&[(20.0, 15.0), (20.0, 20.0), (15.0, 20.0)], 1.5, false);
-            d.rpoly(&[(9.0, 20.0), (4.0, 20.0), (4.0, 15.0)], 1.5, false);
-        }
-        Icon::Miniplayer => {
-            d.rrect((2.5, 4.5), (21.5, 19.5), 2.5);
-            d.fill_rrect((12.3, 11.8), (18.8, 16.8), 1.0);
-        }
         Icon::NewTab => {
             d.rpoly(&[(10.5, 4.5), (4.5, 4.5), (4.5, 19.5), (19.5, 19.5), (19.5, 13.5)], 2.2, false);
             d.line((11.6, 12.4), (19.4, 4.6));
@@ -1061,8 +1036,8 @@ mod tests {
         Icon::Settings, Icon::Grid, Icon::List, Icon::Back, Icon::Forward, Icon::Close, Icon::Check,
         Icon::People, Icon::Share, Icon::Hourglass, Icon::Download, Icon::Minus, Icon::PlusCircle,
         Icon::Bookmark, Icon::BookmarkFilled, Icon::Sort, Icon::Filter, Icon::Episode, Icon::Sliders, Icon::Eye,
-        Icon::EyeOff, Icon::DragHandle, Icon::Folder, Icon::Book, Icon::Radio, Icon::Clock, Icon::Fullscreen,
-        Icon::Miniplayer, Icon::NewTab, Icon::Trash, Icon::Edit, Icon::Keyboard, Icon::ChevronRight,
+        Icon::EyeOff, Icon::DragHandle, Icon::Folder, Icon::Book,
+        Icon::NewTab, Icon::Trash, Icon::Edit, Icon::Keyboard, Icon::ChevronRight,
         Icon::ChevronDown, Icon::HomeFilled, Icon::Customize, Icon::ArrowLeft, Icon::ArrowRight,
     ];
 

@@ -7,7 +7,7 @@ use librespot_playback::player::LoadFailure;
 
 use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
-use super::widgets::{child_in, galley_truncated, text_on_baseline, MenuKind, RowOpts};
+use super::widgets::{child_in, galley_truncated, text_on_baseline};
 use super::{Action, App, Auth, Page, PlayState, PlayTarget, Repeat, SideTab, SEARCH_ID, SIDEBAR_W};
 use crate::api::Req;
 use crate::config::{vol_pct_to_raw, vol_raw_db, vol_raw_to_pct};
@@ -909,10 +909,12 @@ impl App {
                 self.actions.push(Action::Go(Page::Album(id.clone())));
             }
         }
-        r.context_menu(|ui| {
-            let t = super::track_from_now(&np);
-            self.song_menu(ui, &t, MenuKind::NowPlaying, &RowOpts::tracks(false, false));
-        });
+        // Clic derecho: el menú de cristal de los tres puntos, desde el puntero.
+        if r.secondary_clicked() {
+            self.player_more_open = true;
+            self.player_more_sub = None;
+            self.player_more_at = r.interact_pointer_pos();
+        }
         // Tarda en cargar (`watchdog::SLOW_AFTER`): la tercera línea lo dice, en lugar del álbum.
         let slow = self.player.state == PlayState::Loading
             && self.player.remote.is_none()
@@ -1024,8 +1026,9 @@ impl App {
         // Los tres puntos: el panel de cristal de `player_menu.rs`.
         let more = self.bar_icon(ui, boxed(lay.more, 0.0), Icon::More, st.icon, "Más");
         if more.clicked() {
-            self.player_more_open = !self.player_more_open;
+            self.player_more_open = !self.player_more_open || self.player_more_at.is_some();
             self.player_more_sub = None;
+            self.player_more_at = None;
         }
         if self.player_more_open {
             let ctx = ui.ctx().clone();

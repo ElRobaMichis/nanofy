@@ -1036,6 +1036,13 @@ pub struct App {
     /// El panel de los tres puntos del reproductor, abierto, y la fila cuyo submenú se ve.
     pub player_more_open: bool,
     pub player_more_sub: Option<usize>,
+    /// Abierto con el clic derecho en la portada: desde el puntero, no sobre los tres puntos.
+    pub player_more_at: Option<egui::Pos2>,
+    /// El menú de cristal de una canción de una lista (tres puntos de la fila o clic derecho).
+    pub song_more: Option<player_menu::SongMenu>,
+    /// El modo de control pide abrir el menú de la fila `.1` (de la lista `.0`, o de la primera
+    /// que la tenga) con el submenú `.2`, como el botón de sus tres puntos.
+    pub song_more_req: Option<(Option<String>, usize, Option<usize>)>,
     /// El modo de control pide abrir «Añadir a una playlist» como el botón del reproductor.
     pub add_from_bar: bool,
     /// Carpeta abierta dentro de la biblioteca (su id).
@@ -1399,6 +1406,9 @@ impl App {
             library_group_open: false,
             player_more_open: false,
             player_more_sub: None,
+            player_more_at: None,
+            song_more: None,
+            song_more_req: None,
             add_from_bar: false,
             library_folder: None,
             library_recent,

@@ -258,6 +258,9 @@ pub enum Req {
     ArtistAlbums(String),
     Search(String),
     Recent,
+    /// Contextos (playlists, álbumes, artistas, Me gusta) reproducidos hace poco en la cuenta, con
+    /// su hora: el orden «Recientes» de la biblioteca.
+    RecentContexts,
     Devices,
     PlayerState,
     /// Última actividad de la cuenta (historial), para comparar con la copia local.
@@ -437,6 +440,8 @@ pub enum Resp {
     ArtistAlbums(Vec<AlbumRef>),
     Search(SearchResult),
     Recent(Vec<Track>),
+    /// (uri del contexto, hora en segundos Unix) de lo más reciente a lo más antiguo.
+    RecentContexts(Vec<(String, u64)>),
     Devices(Vec<Device>),
     PlayerState(Option<PlaybackState>),
     Queue(QueueResponse),
@@ -3252,6 +3257,20 @@ impl Client {
                 .map(slim_track)
                 .collect(),
             )),
+            Req::RecentContexts => {
+                let page: Paging<PlayHistory> = self.get_json(&format!("{BASE}/me/player/recently-played?limit=50"))?;
+                let mut seen = std::collections::HashSet::new();
+                let mut out = Vec::new();
+                for h in page.items {
+                    let Some(uri) = h.context.map(|c| c.uri).filter(|u| !u.is_empty()) else {
+                        continue;
+                    };
+                    if seen.insert(uri.clone()) {
+                        out.push((uri, h.played_at.as_deref().map(rfc3339_to_unix).unwrap_or(0)));
+                    }
+                }
+                Ok(Resp::RecentContexts(out))
+            }
             Req::Devices => Ok(Resp::Devices(
                 self.get_json::<Devices>(&format!("{BASE}/me/player/devices"))?
                     .devices,

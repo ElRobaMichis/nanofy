@@ -8,6 +8,8 @@ mod artist;
 pub mod control;
 mod icon_masks;
 mod icons;
+mod library;
+mod library_masks;
 mod pages;
 mod panels;
 mod player_bar;
@@ -1019,8 +1021,16 @@ pub struct App {
     pub sidebar_pins_open: bool,
     pub sidebar_playlists_open: bool,
     pub library_grid: bool,
-    pub library_sort_name: bool,
     pub library_filter: String,
+    /// La lupa de la biblioteca abierta (con su campo para filtrar).
+    pub library_search_open: bool,
+    /// Carpeta abierta dentro de la biblioteca (su id).
+    pub library_folder: Option<String>,
+    /// Última vez que sonó cada cosa de la biblioteca (clave de `library::library_key`), en
+    /// segundos Unix, aquí y en la cuenta (recently-played). Ordena «Recientes». Va en su propio
+    /// archivo y no en los ajustes: cambia con cada reproducción.
+    pub library_recent: HashMap<String, u64>,
+    library_recent_path: std::path::PathBuf,
     pub home_filter: u8,
     pub artist_tab: u8,
     pub artist_grid: bool,
@@ -1116,6 +1126,11 @@ impl App {
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
         let play_log_path = paths.state_dir.join("plays.json");
+        let library_recent_path = paths.state_dir.join("library_recent.json");
+        let library_recent: HashMap<String, u64> = std::fs::read_to_string(&library_recent_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
         let play_log = std::sync::Arc::new(PlayLog::load(&play_log_path));
         crate::tmark("home+plays");
         let volume = vol_pct_to_raw(settings.volume as f32);
@@ -1365,8 +1380,11 @@ impl App {
             sidebar_pins_open: false,
             sidebar_playlists_open: false,
             library_grid: settings_library_grid,
-            library_sort_name: false,
             library_filter: String::new(),
+            library_search_open: false,
+            library_folder: None,
+            library_recent,
+            library_recent_path,
             home_filter: 0,
             artist_tab: 0,
             artist_grid: true,
@@ -4818,6 +4836,7 @@ impl App {
                     }
                 }
             }
+            Resp::RecentContexts(list) => self.merge_recent_contexts(list),
             Resp::Recent(t) => {
                 if !self.play_log.seeded {
                     // Primera vez: el historial de Spotify sirve de semilla del registro local.
@@ -7386,6 +7405,7 @@ impl App {
         }
         self.last_play = Some(t.clone());
         self.last_play_page = Some(self.page().clone());
+        self.note_library_play(&t);
         // Algo nuevo que reproducir: lo de la canción que no se pudo cargar ya no aplica.
         self.forget_failed_load();
         self.restore_wanted = false;
@@ -8005,6 +8025,13 @@ impl App {
             // Lo preparado por la precarga inteligente era el fichero de la calidad anterior.
             self.warm.forget();
         }
+        // Lo que se cambia desde la biblioteca (fijadas, vista, orden) no pasa por el borrador:
+        // un borrador abierto antes de fijar algo no debe deshacerlo al guardar.
+        self.draft.pinned = self.settings.pinned.clone();
+        self.draft.liked_unpinned = self.settings.liked_unpinned;
+        self.draft.library_grid = self.settings.library_grid;
+        self.draft.library_oldest = self.settings.library_oldest;
+        self.draft.library_grouped = self.settings.library_grouped;
         self.settings = self.draft.clone();
         self.settings.save(&self.paths);
         self.apply_theme(ctx);
@@ -8277,7 +8304,8 @@ impl crate::shell::UiApp for App {
                 // 1 px, como en la referencia; la del artista, de borde a borde (su cabecera ocupa
                 // el panel entero).
                 let page_now = self.page().clone();
-                let black = matches!(page_now, Page::Artist(_) | Page::Home | Page::Search);
+                let library = page_now == Page::Library && self.signed_in();
+                let black = library || matches!(page_now, Page::Artist(_) | Page::Home | Page::Search);
                 if black && p.dark {
                     ui.painter().rect_filled(panel, egui::CornerRadius::same(8), bg);
                     ui.painter().rect_stroke(panel, egui::CornerRadius::same(8), egui::Stroke::new(1.0, ARTIST_PANEL_EDGE), egui::StrokeKind::Inside);
@@ -8289,6 +8317,13 @@ impl crate::shell::UiApp for App {
                     Page::Home | Page::Search => (HOME_PAD_LEFT, HOME_PAD_RIGHT, HOME_PAD_TOP),
                     _ => (CONTENT_PAD_LEFT, CONTENT_PAD_RIGHT, CONTENT_PAD_TOP),
                 };
+                if library {
+                    // La biblioteca lleva su barra fija y desplaza solo lo de debajo.
+                    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(panel));
+                    c.set_clip_rect(panel.shrink(1.0));
+                    self.library_panel(&mut c, panel);
+                    return;
+                }
                 let inner = egui::Rect::from_min_max(
                     egui::pos2(panel.min.x + pad_l, panel.min.y + pad_t),
                     egui::pos2(panel.max.x - pad_r, panel.max.y),

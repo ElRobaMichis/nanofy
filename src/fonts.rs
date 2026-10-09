@@ -27,6 +27,17 @@ const PRIMARY: &[(&str, &str)] = &[
     ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
 ];
 
+/// Seminegrita (títulos de las tarjetas de la biblioteca). Sin ninguna, se usa la negrita.
+#[cfg(target_os = "windows")]
+const SEMIBOLD: &[&str] = &["C:/Windows/Fonts/seguisb.ttf"];
+#[cfg(target_os = "macos")]
+const SEMIBOLD: &[&str] = &[];
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const SEMIBOLD: &[&str] = &[
+    "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
+    "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
+];
+
 #[cfg(target_os = "windows")]
 const FALLBACKS: &[&str] = &[
     "C:/Windows/Fonts/YuGothM.ttc",  // japonés (kana + kanji)
@@ -66,6 +77,7 @@ fn family(name: &str) -> FontFamily {
 
 pub fn install_system_fonts(ctx: &egui::Context) {
     let bold = family("bold");
+    let semibold = family("semibold");
     let mut primary_ok = false;
     for (reg, bld) in PRIMARY {
         let (Some(r), Some(b)) = (map(reg), map(bld)) else {
@@ -79,21 +91,39 @@ pub fn install_system_fonts(ctx: &egui::Context) {
                     family: FontFamily::Proportional,
                     priority: FontPriority::Highest,
                 },
-                // La familia negrita también necesita la regular como respaldo.
+                // Las familias negrita y seminegrita también necesitan la regular como respaldo.
                 InsertFontFamily {
                     family: bold.clone(),
                     priority: FontPriority::Lowest,
                 },
+                InsertFontFamily {
+                    family: semibold.clone(),
+                    priority: FontPriority::Lowest,
+                },
             ],
         ));
-        ctx.add_font(FontInsert::new(
-            "nanofy-bold",
-            FontData::from_static(b),
-            vec![InsertFontFamily {
-                family: bold.clone(),
+        let semi = SEMIBOLD.iter().find_map(|p| map(p));
+        let mut bold_families = vec![InsertFontFamily {
+            family: bold.clone(),
+            priority: FontPriority::Highest,
+        }];
+        if semi.is_none() {
+            bold_families.push(InsertFontFamily {
+                family: semibold.clone(),
                 priority: FontPriority::Highest,
-            }],
-        ));
+            });
+        }
+        ctx.add_font(FontInsert::new("nanofy-bold", FontData::from_static(b), bold_families));
+        if let Some(sb) = semi {
+            ctx.add_font(FontInsert::new(
+                "nanofy-semibold",
+                FontData::from_static(sb),
+                vec![InsertFontFamily {
+                    family: semibold.clone(),
+                    priority: FontPriority::Highest,
+                }],
+            ));
+        }
         primary_ok = true;
         break;
     }
@@ -105,10 +135,16 @@ pub fn install_system_fonts(ctx: &egui::Context) {
                 ctx.add_font(FontInsert::new(
                     "nanofy-bold",
                     (**data).clone(),
-                    vec![InsertFontFamily {
-                        family: bold.clone(),
-                        priority: FontPriority::Highest,
-                    }],
+                    vec![
+                        InsertFontFamily {
+                            family: bold.clone(),
+                            priority: FontPriority::Highest,
+                        },
+                        InsertFontFamily {
+                            family: semibold.clone(),
+                            priority: FontPriority::Highest,
+                        },
+                    ],
                 ));
             }
         }
@@ -134,6 +170,10 @@ pub fn install_system_fonts(ctx: &egui::Context) {
                 },
                 InsertFontFamily {
                     family: bold.clone(),
+                    priority: FontPriority::Lowest,
+                },
+                InsertFontFamily {
+                    family: semibold.clone(),
                     priority: FontPriority::Lowest,
                 },
             ],

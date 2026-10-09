@@ -870,12 +870,22 @@ impl App {
                 self.settings.library_grid = self.library_grid;
                 ok()
             }
-            "library_sort_name" => {
-                self.library_sort_name = b(cmd, "on", !self.library_sort_name);
+            "library_oldest" => {
+                self.settings.library_oldest = b(cmd, "on", !self.settings.library_oldest);
+                ok()
+            }
+            "library_grouped" => {
+                self.settings.library_grouped = b(cmd, "on", !self.settings.library_grouped);
                 ok()
             }
             "library_filter" => {
                 self.library_filter = s(cmd, "q").unwrap_or("").to_string();
+                self.library_search_open = b(cmd, "open", !self.library_filter.is_empty());
+                ok()
+            }
+            // Abre una carpeta dentro de la biblioteca (sin `id`, vuelve a la raíz).
+            "library_folder" => {
+                self.library_folder = s(cmd, "id").map(str::to_string);
                 ok()
             }
             "home_filter" => match n(cmd, "n") {
@@ -1494,8 +1504,10 @@ impl App {
             "fullscreen": self.fullscreen,
             "sidebar_visible": self.settings.sidebar_visible,
             "library_grid": self.library_grid,
-            "library_sort_name": self.library_sort_name,
+            "library_oldest": self.settings.library_oldest,
+            "library_grouped": self.settings.library_grouped,
             "library_filter": self.library_filter,
+            "library_folder": self.library_folder,
             "home_filter": self.home_filter,
             "artist_tab": self.artist_tab,
             "artist_grid": self.artist_grid,

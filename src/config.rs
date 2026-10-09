@@ -201,10 +201,17 @@ pub struct Settings {
     /// se vuelve a abrir el navegador sin que lo pida: queda el aviso «Conecta tu biblioteca» del
     /// inicio. Los settings.json de antes no lo traen y lo leen como `false`.
     pub library_consent_asked: bool,
-    /// Playlists fijadas en la biblioteca (ids).
+    /// Fijadas en la biblioteca, la última primero: ids de playlist y, para lo demás,
+    /// `album:<id>`, `artist:<id>` y `folder:<id>`.
     pub pinned: Vec<String>,
+    /// «Canciones que te gustan» se desfijó (de fábrica va fijada, como en Spotify).
+    pub liked_unpinned: bool,
     /// Biblioteca en cuadrícula (true) o lista.
     pub library_grid: bool,
+    /// Biblioteca de lo más antiguo a lo más reciente (el botón «Recientes»).
+    pub library_oldest: bool,
+    /// Biblioteca agrupada por tipo (playlists, carpetas, álbumes, artistas).
+    pub library_grouped: bool,
     /// Secciones del inicio fijadas arriba y ocultas (ids de sección).
     pub home_pinned: Vec<String>,
     pub home_hidden: Vec<String>,
@@ -254,7 +261,10 @@ impl Default for Settings {
             client_id: option_env!("NANOFY_CLIENT_ID").unwrap_or("").to_string(),
             library_consent_asked: false,
             pinned: Vec::new(),
+            liked_unpinned: false,
             library_grid: true,
+            library_oldest: false,
+            library_grouped: false,
             home_pinned: Vec::new(),
             home_hidden: Vec::new(),
             home_order: Vec::new(),

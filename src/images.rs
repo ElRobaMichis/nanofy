@@ -142,6 +142,9 @@ pub struct Images {
     colors: HashMap<String, egui::Color32>,
     /// Color medio por URL de portada (la «pila» de las tarjetas de álbum).
     means: HashMap<String, egui::Color32>,
+    /// Color medio de la franja de abajo de cada portada (el número de canciones de los mixes de
+    /// Spotify en la biblioteca se tiñe con él).
+    bottoms: HashMap<String, egui::Color32>,
 }
 
 impl Drop for Images {
@@ -231,6 +234,7 @@ impl Images {
             waiting_now: 0,
             colors: HashMap::new(),
             means: HashMap::new(),
+            bottoms: HashMap::new(),
         }
     }
 
@@ -318,6 +322,11 @@ impl Images {
         self.means.get(url).copied().map(stack_color)
     }
 
+    /// Color de la franja de abajo de la portada, si ya llegó (ver `bottom_color`).
+    pub fn bottom(&self, url: &str) -> Option<egui::Color32> {
+        self.bottoms.get(url).copied()
+    }
+
     pub fn tint(&self, url: &str) -> Option<egui::Color32> {
         let c = self.colors.get(url).copied()?;
         let (r, g, b) = (c.r() as f32, c.g() as f32, c.b() as f32);
@@ -341,6 +350,7 @@ impl Images {
                 let bytes = img.pixels.len() * 4;
                 if let Some(url) = key.split_once('|').map(|(_, u)| u.to_string()) {
                     self.means.entry(url.clone()).or_insert_with(|| mean_color(&img));
+                    self.bottoms.entry(url.clone()).or_insert_with(|| bottom_color(&img));
                     self.colors.entry(url).or_insert_with(|| dominant_color(&img));
                 }
                 Slot::Ready {
@@ -677,6 +687,23 @@ fn mean_color(img: &ColorImage) -> egui::Color32 {
         g += px.g() as u64;
         b += px.b() as u64;
         n += 1;
+    }
+    let n = n.max(1);
+    egui::Color32::from_rgb((r / n) as u8, (g / n) as u8, (b / n) as u8)
+}
+
+/// Color medio del 3 % de abajo de la imagen: la franja de color de los mixes de Spotify.
+fn bottom_color(img: &ColorImage) -> egui::Color32 {
+    let [w, h] = img.size;
+    let rows = (h * 3 / 100).max(1);
+    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+    for y in h.saturating_sub(rows)..h {
+        for px in &img.pixels[y * w..(y + 1) * w] {
+            r += px.r() as u64;
+            g += px.g() as u64;
+            b += px.b() as u64;
+            n += 1;
+        }
     }
     let n = n.max(1);
     egui::Color32::from_rgb((r / n) as u8, (g / n) as u8, (b / n) as u8)

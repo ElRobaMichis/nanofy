@@ -107,6 +107,11 @@ pub fn bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("bold".into()))
 }
 
+/// Seminegrita (Segoe UI Semibold): títulos de las tarjetas y textos de la barra de la biblioteca.
+pub fn semibold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("semibold".into()))
+}
+
 pub fn regular(size: f32) -> FontId {
     FontId::new(size, FontFamily::Proportional)
 }

@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;

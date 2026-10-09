@@ -6,7 +6,7 @@ use egui::{pos2, vec2, Align, Button, Color32, CornerRadius, Label, Layout, Rect
 
 use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
-use super::widgets::{child_in, galley_truncated, keyed_child, text_on_baseline, uri_to_link, CardInfo, CardKind, RowOpts, Source, CARD_H, CARD_W, HEADER_H, TABLE_HEAD_H, TABLE_ROW_H};
+use super::widgets::{child_in, galley_truncated, text_on_baseline, uri_to_link, CardInfo, CardKind, RowOpts, Source, HEADER_H, TABLE_HEAD_H, TABLE_ROW_H};
 use super::{fmt_thousands, strip_html, Action, App, Auth, FolderDialog, Page, PlayTarget, ERROR_RED, LIKED};
 use super::panels::{about_view, Tone};
 use crate::api::Req;
@@ -229,36 +229,6 @@ impl App {
             }
             if Self::menu_item(ui, Some(Icon::Share), "Copiar enlace", false).clicked() {
                 self.actions.push(Action::CopyText(format!("https://open.spotify.com/artist/{id}"), "Enlace"));
-                ui.close();
-            }
-        });
-    }
-
-    fn liked_card(&mut self, ui: &mut egui::Ui) {
-        let total = self.lists.get(LIKED).map(|l| l.total).unwrap_or(0);
-        let preview: Vec<String> = self
-            .lists
-            .get(LIKED)
-            .map(|l| l.tracks.iter().take(3).map(|t| t.name.clone()).collect())
-            .unwrap_or_default();
-        let sub = if preview.is_empty() { "Tus canciones guardadas".to_string() } else { preview.join(", ") };
-        let r = self.card(
-            ui,
-            CardInfo {
-                kind: CardKind::Liked,
-                cover: None,
-                title: "Canciones que te gustan",
-                subtitle: &sub,
-                count: (total > 0).then_some(total),
-                pinned: false,
-            },
-        );
-        if r.clicked() {
-            self.actions.push(Action::Go(Page::Liked));
-        }
-        r.context_menu(|ui| {
-            if Self::menu_item(ui, Some(Icon::NewTab), "Abrir en una nueva pestaña", false).clicked() {
-                self.actions.push(Action::OpenInTab(Page::Liked));
                 ui.close();
             }
         });
@@ -1221,187 +1191,13 @@ impl App {
 
     // -------------------------------------------------------------- biblioteca
 
+    /// «Tu biblioteca» sin sesión. Con sesión, la página entera es `library_panel` (library.rs),
+    /// que `mod.rs` llama fuera del desplazamiento general (lleva su barra fija).
     fn library_page(&mut self, ui: &mut egui::Ui) {
-        if !self.signed_in() {
-            self.welcome(ui);
-            return;
-        }
-        let p = theme::palette(ui.ctx());
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let grid = self.library_grid;
-            if icons::button(ui, Icon::List, 32.0, if !grid { p.text } else { p.weak }).on_hover_text("Lista").clicked() {
-                self.library_grid = false;
-                self.settings.library_grid = false;
-            }
-            if icons::button(ui, Icon::Grid, 32.0, if grid { p.text } else { p.weak }).on_hover_text("Cuadrícula").clicked() {
-                self.library_grid = true;
-                self.settings.library_grid = true;
-            }
-            ui.add_space(8.0);
-            if Self::pill(ui, "Recientes", !self.library_sort_name).clicked() {
-                self.library_sort_name = false;
-            }
-            if Self::pill(ui, "Nombre", self.library_sort_name).clicked() {
-                self.library_sort_name = true;
-            }
-            ui.add_space(8.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.library_filter)
-                    .hint_text("Filtrar tu biblioteca")
-                    .desired_width(220.0),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if icons::button(ui, Icon::Plus, 32.0, p.weak).on_hover_text("Nueva playlist (Ctrl+N)").clicked() {
-                    self.actions.push(Action::OpenEditor(None));
-                }
-            });
-        });
-        ui.add_space(10.0);
-        self.request_once("albums", Req::SavedAlbums);
-        self.request_once("artists", Req::FollowedArtists);
-
-        // Índices y no copias: filtrarlos y ordenarlos cuesta microsegundos y, al rehacerse en
-        // cada fotograma, nunca apuntan a otro elemento tras renombrar, fijar o recargar la
-        // biblioteca (una caché por longitudes sí se quedaría desfasada y abriría otra playlist).
-        let filter = self.library_filter.trim().to_lowercase();
-        let matches = |s: &str| filter.is_empty() || s.to_lowercase().contains(&filter);
-        let mut pls: Vec<usize> = (0..self.playlists.len()).filter(|&i| matches(&self.playlists[i].name)).collect();
-        let mut albums: Vec<usize> = (0..self.saved_albums.len())
-            .filter(|&i| matches(&self.saved_albums[i].name) || matches(&self.saved_albums[i].artists_str()))
-            .collect();
-        let mut artists: Vec<usize> = (0..self.followed_artists.len()).filter(|&i| matches(&self.followed_artists[i].name)).collect();
-        if self.library_sort_name {
-            pls.sort_by_cached_key(|&i| self.playlists[i].name.to_lowercase());
-            albums.sort_by_cached_key(|&i| self.saved_albums[i].name.to_lowercase());
-            artists.sort_by_cached_key(|&i| self.followed_artists[i].name.to_lowercase());
-        }
-        {
-            // Orden estable: las fijadas suben sin perder el orden elegido entre ellas.
-            let pinned: std::collections::HashSet<&str> = self.settings.pinned.iter().map(String::as_str).collect();
-            pls.sort_by_key(|&i| !pinned.contains(self.playlists[i].id.as_str()));
-        }
-        let liked = matches("canciones que te gustan");
-        // Primer arranque sin copia: el hueco de la biblioteca mientras llega el rootlist, en vez
-        // de una página vacía (con copia se ve ella al instante y se sustituye al llegar). Solo si
-        // tampoco hay álbumes ni artistas que enseñar: alguien sin playlists, sin red, vería el
-        // hueco para siempre en vez de su copia de lo demás.
-        if !self.playlists_loaded && self.playlists.is_empty() && self.saved_albums.is_empty() && self.followed_artists.is_empty() {
-            if self.library_grid {
-                Self::skeleton_cards(ui, 8);
-            } else {
-                Self::skeleton_rows(ui, 8, 56.0, 40.0, 0.0);
-            }
-            return;
-        }
-
-        if self.library_grid {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(4.0, 8.0);
-                if liked {
-                    self.liked_card(ui);
-                }
-                // Las tarjetas fuera de la vista solo reservan su hueco: así la cuadrícula fluye
-                // igual, pero solo se copian y dibujan (y piden portada) las que se ven.
-                for &i in &pls {
-                    if let Some(mut c) = Self::card_slot(ui, ("lib_pl", i, &self.playlists[i].id)) {
-                        let pl = self.playlists[i].clone();
-                        self.playlist_card(&mut c, &pl);
-                    }
-                }
-                for &i in &albums {
-                    if let Some(mut c) = Self::card_slot(ui, ("lib_al", i, &self.saved_albums[i].id)) {
-                        let a = self.saved_albums[i].clone();
-                        let sub = a.artists_str();
-                        self.album_card(&mut c, &a.id, a.cover(300), &a.name, &sub, a.total_tracks);
-                    }
-                }
-                for &i in &artists {
-                    if let Some(mut c) = Self::card_slot(ui, ("lib_ar", i, &self.followed_artists[i].id)) {
-                        let a = self.followed_artists[i].clone();
-                        self.artist_card(&mut c, &a);
-                    }
-                }
-            });
-        } else {
-            // Solo las filas visibles, como en track_rows: un bloque con la altura de todas y cada
-            // fila a la vista en su sitio. Todas miden 56 px (list_entry reserva exactamente eso) más
-            // el espaciado, así que la posición de cada una se calcula sin dibujar las demás.
-            let lead = liked as usize;
-            let n = lead + pls.len() + albums.len() + artists.len();
-            if n == 0 {
-                return;
-            }
-            let gap = ui.spacing().item_spacing.y;
-            let pitch = 56.0 + gap;
-            let w = ui.available_width();
-            let (block, _) = ui.allocate_exact_size(vec2(w, n as f32 * pitch - gap), Sense::hover());
-            let clip = ui.clip_rect();
-            let first = ((clip.top() - block.top()) / pitch).floor().max(0.0) as usize;
-            let last = (((clip.bottom() - block.top()) / pitch).ceil().max(0.0) as usize).min(n);
-            for row in first..last {
-                let rect = Rect::from_min_size(pos2(block.min.x, block.min.y + row as f32 * pitch), vec2(w, 56.0));
-                if row < lead {
-                    let liked_total = self.lists.get(LIKED).map(|l| l.total).unwrap_or(0);
-                    let mut c = keyed_child(ui, rect, "lib_liked");
-                    let r = self.list_entry(&mut c, None, CardKind::Liked, "Canciones que te gustan", &format!("{liked_total} canciones"));
-                    if r.clicked() {
-                        self.actions.push(Action::Go(Page::Liked));
-                    }
-                    continue;
-                }
-                // Copia solo de la fila visible: list_entry y el menú necesitan `&mut self`.
-                let k = row - lead;
-                if let Some(&i) = pls.get(k) {
-                    let pl = self.playlists[i].clone();
-                    // Sin nombre del propietario todavía (del rootlist, sin la Web API): solo «Playlist».
-                    let sub = match pl.owner_name() {
-                        "" => "Playlist".to_string(),
-                        owner => format!("Playlist · {owner}"),
-                    };
-                    let mut c = keyed_child(ui, rect, ("lib_pl", i, &pl.id));
-                    let r = self.list_entry(&mut c, pl.cover(64), CardKind::Playlist, &pl.name, &sub);
-                    if r.clicked() {
-                        self.actions.push(Action::OpenPlaylist(pl.clone()));
-                    }
-                    self.playlist_row_menu(&r, &pl);
-                    continue;
-                }
-                let k = k - pls.len();
-                if let Some(&i) = albums.get(k) {
-                    let a = self.saved_albums[i].clone();
-                    let sub = format!("Álbum · {}", a.artists_str());
-                    let mut c = keyed_child(ui, rect, ("lib_al", i, &a.id));
-                    let r = self.list_entry(&mut c, a.cover(64), CardKind::Album, &a.name, &sub);
-                    if r.clicked() {
-                        self.actions.push(Action::Go(Page::Album(a.id.clone())));
-                    }
-                    continue;
-                }
-                let k = k - albums.len();
-                if let Some(&i) = artists.get(k) {
-                    let a = self.followed_artists[i].clone();
-                    let mut c = keyed_child(ui, rect, ("lib_ar", i, &a.id));
-                    let r = self.list_entry(&mut c, a.cover(64), CardKind::Artist, &a.name, "Artista");
-                    if r.clicked() {
-                        self.actions.push(Action::Go(Page::Artist(a.id.clone())));
-                    }
-                }
-            }
-        }
+        self.welcome(ui);
     }
 
-    /// Hueco de una tarjeta en la cuadrícula de la biblioteca. Siempre lo reserva (para que el
-    /// flujo de filas no cambie), pero solo devuelve dónde dibujarla si está a la vista.
-    fn card_slot(ui: &mut egui::Ui, key: impl egui::AsIdSalt) -> Option<egui::Ui> {
-        let (_, rect) = ui.allocate_space(vec2(CARD_W, CARD_H));
-        if !ui.is_rect_visible(rect) {
-            return None;
-        }
-        Some(keyed_child(ui, rect, key))
-    }
-
-    fn playlist_row_menu(&mut self, r: &egui::Response, pl: &Playlist) {
+    pub(super) fn playlist_row_menu(&mut self, r: &egui::Response, pl: &Playlist) {
         let pinned = self.settings.pinned.contains(&pl.id);
         let mine = self.is_mine(pl);
         r.context_menu(|ui| {
@@ -1425,7 +1221,7 @@ impl App {
     }
 
     /// Fila de biblioteca en vista de lista: miniatura con forma según el tipo + textos.
-    fn list_entry(&mut self, ui: &mut egui::Ui, cover: Option<&str>, kind: CardKind, title: &str, subtitle: &str) -> egui::Response {
+    pub(super) fn list_entry(&mut self, ui: &mut egui::Ui, cover: Option<&str>, kind: CardKind, title: &str, subtitle: &str) -> egui::Response {
         let p = theme::palette(ui.ctx());
         let w = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(vec2(w, 56.0), Sense::click());

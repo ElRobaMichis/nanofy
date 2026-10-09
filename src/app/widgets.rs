@@ -1497,7 +1497,9 @@ impl App {
                     let n_fit = (1..=3).take_while(|&k| fits(k as f32)).count();
                     let mut k = 1.0;
                     if n_fit >= 1 {
-                        if Self::slot_button(ui, id.with("add"), at(k), Icon::PlusCircle, 24.0, ink.dim).on_hover_text("Añadir a playlist").clicked() {
+                        // El mismo icono y tamaño que en el reproductor (al lado del corazón); el
+                        // círculo con «+» es el de guardar en la biblioteca.
+                        if Self::slot_button(ui, id.with("add"), at(k), Icon::PlusSquare, TABLE_HEART, ink.dim).on_hover_text("Añadir a playlist").clicked() {
                             self.open_add_dialog(vec![uri.clone()]);
                         }
                         k += 1.0;

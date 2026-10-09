@@ -176,6 +176,10 @@ enum Item {
     Folder(usize),
     Album(usize),
     Artist(usize),
+    /// Podcast que sigues (`followed_shows_list`).
+    Show(usize),
+    /// Audiolibro guardado (`audiobooks`).
+    Audiobook(usize),
 }
 
 impl Item {
@@ -185,11 +189,57 @@ impl Item {
             Item::Folder(_) => 1,
             Item::Album(_) => 2,
             Item::Artist(_) => 3,
+            Item::Show(_) => 4,
+            Item::Audiobook(_) => 5,
+        }
+    }
+
+    /// ¿Entra en el filtro `kind` del menú «Agrupar» (índice en `KINDS`)?
+    fn is_kind(self, kind: u8) -> bool {
+        match kind {
+            1 => self == Item::Liked,
+            2 => matches!(self, Item::Liked | Item::Playlist(_)),
+            3 => matches!(self, Item::Album(_)),
+            4 => matches!(self, Item::Artist(_)),
+            5 => matches!(self, Item::Folder(_)),
+            6 => matches!(self, Item::Show(_)),
+            7 => matches!(self, Item::Audiobook(_)),
+            _ => true,
         }
     }
 }
 
-const GROUPS: [&str; 4] = ["Playlists", "Carpetas", "Álbumes", "Artistas"];
+const GROUPS: [&str; 6] = ["Playlists", "Carpetas", "Álbumes", "Artistas", "Podcasts", "Audiolibros"];
+
+/// Filtros del menú «Agrupar», en su orden (`settings.library_kind`).
+const KINDS: [&str; 8] = ["Todo", "Canciones", "Playlists", "Álbumes", "Artistas", "Carpetas", "Podcasts", "Audiolibros"];
+
+// --- Menú «Agrupar» (referencias 15.png y 16.png: la ventana de 12.webp reducida a 0,853) ----
+
+/// Panel de 191,1 × 475,9 px con su esquina a 11,3 px a la izquierda del icono de agrupar y a
+/// 64,7 px del borde de arriba del panel de la página; radio 7.
+const GM_W: f32 = 191.1;
+const GM_H: f32 = 475.9;
+const GM_LEFT: f32 = -11.3;
+const GM_TOP: f32 = 64.7;
+/// Filtros: tinta desde 23,6; líneas base desde 35,2 cada 50; Segoe UI Semilight 17.
+const GM_TEXT_X: f32 = 23.6;
+const GM_FIRST_BASE: f32 = 35.2;
+const GM_ROW: f32 = 50.0;
+const GM_FONT: f32 = 17.0;
+/// Línea oscura de 24,6 a 166,6 en y 417,4; «Agrupar» (15,2) con su línea base en 451,3.
+const GM_LINE_Y: f32 = 417.4;
+const GM_LINE_X0: f32 = 24.6;
+const GM_LINE_X1: f32 = 166.6;
+const GM_GROUP_BASE: f32 = 451.3;
+const GM_GROUP_FONT: f32 = 15.2;
+/// Interruptor: píldora de (117,2, 432,6) a (167,6, 458,4) y bola de radio 9,6 con su centro en
+/// y 445, en x 129,5 apagado y 154,3 encendido.
+const GM_TRACK: [f32; 4] = [117.2, 432.6, 167.6, 458.4];
+const GM_KNOB_R: f32 = 9.6;
+const GM_KNOB_Y: f32 = 445.0;
+const GM_KNOB_OFF: f32 = 129.5;
+const GM_KNOB_ON: f32 = 154.3;
 
 /// Clave de una uri de Spotify en la biblioteca (la de `pinned` y del registro de lo reciente):
 /// el id de una playlist, `album:<id>`, `artist:<id>` o `liked`.
@@ -199,6 +249,8 @@ pub fn library_key(uri: &str) -> Option<String> {
         ["spotify", "playlist", id] => Some(id.to_string()),
         ["spotify", "album", id] => Some(format!("album:{id}")),
         ["spotify", "artist", id] => Some(format!("artist:{id}")),
+        ["spotify", "show", id] => Some(format!("show:{id}")),
+        ["spotify", "audiobook", id] => Some(format!("audiobook:{id}")),
         ["spotify", "collection", ..] => Some("liked".into()),
         ["spotify", "user", _, "collection", ..] => Some("liked".into()),
         _ => None,
@@ -294,6 +346,8 @@ impl App {
             Item::Folder(i) => format!("folder:{}", self.folders[i].id),
             Item::Album(i) => format!("album:{}", self.saved_albums[i].id),
             Item::Artist(i) => format!("artist:{}", self.followed_artists[i].id),
+            Item::Show(i) => format!("show:{}", self.followed_shows_list[i].id),
+            Item::Audiobook(i) => format!("audiobook:{}", self.audiobooks[i].id),
         }
     }
 
@@ -403,6 +457,21 @@ impl App {
                     items.push((Item::Artist(i), recent(&format!("artist:{}", a.id)), 200_000 + i));
                 }
             }
+            for (i, sh) in self.followed_shows_list.iter().enumerate() {
+                if matches(&sh.name) || matches(&sh.publisher) {
+                    items.push((Item::Show(i), recent(&format!("show:{}", sh.id)), 300_000 + i));
+                }
+            }
+            for (i, b) in self.audiobooks.iter().enumerate() {
+                if matches(&b.name) || matches(&b.authors_str()) {
+                    items.push((Item::Audiobook(i), recent(&format!("audiobook:{}", b.id)), 400_000 + i));
+                }
+            }
+            // El filtro del menú «Agrupar» (sin agrupar; agrupando se ve todo, por tipo).
+            let kind = self.settings.library_kind;
+            if !self.settings.library_grouped && kind != 0 {
+                items.retain(|(it, ..)| it.is_kind(kind));
+            }
         }
         // Fijadas: «Canciones que te gustan» y luego por orden de fijado (la última primero).
         let pin_order: HashMap<&str, usize> = self.settings.pinned.iter().enumerate().map(|(i, k)| (k.as_str(), i)).collect();
@@ -505,6 +574,23 @@ impl App {
                 let a = &self.followed_artists[i];
                 CardData { item, key, title: a.name.clone(), subtitle: String::new(), count: None, count_color: COUNT, cover: a.cover(300).map(str::to_string), pinned }
             }
+            Item::Show(i) => {
+                let sh = &self.followed_shows_list[i];
+                CardData {
+                    item,
+                    key,
+                    title: sh.name.clone(),
+                    subtitle: sh.publisher.clone(),
+                    count: sh.total_episodes,
+                    count_color: COUNT,
+                    cover: sh.cover(300).map(str::to_string),
+                    pinned,
+                }
+            }
+            Item::Audiobook(i) => {
+                let b = &self.audiobooks[i];
+                CardData { item, key, title: b.name.clone(), subtitle: b.authors_str(), count: None, count_color: COUNT, cover: b.cover(300).map(str::to_string), pinned }
+            }
         }
     }
 
@@ -514,6 +600,8 @@ impl App {
         self.request_once("artists", Req::FollowedArtists);
         self.request_once("rootlist", Req::Rootlist);
         self.request_once("recent_contexts", Req::RecentContexts);
+        self.request_once("saved_shows", Req::SavedShows);
+        self.request_once("saved_audiobooks", Req::SavedAudiobooks);
         let origin = pos2(panel.min.x.round(), panel.min.y.round());
         self.library_toolbar(ui, origin, panel);
 
@@ -581,32 +669,30 @@ impl App {
         // Agrupar: su icono a 46 px del texto de orden y su texto 15 más allá.
         let group_x = SORT_TEXT_X + text_w + GAP_SORT_GROUP;
         let dx = group_x - (lm::GROUP.ox as f32 + 2.0);
-        let ga = painter.layout_no_wrap("Agrupar".into(), theme::semibold(BAR_FONT), st.icon);
+        // Con un filtro elegido (y sin agrupar), el botón lleva su nombre.
+        let kind = self.settings.library_kind as usize;
+        let glabel = if !self.settings.library_grouped && kind != 0 { KINDS[kind.min(KINDS.len() - 1)] } else { "Agrupar" };
+        let ga = painter.layout_no_wrap(glabel.into(), theme::semibold(BAR_FONT), st.icon);
         let ga_ink = ink_left(&ga);
         let ga_w = ga.size().x - ga_ink - ink_right(&ga);
         let gtext_x = group_x + 20.0 + GAP_GROUP_TEXT;
         let group_hit = Rect::from_min_max(at(group_x - 8.0, 9.0), at(gtext_x + ga_w + 8.0, 50.0));
         let group_r = ui.interact(group_hit, ui.id().with("lib_group"), Sense::click());
         hand(ui, &group_r);
-        let grouped = self.settings.library_grouped;
+        // En blanco con el menú abierto, agrupando o con un filtro (como en la referencia).
+        let active = self.library_group_open || self.settings.library_grouped || kind != 0;
         let hov = group_r.hovered();
-        let c = if grouped { st.icon_on } else if hov { st.hover } else { st.icon };
+        let c = if active { st.icon_on } else if hov { st.hover } else { st.icon };
         paint_mask(&painter, "group", &lm::GROUP, px(&painter, at(dx, 0.0)), c);
-        let tc = if grouped { st.icon_on } else if hov { st.hover } else { st.bar_text };
+        let tc = if active { st.icon_on } else if hov { st.hover } else { st.bar_text };
         text_on_baseline(&painter, at(gtext_x - ga_ink, BAR_BASE), ga, tc);
-        egui::Popup::menu(&group_r).show(|ui| {
-            ui.set_min_width(200.0);
-            if Self::menu_item(ui, if grouped { None } else { Some(Icon::Check) }, "Sin agrupar", false).clicked() {
-                self.settings.library_grouped = false;
-                self.settings.save(&self.paths);
-                ui.close();
-            }
-            if Self::menu_item(ui, if grouped { Some(Icon::Check) } else { None }, "Por tipo", false).clicked() {
-                self.settings.library_grouped = true;
-                self.settings.save(&self.paths);
-                ui.close();
-            }
-        });
+        if group_r.clicked() {
+            self.library_group_open = !self.library_group_open;
+        }
+        if self.library_group_open {
+            let ctx = ui.ctx().clone();
+            self.library_group_menu(&ctx, at(group_x + GM_LEFT, GM_TOP), group_r.rect);
+        }
 
         // Lupa: abre un campo para filtrar la biblioteca.
         let search_x = gtext_x + ga_w + GAP_GROUP_SEARCH;
@@ -801,7 +887,7 @@ impl App {
                 painter.rect_filled(Rect::from_min_max(pos2(x + 9.0, t + 4.4), pos2(x + CARD - 9.0, t + 10.5)), top_rounded(3), front);
                 (t + COVER_TOP_PLAYLIST, t + TITLE_BASE_PLAYLIST)
             }
-            Item::Album(_) => {
+            Item::Album(_) | Item::Show(_) | Item::Audiobook(_) => {
                 painter.rect_filled(Rect::from_min_max(pos2(x + 8.0, t), pos2(x + CARD - 8.0, t + 7.6)), top_rounded(4), stack(self));
                 (t + COVER_TOP_ALBUM, t + TITLE_BASE_ALBUM)
             }
@@ -892,6 +978,13 @@ impl App {
             }
             Item::Album(i) => self.actions.push(Action::Go(Page::Album(self.saved_albums[i].id.clone()))),
             Item::Artist(i) => self.actions.push(Action::Go(Page::Artist(self.followed_artists[i].id.clone()))),
+            Item::Show(i) => {
+                let sh = self.followed_shows_list[i].clone();
+                let id = sh.id.clone();
+                self.shows.entry(id.clone()).or_insert_with(|| (sh, Vec::new()));
+                self.actions.push(Action::Go(Page::Show(id)));
+            }
+            Item::Audiobook(i) => self.actions.push(Action::Go(Page::Show(self.audiobooks[i].id.clone()))),
         }
     }
 
@@ -931,6 +1024,17 @@ impl App {
                     let id = self.followed_artists[i].id.clone();
                     if Self::menu_item(ui, Some(Icon::NewTab), "Abrir en una nueva pestaña", false).clicked() {
                         self.actions.push(Action::OpenInTab(Page::Artist(id)));
+                        ui.close();
+                    }
+                }
+                Item::Show(_) | Item::Audiobook(_) => {
+                    let id = match item {
+                        Item::Show(i) => self.followed_shows_list[i].id.clone(),
+                        Item::Audiobook(i) => self.audiobooks[i].id.clone(),
+                        _ => String::new(),
+                    };
+                    if Self::menu_item(ui, Some(Icon::NewTab), "Abrir en una nueva pestaña", false).clicked() {
+                        self.actions.push(Action::OpenInTab(Page::Show(id)));
                         ui.close();
                     }
                 }
@@ -974,7 +1078,7 @@ impl App {
             let d = self.card_data(item);
             let kind = match item {
                 Item::Liked => CardKind::Liked,
-                Item::Album(_) => CardKind::Album,
+                Item::Album(_) | Item::Show(_) | Item::Audiobook(_) => CardKind::Album,
                 Item::Artist(_) => CardKind::Artist,
                 _ => CardKind::Playlist,
             };
@@ -982,6 +1086,8 @@ impl App {
                 Item::Liked | Item::Playlist(_) => "Playlist",
                 Item::Folder(_) => "Carpeta",
                 Item::Album(_) => "Álbum",
+                Item::Show(_) => "Podcast",
+                Item::Audiobook(_) => "Audiolibro",
                 Item::Artist(_) => "Artista",
             };
             let sub = if d.subtitle.is_empty() || matches!(item, Item::Liked) { what.to_string() } else { format!("{what} · {}", d.subtitle) };
@@ -994,6 +1100,90 @@ impl App {
                 self.open_library_item(item);
             }
             self.library_item_menu(&r, item, &d.key, d.pinned);
+        }
+    }
+}
+
+impl App {
+    /// Menú de «Agrupar», copiado de 15.png (interruptor apagado) y 16.png (encendido): los
+    /// filtros por tipo, una línea y el interruptor «Agrupar». Agrupando, los filtros se apagan
+    /// (se ve todo, por tipo) salvo «Todo». Cristal como «Añadir a una playlist».
+    fn library_group_menu(&mut self, ctx: &egui::Context, min: egui::Pos2, button: Rect) {
+        let p = theme::palette(ctx);
+        let dark = p.dark;
+        let rect = Rect::from_min_size(pos2(min.x.round(), min.y.round()), vec2(GM_W, GM_H));
+        let at = |x: f32, y: f32| pos2(rect.min.x + x, rect.min.y + y);
+        let text_on = if dark { Color32::from_gray(224) } else { p.text };
+        let text_off = if dark { Color32::from_gray(89) } else { p.faint };
+        let grouped = self.settings.library_grouped;
+        let mut pick: Option<u8> = None;
+        let mut toggle = false;
+        egui::Area::new(egui::Id::new("library_group_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                ui.allocate_rect(rect, Sense::click());
+                let painter = ui.painter().clone();
+                if dark {
+                    painter.add(egui::Shape::Callback(egui::epaint::PaintCallback {
+                        rect,
+                        callback: std::sync::Arc::new(crate::raster::BackdropBlur { sigma: 56.0, corner: 7.0 }),
+                    }));
+                }
+                let glass = if dark { Color32::from_rgba_unmultiplied(34, 34, 34, 191) } else { Color32::from_rgba_unmultiplied(250, 250, 250, 232) };
+                painter.rect_filled(rect, CornerRadius::same(7), glass);
+                for (k, name) in KINDS.iter().enumerate() {
+                    let base = rect.min.y + GM_FIRST_BASE + GM_ROW * k as f32;
+                    let on = !grouped || k == 0;
+                    let row = Rect::from_min_max(pos2(rect.min.x + 8.0, base - 6.0 - GM_ROW / 2.0 + 1.0), pos2(rect.max.x - 8.0, base - 6.0 + GM_ROW / 2.0 - 1.0));
+                    let r = ui.interact(row, egui::Id::new(("library_group_kind", k)), if on { Sense::click() } else { Sense::hover() });
+                    if on && r.hovered() {
+                        painter.rect_filled(row, CornerRadius::same(4), if dark { Color32::from_white_alpha(10) } else { p.hover });
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let color = if on { text_on } else { text_off };
+                    let g = painter.layout_no_wrap(name.to_string(), theme::semilight(GM_FONT), color);
+                    let lead = ink_left(&g);
+                    text_on_baseline(&painter, pos2(rect.min.x + GM_TEXT_X - lead, base), g, color);
+                    if on && r.clicked() {
+                        pick = Some(k as u8);
+                    }
+                }
+                let line = if dark { Color32::from_black_alpha(140) } else { p.border };
+                painter.line_segment([at(GM_LINE_X0, GM_LINE_Y), at(GM_LINE_X1, GM_LINE_Y)], egui::Stroke::new(1.0, line));
+                // «Agrupar» y su interruptor (toda la fila lo cambia).
+                let row = Rect::from_min_max(at(8.0, GM_LINE_Y + 6.0), at(GM_W - 8.0, GM_H - 6.0));
+                let r = ui.interact(row, egui::Id::new("library_group_switch"), Sense::click());
+                if r.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let g = painter.layout_no_wrap("Agrupar".into(), theme::semilight(GM_GROUP_FONT), text_on);
+                let lead = ink_left(&g);
+                text_on_baseline(&painter, pos2(rect.min.x + GM_TEXT_X - lead, rect.min.y + GM_GROUP_BASE), g, text_on);
+                let track = Rect::from_min_max(at(GM_TRACK[0], GM_TRACK[1]), at(GM_TRACK[2], GM_TRACK[3]));
+                painter.rect_filled(track, CornerRadius::same(13), if dark { Color32::from_gray(17) } else { p.card2 });
+                let t = ui.ctx().animate_bool_with_time(egui::Id::new("library_group_knob"), grouped, 0.12);
+                let kx = GM_KNOB_OFF + (GM_KNOB_ON - GM_KNOB_OFF) * t;
+                let knob = if grouped { theme::GREEN } else if dark { Color32::from_gray(53) } else { p.faint };
+                painter.circle_filled(at(kx, GM_KNOB_Y), GM_KNOB_R, knob);
+                if r.clicked() {
+                    toggle = true;
+                }
+            });
+        if let Some(k) = pick {
+            self.settings.library_kind = k;
+            self.settings.save(&self.paths);
+            self.library_group_open = false;
+        }
+        if toggle {
+            self.settings.library_grouped = !grouped;
+            self.settings.save(&self.paths);
+        }
+        let outside = ctx.input(|i| {
+            i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p) && !button.contains(p))
+        });
+        if outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.library_group_open = false;
         }
     }
 }

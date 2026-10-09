@@ -890,6 +890,15 @@ impl App {
                 self.settings.library_grouped = b(cmd, "on", !self.settings.library_grouped);
                 ok()
             }
+            // Filtro por tipo de la biblioteca (0 todo … 7 audiolibros) y su menú.
+            "library_kind" => {
+                self.settings.library_kind = n(cmd, "n").unwrap_or(0).min(7) as u8;
+                ok()
+            }
+            "library_group_menu" => {
+                self.library_group_open = b(cmd, "on", !self.library_group_open);
+                ok()
+            }
             "library_filter" => {
                 self.library_filter = s(cmd, "q").unwrap_or("").to_string();
                 self.library_search_open = b(cmd, "open", !self.library_filter.is_empty());
@@ -1518,6 +1527,7 @@ impl App {
             "library_grid": self.library_grid,
             "library_oldest": self.settings.library_oldest,
             "library_grouped": self.settings.library_grouped,
+            "library_kind": self.settings.library_kind,
             "library_filter": self.library_filter,
             "library_folder": self.library_folder,
             "home_filter": self.home_filter,

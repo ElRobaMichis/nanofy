@@ -1031,6 +1031,8 @@ pub struct App {
     pub library_filter: String,
     /// La lupa de la biblioteca abierta (con su campo para filtrar).
     pub library_search_open: bool,
+    /// El menú de «Agrupar» de la biblioteca, abierto.
+    pub library_group_open: bool,
     /// El panel de los tres puntos del reproductor, abierto, y la fila cuyo submenú se ve.
     pub player_more_open: bool,
     pub player_more_sub: Option<usize>,
@@ -1394,6 +1396,7 @@ impl App {
             library_grid: settings_library_grid,
             library_filter: String::new(),
             library_search_open: false,
+            library_group_open: false,
             player_more_open: false,
             player_more_sub: None,
             add_from_bar: false,
@@ -8052,6 +8055,7 @@ impl App {
         self.draft.library_grid = self.settings.library_grid;
         self.draft.library_oldest = self.settings.library_oldest;
         self.draft.library_grouped = self.settings.library_grouped;
+        self.draft.library_kind = self.settings.library_kind;
         self.settings = self.draft.clone();
         self.settings.save(&self.paths);
         self.apply_theme(ctx);

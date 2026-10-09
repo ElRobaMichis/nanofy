@@ -210,8 +210,11 @@ pub struct Settings {
     pub library_grid: bool,
     /// Biblioteca de lo más antiguo a lo más reciente (el botón «Recientes»).
     pub library_oldest: bool,
-    /// Biblioteca agrupada por tipo (playlists, carpetas, álbumes, artistas).
+    /// Biblioteca agrupada por tipo (playlists, carpetas, álbumes, artistas…).
     pub library_grouped: bool,
+    /// Filtro de la biblioteca sin agrupar: 0 todo, 1 canciones, 2 playlists, 3 álbumes,
+    /// 4 artistas, 5 carpetas, 6 podcasts, 7 audiolibros.
+    pub library_kind: u8,
     /// Secciones del inicio fijadas arriba y ocultas (ids de sección).
     pub home_pinned: Vec<String>,
     pub home_hidden: Vec<String>,
@@ -265,6 +268,7 @@ impl Default for Settings {
             library_grid: true,
             library_oldest: false,
             library_grouped: false,
+            library_kind: 0,
             home_pinned: Vec::new(),
             home_hidden: Vec::new(),
             home_order: Vec::new(),

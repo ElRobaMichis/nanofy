@@ -696,7 +696,7 @@ impl App {
             sections.push((None, items));
         }
         let folder_head = self.library_folder.is_some();
-        let top = ui.min_rect().min.y;
+        let empty = sections.iter().all(|(_, v)| v.is_empty());
         // Alto de todo para reservarlo de una vez.
         let mut h = FIRST_ROW - SCROLL_TOP + if folder_head { GROUP_HEAD_H } else { 0.0 };
         for (head, v) in &sections {
@@ -705,22 +705,29 @@ impl App {
             }
             h += v.len().div_ceil(cols) as f32 * PITCH_Y;
         }
-        if sections.iter().all(|(_, v)| v.is_empty()) {
-            let g = ui.painter().layout_no_wrap(
-                if self.library_filter.trim().is_empty() { "Aquí aparecerá lo que guardes".into() } else { "Nada coincide con tu búsqueda".into() },
-                theme::regular(14.0),
-                st.sub,
-            );
-            text_on_baseline(ui.painter(), pos2(o.x + GRID_LEFT, top + 40.0), g, st.sub);
-            ui.allocate_space(vec2(panel.width(), 80.0));
-            return;
+        if empty {
+            h += 60.0;
         }
         let (block, _) = ui.allocate_exact_size(vec2(panel.width() - 2.0, h + 24.0), Sense::hover());
         let clip = ui.clip_rect();
         let mut y = block.min.y + FIRST_ROW - SCROLL_TOP;
+        // La cabecera de la carpeta va siempre, también vacía: es la forma de salir de ella.
         if folder_head {
-            self.folder_header(ui, pos2(o.x + GRID_LEFT, y - FIRST_ROW + SCROLL_TOP + 8.0));
+            self.folder_header(ui, pos2(o.x + GRID_LEFT, block.min.y + 8.0));
             y += GROUP_HEAD_H;
+        }
+        if empty {
+            let text = if !self.library_filter.trim().is_empty() {
+                "Nada coincide con tu búsqueda"
+            } else if folder_head {
+                "Esta carpeta está vacía. Añade playlists desde su menú («Añadir a carpeta»)."
+            } else {
+                "Aquí aparecerá lo que guardes"
+            };
+            let g = ui.painter().layout_no_wrap(text.into(), theme::regular(14.0), st.sub);
+            let at = if folder_head { y - FIRST_ROW + SCROLL_TOP + 20.0 } else { y + 20.0 };
+            text_on_baseline(ui.painter(), pos2(o.x + GRID_LEFT, at), g, st.sub);
+            return;
         }
         for (head, v) in sections {
             if let Some(name) = head {
@@ -943,6 +950,17 @@ impl App {
         }
         let n = items.len();
         if n == 0 {
+            let text = if !self.library_filter.trim().is_empty() {
+                "Nada coincide con tu búsqueda"
+            } else if self.library_folder.is_some() {
+                "Esta carpeta está vacía. Añade playlists desde su menú («Añadir a carpeta»)."
+            } else {
+                "Aquí aparecerá lo que guardes"
+            };
+            let g = ui.painter().layout_no_wrap(text.into(), theme::regular(14.0), style(ui.ctx()).sub);
+            let at = pos2(ui.min_rect().min.x + GRID_LEFT, ui.cursor().min.y + 20.0);
+            text_on_baseline(ui.painter(), at, g, style(ui.ctx()).sub);
+            ui.add_space(40.0);
             return;
         }
         let pitch = 56.0;

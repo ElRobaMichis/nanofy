@@ -39,6 +39,8 @@ impl App {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             if resp.clicked() {
+                // Siempre a la raíz de la biblioteca, también desde dentro de una carpeta.
+                self.library_folder = None;
                 self.go_main(Page::Library);
             }
         }

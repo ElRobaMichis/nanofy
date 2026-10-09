@@ -2058,6 +2058,11 @@ impl App {
     }
 
     pub fn back(&mut self) {
+        // Dentro de una carpeta de la biblioteca, «atrás» sale de ella.
+        if self.library_folder.is_some() && *self.page() == Page::Library {
+            self.library_folder = None;
+            return;
+        }
         if let ActiveTab::Tab(i) = self.active {
             if let Some(t) = self.tabs.get_mut(i) {
                 if t.idx > 0 {

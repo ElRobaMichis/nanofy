@@ -119,6 +119,8 @@ const MIN_COVER: f32 = 160.0;
 /// vista (bajo la barra fija). Tras mover la rueda, la página deja de seguirla estos segundos.
 const FOLLOW_AT: f32 = 0.35;
 const FOLLOW_PAUSE: f64 = 3.0;
+/// Hueco que deja el área de desplazamiento debajo de cada página (app/mod.rs).
+const PAGE_TAIL: f32 = 24.0;
 
 /// Colores de la referencia (la página va siempre sobre su fondo oscuro, también en el tema
 /// claro).
@@ -648,10 +650,18 @@ impl App {
             ("song-lyr-size", &sm::LYR_SIZE, "Tamaño del texto (pronto)"),
         ];
         let on = self.settings.lyrics_sync;
+        let current = self.player.now.as_ref().and_then(|n| n.id.as_deref()) == Some(page.id.as_str());
+        // Siguiendo de verdad: encendida, bajada hasta la letra y sin haber movido la rueda.
+        let now = ui.input(|i| i.time);
+        let following = on && self.track_pinned && now >= self.track_scroll.paused_until;
         for (k, (name, mask, tip)) in icons.into_iter().enumerate() {
             let c = pos2(o.x + LYR_ICON_X, rule_y + LYR_ICON_DY + k as f32 * LYR_ICON_PITCH);
             let tip = if k == 0 {
-                if on { "La letra sigue a la canción (pulsa para moverte libremente)" } else { "Seguir la canción" }
+                match (on, following || !current) {
+                    (true, true) => "La letra sigue a la canción (pulsa para moverte libremente)",
+                    (true, false) => "Ir a lo que suena",
+                    (false, _) => "Seguir la canción",
+                }
             } else {
                 tip
             };
@@ -665,14 +675,18 @@ impl App {
             };
             paint_mask(painter, name, mask, px(painter, c), color);
             if k == 0 && r.clicked() {
-                self.settings.lyrics_sync = !on;
-                self.draft.lyrics_sync = !on;
-                if !self.ephemeral {
-                    self.settings.save(&self.paths);
+                // Encendida pero sin seguir (arriba, en la ficha, o tras mover la rueda): el
+                // clic baja hasta lo que suena en vez de apagarla. Si ya la sigue, la apaga.
+                let turn = !on || following || !current;
+                if turn {
+                    self.settings.lyrics_sync = !on;
+                    self.draft.lyrics_sync = !on;
+                    if !self.ephemeral {
+                        self.settings.save(&self.paths);
+                    }
                 }
-                // Al encenderla, la página baja hasta lo que suena.
                 self.track_scroll.paused_until = 0.0;
-                self.track_follow_now = !on && self.player.now.as_ref().and_then(|n| n.id.as_deref()) == Some(page.id.as_str());
+                self.track_follow_now = current && (!on || !turn);
             }
         }
     }
@@ -758,9 +772,7 @@ impl App {
         let off = view.min.y - o.y;
         let engaged = follow && (pinned || self.track_follow_now) && now >= self.track_scroll.paused_until;
         if engaged {
-            let pin_at = rule_nat - BAR_H;
-            let anchor = BAR_H + (FOLLOW_AT * (view.height() - BAR_H)).max(LINE_FIRST);
-            let target = cur_line.map(|i| rule_nat + rows[i].0 - anchor).unwrap_or(pin_at).max(pin_at + 1.0);
+            let target = follow_target(cur_line.map(|i| rows[i].0), rule_nat, end, view.height());
             match self.track_scroll.anim {
                 Some((_, to, _)) if (to - target).abs() < 0.5 => {}
                 _ if (off - target).abs() < 0.5 => {
@@ -913,6 +925,19 @@ impl App {
     }
 }
 
+/// Desplazamiento que deja el renglón que suena (`line`: su línea base desde la línea de las
+/// pestañas; `None` antes del primero) a `FOLLOW_AT` de la letra a la vista, con las pestañas
+/// fijas arriba. `rule`: la línea de las pestañas y `end`: dónde acaba la página, desde arriba;
+/// `view_h`: el alto a la vista. Nunca pasa del final de la página (lo que mide más los 24 que
+/// deja debajo el área de desplazamiento): pedir más hacía que egui lo devolviera al tope en
+/// cada fotograma y, con los últimos renglones, la página bajaba y subía sin parar.
+fn follow_target(line: Option<f32>, rule: f32, end: f32, view_h: f32) -> f32 {
+    let pin_at = rule - BAR_H;
+    let anchor = BAR_H + (FOLLOW_AT * (view_h - BAR_H)).max(LINE_FIRST);
+    let max_off = (end.max(view_h) + PAGE_TAIL - view_h).max(0.0);
+    line.map(|l| rule + l - anchor).unwrap_or(pin_at).max(pin_at + 1.0).min(max_off)
+}
+
 /// Las pestañas que enseñan la página de `old` pasan a la de `new`, en el mismo paso del
 /// historial. Devuelve si alguna lo hacía.
 fn follow_in_tabs(tabs: &mut [super::Tab], old: &str, new: &str) -> bool {
@@ -1021,6 +1046,29 @@ mod tests {
         assert_eq!(p.album.as_ref().and_then(|a| a.cover(640)), Some("https://i.scdn.co/image/x"));
         assert_eq!(p.album.as_ref().and_then(|a| a.uri.as_deref()), Some("spotify:album:al"));
         assert_eq!(p.artists.iter().map(|a| (a.id.as_str(), a.name.as_str())).collect::<Vec<_>>(), [("ar", "Artista"), ("", "Sin id")]);
+    }
+
+    #[test]
+    fn seguir_la_letra_sin_pasar_del_final() {
+        let (rule, view_h) = (627.3, 870.0);
+        let end = rule + 30.0 * LINE_PITCH + 40.0;
+        let max_off = end + PAGE_TAIL - view_h;
+        // Antes del primer renglón y en los primeros: justo con las pestañas fijas arriba.
+        assert_eq!(follow_target(None, rule, end, view_h), rule - BAR_H + 1.0);
+        assert_eq!(follow_target(Some(LINE_FIRST), rule, end, view_h), rule - BAR_H + 1.0);
+        // En medio: el renglón a FOLLOW_AT de la letra a la vista.
+        let l = LINE_FIRST + 12.0 * LINE_PITCH;
+        let t = follow_target(Some(l), rule, end, view_h);
+        let at = rule + l - t;
+        assert!((at - (BAR_H + FOLLOW_AT * (view_h - BAR_H))).abs() < 0.01, "{at}");
+        // Los últimos: nunca más allá del final (de un renglón al siguiente no cambia).
+        for k in 24..30 {
+            let t = follow_target(Some(LINE_FIRST + k as f32 * LINE_PITCH), rule, end, view_h);
+            assert!(t <= max_off + 0.01, "renglón {k}: {t} > {max_off}");
+        }
+        assert_eq!(follow_target(Some(LINE_FIRST + 29.0 * LINE_PITCH), rule, end, view_h), max_off);
+        // Página más corta que la vista: no se desplaza.
+        assert_eq!(follow_target(Some(LINE_FIRST), 100.0, 400.0, view_h), PAGE_TAIL);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use super::{warm, Action, ActiveTab, App, Auth, LastTransition, Page, PlayState,
 use crate::api::Req;
 use crate::backend::Cmd;
 use crate::config::{vol_pct_to_raw, Loudness};
-use crate::model::{AudioInfo, AudioOutput, Resampling};
+use crate::model::{AudioInfo, AudioOutput, NowPlaying, Resampling};
 use crate::update::{Asset, FailKind, MoveReason, Stage, UpdateInfo};
 
 fn s<'a>(cmd: &'a Value, key: &str) -> Option<&'a str> {
@@ -914,6 +914,16 @@ impl App {
                 self.track_tab = n(cmd, "i").unwrap_or(0).clamp(0, 2) as u8;
                 ok()
             }
+            // Lo que hace la página al cambiar de canción, sin tocar la reproducción ni el
+            // historial: la página abierta pasa a la de `to`.
+            "track_follow" => {
+                let (Page::Track(old), Some(to)) = (self.page().clone(), s(cmd, "to").map(str::to_string)) else {
+                    return err("hace falta la página de una canción abierta y to");
+                };
+                let np = NowPlaying { uri: format!("spotify:track:{to}"), id: Some(to.clone()), name: "(prueba)".into(), ..Default::default() };
+                self.follow_track_page(&old, &to, &np);
+                ok()
+            }
             "track_scroll" => match n(cmd, "px") {
                 Some(px) => {
                     self.track_scroll.set = Some(px as f32);
@@ -1618,6 +1628,7 @@ impl App {
                 },
                 _ => Value::Null,
             },
+            "track_pages_loaded": self.track_pages.keys().collect::<Vec<_>>(),
             "autoplay": self.settings.autoplay,
             "song_menu": self.song_more.as_ref().map(|m| json!({"list": m.row.0, "i": m.row.1, "uri": m.track.uri, "sub": m.sub, "remove_from": m.remove_from})),
             "library_filter": self.library_filter,

@@ -268,12 +268,43 @@ impl App {
         }
     }
 
+    /// Cambió la canción que suena (`old` → `new`): las pestañas que enseñan la página de `old`
+    /// pasan a la de `new`, sin sumar un paso al historial (Atrás no recorre cada canción). Si su
+    /// página aún no ha llegado, se enseña al momento con lo que ya se sabe de ella.
+    pub(super) fn follow_track_page(&mut self, old: &str, new: &str, np: &NowPlaying) {
+        let followed = follow_in_tabs(&mut self.tabs, old, new);
+        if followed && !self.track_pages.contains_key(new) {
+            self.track_pages.insert(new.to_string(), provisional_page(new, np));
+        }
+        // Quien seguía la letra sigue en ella aunque la cabecera de la nueva mida otra cosa.
+        if followed && self.track_pinned && self.settings.lyrics_sync {
+            self.track_follow_now = true;
+        }
+    }
+
+    /// Con la página de la canción que suena abierta, la de la siguiente por adelantado (la
+    /// siguiente del estado de Spotify), para que al cambiar se vea entera al instante.
+    fn prefetch_next_track_page(&mut self, id: &str) {
+        let now = self.player.now.as_ref().map(|n| (n.id.clone(), n.uri.clone()));
+        let Some((Some(now_id), now_uri)) = now else { return };
+        if now_id != id {
+            return;
+        }
+        let Some(Some(info)) = &self.server_cluster else { return };
+        let Some(next) = info.next.iter().find(|u| u.starts_with("spotify:track:") && **u != now_uri) else { return };
+        let next = next.trim_start_matches("spotify:track:").to_string();
+        if !self.track_pages.contains_key(&next) {
+            self.request_once(&format!("trackpage:{next}"), Req::TrackPage(next.clone()));
+        }
+    }
+
     pub(super) fn track_page(&mut self, ui: &mut egui::Ui, id: String) {
         if !self.signed_in() {
             self.welcome(ui);
             return;
         }
         self.request_once(&format!("trackpage:{id}"), Req::TrackPage(id.clone()));
+        self.prefetch_next_track_page(&id);
         let Some(page) = self.track_pages.remove(&id) else {
             let o = ui.max_rect().min;
             let failed = self.track_page_failed.contains(&id);
@@ -392,6 +423,7 @@ impl App {
         let rule_nat = bottom + RULE_BELOW;
         let off = view.min.y - o.y;
         let pinned = off > rule_nat - BAR_H;
+        self.track_pinned = pinned;
         let rule_y = if pinned { view.min.y + BAR_H } else { o.y + rule_nat };
 
         // Contenido de la pestaña.
@@ -881,6 +913,48 @@ impl App {
     }
 }
 
+/// Las pestañas que enseñan la página de `old` pasan a la de `new`, en el mismo paso del
+/// historial. Devuelve si alguna lo hacía.
+fn follow_in_tabs(tabs: &mut [super::Tab], old: &str, new: &str) -> bool {
+    let mut followed = false;
+    for t in tabs {
+        if matches!(t.history.get(t.idx), Some(Page::Track(id)) if id == old) {
+            t.history[t.idx] = Page::Track(new.to_string());
+            followed = true;
+        }
+    }
+    followed
+}
+
+/// La página de una canción que acaba de empezar, con lo que ya se sabe de ella (nombre,
+/// artistas, álbum y portada) mientras llega la de verdad (`Req::TrackPage`, que la sustituye).
+fn provisional_page(id: &str, np: &NowPlaying) -> TrackPage {
+    TrackPage {
+        id: id.to_string(),
+        uri: np.uri.clone(),
+        name: np.name.clone(),
+        duration_ms: np.duration_ms,
+        album: np.album_id.clone().map(|aid| AlbumRef {
+            uri: Some(format!("spotify:album:{aid}")),
+            id: Some(aid),
+            name: np.album.clone(),
+            images: np.cover_url.iter().map(|u| Image { url: u.clone(), width: Some(300), height: Some(300) }).collect(),
+            ..Default::default()
+        }),
+        artists: np
+            .artists
+            .iter()
+            .map(|(name, id)| Artist {
+                uri: id.as_ref().map(|i| format!("spotify:artist:{i}")).unwrap_or_default(),
+                id: id.clone().unwrap_or_default(),
+                name: name.clone(),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
 /// La canción de la página como pista (para el menú de los tres puntos).
 fn track_of(page: &TrackPage) -> Track {
     Track {
@@ -914,6 +988,39 @@ mod tests {
         let l = wrap_words("uno dos tres cuatro cinco seis", 4.0, 3, w);
         assert_eq!(l.len(), 3);
         assert!(l[2].ends_with('…') && w(&l[2]) <= 4.0, "{l:?}");
+    }
+
+    #[test]
+    fn la_pagina_sigue_a_la_cancion_que_suena() {
+        let tab = |history: Vec<Page>, idx| super::super::Tab { history, idx, hidden: true };
+        let mut tabs = vec![
+            tab(vec![Page::Home, Page::Album("al".into()), Page::Track("a".into())], 2),
+            // Otra pestaña con la página de «a» más atrás en su historial: esa no se toca.
+            tab(vec![Page::Track("a".into()), Page::Liked], 1),
+        ];
+        assert!(follow_in_tabs(&mut tabs, "a", "b"));
+        assert_eq!(tabs[0].history, [Page::Home, Page::Album("al".into()), Page::Track("b".into())], "se sustituye, no se añade");
+        assert_eq!(tabs[0].idx, 2);
+        assert_eq!(tabs[1].history[0], Page::Track("a".into()));
+        // La página de otra canción (abierta a propósito) no sigue a la que suena.
+        assert!(!follow_in_tabs(&mut tabs, "x", "y"));
+        assert_eq!(tabs[0].history[2], Page::Track("b".into()));
+
+        let np = NowPlaying {
+            uri: "spotify:track:b".into(),
+            id: Some("b".into()),
+            name: "Canción".into(),
+            artists: vec![("Artista".into(), Some("ar".into())), ("Sin id".into(), None)],
+            album: "Disco".into(),
+            album_id: Some("al".into()),
+            cover_url: Some("https://i.scdn.co/image/x".into()),
+            duration_ms: 1000,
+        };
+        let p = provisional_page("b", &np);
+        assert_eq!((p.name.as_str(), p.duration_ms, p.playcount), ("Canción", 1000, None));
+        assert_eq!(p.album.as_ref().and_then(|a| a.cover(640)), Some("https://i.scdn.co/image/x"));
+        assert_eq!(p.album.as_ref().and_then(|a| a.uri.as_deref()), Some("spotify:album:al"));
+        assert_eq!(p.artists.iter().map(|a| (a.id.as_str(), a.name.as_str())).collect::<Vec<_>>(), [("ar", "Artista"), ("", "Sin id")]);
     }
 
     #[test]

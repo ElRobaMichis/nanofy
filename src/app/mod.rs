@@ -1032,8 +1032,11 @@ pub struct App {
     /// La zona visible y el panel del contenido de la página de canción, de este fotograma.
     track_view: Option<egui::Rect>,
     track_panel: Option<egui::Rect>,
-    /// Recién encendida la sincronización: bajar hasta lo que suena aunque no se esté en la letra.
+    /// Recién encendida la sincronización (o cambiada la canción mientras se seguía la letra):
+    /// bajar hasta lo que suena aunque no se esté en la letra.
     track_follow_now: bool,
+    /// La página de canción estaba bajada hasta la letra (pestañas fijas) en el último fotograma.
+    track_pinned: bool,
     /// Letra pedida para una canción que no suena (y cuándo), para no pedirla en cada fotograma.
     track_lyrics_asked: Option<(String, Instant)>,
     /// Canciones cuya letra ya se pidió por adelantado.
@@ -1436,6 +1439,7 @@ impl App {
             track_view: None,
             track_panel: None,
             track_follow_now: false,
+            track_pinned: false,
             track_lyrics_asked: None,
             lyrics_prefetched: HashSet::new(),
             lyrics_for: None,
@@ -4112,6 +4116,13 @@ impl App {
             self.snapshot_dirty = true;
         }
         self.play_log_dirty = true;
+        // La página de la canción que sonaba pasa a la nueva.
+        let old = self.player.now.as_ref().and_then(|n| n.id.clone());
+        if let (Some(old), Some(new)) = (old, np.id.clone()) {
+            if old != new && np.uri.starts_with("spotify:track:") {
+                self.follow_track_page(&old, &new, &np);
+            }
+        }
         self.player.now = Some(np);
         self.ensure_media();
         self.media_dirty = true;
@@ -8595,7 +8606,12 @@ impl crate::shell::UiApp for App {
             .show(ui, |ui| self.player_bar(ui));
 
         // La cola y la letra van en sus paneles de cristal sobre el contenido (abajo).
-        let page_key = format!("{:?}", self.page());
+        // Las páginas de canción comparten el desplazamiento: al cambiar de canción (la página
+        // sigue a la que suena) quien estaba en la letra sigue en la letra.
+        let page_key = match self.page() {
+            Page::Track(_) => "Track".to_string(),
+            p => format!("{p:?}"),
+        };
         let tint = if p.dark { self.page_tint() } else { None };
         let mut content: Option<egui::Rect> = None;
         egui::CentralPanel::default()

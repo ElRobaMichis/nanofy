@@ -960,14 +960,22 @@ impl App {
                 }
             }
             if hit.is_some_and(|r| r.clicked()) {
-                // Con las explicaciones, un verso explicado se elige; si no, se salta a él.
-                // (Se dibuja en el fotograma siguiente: este ya pintó el resaltado y la tarjeta.)
+                // Con las explicaciones, el primer clic en un verso explicado lo elige (se ve su
+                // explicación); otro clic en el que ya se ve, o en uno sin explicación, salta a
+                // ese renglón. Al saltar siguiendo la canción, la tarjeta vuelve a ir con lo que
+                // suena. (Se dibuja en el fotograma siguiente: este ya pintó resaltado y tarjeta.)
                 match in_span {
-                    Some(k) => {
+                    Some(k) if sel != Some(k) => {
                         self.track_note_pick = Some((id.clone(), k));
                         ui.ctx().request_repaint();
                     }
-                    None => seek_to = Some(lyrics.lines[i].start_ms),
+                    _ if synced && current => {
+                        seek_to = Some(lyrics.lines[i].start_ms);
+                        if in_span.is_some() && follow {
+                            self.track_note_pick = None;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

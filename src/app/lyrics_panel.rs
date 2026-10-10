@@ -160,6 +160,16 @@ fn sung_rows(g: &egui::Galley, mut chars: f32) -> Vec<(usize, f32)> {
     out
 }
 
+/// Duración del desplazamiento al cambiar de renglón.
+const SCROLL_SECS: f64 = 0.45;
+
+/// Desplazamiento a los `t` segundos de ir de `from` a `to` (frenando al final), y si ya llegó.
+fn scroll_step(from: f32, to: f32, t: f64) -> (f32, bool) {
+    let k = (t / SCROLL_SECS).clamp(0.0, 1.0) as f32;
+    let e = 1.0 - (1.0 - k).powi(3);
+    (from + (to - from) * e, k >= 1.0)
+}
+
 /// Desplazamiento que deja la línea base `base` (desde arriba de la lista) a `FOLLOW_AT`, sin
 /// pasar de los límites.
 fn follow_offset(base: f32, max_off: f32) -> f32 {
@@ -319,20 +329,37 @@ impl App {
         if self.lyrics_follow_track != lyrics.track_id {
             self.lyrics_follow_track = lyrics.track_id.clone();
             self.lyrics_offset = 0.0;
+            self.lyrics_anim = None;
         }
         // Sin sincronizar (apagado, o letra sin tiempos): toda en blanco y quieta.
         let follow = self.settings.lyrics_sync && synced;
         if follow {
             let target = current.map(|i| follow_offset(rows[i].0, max_off)).unwrap_or(0.0);
-            let dt = ui.input(|i| i.stable_dt).min(0.1);
-            let k = 1.0 - (-dt * 9.0).exp();
-            self.lyrics_offset += (target - self.lyrics_offset) * k;
-            if (target - self.lyrics_offset).abs() > 0.5 {
-                ui.ctx().request_repaint();
-            } else {
-                self.lyrics_offset = target;
+            let now = ui.input(|i| i.time);
+            // Al cambiar de renglón, un desplazamiento de duración fija por el reloj (no por
+            // fotogramas: tras segundos sin pintar, el primero se llevaba casi todo el camino).
+            match self.lyrics_anim {
+                Some((_, to, _)) if (to - target).abs() < 0.5 => {}
+                _ if (self.lyrics_offset - target).abs() < 0.5 => {
+                    self.lyrics_anim = None;
+                    self.lyrics_offset = target;
+                }
+                _ => self.lyrics_anim = Some((self.lyrics_offset, target, now)),
+            }
+            if let Some((from, to, t0)) = self.lyrics_anim {
+                let (off, done) = scroll_step(from, to, now - t0);
+                self.lyrics_offset = off;
+                if done {
+                    self.lyrics_anim = None;
+                } else {
+                    ui.ctx().request_repaint();
+                    // Mientras dura, la ventana pinta hasta 60 fotogramas por segundo aunque no se
+                    // esté tocando nada (`shell::ANIM_UNTIL_KEY`).
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(crate::shell::ANIM_UNTIL_KEY), now + 0.1));
+                }
             }
         } else if ui.rect_contains_pointer(list) {
+            self.lyrics_anim = None;
             let wheel = ui.input(|i| i.smooth_scroll_delta.y);
             self.lyrics_offset = (self.lyrics_offset - wheel).clamp(0.0, max_off.max(0.0));
         }
@@ -443,6 +470,16 @@ mod tests {
         assert_eq!(sung_chars(&line("Sin tiempos", &[]), 5000, 9000), None);
         // Espacios delante: no cuentan.
         assert_eq!(sung_chars(&line("  ab", &[(0, 4)]), 9000, 9000), Some(2.0));
+    }
+
+    #[test]
+    fn desplazamiento_por_el_reloj() {
+        // Empieza donde estaba, frena al final y llega a la vez aunque falten fotogramas.
+        assert_eq!(scroll_step(100.0, 200.0, 0.0), (100.0, false));
+        let (mid, done) = scroll_step(100.0, 200.0, SCROLL_SECS / 2.0);
+        assert!(!done && mid > 150.0 && mid < 200.0, "{mid}");
+        assert_eq!(scroll_step(100.0, 200.0, SCROLL_SECS), (200.0, true));
+        assert_eq!(scroll_step(100.0, 200.0, 5.0), (200.0, true));
     }
 
     #[test]

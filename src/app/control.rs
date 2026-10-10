@@ -887,6 +887,15 @@ impl App {
                 self.settings.lyrics_sync = b(cmd, "on", !self.settings.lyrics_sync);
                 ok()
             }
+            // Desplazamiento del panel de la letra (px desde arriba), para medir su animación.
+            "lyrics_offset" => match n(cmd, "px") {
+                Some(px) => {
+                    self.lyrics_offset = px as f32;
+                    self.lyrics_anim = None;
+                    ok()
+                }
+                None => err("falta px"),
+            },
             // Pestaña del panel de la cola: «Recientes» (`recent`) o «Cola».
             "queue_tab" => {
                 self.queue_recent = b(cmd, "recent", !self.queue_recent);
@@ -1591,6 +1600,7 @@ impl App {
             "ephemeral": self.ephemeral,
             "mem_mb": self.mem_mb,
             "frame_ms": self.frame_ms,
+            "frames_painted": self.frames_painted,
             "frames": {
                 "count": self.frame_hist.len(),
                 "avg_ms": if self.frame_hist.is_empty() { 0.0 } else { self.frame_hist.iter().sum::<f32>() / self.frame_hist.len() as f32 },

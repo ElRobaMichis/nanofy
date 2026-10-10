@@ -29,6 +29,12 @@ pub const FRAME_MS_KEY: &str = "nanofy_frame_ms";
 pub const FRAME_PHASES_KEY: &str = "nanofy_frame_phases";
 /// Fotogramas por segundo para animaciones cuando el usuario no está interactuando.
 const IDLE_FPS: u32 = 24;
+/// Hasta cuándo (segundos de `RawInput::time`) hay una animación que debe verse fluida aunque no
+/// se esté tocando nada (el desplazamiento de la letra al cambiar de renglón): mientras tanto, hasta
+/// `SMOOTH_FPS` en vez de `IDLE_FPS`. El intervalo se cuenta desde el final de cada fotograma, así
+/// que con ~5 ms de trabajo por fotograma salen unos 60 por segundo.
+pub const ANIM_UNTIL_KEY: &str = "nanofy_anim_until";
+const SMOOTH_FPS: u32 = 90;
 /// Tiempo tras la última entrada durante el que se aplica el límite alto de fps.
 const INTERACTIVE_WINDOW: Duration = Duration::from_millis(400);
 
@@ -270,8 +276,11 @@ impl<A: UiApp> Shell<A> {
             .data(|d| d.get_temp::<u32>(egui::Id::new(FPS_CAP_KEY)))
             .unwrap_or(144)
             .clamp(30, 480);
+        let anim_until = self.ctx.data(|d| d.get_temp::<f64>(egui::Id::new(ANIM_UNTIL_KEY))).unwrap_or(0.0);
         if self.last_input.elapsed() < INTERACTIVE_WINDOW {
             cap
+        } else if anim_until > self.start.elapsed().as_secs_f64() {
+            SMOOTH_FPS.min(cap)
         } else {
             IDLE_FPS.min(cap)
         }

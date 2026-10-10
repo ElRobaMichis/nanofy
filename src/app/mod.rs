@@ -1020,6 +1020,10 @@ pub struct App {
     pub lyrics_button: Option<egui::Rect>,
     pub lyrics_offset: f32,
     pub lyrics_follow_track: String,
+    /// Desplazamiento en curso al cambiar de renglón: desde, hasta y cuándo empezó (s).
+    pub lyrics_anim: Option<(f32, f32, f64)>,
+    /// Fotogramas pintados desde que se abrió (para medir la fluidez desde el modo de control).
+    pub frames_painted: u64,
 
     pub jam_open: bool,
     pub jam: Option<JamSession>,
@@ -1403,6 +1407,8 @@ impl App {
             lyrics_button: None,
             lyrics_offset: 0.0,
             lyrics_follow_track: String::new(),
+            lyrics_anim: None,
+            frames_painted: 0,
             jam_open: false,
             jam: None,
             jam_link: String::new(),
@@ -8344,6 +8350,7 @@ impl crate::shell::UiApp for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        self.frames_painted += 1;
         let ctx = ui.ctx().clone();
         self.drain(&ctx);
         self.tick(&ctx);

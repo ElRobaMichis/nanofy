@@ -1056,7 +1056,10 @@ pub struct App {
     /// El panel de la cola en «Recientes» (si no, en «Cola»).
     pub queue_recent: bool,
     /// Arrastrando por su asa la canción `n` de las añadidas a la cola.
-    pub queue_drag: Option<usize>,
+    pub queue_drag: Option<(bool, usize)>,
+    /// Cuándo volver a pedir la cola (tras aleatorio, repetir o mover una canción, Spotify tarda
+    /// un momento en tenerla al día).
+    queue_refresh: Vec<Instant>,
     /// El modo de control pide abrir «Añadir a una playlist» como el botón del reproductor.
     pub add_from_bar: bool,
     /// Carpeta abierta dentro de la biblioteca (su id).
@@ -1430,6 +1433,7 @@ impl App {
             song_more_req: None,
             queue_recent: false,
             queue_drag: None,
+            queue_refresh: Vec::new(),
             add_from_bar: false,
             library_folder: None,
             library_recent,
@@ -5948,6 +5952,18 @@ impl App {
                 self.queue_at = Instant::now();
                 self.api.send(Req::Queue);
             }
+            // Puesta al día pedida tras aleatorio, repetir o mover una canción.
+            if let Some(&at) = self.queue_refresh.first() {
+                if Instant::now() >= at {
+                    self.queue_refresh.remove(0);
+                    if self.side == Some(SideTab::Queue) {
+                        self.queue_at = Instant::now();
+                        self.api.send(Req::Queue);
+                    }
+                } else {
+                    ctx.request_repaint_after(at - Instant::now());
+                }
+            }
             if self.jam_open && self.jam.is_some() && self.jam_at.elapsed() > Duration::from_secs(10)
             {
                 self.jam_at = Instant::now();
@@ -7948,6 +7964,50 @@ impl App {
         } else {
             self.backend.send(Cmd::Shuffle(on));
         }
+        // El orden de lo siguiente cambia: la cola abierta se pone al día sin cerrarla.
+        self.queue_refresh_soon();
+    }
+
+    /// Pide la cola otra vez dentro de un momento y algo después (Spotify tarda en reflejar un
+    /// cambio de orden), si el panel de la cola está abierto.
+    pub fn queue_refresh_soon(&mut self) {
+        let now = Instant::now();
+        self.queue_refresh = vec![now + Duration::from_millis(700), now + Duration::from_millis(2500)];
+    }
+
+    /// Mueve la siguiente canción `uri` delante de `before` o, sin él, detrás de `after` (asa de
+    /// la cola). Se ve al instante; Spotify la confirma en la siguiente consulta.
+    pub fn queue_move(&mut self, uri: String, before: Option<String>, after: Option<String>) {
+        if self.player.remote.is_some() {
+            self.status_err("Para reordenar la cola, la música tiene que sonar en Nanofy");
+            return;
+        }
+        let place = |list: &mut Vec<String>| {
+            if let Some(from) = list.iter().position(|u| *u == uri) {
+                let u = list.remove(from);
+                let to = match (&before, &after) {
+                    (Some(b), _) => list.iter().position(|x| x == b),
+                    (None, Some(a)) => list.iter().position(|x| x == a).map(|i| i + 1),
+                    _ => None,
+                }
+                .unwrap_or(from)
+                .min(list.len());
+                list.insert(to, u);
+            }
+        };
+        if let Some(q) = self.queue.as_mut() {
+            let mut uris: Vec<String> = q.queue.iter().map(|t| t.uri.clone()).collect();
+            place(&mut uris);
+            let mut rest = std::mem::take(&mut q.queue);
+            for u in &uris {
+                if let Some(i) = rest.iter().position(|t| &t.uri == u) {
+                    q.queue.push(rest.remove(i));
+                }
+            }
+        }
+        place(&mut self.queued_local);
+        self.backend.send(Cmd::MoveNext { uri, before, after });
+        self.queue_refresh_soon();
     }
 
     pub fn cycle_repeat(&mut self) {
@@ -7969,6 +8029,7 @@ impl App {
                 track: next == Repeat::Track,
             });
         }
+        self.queue_refresh_soon();
     }
 
     pub fn select_device(&mut self, d: Device, is_self: bool) {

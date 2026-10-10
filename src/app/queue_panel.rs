@@ -177,8 +177,9 @@ enum Kind {
     Now,
     /// Añadida a la cola desde Nanofy (posición entre ellas): se quita y se reordena.
     Queued(usize),
-    /// Lo que queda de la lista en curso: Spotify no deja quitarla suelta.
-    Context,
+    /// Lo que queda de la lista en curso (posición en ella): se reordena; Spotify no deja
+    /// quitarla suelta.
+    Context(usize),
     /// En «Recientes»: sin asa ni X.
     Recent,
 }
@@ -215,19 +216,16 @@ fn slot_at(dy: f32, n: usize) -> usize {
     ((dy / ROW) + 0.5).floor().clamp(0.0, n as f32) as usize
 }
 
-/// La cola con la de `from` llevada al hueco `slot`; `None` si queda igual.
-fn reordered(order: &[String], from: usize, slot: usize) -> Option<Vec<String>> {
-    if from >= order.len() {
+/// Dónde cae la de `from` soltada en el hueco `slot` de su grupo: delante de cuál o, al final,
+/// detrás de la última. `None` si queda donde estaba.
+fn drop_target(uris: &[String], from: usize, slot: usize) -> Option<(Option<String>, Option<String>)> {
+    if from >= uris.len() || slot == from || slot == from + 1 {
         return None;
     }
-    let to = if slot > from { slot - 1 } else { slot };
-    if to == from {
-        return None;
+    match uris.get(slot) {
+        Some(b) => Some((Some(b.clone()), None)),
+        None => Some((None, uris.last().cloned())),
     }
-    let mut v = order.to_vec();
-    let u = v.remove(from);
-    v.insert(to.min(v.len()), u);
-    Some(v)
 }
 
 /// Cristal: lo de detrás desenfocado y el velo encima.
@@ -342,7 +340,11 @@ impl App {
         let mut queued: Vec<Track> = Vec::new();
         let mut rest: Vec<Track> = Vec::new();
         let mut pending: Vec<String> = self.queued_local.clone();
-        for t in &q.queue {
+        // La Web API a veces repite la que suena como primera de la cola (no lo es: no está entre
+        // las siguientes y no se puede mover): fuera, salvo que sea una añadida a mano.
+        let now_uri = self.player.now.as_ref().map(|n| n.uri.clone()).or(q.currently_playing.as_ref().map(|t| t.uri.clone()));
+        let skip = usize::from(q.queue.first().is_some_and(|t| Some(&t.uri) == now_uri.as_ref() && !pending.contains(&t.uri)));
+        for t in q.queue.iter().skip(skip) {
             if rest.is_empty() {
                 if let Some(i) = pending.iter().position(|u| u == &t.uri) {
                     pending.remove(i);
@@ -386,36 +388,37 @@ impl App {
         text_at(&painter, "A continuación:", theme::bold(NEXT_FONT), ink.head, o.x + TAB_X[0], o.y + y, W - 50.0);
         let mut head = y + HEAD_DY;
         let mut end = head;
-        // Primera fila y cuántas tiene el grupo de lo añadido a la cola (para reordenar).
-        let mut queued_rows: Option<(f32, usize)> = None;
+        // Primera fila y canciones de cada grupo (para reordenar dentro de él).
+        let mut spans: Vec<(bool, f32, Vec<String>)> = Vec::new();
         for (gi, g) in groups.iter().enumerate() {
             self.queue_group_head(ui, o, head, g, gi, ink);
             let list_id = if g.context { "queue_rest" } else { "queue_next" };
             let first = head + FIRST_ROW_DY;
             for (i, t) in g.tracks.iter().enumerate() {
                 let c = first + ROW * i as f32;
-                let kind = if g.context { Kind::Context } else { Kind::Queued(i) };
+                let kind = if g.context { Kind::Context(i) } else { Kind::Queued(i) };
                 self.queue_row(ui, o, c, t, kind, list_id, i, &g.tracks, ink);
             }
             let last = first + ROW * (g.tracks.len() as f32 - 1.0);
-            if !g.context {
-                queued_rows = Some((first, g.tracks.len()));
-            }
+            spans.push((g.context, first, g.tracks.iter().map(|t| t.uri.clone()).collect()));
             end = last + ROW / 2.0;
             head = last + NEXT_HEAD_DY;
         }
-        // Arrastrando una añadida por su asa: una raya verde en el hueco donde caería y, al
-        // soltar, la cola se rehace en el orden nuevo.
-        if let Some(from) = self.queue_drag {
+        // Arrastrando una por su asa (dentro de su grupo): una raya verde en el hueco donde
+        // caería y, al soltar, se mueve ahí (en la cola de verdad, sin cortar lo que suena).
+        if let Some((context, from)) = self.queue_drag {
             let down = ui.input(|i| i.pointer.any_down());
             let py = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())).map(|p| p.y);
-            if let (Some((first, n)), Some(py)) = (queued_rows, py) {
-                let slot = slot_at(py - o.y - first, n);
+            if let (Some((_, first, uris)), Some(py)) = (spans.iter().find(|s| s.0 == context), py) {
+                let slot = slot_at(py - o.y - first, uris.len());
                 if down {
-                    let my = o.y + first - ROW / 2.0 + ROW * slot as f32;
-                    painter.rect_filled(Rect::from_min_max(pos2(o.x + COVER_X, my - 1.0), pos2(o.x + CLOSE_X + 8.0, my + 1.0)), CornerRadius::same(1), GREEN);
-                } else if let Some(order) = reordered(&self.queued_local, from, slot) {
-                    self.queue_rebuild(order);
+                    if drop_target(uris, from, slot).is_some() {
+                        let my = o.y + first - ROW / 2.0 + ROW * slot as f32;
+                        painter.rect_filled(Rect::from_min_max(pos2(o.x + COVER_X, my - 1.0), pos2(o.x + CLOSE_X + 8.0, my + 1.0)), CornerRadius::same(1), GREEN);
+                    }
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                } else if let (Some((before, after)), Some(uri)) = (drop_target(uris, from, slot), uris.get(from).cloned()) {
+                    self.queue_move(uri, before, after);
                 }
             }
             if !down {
@@ -496,7 +499,8 @@ impl App {
         let resp = ui.interact(row, egui::Id::new(("queue_row", list_id, i)), Sense::click());
         let painter = ui.painter().clone();
         let menu_here = self.song_menu_on(list_id, i);
-        if resp.hovered() || resp.contains_pointer() || menu_here || self.queue_drag.is_some_and(|f| kind == Kind::Queued(f)) {
+        let dragged = self.queue_drag.is_some_and(|(c, f)| kind == if c { Kind::Context(f) } else { Kind::Queued(f) });
+        if resp.hovered() || resp.contains_pointer() || menu_here || dragged {
             painter.rect_filled(row, CornerRadius::same(6), ink.hover);
         }
         // Portada; la que suena, oscurecida y con las barras verdes.
@@ -521,12 +525,16 @@ impl App {
             // Asa: arrastrar reordena las añadidas a la cola.
             let hc = pos2(o.x + HANDLE_X, y + HANDLE_DY);
             let handle = ui.interact(Rect::from_center_size(hc, vec2(26.0, 34.0)), egui::Id::new(("queue_handle", list_id, i)), Sense::drag());
-            let movable = matches!(kind, Kind::Queued(_));
+            let movable = matches!(kind, Kind::Queued(_) | Kind::Context(_));
             if movable && handle.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             }
-            if let (Kind::Queued(k), true) = (kind, handle.drag_started()) {
-                self.queue_drag = Some(k);
+            if handle.drag_started() {
+                match kind {
+                    Kind::Queued(k) => self.queue_drag = Some((false, k)),
+                    Kind::Context(k) => self.queue_drag = Some((true, k)),
+                    _ => {}
+                }
             }
             if movable && handle.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -607,12 +615,15 @@ mod tests {
     #[test]
     fn huecos_y_orden_al_soltar() {
         let o: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        let s = |v: &str| Some(v.to_string());
         // Sobre su propio hueco o el de después: igual.
-        assert_eq!(reordered(&o, 1, 1), None);
-        assert_eq!(reordered(&o, 1, 2), None);
-        assert_eq!(reordered(&o, 0, 4).unwrap(), ["b", "c", "d", "a"]);
-        assert_eq!(reordered(&o, 3, 0).unwrap(), ["d", "a", "b", "c"]);
-        assert_eq!(reordered(&o, 1, 3).unwrap(), ["a", "c", "b", "d"]);
+        assert_eq!(drop_target(&o, 1, 1), None);
+        assert_eq!(drop_target(&o, 1, 2), None);
+        // Al final: detrás de la última; arriba del todo: delante de la primera.
+        assert_eq!(drop_target(&o, 0, 4), Some((None, s("d"))));
+        assert_eq!(drop_target(&o, 3, 0), Some((s("a"), None)));
+        // «b» en el hueco antes de «d»: delante de «d».
+        assert_eq!(drop_target(&o, 1, 3), Some((s("d"), None)));
         // El hueco: medio paso por encima del centro de una fila es el de antes de ella.
         assert_eq!(slot_at(-40.0, 4), 0);
         assert_eq!(slot_at(-31.0, 4), 0);

@@ -1,6 +1,6 @@
 [package]
 name = "nanofy"
-version = "1.22.0"
+version = "1.22.1"
 edition = "2021"
 description = "Cliente nativo y ligero de Spotify (Rust + egui + librespot)"
 license = "MIT"

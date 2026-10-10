@@ -157,6 +157,13 @@ pub enum Cmd {
         context: bool,
         track: bool,
     },
+    /// Mueve una de las siguientes canciones (arrastrada en la cola) delante de `before` o, sin
+    /// él, detrás de `after` (ver `Spirc::move_next`).
+    MoveNext {
+        uri: String,
+        before: Option<String>,
+        after: Option<String>,
+    },
     /// Trae a este equipo la reproducción que suena en otro dispositivo.
     TransferHere,
     /// Prepara una canción en el reproductor (metadatos, clave y primer trozo de audio) sin
@@ -1022,6 +1029,7 @@ async fn run(
                         Ok(())
                     }
                     Cmd::Shuffle(on) => a.spirc.shuffle(on),
+                    Cmd::MoveNext { uri, before, after } => a.spirc.move_next(uri, before, after),
                     Cmd::Repeat { context, track } => a
                         .spirc
                         .repeat(context)

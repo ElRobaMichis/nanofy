@@ -189,6 +189,12 @@ enum SpircCommand {
     DjJump,
     /// Nanofy: autoplay activado o no, en marcha (ver `Spirc::set_autoplay`).
     SetAutoplay(bool),
+    /// Nanofy: mueve una de las siguientes canciones (ver `Spirc::move_next`).
+    MoveNext {
+        uri: String,
+        before: Option<String>,
+        after: Option<String>,
+    },
 }
 
 impl SpircCommand {
@@ -562,6 +568,12 @@ impl Spirc {
         Ok(self.commands.send(SpircCommand::SetAutoplay(on))?)
     }
 
+    /// Nanofy: mueve la siguiente canción `uri` (arrastrada en la cola) delante de `before` o, sin
+    /// él, detrás de `after`. Lo demás de la cola queda igual y la que suena no se toca.
+    pub fn move_next(&self, uri: String, before: Option<String>, after: Option<String>) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::MoveNext { uri, before, after })?)
+    }
+
     /// Acquires the control as active connect device.
     ///
     /// Does not [Spirc::transfer] the playback. Does nothing if we are not the active device.
@@ -898,6 +910,7 @@ impl SpircTask {
             SpircCommand::VolumeUp => self.handle_volume_up(),
             SpircCommand::VolumeDown => self.handle_volume_down(),
             SpircCommand::Shuffle(shuffle) => self.handle_shuffle(shuffle)?,
+            SpircCommand::MoveNext { uri, before, after } => self.handle_move_next(&uri, before.as_deref(), after.as_deref()),
             SpircCommand::Repeat(repeat) => self.handle_repeat_context(repeat)?,
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
@@ -2057,6 +2070,26 @@ impl SpircTask {
                 ..
             } => *nominal_start_time = now - position_ms as i64,
         };
+    }
+
+    /// Nanofy: ver `Spirc::move_next`.
+    fn handle_move_next(&mut self, uri: &str, before: Option<&str>, after: Option<&str>) {
+        let mut next = self.connect_state.next_tracks().clone();
+        let Some(from) = next.iter().position(|t| t.uri == uri) else {
+            warn!("move_next: {uri} no está entre las siguientes");
+            return;
+        };
+        let track = next.remove(from);
+        let to = match (before, after) {
+            (Some(b), _) => next.iter().position(|t| t.uri == b),
+            (None, Some(a)) => next.iter().position(|t| t.uri == a).map(|i| i + 1),
+            _ => None,
+        }
+        .unwrap_or(from)
+        .min(next.len());
+        next.insert(to, track);
+        self.connect_state.set_next_tracks(next);
+        self.connect_state.update_queue_revision();
     }
 
     fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {

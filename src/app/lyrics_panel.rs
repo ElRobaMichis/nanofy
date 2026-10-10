@@ -298,6 +298,7 @@ impl App {
             note(&painter, "Esta canción no tiene letra disponible.");
             return;
         };
+        self.prefetch_next_lyrics();
         let synced = lyrics.synced();
         let pos = self.player.position();
         let current = lyrics.current_line(pos);

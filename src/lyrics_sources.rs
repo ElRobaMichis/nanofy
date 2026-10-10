@@ -227,6 +227,26 @@ pub fn parse_kpoe(track_id: &str, v: &Value, provider: &str) -> Option<Lyrics> {
     lyrics(track_id, with_stanza_gaps(lines, &breaks), provider)
 }
 
+/// De las respuestas de las fuentes por orden de preferencia (`None`: aún no respondió;
+/// `Some(None)`: no la tiene), la que gana ya: la primera con letra, cuando todas las de delante
+/// ya dijeron que no. Que una peor responda antes no la hace ganar.
+pub fn winner<T>(got: &[Option<Option<T>>]) -> Option<&T> {
+    for slot in got {
+        match slot {
+            Some(Some(l)) => return Some(l),
+            Some(None) => continue,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// La mejor que ha llegado hasta ahora, aunque falte por responder alguna mejor (para ir
+/// enseñándola), con su hueco.
+pub fn best_so_far<T>(got: &[Option<Option<T>>]) -> Option<(usize, &T)> {
+    got.iter().enumerate().find_map(|(k, s)| s.as_ref().and_then(|l| l.as_ref()).map(|l| (k, l)))
+}
+
 /// Minúsculas y solo letras y números (lo demás, espacios simples).
 fn norm(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -381,6 +401,25 @@ mod tests {
         assert_eq!(l.lines[0].end_ms, Some(33728));
         assert_eq!(l.lines[2].start_ms, 38055);
         assert!(l.lines[3].syllables.is_empty());
+    }
+
+    #[test]
+    fn gana_el_orden_no_la_prisa() {
+        // Llegó antes la de Musixmatch por renglones (hueco 4), pero BiniLyrics por sílabas aún
+        // no respondió: no gana nadie todavía; se puede ir enseñando la 4.
+        let mut got: Vec<Option<Option<&str>>> = vec![None, None, None, None, Some(Some("mxm-renglones")), None, None];
+        assert_eq!(winner(&got), None);
+        assert_eq!(best_so_far(&got), Some((4, &"mxm-renglones")));
+        // BiniLyrics por sílabas la tiene: gana ya, aunque falten las demás.
+        got[0] = Some(Some("bini-silabas"));
+        assert_eq!(winner(&got), Some(&"bini-silabas"));
+        // Sin sílabas ni palabras: la de BiniLyrics por renglones en cuanto las dos de delante
+        // dicen que no, aunque falten LRCLIB y el resto.
+        let got: Vec<Option<Option<&str>>> = vec![Some(None), Some(None), Some(Some("bini-renglones")), None, None, None, None];
+        assert_eq!(winner(&got), Some(&"bini-renglones"));
+        // Ninguna: nada.
+        let got: Vec<Option<Option<&str>>> = vec![Some(None); 7];
+        assert_eq!(winner(&got), None);
     }
 
     #[test]

@@ -175,6 +175,8 @@ struct EnrichQueue {
     /// Letras de la canción que suena. Van antes que cualquier género y solo cuenta la última:
     /// una petición nueva sustituye a la que aún espera.
     lyrics: Option<Req>,
+    /// La de la canción siguiente, por adelantado (detrás de la de la que suena; la última vale).
+    prefetch: Option<Req>,
     /// Géneros por buscar: (clave, artista, álbum). Se sirven de la más nueva a la más vieja,
     /// para que la página abierta los tenga antes que las que ya se dejaron atrás.
     genres: std::collections::VecDeque<(String, String, Option<String>)>,
@@ -381,6 +383,11 @@ pub enum Req {
         album: String,
         duration_ms: u32,
     },
+    /// La letra de la canción `id` que viene después, por adelantado (llega como `Resp::Lyrics`;
+    /// la app solo la guarda).
+    LyricsPrefetch {
+        id: String,
+    },
     JamCurrent,
     JamJoin(String),
     JamLeave(String),
@@ -482,6 +489,9 @@ pub enum Resp {
         following: bool,
     },
     Lyrics(Option<Lyrics>),
+    /// Una letra para ir mostrando mientras falta por responder una fuente mejor (la definitiva
+    /// llega después como `Lyrics`).
+    LyricsEarly(Lyrics),
     Jam(Option<JamSession>),
     WebConnected,
     WebDisconnected,
@@ -622,6 +632,49 @@ impl Api {
             read_backoff: Mutex::new([None, None]),
         });
 
+        /// `run_lyrics` en un hilo propio.
+        fn spawn_lyrics(req: Req, client: &Arc<Client>, ui: &UiTx) {
+            let (client, ui) = (client.clone(), ui.clone());
+            let _ = std::thread::Builder::new()
+                .name("nanofy-letras".into())
+                .stack_size(512 * 1024)
+                .spawn(move || run_lyrics(req, &client, &ui));
+        }
+        /// Las letras: todas las fuentes a la vez (`Client::lyrics_parallel`).
+        fn run_lyrics(req: Req, client: &Arc<Client>, ui: &UiTx) {
+            let t0 = std::time::Instant::now();
+            let l = match &req {
+                Req::Lyrics { id, name, artist, album, duration_ms } => {
+                    let early = |l: &Lyrics| {
+                        log::info!("[letra] provisional a los {} ms: {} ({})", t0.elapsed().as_millis(), l.provider, l.sync_type);
+                        ui.send(Msg::Api(ApiResult { req: req.clone(), result: Ok(Resp::LyricsEarly(l.clone())) }));
+                    };
+                    Client::lyrics_parallel(client, id, name, artist, album, *duration_ms, Some(&early))
+                }
+                // Por adelantado solo se sabe la canción: sus datos, de los metadatos (rápidos).
+                Req::LyricsPrefetch { id } => match client.tracks_by_ids(std::slice::from_ref(id)) {
+                    Ok(mut v) => v.pop().and_then(|t| {
+                        let album = t.album.as_ref().map(|a| a.name.clone()).unwrap_or_default();
+                        Client::lyrics_parallel(client, id, &t.name, &t.artists_str(), &album, t.duration_ms, None)
+                    }),
+                    Err(e) => {
+                        log::info!("letra por adelantado de {id}: {e}");
+                        None
+                    }
+                },
+                _ => None,
+            };
+            log::info!(
+                "[letra] {:?} en {} ms: {}",
+                match &req {
+                    Req::LyricsPrefetch { .. } => "por adelantado",
+                    _ => "la que suena",
+                },
+                t0.elapsed().as_millis(),
+                l.as_ref().map(|l| format!("{} ({}, {} renglones)", l.provider, l.sync_type, l.lines.len())).unwrap_or_else(|| "sin letra".into())
+            );
+            ui.send(Msg::Api(ApiResult { req, result: Ok(Resp::Lyrics(l)) }));
+        }
         fn run(req: Req, client: &Client, ui: &UiTx) {
             let t0 = std::time::Instant::now();
             let result = client.exec(&req, ui);
@@ -750,7 +803,7 @@ impl Api {
                             }
                             // Las letras antes que nada: las espera la canción que suena, y
                             // detrás de varias búsquedas de géneros tardarían más que antes.
-                            if let Some(req) = q.lyrics.take() {
+                            if let Some(req) = q.lyrics.take().or_else(|| q.prefetch.take()) {
                                 break Job::Lyrics(req);
                             }
                             if let Some((key, artist, album)) = q.genres.pop_back() {
@@ -760,13 +813,15 @@ impl Api {
                         }
                     };
                     match job {
-                        Job::Lyrics(req) => run(req, &client, &ui),
+                        // Cada letra en su hilo: la de una canción ya saltada, esperando a una
+                        // fuente lenta, no retrasa la de la siguiente.
+                        Job::Lyrics(req) => spawn_lyrics(req, &client, &ui),
                         Job::Genres(key, artist, album) => {
                             let t0 = Instant::now();
                             let lyrics_waiting = || {
                                 let req = enrich.0.lock().unwrap().lyrics.take();
                                 if let Some(req) = req {
-                                    run(req, &client, &ui);
+                                    spawn_lyrics(req, &client, &ui);
                                 }
                             };
                             let genres = client.external_genres(&key, &artist, album.as_deref(), &lyrics_waiting);
@@ -842,9 +897,11 @@ impl Api {
         }
         // Las letras, a su hueco del carril de enriquecimiento: si aún espera la de una canción
         // ya saltada, la sustituye (la app solo acepta la de la que suena).
-        if matches!(req, Req::Lyrics { .. }) {
+        if matches!(req, Req::Lyrics { .. } | Req::LyricsPrefetch { .. }) {
             let (lock, cv) = &*self.enrich;
-            if let Some(old) = lock.lock().unwrap().lyrics.replace(req) {
+            let mut q = lock.lock().unwrap();
+            let slot = if matches!(req, Req::Lyrics { .. }) { &mut q.lyrics } else { &mut q.prefetch };
+            if let Some(old) = slot.replace(req) {
                 log::info!("api {:?} descartada: hay unas letras más nuevas", old);
             }
             cv.notify_one();
@@ -1462,10 +1519,124 @@ impl Client {
     }
 
     /// Letras desde LRCLIB (https://lrclib.net), sin autenticación.
+    /// La letra de una canción con todas las fuentes a la vez. Por orden de preferencia:
+    /// BiniLyrics por sílabas, Musixmatch por palabras, BiniLyrics por renglones, LRCLIB, Musixmatch
+    /// por renglones y el endpoint interno de Spotify (solo responde a algunas cuentas); una letra
+    /// de LRCLIB sin tiempos, si ninguna los trae. Se devuelve la mejor en cuanto las anteriores
+    /// han fallado, sin esperar a las peores (sus hilos acaban solos, con sus plazos de red); que
+    /// una peor responda antes no la hace ganar. Con `early`, si a los `EARLY_AFTER` aún falta una
+    /// mejor por responder, se le pasa la mejor que haya (y otra vez cada vez que llegue una mejor)
+    /// para ir mostrándola.
+    #[allow(clippy::too_many_arguments)]
+    fn lyrics_parallel(
+        client: &Arc<Client>,
+        id: &str,
+        name: &str,
+        artist: &str,
+        album: &str,
+        duration_ms: u32,
+        early: Option<&dyn Fn(&Lyrics)>,
+    ) -> Option<Lyrics> {
+        /// Tras esto se enseña la mejor que haya mientras se espera a las mejores.
+        const EARLY_AFTER: Duration = Duration::from_millis(700);
+        /// Huecos por preferencia; el último, la letra sin tiempos de LRCLIB.
+        const SLOTS: usize = 7;
+        let dur_s = (duration_ms + 500) / 1000;
+        let (tx, rx) = mpsc::channel::<(usize, Option<Lyrics>)>();
+        let job = |f: Box<dyn FnOnce(&Client, &mpsc::Sender<(usize, Option<Lyrics>)>) + Send>| {
+            let c = client.clone();
+            let tx = tx.clone();
+            let _ = std::thread::Builder::new().name("nanofy-letra".into()).stack_size(512 * 1024).spawn(move || f(&c, &tx));
+        };
+        let own = |s: &str| s.to_string();
+        let (i, n, a, al) = (own(id), own(name), own(artist), own(album));
+        {
+            let (i, n, a, al) = (i.clone(), n.clone(), a.clone(), al.clone());
+            job(Box::new(move |c, tx| {
+                // Una búsqueda para las dos de BiniLyrics: por sílabas y, si no, por renglones.
+                let found = c.binilyrics_search(&n, &a);
+                let word = found.as_deref().and_then(|r| c.binilyrics(&i, r, &n, &a, &al, dur_s, "word"));
+                let had_word = word.is_some();
+                let _ = tx.send((0, word));
+                let line = if had_word { None } else { found.as_deref().and_then(|r| c.binilyrics(&i, r, &n, &a, &al, dur_s, "line")) };
+                let _ = tx.send((2, line));
+            }));
+        }
+        for (slot, source) in [(1, "musixmatch-word"), (4, "musixmatch")] {
+            let (i, n, a, al) = (i.clone(), n.clone(), a.clone(), al.clone());
+            job(Box::new(move |c, tx| {
+                let _ = tx.send((slot, c.lyrics_plus(&i, &n, &a, &al, dur_s, source)));
+            }));
+        }
+        {
+            let (i, n, a, al) = (i.clone(), n.clone(), a.clone(), al.clone());
+            job(Box::new(move |c, tx| {
+                let l = c.lrclib(&i, &n, &a, &al, duration_ms);
+                let synced = l.as_ref().is_some_and(|l| l.synced());
+                let _ = tx.send((3, l.clone().filter(|_| synced)));
+                let _ = tx.send((6, l.filter(|_| !synced)));
+            }));
+        }
+        {
+            let i = i.clone();
+            job(Box::new(move |c, tx| {
+                let _ = tx.send((5, c.spotify_lyrics(&i)));
+            }));
+        }
+        drop(tx);
+        let mut got: [Option<Option<Lyrics>>; SLOTS] = Default::default();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(12);
+        // Hueco de la última provisional enseñada.
+        let mut shown: Option<usize> = None;
+        loop {
+            if let Some(l) = crate::lyrics_sources::winner(&got) {
+                return Some(l.clone());
+            }
+            if let Some(cb) = early.filter(|_| start.elapsed() >= EARLY_AFTER) {
+                if let Some((k, l)) = crate::lyrics_sources::best_so_far(&got).filter(|(k, _)| shown.is_none_or(|s| *k < s)) {
+                    cb(l);
+                    shown = Some(k);
+                }
+            }
+            let now = Instant::now();
+            let mut wait = deadline.saturating_duration_since(now);
+            if early.is_some() && shown.is_none() && now < start + EARLY_AFTER {
+                wait = wait.min(start + EARLY_AFTER - now);
+            }
+            match rx.recv_timeout(wait) {
+                Ok((k, l)) => got[k] = Some(l),
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                // Todas respondieron sin letra, o se acabó el plazo: la mejor de las que hay.
+                Err(_) => return got.into_iter().flatten().flatten().next(),
+            }
+        }
+    }
+
+    /// La letra del endpoint interno de Spotify (solo responde a algunas cuentas), con plazo.
+    fn spotify_lyrics(&self, id: &str) -> Option<Lyrics> {
+        let session = self.session().ok()?;
+        let mut headers = http::HeaderMap::new();
+        headers.insert("app-platform", "WebPlayer".parse().unwrap());
+        headers.insert("accept", "application/json".parse().unwrap());
+        let endpoint = format!("/color-lyrics/v2/track/{id}?format=json&vocalRemoval=false&market=from_token");
+        let result = self.handle.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), session.spclient().request(&http::Method::GET, &endpoint, Some(headers), None)).await
+        });
+        let bytes = result.ok()?.ok()?;
+        let v: Value = serde_json::from_slice(&bytes).ok()?;
+        Lyrics::from_json(id, &v)
+    }
+
     /// GET de una fuente de letras externa: el cuerpo si responde 200 (cualquier otra cosa, al
     /// registro y `None`).
     fn ext_get(&self, url: &str, what: &str) -> Option<String> {
-        let mut resp = match self.ext_agent.get(url).header("User-Agent", "Nanofy (cliente nativo de Spotify)").call() {
+        // Un fallo de conexión (a veces la primera tras abrir) se reintenta una vez enseguida.
+        let call = || self.ext_agent.get(url).header("User-Agent", "Nanofy (cliente nativo de Spotify)").call();
+        let mut resp = match call().or_else(|e| {
+            log::info!("{what}: {e}; otra vez");
+            call()
+        }) {
             Ok(r) => r,
             Err(e) => {
                 log::info!("{what}: {e}");
@@ -1538,7 +1709,9 @@ impl Client {
                 return None;
             }
             if status != 200 {
-                log::info!("lyrics+ {base} ({source}): HTTP {status}");
+                // Demasiadas peticiones o un fallo suyo: también un rato sin preguntarle.
+                log::info!("lyrics+ {base} ({source}): HTTP {status}; dos minutos sin preguntarle");
+                self.lyrics_plus_down.lock().unwrap_or_else(|e| e.into_inner())[k] = Some(Instant::now() + Duration::from_secs(120));
                 continue;
             }
             let v: Value = resp.body_mut().read_json().ok()?;
@@ -3981,62 +4154,8 @@ impl Client {
                     following: false,
                 })
             }
-            Req::Lyrics {
-                id,
-                name,
-                artist,
-                album,
-                duration_ms,
-            } => {
-                // Las fuentes, de más a menos detalle: BiniLyrics por sílabas, Musixmatch por
-                // palabras, BiniLyrics por renglones, LRCLIB y Musixmatch por renglones; Spotify
-                // (solo responde a algunas cuentas) al final. Una letra sin tiempos de LRCLIB se
-                // guarda por si ninguna de las siguientes los trae.
-                let dur_s = (*duration_ms + 500) / 1000;
-                let bini = self.binilyrics_search(name, artist);
-                if let Some(l) = bini.as_deref().and_then(|r| self.binilyrics(id, r, name, artist, album, dur_s, "word")) {
-                    return Ok(Resp::Lyrics(Some(l)));
-                }
-                if let Some(l) = self.lyrics_plus(id, name, artist, album, dur_s, "musixmatch-word") {
-                    return Ok(Resp::Lyrics(Some(l)));
-                }
-                if let Some(l) = bini.as_deref().and_then(|r| self.binilyrics(id, r, name, artist, album, dur_s, "line")) {
-                    return Ok(Resp::Lyrics(Some(l)));
-                }
-                let lrclib = self.lrclib(id, name, artist, album, *duration_ms);
-                if let Some(l) = lrclib.as_ref().filter(|l| l.synced()) {
-                    return Ok(Resp::Lyrics(Some(l.clone())));
-                }
-                if let Some(l) = self.lyrics_plus(id, name, artist, album, dur_s, "musixmatch") {
-                    return Ok(Resp::Lyrics(Some(l)));
-                }
-                // Endpoint interno de Spotify (solo funciona para algunos tokens/cuentas).
-                if let Ok(session) = self.session() {
-                    let mut headers = http::HeaderMap::new();
-                    headers.insert("app-platform", "WebPlayer".parse().unwrap());
-                    headers.insert("accept", "application/json".parse().unwrap());
-                    let endpoint = format!(
-                        "/color-lyrics/v2/track/{id}?format=json&vocalRemoval=false&market=from_token"
-                    );
-                    // Con plazo: una llamada colgada pararía el carril de enriquecimiento entero
-                    // (los géneros esperan detrás). Si vence, se prueba LRCLIB.
-                    let result = self.handle.block_on(async {
-                        tokio::time::timeout(
-                            Duration::from_secs(5),
-                            session.spclient().request(&http::Method::GET, &endpoint, Some(headers), None),
-                        )
-                        .await
-                    });
-                    if let Ok(Ok(bytes)) = result {
-                        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                            if let Some(l) = Lyrics::from_json(id, &v) {
-                                return Ok(Resp::Lyrics(Some(l)));
-                            }
-                        }
-                    }
-                }
-                Ok(Resp::Lyrics(lrclib))
-            }
+            // Van por el carril de enriquecimiento (`run_lyrics`), que las pide en paralelo.
+            Req::Lyrics { .. } | Req::LyricsPrefetch { .. } => Err("las letras van por su carril".into()),
             Req::JamCurrent => {
                 let session = self.session()?;
                 let endpoint = format!(

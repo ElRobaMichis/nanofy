@@ -952,7 +952,7 @@ pub struct QueueResponse {
 
 // ------------------------------------------------------------------ letras
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LyricLine {
     pub start_ms: u32,
     pub words: String,
@@ -965,7 +965,7 @@ pub struct LyricLine {
 }
 
 /// Una sílaba de un renglón con tiempos por sílaba.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Syllable {
     pub start_ms: u32,
     pub chars: usize,
@@ -1016,7 +1016,7 @@ fn lrc_words(text: &str) -> (String, Vec<Syllable>) {
     (words.trim_end().to_string(), syl)
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Lyrics {
     pub track_id: String,
     /// "LINE_SYNCED", "SYLLABLE_SYNCED" (con tiempos por sílaba) o "UNSYNCED"

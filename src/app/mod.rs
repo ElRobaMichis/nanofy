@@ -1015,6 +1015,11 @@ pub struct App {
     pub lyrics: Option<Lyrics>,
     pub lyrics_for: Option<String>,
     pub lyrics_loading: bool,
+    /// Letras ya pedidas en esta sesión (también «sin letra»), por id de canción; las que tienen
+    /// letra se guardan además en disco (`lyrics_from_disk`).
+    lyrics_cache: HashMap<String, Option<Lyrics>>,
+    /// Canciones cuya letra ya se pidió por adelantado.
+    lyrics_prefetched: HashSet<String>,
     /// Panel de la letra: el botón de la letra en este fotograma (para ponerse encima), lo
     /// desplazada que está (px) y de qué canción (otra canción vuelve arriba).
     pub lyrics_button: Option<egui::Rect>,
@@ -1405,6 +1410,8 @@ impl App {
             queue: None,
             queue_at: Instant::now() - Duration::from_secs(60),
             lyrics: None,
+            lyrics_cache: HashMap::new(),
+            lyrics_prefetched: HashSet::new(),
             lyrics_for: None,
             lyrics_loading: false,
             lyrics_button: None,
@@ -4099,6 +4106,13 @@ impl App {
             return;
         }
         self.lyrics_for = Some(id.clone());
+        // Ya la tenemos (pedida antes, por adelantado o guardada en disco): al instante.
+        if let Some(l) = self.lyrics_cache.get(&id).cloned().or_else(|| self.lyrics_from_disk(&id).map(Some)) {
+            self.lyrics_cache.insert(id, l.clone());
+            self.lyrics = l;
+            self.lyrics_loading = false;
+            return;
+        }
         self.lyrics = None;
         self.lyrics_loading = true;
         self.api.send(Req::Lyrics {
@@ -4108,6 +4122,55 @@ impl App {
             album: np.album.clone(),
             duration_ms: np.duration_ms,
         });
+    }
+
+    /// Dónde se guarda la letra de una canción.
+    fn lyrics_file(&self, id: &str) -> PathBuf {
+        self.paths.cache_dir.join("lyrics").join(format!("{id}.json"))
+    }
+
+    /// La letra guardada de una canción, si tiene menos de 30 días.
+    fn lyrics_from_disk(&self, id: &str) -> Option<Lyrics> {
+        let path = self.lyrics_file(id);
+        let age = std::fs::metadata(&path).ok()?.modified().ok()?.elapsed().unwrap_or_default();
+        if age > Duration::from_secs(30 * 24 * 3600) {
+            return None;
+        }
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    }
+
+    /// Guarda la letra (en segundo plano: no frena el fotograma).
+    fn lyrics_to_disk(&self, l: &Lyrics) {
+        let path = self.lyrics_file(&l.track_id);
+        let Ok(json) = serde_json::to_string(l) else { return };
+        std::thread::spawn(move || {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, json);
+        });
+    }
+
+    /// Con el panel de la letra abierto y la de la que suena ya puesta: la de la canción
+    /// siguiente, por adelantado (la siguiente del estado de Spotify), para que al cambiar
+    /// aparezca al instante. Una vez por canción.
+    pub(super) fn prefetch_next_lyrics(&mut self) {
+        if self.lyrics_loading || self.lyrics.is_none() {
+            return;
+        }
+        let now_uri = self.player.now.as_ref().map(|n| n.uri.clone()).unwrap_or_default();
+        let Some(Some(info)) = &self.server_cluster else { return };
+        let Some(next) = info.next.iter().find(|u| u.starts_with("spotify:track:") && **u != now_uri) else { return };
+        let id = next.trim_start_matches("spotify:track:").to_string();
+        if self.lyrics_cache.contains_key(&id) || self.lyrics_prefetched.contains(&id) {
+            return;
+        }
+        self.lyrics_prefetched.insert(id.clone());
+        if let Some(l) = self.lyrics_from_disk(&id) {
+            self.lyrics_cache.insert(id, Some(l));
+            return;
+        }
+        self.api.send(Req::LyricsPrefetch { id });
     }
 
     fn on_api(&mut self, r: ApiResult) {
@@ -5244,6 +5307,15 @@ impl App {
                     "Has dejado de seguir este perfil"
                 });
             }
+            // Mientras falta por responder una fuente mejor: se va enseñando (no se guarda).
+            Resp::LyricsEarly(l) => {
+                if let Req::Lyrics { id, .. } = &r.req {
+                    if self.lyrics_for.as_deref() == Some(id.as_str()) && self.lyrics_loading {
+                        self.lyrics = Some(l);
+                        self.lyrics_loading = false;
+                    }
+                }
+            }
             Resp::Lyrics(l) => {
                 if self.diag {
                     log::info!(
@@ -5251,11 +5323,22 @@ impl App {
                         l.as_ref().map(|l| (l.sync_type.clone(), l.lines.len(), l.lines.first().map(|x| x.words.clone())))
                     );
                 }
-                self.lyrics_loading = false;
-                if let Req::Lyrics { id, .. } = &r.req {
-                    if self.lyrics_for.as_deref() == Some(id.as_str()) {
-                        self.lyrics = l;
-                    }
+                let id = match &r.req {
+                    Req::Lyrics { id, .. } | Req::LyricsPrefetch { id } => id.clone(),
+                    _ => String::new(),
+                };
+                if let Some(l) = &l {
+                    self.lyrics_to_disk(l);
+                }
+                if self.lyrics_cache.len() > 300 {
+                    self.lyrics_cache.clear();
+                }
+                self.lyrics_cache.insert(id.clone(), l.clone());
+                // Solo la de la canción que suena cuenta: la de una ya saltada (o la de la
+                // siguiente) no deja el panel en «sin letra» mientras llega la buena.
+                if self.lyrics_for.as_deref() == Some(id.as_str()) {
+                    self.lyrics = l;
+                    self.lyrics_loading = false;
                 }
             }
             Resp::Jam(j) => {

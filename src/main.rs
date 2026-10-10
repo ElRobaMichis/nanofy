@@ -10,6 +10,7 @@ mod config;
 mod control;
 mod fonts;
 mod images;
+mod lyrics_sources;
 mod media;
 mod mixprobe;
 #[cfg(windows)]

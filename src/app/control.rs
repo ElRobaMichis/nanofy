@@ -458,6 +458,25 @@ impl App {
                 self.ensure_lyrics();
                 ok()
             }
+            // Pide la letra de una canción cualquiera (sin reproducirla), para ver de qué fuente
+            // llega: el resultado queda en `lyrics` del estado. Con el panel de la letra cerrado
+            // (si no, vuelve a pedir la de la que suena).
+            "lyrics_probe" => match (s(cmd, "id"), s(cmd, "name"), s(cmd, "artist")) {
+                (Some(id), Some(name), Some(artist)) => {
+                    self.lyrics_for = Some(id.to_string());
+                    self.lyrics = None;
+                    self.lyrics_loading = true;
+                    self.api.send(Req::Lyrics {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        artist: artist.to_string(),
+                        album: s(cmd, "album").unwrap_or("").to_string(),
+                        duration_ms: n(cmd, "duration_ms").unwrap_or(0) as u32,
+                    });
+                    ok()
+                }
+                _ => err("faltan id, name o artist"),
+            },
             "radio" => match s(cmd, "track_id") {
                 Some(id) => {
                     self.actions.push(Action::OpenRadio(id.to_string()));

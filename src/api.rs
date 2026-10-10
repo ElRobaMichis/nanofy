@@ -602,6 +602,7 @@ impl Api {
         let client = Arc::new(Client {
             agent,
             ext_agent: ureq::Agent::new_with_config(ext_config),
+            lyrics_plus_down: Mutex::new([None; 3]),
             pf,
             shared,
             handle,
@@ -888,6 +889,8 @@ struct Client {
     agent: ureq::Agent,
     /// Para las fuentes externas (letras, géneros), con plazo corto.
     ext_agent: ureq::Agent,
+    /// Servidores de Lyrics+ que no respondieron: hasta cuándo no se les pregunta.
+    lyrics_plus_down: Mutex<[Option<Instant>; 3]>,
     /// Búsqueda de los clientes oficiales (pathfinder), antes que la de la Web API.
     pf: Pathfinder,
     shared: Arc<Shared>,
@@ -1459,6 +1462,93 @@ impl Client {
     }
 
     /// Letras desde LRCLIB (https://lrclib.net), sin autenticación.
+    /// GET de una fuente de letras externa: el cuerpo si responde 200 (cualquier otra cosa, al
+    /// registro y `None`).
+    fn ext_get(&self, url: &str, what: &str) -> Option<String> {
+        let mut resp = match self.ext_agent.get(url).header("User-Agent", "Nanofy (cliente nativo de Spotify)").call() {
+            Ok(r) => r,
+            Err(e) => {
+                log::info!("{what}: {e}");
+                return None;
+            }
+        };
+        let status = resp.status().as_u16();
+        if status != 200 {
+            log::info!("{what}: HTTP {status}");
+            return None;
+        }
+        resp.body_mut().read_to_string().map_err(|e| log::info!("{what}: {e}")).ok()
+    }
+
+    /// Búsqueda en BiniLyrics (lrc.red) por título y artista: sus resultados (cada uno con su
+    /// letra en TTML y si sus tiempos son por palabra o por renglón).
+    fn binilyrics_search(&self, name: &str, artist: &str) -> Option<Vec<Value>> {
+        // Con el título sin «(feat. …)» ni «- Remastered»: con él entero la búsqueda no encuentra
+        // la versión del álbum (p. ej. «Get Lucky (feat. Pharrell Williams & Nile Rodgers)»).
+        let first_artist = artist.split(',').next().unwrap_or(artist).trim();
+        let q = format!("{} {first_artist}", crate::lyrics_sources::search_title(name));
+        let text = self.ext_get(&format!("https://lrc.red/api/v1?q={}", urlencode(q.trim())), "binilyrics")?;
+        let v: Value = serde_json::from_str(&text).ok()?;
+        v.get("results").and_then(|r| r.as_array()).cloned().filter(|r| !r.is_empty())
+    }
+
+    /// La letra de BiniLyrics de la versión que es esta canción, con tiempos `timing` («word»: por
+    /// palabra o sílaba; «line»: por renglón).
+    #[allow(clippy::too_many_arguments)]
+    fn binilyrics(&self, id: &str, results: &[Value], name: &str, artist: &str, album: &str, dur_s: u32, timing: &str) -> Option<Lyrics> {
+        let url = crate::lyrics_sources::pick_lrcred(results, name, artist, album, dur_s, timing)?;
+        let ttml = self.ext_get(&url, "binilyrics ttml")?;
+        let l = crate::lyrics_sources::parse_ttml(id, &ttml, "BiniLyrics")?;
+        log::info!("letra de BiniLyrics ({timing}): {} renglones", l.lines.len());
+        Some(l)
+    }
+
+    /// La letra de Musixmatch a través de Lyrics+ (la API pública que usa YouLy+): `source`
+    /// «musixmatch-word» (por palabras) o «musixmatch» (por renglones). Si un servidor no
+    /// responde se prueba el siguiente; un «no encontrada» basta.
+    fn lyrics_plus(&self, id: &str, name: &str, artist: &str, album: &str, dur_s: u32, source: &str) -> Option<Lyrics> {
+        const SERVERS: [&str; 3] = ["https://lyricsplus.prjktla.my.id", "https://lyricsplus.binimum.org", "https://lyricsplus.prjktla.workers.dev"];
+        let first_artist = artist.split(',').next().unwrap_or(artist).trim();
+        let mut query = format!("title={}&artist={}&source={source}", urlencode(name), urlencode(first_artist));
+        if dur_s > 0 {
+            query.push_str(&format!("&duration={dur_s}"));
+        }
+        if !album.is_empty() {
+            query.push_str(&format!("&album={}", urlencode(album)));
+        }
+        for (k, base) in SERVERS.iter().enumerate() {
+            let down = self.lyrics_plus_down.lock().unwrap_or_else(|e| e.into_inner())[k];
+            if down.is_some_and(|until| Instant::now() < until) {
+                continue;
+            }
+            let url = format!("{base}/v2/lyrics/get?{query}");
+            let mut resp = match self.ext_agent.get(&url).header("User-Agent", "Nanofy (cliente nativo de Spotify)").call() {
+                Ok(r) => r,
+                Err(e) => {
+                    // Sin respuesta (caído o lento): un rato sin preguntarle, para que cada
+                    // canción no espere su plazo entero.
+                    log::info!("lyrics+ {base} ({source}): {e}; dos minutos sin preguntarle");
+                    self.lyrics_plus_down.lock().unwrap_or_else(|e| e.into_inner())[k] = Some(Instant::now() + Duration::from_secs(120));
+                    continue;
+                }
+            };
+            let status = resp.status().as_u16();
+            if status == 404 || status == 403 {
+                log::info!("lyrics+ ({source}): sin letra");
+                return None;
+            }
+            if status != 200 {
+                log::info!("lyrics+ {base} ({source}): HTTP {status}");
+                continue;
+            }
+            let v: Value = resp.body_mut().read_json().ok()?;
+            let l = crate::lyrics_sources::parse_kpoe(id, &v, "Musixmatch")?;
+            log::info!("letra de Musixmatch ({source}): {} renglones", l.lines.len());
+            return Some(l);
+        }
+        None
+    }
+
     fn lrclib(&self, id: &str, name: &str, artist: &str, album: &str, duration_ms: u32) -> Option<Lyrics> {
         let first_artist = artist.split(',').next().unwrap_or(artist).trim();
         let mut url = format!(
@@ -3898,7 +3988,29 @@ impl Client {
                 album,
                 duration_ms,
             } => {
-                // 1) Endpoint interno de Spotify (solo funciona para algunos tokens/cuentas).
+                // Las fuentes, de más a menos detalle: BiniLyrics por sílabas, Musixmatch por
+                // palabras, BiniLyrics por renglones, LRCLIB y Musixmatch por renglones; Spotify
+                // (solo responde a algunas cuentas) al final. Una letra sin tiempos de LRCLIB se
+                // guarda por si ninguna de las siguientes los trae.
+                let dur_s = (*duration_ms + 500) / 1000;
+                let bini = self.binilyrics_search(name, artist);
+                if let Some(l) = bini.as_deref().and_then(|r| self.binilyrics(id, r, name, artist, album, dur_s, "word")) {
+                    return Ok(Resp::Lyrics(Some(l)));
+                }
+                if let Some(l) = self.lyrics_plus(id, name, artist, album, dur_s, "musixmatch-word") {
+                    return Ok(Resp::Lyrics(Some(l)));
+                }
+                if let Some(l) = bini.as_deref().and_then(|r| self.binilyrics(id, r, name, artist, album, dur_s, "line")) {
+                    return Ok(Resp::Lyrics(Some(l)));
+                }
+                let lrclib = self.lrclib(id, name, artist, album, *duration_ms);
+                if let Some(l) = lrclib.as_ref().filter(|l| l.synced()) {
+                    return Ok(Resp::Lyrics(Some(l.clone())));
+                }
+                if let Some(l) = self.lyrics_plus(id, name, artist, album, dur_s, "musixmatch") {
+                    return Ok(Resp::Lyrics(Some(l)));
+                }
+                // Endpoint interno de Spotify (solo funciona para algunos tokens/cuentas).
                 if let Ok(session) = self.session() {
                     let mut headers = http::HeaderMap::new();
                     headers.insert("app-platform", "WebPlayer".parse().unwrap());
@@ -3923,8 +4035,7 @@ impl Client {
                         }
                     }
                 }
-                // 2) LRCLIB: base de datos abierta de letras sincronizadas.
-                Ok(Resp::Lyrics(self.lrclib(id, name, artist, album, *duration_ms)))
+                Ok(Resp::Lyrics(lrclib))
             }
             Req::JamCurrent => {
                 let session = self.session()?;

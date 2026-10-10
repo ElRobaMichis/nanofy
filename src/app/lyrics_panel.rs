@@ -472,6 +472,29 @@ mod tests {
         assert_eq!(sung_chars(&line("  ab", &[(0, 4)]), 9000, 9000), Some(2.0));
     }
 
+    /// Lo cantado, por filas: con el texto partido en dos filas, la primera entera y la segunda
+    /// hasta el carácter que va a medias.
+    #[test]
+    fn relleno_por_filas() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+        let g = ctx.fonts_mut(|f| f.layout("uno dos tres cuatro".to_string(), egui::FontId::proportional(20.0), Color32::WHITE, 70.0));
+        assert!(g.rows.len() >= 2, "{}", g.rows.len());
+        let n0 = g.rows[0].row.glyphs.len() as f32;
+        // Nada cantado: nada.
+        assert!(sung_rows(&g, 0.0).is_empty());
+        // Media letra de la primera fila: solo ella, a mitad de ese carácter.
+        let r = sung_rows(&g, 1.5);
+        assert_eq!(r.len(), 1);
+        let gl = &g.rows[0].row.glyphs[1];
+        assert!((r[0].1 - (g.rows[0].pos.x + gl.pos.x + 0.5 * gl.advance_width)).abs() < 0.01);
+        // Primera fila entera y un carácter de la segunda.
+        let r = sung_rows(&g, n0 + 1.0);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0], (0, g.rows[0].pos.x + g.rows[0].row.size.x));
+        assert_eq!(r[1].0, 1);
+    }
+
     #[test]
     fn desplazamiento_por_el_reloj() {
         // Empieza donde estaba, frena al final y llega a la vez aunque falten fotogramas.

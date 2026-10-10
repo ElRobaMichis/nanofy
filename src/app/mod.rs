@@ -844,6 +844,8 @@ pub struct App {
     pub recent_at: Instant,
     /// Historial fusionado (clave de invalidación, lista).
     pub history_cache: Option<((usize, u64, usize, String), Vec<Track>)>,
+    /// «Ver álbum» de una canción guardada sin su álbum: al llegar sus datos se abre el álbum.
+    album_of_pending: Option<String>,
     /// Las filas muestran «Añadida por …» (playlists colaborativas).
     pub rows_added_by: bool,
     pub queued_local: Vec<String>,
@@ -1283,6 +1285,7 @@ impl App {
             jam_queue_active: false,
             recent_at: Instant::now(),
             history_cache: None,
+            album_of_pending: None,
             rows_added_by: false,
             queued_local: Vec::new(),
             pending_queue: None,
@@ -4846,6 +4849,31 @@ impl App {
                         r.album = t.album.clone();
                     }
                 }
+                // También en el registro local, del que sale el historial («Recientes» y la
+                // página Historial): la canción se guardó al empezar, aún sin su álbum.
+                if album_id.is_some() {
+                    let stale = self
+                        .play_log
+                        .entries
+                        .iter()
+                        .any(|e| e.track.id == t.id && e.track.album.as_ref().is_none_or(|a| a.id.is_none()));
+                    if stale {
+                        for e in std::sync::Arc::make_mut(&mut self.play_log).entries.iter_mut() {
+                            if e.track.id == t.id && e.track.album.as_ref().is_none_or(|a| a.id.is_none()) {
+                                e.track.album = t.album.clone();
+                            }
+                        }
+                        self.play_log_dirty = true;
+                        self.history_cache = None;
+                    }
+                }
+                if t.id.is_some() && self.album_of_pending == t.id {
+                    self.album_of_pending = None;
+                    match album_id {
+                        Some(a) => self.go(Page::Album(a)),
+                        None => self.status_err("No se encontró el álbum de esta canción"),
+                    }
+                }
             }
             Resp::RadioPlaylist { playlist_id } => {
                 if let Req::RadioPlaylist(seed) = &r.req {
@@ -6230,6 +6258,14 @@ impl App {
         let mut keep = self.queued_local.clone();
         keep.remove(i);
         self.queue_rebuild(keep);
+    }
+
+    /// «Ver álbum» de una canción guardada sin su álbum (el historial lo guardaba así al empezar
+    /// a sonar): se piden los datos de la canción y, al llegar, se abre su álbum.
+    pub fn open_album_of(&mut self, track_id: String) {
+        self.album_of_pending = Some(track_id.clone());
+        self.status("Buscando el álbum…");
+        self.api.send(Req::TrackInfo(track_id));
     }
 
     pub fn queue_clear(&mut self) {

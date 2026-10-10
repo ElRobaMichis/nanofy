@@ -1270,7 +1270,14 @@ impl App {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for e in local.into_iter().take(200) {
             if seen.insert(e.track.uri.clone()) {
-                out.push(e.track.clone());
+                let mut t = e.track.clone();
+                // Guardada al empezar a sonar, sin su álbum: el de Spotify, si lo trae.
+                if t.album.as_ref().is_none_or(|a| a.id.is_none()) {
+                    if let Some(r) = self.recent.iter().find(|r| r.uri == t.uri && r.album.as_ref().is_some_and(|a| a.id.is_some())) {
+                        t.album = r.album.clone();
+                    }
+                }
+                out.push(t);
             }
         }
         for t in &self.recent {

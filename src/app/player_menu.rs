@@ -293,7 +293,8 @@ impl App {
                 s.track.is_some() && s.remove_from.is_some(),
             ),
             What::Radio => ("Ir a la radio de la canción".to_string(), s.id.is_some() && !s.is_episode),
-            What::Album => ("Ver álbum".to_string(), s.album_id.is_some()),
+            // Sin el álbum a mano (canciones del historial guardadas sin él) se busca al elegirlo.
+            What::Album => ("Ver álbum".to_string(), s.album_id.is_some() || (s.id.is_some() && !s.is_episode)),
             What::Artist => ("Ver artista".to_string(), !s.artists.is_empty()),
             What::Miniplayer => ((if self.miniplayer { "Salir del miniplayer" } else { "Miniplayer" }).to_string(), true),
             What::Fullscreen => ((if self.fullscreen { "Salir de pantalla completa" } else { "Pantalla completa" }).to_string(), true),
@@ -468,11 +469,11 @@ impl App {
                         self.actions.push(Action::OpenRadio(id));
                     }
                 }
-                What::Album => {
-                    if let Some(aid) = s.album_id.clone() {
-                        self.actions.push(Action::Go(Page::Album(aid)));
-                    }
-                }
+                What::Album => match (s.album_id.clone(), s.id.clone()) {
+                    (Some(aid), _) => self.actions.push(Action::Go(Page::Album(aid))),
+                    (None, Some(id)) => self.open_album_of(id),
+                    _ => {}
+                },
                 What::Miniplayer => self.toggle_miniplayer(ctx),
                 What::Fullscreen => self.toggle_fullscreen(ctx),
                 What::Jam => self.jam_open = true,

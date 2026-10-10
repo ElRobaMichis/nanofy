@@ -295,26 +295,9 @@ impl Images {
     /// Color de arriba del degradado de una página (playlist, álbum) según su portada ya
     /// cargada: el tono dominante con la saturación moderada y oscurecido hasta una luminancia
     /// de ~40 (en la referencia de diseño, una portada azul da (30, 39, 87)).
-    /// Color de la portada para el fondo del reproductor, adaptado al tema: en oscuro con la
-    /// luminancia llevada a ~52; en claro, un tinte suave sobre blanco.
+    /// Color de la portada para el fondo del reproductor, adaptado al tema (ver `bar_color`).
     pub fn color(&self, url: &str, dark: bool) -> Option<egui::Color32> {
-        let raw = self.colors.get(url).copied()?;
-        let (r, g, b) = (raw.r() as f64, raw.g() as f64, raw.b() as f64);
-        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        Some(if dark {
-            let target = 52.0;
-            let k = if lum > 1.0 { (target / lum).min(1.4) } else { 1.0 };
-            let c = |v: f64| ((v * k).clamp(0.0, 255.0)) as u8;
-            egui::Color32::from_rgb(c(r), c(g), c(b))
-        } else {
-            // Tinte: 78 % blanco + 22 % color, y nunca más oscuro que ~215 de luminancia.
-            let mix = |v: f64| 255.0 * 0.78 + v * 0.22;
-            let (mr, mg, mb) = (mix(r), mix(g), mix(b));
-            let l2 = 0.2126 * mr + 0.7152 * mg + 0.0722 * mb;
-            let k = if l2 < 215.0 { 215.0 / l2 } else { 1.0 };
-            let c = |v: f64| ((v * k).clamp(0.0, 255.0)) as u8;
-            egui::Color32::from_rgb(c(mr), c(mg), c(mb))
-        })
+        self.colors.get(url).copied().map(|raw| bar_color(raw, dark))
     }
 
     /// Color de la «pila» de la tarjeta de esta portada (ver `stack_color`), si ya llegó.
@@ -742,4 +725,66 @@ fn dominant_color(img: &ColorImage) -> egui::Color32 {
         return egui::Color32::from_rgb(128, 128, 128);
     }
     egui::Color32::from_rgb((r / wsum) as u8, (g / wsum) as u8, (b / wsum) as u8)
+}
+
+/// Fondo del reproductor a partir del color dominante de la portada. En oscuro: saturación como
+/// mucho 0,55, luminancia llevada a ~52 y ningún canal por encima de 100. La luminancia apenas
+/// cuenta el rojo, así que un rojo o un rosa intensos se quedaban con el canal rojo en 140-170:
+/// el fondo salía chillón y los iconos grises casi no se veían. En claro, un tinte suave sobre
+/// blanco (78 % blanco, nunca más oscuro que ~215 de luminancia).
+pub fn bar_color(raw: egui::Color32, dark: bool) -> egui::Color32 {
+    let (r, g, b) = (raw.r() as f64, raw.g() as f64, raw.b() as f64);
+    let lum = |r: f64, g: f64, b: f64| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if dark {
+        // Hacia el gris de su misma luminancia, lo justo para que la saturación (máx − mín) / máx
+        // quede en 0,55: con mezcla k, vale k·(máx − mín) / (l + k·(máx − l)).
+        let l = lum(r, g, b);
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
+        const SAT: f64 = 0.55;
+        let den = (max - min) - SAT * (max - l);
+        let k = if sat > SAT && den > 0.0 { (SAT * l / den).clamp(0.0, 1.0) } else { 1.0 };
+        let (r, g, b) = (l + (r - l) * k, l + (g - l) * k, l + (b - l) * k);
+        let l2 = lum(r, g, b);
+        let f = if l2 > 1.0 { (52.0 / l2).min(1.4) } else { 1.0 };
+        let f = f.min(100.0 / r.max(g).max(b).max(1.0));
+        let c = |v: f64| (v * f).round().clamp(0.0, 255.0) as u8;
+        egui::Color32::from_rgb(c(r), c(g), c(b))
+    } else {
+        let mix = |v: f64| 255.0 * 0.78 + v * 0.22;
+        let (mr, mg, mb) = (mix(r), mix(g), mix(b));
+        let l2 = lum(mr, mg, mb);
+        let k = if l2 < 215.0 { 215.0 / l2 } else { 1.0 };
+        let c = |v: f64| ((v * k).clamp(0.0, 255.0)) as u8;
+        egui::Color32::from_rgb(c(mr), c(mg), c(mb))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::Color32;
+
+    fn sat(c: Color32) -> f64 {
+        let (max, min) = (c.r().max(c.g()).max(c.b()) as f64, c.r().min(c.g()).min(c.b()) as f64);
+        if max > 0.0 { (max - min) / max } else { 0.0 }
+    }
+
+    /// Un rosa intenso ya no sale chillón: ningún canal pasa de 100 y la saturación queda en
+    /// ~0,55; un azul, un verde o un gris siguen como antes (en su tono y oscuros).
+    #[test]
+    fn fondo_del_reproductor_sin_colores_chillones() {
+        let pink = bar_color(Color32::from_rgb(230, 40, 110), true);
+        assert!(pink.r() <= 100 && pink.r() > pink.b() && pink.b() > pink.g(), "{pink:?}");
+        assert!(sat(pink) <= 0.6, "{pink:?}");
+        let red = bar_color(Color32::from_rgb(255, 0, 0), true);
+        assert!(red.r() <= 100, "{red:?}");
+        let blue = bar_color(Color32::from_rgb(30, 39, 87), true);
+        assert!(blue.b() > blue.g() && blue.g() > blue.r() && blue.b() <= 100, "{blue:?}");
+        let gray = bar_color(Color32::from_gray(80), true);
+        assert!(gray.r() == gray.g() && gray.g() == gray.b() && (45..=60).contains(&gray.r()), "{gray:?}");
+        // En claro, como siempre: un tinte claro.
+        let light = bar_color(Color32::from_rgb(230, 40, 110), false);
+        assert!(light.r() > 200 && light.g() > 180, "{light:?}");
+    }
 }

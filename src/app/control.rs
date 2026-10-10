@@ -882,6 +882,11 @@ impl App {
                 self.player_more_sub = n(cmd, "sub").map(|v| v as usize);
                 ok()
             }
+            // Panel de la letra: seguir la canción (`on`) o desplazarse libremente.
+            "lyrics_sync" => {
+                self.settings.lyrics_sync = b(cmd, "on", !self.settings.lyrics_sync);
+                ok()
+            }
             // Pestaña del panel de la cola: «Recientes» (`recent`) o «Cola».
             "queue_tab" => {
                 self.queue_recent = b(cmd, "recent", !self.queue_recent);
@@ -1551,6 +1556,8 @@ impl App {
             "library_grouped": self.settings.library_grouped,
             "library_kind": self.settings.library_kind,
             "queue_recent": self.queue_recent,
+            "lyrics_sync": self.settings.lyrics_sync,
+            "lyrics_offset": self.lyrics_offset,
             "autoplay": self.settings.autoplay,
             "song_menu": self.song_more.as_ref().map(|m| json!({"list": m.row.0, "i": m.row.1, "uri": m.track.uri, "sub": m.sub, "remove_from": m.remove_from})),
             "library_filter": self.library_filter,

@@ -16,6 +16,7 @@ mod pages;
 mod panels;
 mod player_bar;
 mod player_menu;
+mod lyrics_panel;
 mod queue_panel;
 mod theme;
 mod warm;
@@ -28,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use egui::{CornerRadius, Frame, Key, Margin, Modifiers};
+use egui::{Frame, Key, Margin, Modifiers};
 use souvlaki::{MediaControlEvent, SeekDirection};
 
 use crate::api::{Api, ApiResult, Req, Resp};
@@ -1014,9 +1015,11 @@ pub struct App {
     pub lyrics: Option<Lyrics>,
     pub lyrics_for: Option<String>,
     pub lyrics_loading: bool,
-    /// Última línea de letra a la que se desplazó el panel (pista, índice): el desplazamiento
-    /// animado se pide una vez por cambio de línea, no en cada fotograma.
-    pub lyrics_scrolled: Option<(String, usize)>,
+    /// Panel de la letra: el botón de la letra en este fotograma (para ponerse encima), lo
+    /// desplazada que está (px) y de qué canción (otra canción vuelve arriba).
+    pub lyrics_button: Option<egui::Rect>,
+    pub lyrics_offset: f32,
+    pub lyrics_follow_track: String,
 
     pub jam_open: bool,
     pub jam: Option<JamSession>,
@@ -1397,7 +1400,9 @@ impl App {
             lyrics: None,
             lyrics_for: None,
             lyrics_loading: false,
-            lyrics_scrolled: None,
+            lyrics_button: None,
+            lyrics_offset: 0.0,
+            lyrics_follow_track: String::new(),
             jam_open: false,
             jam: None,
             jam_link: String::new(),
@@ -8150,6 +8155,7 @@ impl App {
         self.draft.library_oldest = self.settings.library_oldest;
         self.draft.library_grouped = self.settings.library_grouped;
         self.draft.library_kind = self.settings.library_kind;
+        self.draft.lyrics_sync = self.settings.lyrics_sync;
         self.settings = self.draft.clone();
         self.settings.save(&self.paths);
         self.apply_theme(ctx);
@@ -8389,26 +8395,7 @@ impl crate::shell::UiApp for App {
             }))
             .show(ui, |ui| self.player_bar(ui));
 
-        // La letra va en su columna; la cola, en su panel de cristal sobre el contenido (abajo).
-        if let Some(tab) = self.side.filter(|t| *t == SideTab::Lyrics) {
-            egui::Panel::right("side")
-                .exact_size(340.0)
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(Frame::new().fill(bg).inner_margin(Margin { left: 0, right: 8, top: 0, bottom: 0 }))
-                .show(ui, |ui| {
-                    Frame::new()
-                        .fill(p.card)
-                        .corner_radius(CornerRadius::same(14))
-                        .stroke(egui::Stroke::new(1.0, p.border))
-                        .inner_margin(Margin::symmetric(14, 12))
-                        .show(ui, |ui| {
-                            ui.set_min_height(ui.available_height());
-                            self.side_panel(ui, tab)
-                        });
-                });
-        }
-
+        // La cola y la letra van en sus paneles de cristal sobre el contenido (abajo).
         let page_key = format!("{:?}", self.page());
         let tint = if p.dark { self.page_tint() } else { None };
         let mut content: Option<egui::Rect> = None;
@@ -8463,8 +8450,10 @@ impl crate::shell::UiApp for App {
                     });
             });
 
-        if let (Some(SideTab::Queue), Some(c)) = (self.side, content) {
-            self.queue_panel(&ctx, c);
+        match (self.side, content) {
+            (Some(SideTab::Queue), Some(c)) => self.queue_panel(&ctx, c),
+            (Some(SideTab::Lyrics), Some(c)) => self.lyrics_float(&ctx, c),
+            _ => {}
         }
         // Encima de la barra del reproductor (no en el miniplayer, que es solo la barra).
         self.playback_error_banner(&ctx);

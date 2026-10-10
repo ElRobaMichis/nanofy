@@ -215,6 +215,8 @@ pub struct Settings {
     /// Filtro de la biblioteca sin agrupar: 0 todo, 1 canciones, 2 playlists, 3 álbumes,
     /// 4 artistas, 5 carpetas, 6 podcasts, 7 audiolibros.
     pub library_kind: u8,
+    /// Panel de la letra: la letra sigue a la canción (si no, se desplaza libremente).
+    pub lyrics_sync: bool,
     /// Secciones del inicio fijadas arriba y ocultas (ids de sección).
     pub home_pinned: Vec<String>,
     pub home_hidden: Vec<String>,
@@ -269,6 +271,7 @@ impl Default for Settings {
             library_oldest: false,
             library_grouped: false,
             library_kind: 0,
+            lyrics_sync: true,
             home_pinned: Vec::new(),
             home_hidden: Vec::new(),
             home_order: Vec::new(),

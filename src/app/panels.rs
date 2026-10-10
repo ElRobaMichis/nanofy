@@ -5,119 +5,12 @@ use egui::{vec2, Align, Button, Color32, Label, Layout, RichText, Sense};
 
 use super::icons::{self, Icon};
 use super::theme;
-use super::{pick_image_file, Action, App, PlayState, SideTab, ERROR_RED, GREEN};
+use super::{pick_image_file, Action, App, ERROR_RED, GREEN};
 use crate::api::Req;
 use crate::model::*;
 use crate::update::{FailKind, MoveReason, NoteLine, Stage, UpdateInfo};
 
 impl App {
-    pub fn side_panel(&mut self, ui: &mut egui::Ui, tab: SideTab) {
-        ui.horizontal(|ui| {
-            for (t, label) in [(SideTab::Queue, "Cola"), (SideTab::Lyrics, "Letra")] {
-                let selected = tab == t;
-                if ui.selectable_label(selected, RichText::new(label).strong()).clicked() && !selected {
-                    self.toggle_side(t);
-                }
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let p = theme::palette(ui.ctx());
-                if icons::button(ui, Icon::Close, 28.0, p.weak).on_hover_text("Cerrar").clicked() {
-                    self.side = None;
-                }
-            });
-        });
-        ui.separator();
-        // La cola tiene su panel de cristal (`queue_panel.rs`); aquí solo la letra.
-        if tab == SideTab::Lyrics {
-            self.lyrics_panel(ui);
-        }
-    }
-
-    fn lyrics_panel(&mut self, ui: &mut egui::Ui) {
-        let weak = ui.visuals().weak_text_color();
-        if !self.signed_in() {
-            ui.label("Inicia sesión para ver las letras.");
-            return;
-        }
-        self.ensure_lyrics();
-        let Some(np) = self.player.now.clone() else {
-            ui.label(RichText::new("Nada en reproducción.").color(weak));
-            return;
-        };
-        ui.add(Label::new(RichText::new(&np.name).strong()).truncate());
-        ui.add(Label::new(RichText::new(np.artists_str()).small().color(weak)).truncate());
-        ui.add_space(6.0);
-        if self.lyrics_loading {
-            Self::loading(ui, "Buscando la letra");
-            return;
-        }
-        let Some(lyrics) = self.lyrics.clone() else {
-            ui.label(RichText::new("Esta canción no tiene letra disponible.").color(weak));
-            return;
-        };
-        let pos = self.player.position();
-        let current = lyrics.current_line(pos);
-        let playing = self.player.state == PlayState::Playing;
-        let mut seek_to: Option<u32> = None;
-        // Desplazar a la línea actual solo cuando cambia: pedirlo en cada fotograma mantenía la
-        // animación de egui viva para siempre (20 fps y un 15 % de CPU con el panel abierto).
-        let mut scrolled = self.lyrics_scrolled.clone();
-        let track_id = lyrics.track_id.clone();
-        egui::ScrollArea::vertical()
-            .id_salt(("lyrics_scroll", &lyrics.track_id))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (i, line) in lyrics.lines.iter().enumerate() {
-                    let is_cur = current == Some(i);
-                    let past = current.map(|c| i < c).unwrap_or(false);
-                    let text = if line.words.trim().is_empty() {
-                        "♪"
-                    } else {
-                        line.words.as_str()
-                    };
-                    let rich = if is_cur {
-                        RichText::new(text).size(18.0).strong().color(GREEN)
-                    } else if past {
-                        RichText::new(text).size(16.0).color(weak.gamma_multiply(0.8))
-                    } else {
-                        RichText::new(text).size(16.0)
-                    };
-                    let r = ui.add(Label::new(rich).wrap().sense(if lyrics.synced() {
-                        Sense::click()
-                    } else {
-                        Sense::hover()
-                    }));
-                    if is_cur && playing && scrolled.as_ref() != Some(&(track_id.clone(), i)) {
-                        r.scroll_to_me(Some(Align::Center));
-                        scrolled = Some((track_id.clone(), i));
-                    }
-                    if lyrics.synced() && r.clicked() {
-                        seek_to = Some(line.start_ms);
-                    }
-                    ui.add_space(4.0);
-                }
-                ui.add_space(12.0);
-                if !lyrics.provider.is_empty() {
-                    ui.label(
-                        RichText::new(format!("Letra: {}", lyrics.provider))
-                            .small()
-                            .color(weak),
-                    );
-                }
-                if !lyrics.synced() {
-                    ui.label(
-                        RichText::new("Letra sin sincronizar.")
-                            .small()
-                            .color(weak),
-                    );
-                }
-            });
-        self.lyrics_scrolled = scrolled;
-        if let Some(ms) = seek_to {
-            self.seek(ms);
-        }
-    }
-
     pub fn overlays(&mut self, ctx: &egui::Context) {
         self.shortcuts_window(ctx);
         self.jam_window(ctx);

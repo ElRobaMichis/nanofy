@@ -1012,9 +1012,13 @@ impl App {
             }
         }
         // Abiertos, los botones de la derecha se quedan en blanco (como el de añadir a playlist).
+        self.lyrics_button = None;
         if let Some(x) = lay.lyrics {
             let color = if self.side == Some(SideTab::Lyrics) { Color32::WHITE } else { st.icon };
-            if self.bar_icon(ui, boxed(x, 0.0), Icon::Lyrics, color, "Letra (L)").clicked() {
+            let r = self.bar_icon(ui, boxed(x, 0.0), Icon::Lyrics, color, "Letra (L)");
+            // El panel de la letra se coloca encima de este botón (`lyrics_panel.rs`).
+            self.lyrics_button = Some(r.rect);
+            if r.clicked() {
                 self.toggle_side(SideTab::Lyrics);
             }
         }

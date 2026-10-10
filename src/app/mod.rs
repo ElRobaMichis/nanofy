@@ -4164,6 +4164,12 @@ impl App {
                     Req::PlayerState | Req::Devices | Req::Queue => {
                         log::warn!("{e}")
                     }
+                    // «Ver álbum» de una canción sin su álbum: que no se quede en «Buscando».
+                    Req::TrackInfo(ref id) if self.album_of_pending.as_deref() == Some(id.as_str()) => {
+                        self.album_of_pending = None;
+                        log::warn!("álbum de {id}: {e}");
+                        self.status_err("No se pudo encontrar el álbum de esta canción");
+                    }
                     // Se ve la copia del disco (o una carga a medias) y la fresca no llegó (sin
                     // red, límite de ritmo): se mantiene y se reintenta con espera creciente. Antes
                     // se desmarcaba sin más y la página abierta la pedía otra vez al fotograma
@@ -4836,15 +4842,21 @@ impl App {
             }
             Resp::TrackInfo(t) => {
                 let album_id = t.album.as_ref().and_then(|a| a.id.clone());
+                // La pista puede volver con otro id (Spotify sustituye ediciones): lo que cuenta
+                // es la que se pidió.
+                let asked = match &r.req {
+                    Req::TrackInfo(id) => Some(id.clone()),
+                    _ => t.id.clone(),
+                };
                 if let Some(now) = self.player.now.as_mut() {
-                    if now.id == t.id && now.album_id.is_none() {
+                    if now.id == asked && now.album_id.is_none() {
                         now.album_id = album_id.clone();
                         if now.cover_url.is_none() {
                             now.cover_url = t.cover(300).map(|s| s.to_string());
                         }
                     }
                 }
-                if let Some(r) = self.recent.iter_mut().find(|r| r.id == t.id) {
+                if let Some(r) = self.recent.iter_mut().find(|r| r.id == asked) {
                     if r.album.as_ref().map(|a| a.id.is_none()).unwrap_or(true) {
                         r.album = t.album.clone();
                     }
@@ -4856,10 +4868,10 @@ impl App {
                         .play_log
                         .entries
                         .iter()
-                        .any(|e| e.track.id == t.id && e.track.album.as_ref().is_none_or(|a| a.id.is_none()));
+                        .any(|e| e.track.id == asked && e.track.album.as_ref().is_none_or(|a| a.id.is_none()));
                     if stale {
                         for e in std::sync::Arc::make_mut(&mut self.play_log).entries.iter_mut() {
-                            if e.track.id == t.id && e.track.album.as_ref().is_none_or(|a| a.id.is_none()) {
+                            if e.track.id == asked && e.track.album.as_ref().is_none_or(|a| a.id.is_none()) {
                                 e.track.album = t.album.clone();
                             }
                         }
@@ -4867,7 +4879,7 @@ impl App {
                         self.history_cache = None;
                     }
                 }
-                if t.id.is_some() && self.album_of_pending == t.id {
+                if asked.is_some() && self.album_of_pending == asked {
                     self.album_of_pending = None;
                     match album_id {
                         Some(a) => self.go(Page::Album(a)),

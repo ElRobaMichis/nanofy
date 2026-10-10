@@ -111,6 +111,8 @@ struct SessionData {
     time_delta: i64,
     invalid: bool,
     user_data: UserData,
+    /// Nanofy: autoplay cambiado en marcha (`Session::set_autoplay`); manda sobre la configuración.
+    autoplay_live: Option<bool>,
 }
 
 struct SessionInternal {
@@ -617,6 +619,9 @@ impl Session {
     }
 
     pub fn autoplay(&self) -> bool {
+        if let Some(live) = self.0.data.read().expect(SESSION_DATA_POISON_MSG).autoplay_live {
+            return live;
+        }
         if let Some(overide) = self.config().autoplay {
             return overide;
         }
@@ -625,6 +630,12 @@ impl Session {
             Some(value) => matches!(&*value, "1"),
             None => false,
         }
+    }
+
+    /// Nanofy: activa o desactiva el autoplay sin reiniciar la sesión (sustituye al de la
+    /// configuración desde ahora).
+    pub fn set_autoplay(&self, on: bool) {
+        self.0.data.write().expect(SESSION_DATA_POISON_MSG).autoplay_live = Some(on);
     }
 
     pub fn set_user_attribute(&self, key: &str, value: &str) -> Option<String> {

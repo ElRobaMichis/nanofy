@@ -187,6 +187,8 @@ enum SpircCommand {
     Reload,
     /// Nanofy: el botón del DJ con el DJ sonando (ver `Spirc::dj_jump`).
     DjJump,
+    /// Nanofy: autoplay activado o no, en marcha (ver `Spirc::set_autoplay`).
+    SetAutoplay(bool),
 }
 
 impl SpircCommand {
@@ -554,6 +556,12 @@ impl Spirc {
         Ok(self.commands.send(SpircCommand::DjJump)?)
     }
 
+    /// Nanofy: activa o desactiva el autoplay (seguir con canciones parecidas al acabarse lo que
+    /// suena) sin reiniciar la sesión. Activado con la lista ya en su final, se rellena enseguida.
+    pub fn set_autoplay(&self, on: bool) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::SetAutoplay(on))?)
+    }
+
     /// Acquires the control as active connect device.
     ///
     /// Does not [Spirc::transfer] the playback. Does nothing if we are not the active device.
@@ -821,6 +829,15 @@ impl SpircTask {
                 if let Some(rx) = self.commands.as_mut() {
                     rx.close()
                 }
+            }
+            // Un ajuste: vale también sin ser el dispositivo activo.
+            SpircCommand::SetAutoplay(on) => {
+                self.session.set_autoplay(on);
+                self.player.emit_auto_play_changed_event(on);
+                if self.connect_state.is_active() {
+                    self.add_autoplay_resolving_when_required();
+                }
+                return Ok(());
             }
             SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
                 let device_id = self.session.device_id();

@@ -418,9 +418,7 @@ impl Settings {
 
     /// Ajustes que obligan a reiniciar el reproductor de librespot (y con él la sesión).
     pub fn restart_differs(&self, other: &Settings) -> bool {
-        self.device_name != other.device_name
-            || self.autoplay != other.autoplay
-            || self.audio_cache_mb != other.audio_cache_mb
+        self.device_name != other.device_name || self.audio_cache_mb != other.audio_cache_mb
     }
 
     /// Ajustes de audio que se aplican en vivo, sin reiniciar (`Cmd::AudioTuning`): la calidad y
@@ -736,9 +734,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Solo el nombre, autoplay y la caché reinician el reproductor; calidad, gapless y volumen
-    /// se aplican en vivo; el fundido tiene su propia orden; lo demás (tema, zoom…) no toca la
-    /// reproducción.
+    /// Solo el nombre y la caché reinician el reproductor; calidad, gapless y volumen se aplican
+    /// en vivo; el fundido y el autoplay tienen su propia orden; lo demás (tema, zoom…) no toca
+    /// la reproducción.
     #[test]
     fn ajustes_que_reinician_y_ajustes_en_vivo() {
         let base = Settings::default();
@@ -748,7 +746,7 @@ mod tests {
             (base.restart_differs(&s), base.audio_differs(&s))
         };
         assert_eq!(with(&|s| s.device_name = "Otro".into()), (true, false));
-        assert_eq!(with(&|s| s.autoplay = !s.autoplay), (true, false));
+        assert_eq!(with(&|s| s.autoplay = !s.autoplay), (false, false));
         assert_eq!(with(&|s| s.audio_cache_mb = 1024), (true, false));
         assert_eq!(with(&|s| s.quality = Quality::Low), (false, true));
         assert_eq!(with(&|s| s.normalisation = false), (false, true));

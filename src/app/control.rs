@@ -882,6 +882,11 @@ impl App {
                 self.player_more_sub = n(cmd, "sub").map(|v| v as usize);
                 ok()
             }
+            // Pestaña del panel de la cola: «Recientes» (`recent`) o «Cola».
+            "queue_tab" => {
+                self.queue_recent = b(cmd, "recent", !self.queue_recent);
+                ok()
+            }
             // El menú de cristal de una canción, como sus tres puntos: la fila `i` de la lista `list`
             // (o de la primera que la tenga), con el submenú `sub`; `on: false` lo cierra.
             "song_menu" => {
@@ -1545,6 +1550,8 @@ impl App {
             "library_oldest": self.settings.library_oldest,
             "library_grouped": self.settings.library_grouped,
             "library_kind": self.settings.library_kind,
+            "queue_recent": self.queue_recent,
+            "autoplay": self.settings.autoplay,
             "song_menu": self.song_more.as_ref().map(|m| json!({"list": m.row.0, "i": m.row.1, "uri": m.track.uri, "sub": m.sub, "remove_from": m.remove_from})),
             "library_filter": self.library_filter,
             "library_folder": self.library_folder,

@@ -5,8 +5,6 @@ use egui::{vec2, Align, Button, Color32, Label, Layout, RichText, Sense};
 
 use super::icons::{self, Icon};
 use super::theme;
-
-use super::widgets::RowOpts;
 use super::{pick_image_file, Action, App, PlayState, SideTab, ERROR_RED, GREEN};
 use crate::api::Req;
 use crate::model::*;
@@ -29,108 +27,10 @@ impl App {
             });
         });
         ui.separator();
-        match tab {
-            SideTab::Queue => self.queue_panel(ui),
-            SideTab::Lyrics => self.lyrics_panel(ui),
+        // La cola tiene su panel de cristal (`queue_panel.rs`); aquí solo la letra.
+        if tab == SideTab::Lyrics {
+            self.lyrics_panel(ui);
         }
-    }
-
-    fn queue_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.signed_in() {
-            ui.label("Inicia sesión para ver la cola.");
-            return;
-        }
-        let weak = ui.visuals().weak_text_color();
-        let Some(q) = self.queue.take() else {
-            Self::loading(ui, "Cargando la cola");
-            return;
-        };
-        egui::ScrollArea::vertical()
-            .id_salt("queue_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if let Some(now) = &q.currently_playing {
-                    ui.label(RichText::new("Sonando ahora").small().strong().color(weak));
-                    let one = vec![now.clone()];
-                    self.track_rows(ui, "queue_now", &one, RowOpts { selectable: false, ..RowOpts::tracks(true, false) });
-                    ui.add_space(8.0);
-                }
-                // Lo añadido a la cola desde Nanofy va primero; el resto es la continuación del
-                // contexto (playlist, radio, álbum…). Es el mismo orden en que sonarán.
-                let mut queued: Vec<Track> = Vec::new();
-                let mut rest: Vec<Track> = Vec::new();
-                let mut pending: Vec<String> = self.queued_local.clone();
-                for t in &q.queue {
-                    if rest.is_empty() {
-                        if let Some(i) = pending.iter().position(|u| u == &t.uri) {
-                            pending.remove(i);
-                            queued.push(t.clone());
-                            continue;
-                        }
-                    }
-                    rest.push(t.clone());
-                }
-                if q.queue.is_empty() {
-                    ui.label(RichText::new("La cola está vacía.").color(weak));
-                }
-                if !queued.is_empty() {
-                    let ms: u64 = queued.iter().map(|t| t.duration_ms as u64).sum();
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Siguiente en la cola · {} · {}", queued.len(), fmt_total(ms))).small().strong().color(weak));
-                        if self.player.remote.is_none() {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.add(Button::new(RichText::new("Vaciar cola").small()).frame(false)).clicked() {
-                                    self.queue_clear();
-                                }
-                            });
-                        }
-                    });
-                    self.track_rows(
-                        ui,
-                        "queue_next",
-                        &queued,
-                        RowOpts { selectable: false, editable_playlist: Some("queue"), ..RowOpts::tracks(true, false) },
-                    );
-                    ui.add_space(8.0);
-                }
-                if !rest.is_empty() {
-                    let ms: u64 = rest.iter().map(|t| t.duration_ms as u64).sum();
-                    let ctx = self.now_context();
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.label(RichText::new("Siguientes de:").small().strong().color(weak));
-                        match &ctx {
-                            Some((name, Some(page))) => {
-                                let l = ui.add(Label::new(RichText::new(name).small().strong().color(GREEN)).sense(Sense::click()));
-                                if l.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if l.clicked() {
-                                    self.actions.push(Action::Go(page.clone()));
-                                }
-                            }
-                            Some((name, None)) => {
-                                ui.label(RichText::new(name).small().strong().color(weak));
-                            }
-                            None => {
-                                ui.label(RichText::new("la reproducción actual").small().strong().color(weak));
-                            }
-                        }
-                        ui.label(RichText::new(format!("· {} · {}", rest.len(), fmt_total(ms))).small().color(weak));
-                    });
-                    self.track_rows(ui, "queue_rest", &rest, RowOpts { selectable: false, ..RowOpts::tracks(true, false) });
-                }
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "La cola la mantiene Spotify; se actualiza cada pocos segundos. \
-                         Añade canciones con «Añadir a la cola» en el menú de cualquier fila.",
-                    )
-                    .small()
-                    .color(weak),
-                );
-            });
-        self.queue = Some(q);
     }
 
     fn lyrics_panel(&mut self, ui: &mut egui::Ui) {

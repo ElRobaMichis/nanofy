@@ -16,6 +16,7 @@ mod pages;
 mod panels;
 mod player_bar;
 mod player_menu;
+mod queue_panel;
 mod theme;
 mod warm;
 mod watchdog;
@@ -1043,6 +1044,10 @@ pub struct App {
     /// El modo de control pide abrir el menú de la fila `.1` (de la lista `.0`, o de la primera
     /// que la tenga) con el submenú `.2`, como el botón de sus tres puntos.
     pub song_more_req: Option<(Option<String>, usize, Option<usize>)>,
+    /// El panel de la cola en «Recientes» (si no, en «Cola»).
+    pub queue_recent: bool,
+    /// Arrastrando por su asa la canción `n` de las añadidas a la cola.
+    pub queue_drag: Option<usize>,
     /// El modo de control pide abrir «Añadir a una playlist» como el botón del reproductor.
     pub add_from_bar: bool,
     /// Carpeta abierta dentro de la biblioteca (su id).
@@ -1409,6 +1414,8 @@ impl App {
             player_more_at: None,
             song_more: None,
             song_more_req: None,
+            queue_recent: false,
+            queue_drag: None,
             add_from_bar: false,
             library_folder: None,
             library_recent,
@@ -2364,6 +2371,17 @@ impl App {
     /// «Guardar» (como el aviso de actualizaciones): cambia los ajustes y el borrador a la vez, así
     /// que lo que hubiera sin guardar en el borrador sigue igual. `persist` = false mientras se
     /// arrastra el deslizador: suena ya con el valor nuevo y el archivo se escribe al soltarlo.
+    /// Autoplay (canciones parecidas al acabarse lo que suena), desde el interruptor de la cola:
+    /// al instante, sin «Guardar» ni reiniciar el reproductor.
+    pub fn set_autoplay(&mut self, on: bool) {
+        self.settings.autoplay = on;
+        self.draft.autoplay = on;
+        if !self.ephemeral {
+            self.settings.save(&self.paths);
+        }
+        self.backend.send(Cmd::Autoplay(on));
+    }
+
     pub fn set_crossfade(&mut self, on: bool, secs: u8, albums: bool, persist: bool) {
         let secs = secs.clamp(crate::config::CROSSFADE_SECS_MIN, crate::config::CROSSFADE_SECS_MAX);
         let changed = (self.settings.crossfade, self.settings.crossfade_secs, self.settings.crossfade_albums) != (on, secs, albums);
@@ -6151,7 +6169,7 @@ impl App {
     /// Reconstruye la cola: recarga el contexto actual en la misma canción y posición (la cola
     /// queda vacía) y vuelve a añadir `keep`. Spotify no ofrece "quitar de la cola" a apps
     /// externas, así que solo se conocen las canciones añadidas desde Nanofy.
-    fn queue_rebuild(&mut self, keep: Vec<String>) {
+    pub(super) fn queue_rebuild(&mut self, keep: Vec<String>) {
         if self.player.remote.is_some() {
             self.status_err("La cola solo se puede editar cuando la música suena en Nanofy");
             return;
@@ -6216,6 +6234,23 @@ impl App {
 
     pub fn queue_clear(&mut self) {
         self.queue_rebuild(Vec::new());
+    }
+
+    /// Quita lo que queda de la lista en curso: sigue la que suena, en su punto, y después solo
+    /// lo añadido a la cola (y, con la reproducción automática, canciones parecidas).
+    pub fn queue_drop_context(&mut self) {
+        if self.player.remote.is_some() {
+            self.status_err("La cola solo se puede editar cuando la música suena en Nanofy");
+            return;
+        }
+        let Some(now) = self.player.now.clone() else { return };
+        let keep = self.queued_local.clone();
+        let pos = self.player.position();
+        self.play(PlayTarget::Tracks { uris: vec![now.uri.clone()], index: Some(0), shuffle: false });
+        self.last_play_page = None;
+        self.queued_local = keep.clone();
+        self.pending_queue = Some((Instant::now() + Duration::from_millis(1500), Some(pos), keep));
+        self.queue = None;
     }
 
     /// Lee `playback.json` y deja la barra como estaba al cerrar (en pausa, mismo segundo).
@@ -8048,6 +8083,7 @@ impl App {
         let volume_changed = self.settings.normalisation != self.draft.normalisation
             || self.settings.loudness != self.draft.loudness;
         let media_changed = self.settings.media_keys != self.draft.media_keys;
+        let autoplay_changed = self.settings.autoplay != self.draft.autoplay;
         self.draft.zoom = self.draft.zoom.clamp(0.7, 2.0);
         self.draft.fps_cap = self.draft.fps_cap.clamp(30, 480);
         self.draft.crossfade_secs = self.draft.crossfade_secs.clamp(crate::config::CROSSFADE_SECS_MIN, crate::config::CROSSFADE_SECS_MAX);
@@ -8099,6 +8135,9 @@ impl App {
         // temporizador «al terminar la canción» puesto debe seguir a 0).
         if crossfade_changed || (restart && self.logged_in()) {
             self.sync_crossfade();
+        }
+        if autoplay_changed {
+            self.backend.send(Cmd::Autoplay(self.settings.autoplay));
         }
     }
 
@@ -8302,7 +8341,8 @@ impl crate::shell::UiApp for App {
             }))
             .show(ui, |ui| self.player_bar(ui));
 
-        if let Some(tab) = self.side {
+        // La letra va en su columna; la cola, en su panel de cristal sobre el contenido (abajo).
+        if let Some(tab) = self.side.filter(|t| *t == SideTab::Lyrics) {
             egui::Panel::right("side")
                 .exact_size(340.0)
                 .resizable(false)
@@ -8323,6 +8363,7 @@ impl crate::shell::UiApp for App {
 
         let page_key = format!("{:?}", self.page());
         let tint = if p.dark { self.page_tint() } else { None };
+        let mut content: Option<egui::Rect> = None;
         egui::CentralPanel::default()
             .frame(Frame::new().fill(bg).inner_margin(Margin {
                 left: if self.settings.sidebar_visible { 0 } else { 6 },
@@ -8334,6 +8375,7 @@ impl crate::shell::UiApp for App {
                 // Panel de contenido con esquinas de 8 px. En playlists y álbumes, degradado del
                 // tono de la portada (plano los primeros 26 px) hasta el fondo de la ventana.
                 let panel = ui.max_rect();
+                content = Some(panel);
                 // Inicio y la página de un artista van sobre el fondo de la ventana con un filo de
                 // 1 px, como en la referencia; la del artista, de borde a borde (su cabecera ocupa
                 // el panel entero).
@@ -8373,6 +8415,9 @@ impl crate::shell::UiApp for App {
                     });
             });
 
+        if let (Some(SideTab::Queue), Some(c)) = (self.side, content) {
+            self.queue_panel(&ctx, c);
+        }
         // Encima de la barra del reproductor (no en el miniplayer, que es solo la barra).
         self.playback_error_banner(&ctx);
         self.overlays(&ctx);

@@ -1252,7 +1252,7 @@ impl App {
 
     /// Historial: lo reproducido en Nanofy (registro local, con hora) y después lo que Spotify
     /// devuelve de otros dispositivos y no está ya en la lista. Se recalcula solo cuando cambia.
-    fn history_list(&mut self) -> Vec<Track> {
+    pub(super) fn history_list(&mut self) -> Vec<Track> {
         let key = (
             self.play_log.entries.len(),
             self.play_log.entries.iter().map(|e| e.last).max().unwrap_or(0),

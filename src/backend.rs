@@ -113,8 +113,11 @@ pub enum Cmd {
     RetryLoad(Option<Box<Cmd>>),
     Logout,
     /// Reinicia el reproductor (y la sesión) con ajustes que no se pueden cambiar en marcha:
-    /// nombre del dispositivo, autoplay, caché de audio.
+    /// nombre del dispositivo y caché de audio.
     Restart(Settings),
+    /// Autoplay (seguir con canciones parecidas al acabarse lo que suena), al instante y sin
+    /// reiniciar. También sin sesión: la conexión siguiente ya lo usa.
+    Autoplay(bool),
     /// Ajustes nuevos sin reiniciar: el reproductor aplica la normalización al instante y la
     /// calidad desde la próxima canción. También sin sesión, para que conectar use los nuevos.
     AudioTuning(Settings),
@@ -895,6 +898,16 @@ async fn run(
                             active = Some(a);
                         }
                         Err(e) => report_start_error(&ui, "No se pudo reiniciar la reproducción", e),
+                    }
+                }
+            }
+            Cmd::Autoplay(on) => {
+                // La copia de aquí es la que usan las reconexiones y `Restart`.
+                settings.autoplay = on;
+                if let Some(a) = active.as_ref() {
+                    log::info!("autoplay en vivo: {}", if on { "activado" } else { "desactivado" });
+                    if let Err(e) = a.spirc.set_autoplay(on) {
+                        log::warn!("autoplay: {e}");
                     }
                 }
             }

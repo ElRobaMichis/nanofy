@@ -84,7 +84,21 @@ impl Texture {
 #[derive(Default)]
 pub struct Raster {
     textures: HashMap<TextureId, Texture>,
+    /// Últimos cristales desenfocados (`BackdropBlur`), para no repetir el cálculo si lo de debajo
+    /// no cambió: el panel de la cola se queda abierto y sus barras repintan a menudo.
+    blur_memo: std::sync::Mutex<Vec<BlurMemo>>,
 }
+
+/// Resultado de un desenfoque: la zona (en píxeles) y sus parámetros, el resumen de los píxeles
+/// de los que sale y lo que quedó dentro del rectángulo.
+struct BlurMemo {
+    key: [usize; 6],
+    digest: u64,
+    out: Vec<u32>,
+}
+
+/// Cristales recordados a la vez (uno por panel o menú abierto).
+const BLUR_MEMOS: usize = 4;
 
 /// Efecto «cristal» de un panel: en un `egui::epaint::PaintCallback` con esto dentro,
 /// `Raster::paint` desenfoca lo ya pintado bajo el rectángulo del callback (en puntos), con las
@@ -173,7 +187,7 @@ impl Raster {
             let Some(blur) = cb.callback.downcast_ref::<BackdropBlur>() else { continue };
             self.paint_pass(buf, w, h, ppp, &primitives[start..i], (!cleared).then_some(clear_px));
             cleared = true;
-            backdrop_blur(buf, w, h, ppp, cb.rect.intersect(p.clip_rect), blur);
+            backdrop_blur(buf, w, h, ppp, cb.rect.intersect(p.clip_rect), blur, &self.blur_memo);
             start = i + 1;
         }
         self.paint_pass(buf, w, h, ppp, &primitives[start..], (!cleared).then_some(clear_px));
@@ -247,7 +261,7 @@ impl Raster {
 /// cada dirección (casi gaussiano) que leen también lo que hay alrededor del rectángulo, y de
 /// vuelta con interpolación bilineal, solo dentro de las esquinas redondeadas. Los tres canales y
 /// la vuelta se reparten entre hilos.
-fn backdrop_blur(buf: &mut [u32], w: usize, h: usize, ppp: f32, rect: egui::Rect, b: &BackdropBlur) {
+fn backdrop_blur(buf: &mut [u32], w: usize, h: usize, ppp: f32, rect: egui::Rect, b: &BackdropBlur, memo: &std::sync::Mutex<Vec<BlurMemo>>) {
     let x0 = (rect.min.x * ppp).floor().max(0.0) as usize;
     let y0 = (rect.min.y * ppp).floor().max(0.0) as usize;
     let x1 = ((rect.max.x * ppp).ceil().max(0.0) as usize).min(w);
@@ -260,6 +274,83 @@ fn backdrop_blur(buf: &mut [u32], w: usize, h: usize, ppp: f32, rect: egui::Rect
     let m = 3 * r * s;
     let (sx0, sy0) = (x0.saturating_sub(m), y0.saturating_sub(m));
     let (sx1, sy1) = ((x1 + m).min(w), (y1 + m).min(h));
+    // Lo de debajo igual que la vez anterior (mismo resumen de todo lo que entra en el
+    // desenfoque): se copia el resultado de entonces.
+    let key = [x0, y0, x1, y1, (b.sigma * ppp * 100.0) as usize, (b.corner * ppp * 100.0) as usize];
+    let digest = region_digest(buf, w, sx0, sy0, sx1, sy1);
+    let mut memos = memo.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = memos.iter().position(|m| m.key == key) {
+        if memos[i].digest == digest {
+            let rw = x1 - x0;
+            for (j, row) in memos[i].out.chunks(rw).enumerate() {
+                buf[(y0 + j) * w + x0..(y0 + j) * w + x1].copy_from_slice(row);
+            }
+            // El más reciente, al final (se descarta el primero).
+            let m = memos.remove(i);
+            memos.push(m);
+            return;
+        }
+        memos.remove(i);
+    }
+    drop(memos);
+    blur_into(buf, w, x0, y0, x1, y1, sx0, sy0, sx1, sy1, s, r, ppp, rect, b);
+    let mut out = Vec::with_capacity((x1 - x0) * (y1 - y0));
+    for y in y0..y1 {
+        out.extend_from_slice(&buf[y * w + x0..y * w + x1]);
+    }
+    let mut memos = memo.lock().unwrap_or_else(|e| e.into_inner());
+    if memos.len() >= BLUR_MEMOS {
+        memos.remove(0);
+    }
+    memos.push(BlurMemo { key, digest, out });
+}
+
+/// Resumen (FNV-1a de 64 bits por bandas, en paralelo) de los píxeles de una zona del búfer.
+fn region_digest(buf: &[u32], w: usize, x0: usize, y0: usize, x1: usize, y1: usize) -> u64 {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
+    let rows_per = (y1 - y0).div_ceil(threads).max(1);
+    let bands: Vec<u64> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (y0..y1)
+            .step_by(rows_per)
+            .map(|ya| {
+                let yb = (ya + rows_per).min(y1);
+                sc.spawn(move || {
+                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                    for y in ya..yb {
+                        for &px in &buf[y * w + x0..y * w + x1] {
+                            h = (h ^ px as u64).wrapping_mul(0x0100_0000_01b3);
+                        }
+                    }
+                    h
+                })
+            })
+            .collect();
+        handles.into_iter().map(|t| t.join().unwrap_or(0)).collect()
+    });
+    bands.into_iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// El desenfoque en sí: reduce la zona `sx0..sx1 × sy0..sy1` a 1/`s`, la suaviza con tres pasadas
+/// de media móvil de radio `r` y la devuelve dentro de `x0..x1 × y0..y1` con las esquinas
+/// redondeadas.
+#[allow(clippy::too_many_arguments)]
+fn blur_into(
+    buf: &mut [u32],
+    w: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    sx0: usize,
+    sy0: usize,
+    sx1: usize,
+    sy1: usize,
+    s: usize,
+    r: usize,
+    ppp: f32,
+    rect: egui::Rect,
+    b: &BackdropBlur,
+) {
     let (dw, dh) = ((sx1 - sx0).div_ceil(s), (sy1 - sy0).div_ceil(s));
     // Planos R, G, B reducidos (×16 para no perder precisión entre pasadas).
     let src: &[u32] = buf;
@@ -645,7 +736,7 @@ mod tests {
             buf[y * w + 5] = 0xff0000;
         }
         let rect = egui::Rect::from_min_max(egui::pos2(40.0, 20.0), egui::pos2(200.0, 380.0));
-        backdrop_blur(&mut buf, w, h, 1.0, rect, &BackdropBlur { sigma: 12.0, corner: 0.0 });
+        backdrop_blur(&mut buf, w, h, 1.0, rect, &BackdropBlur { sigma: 12.0, corner: 0.0 }, &Default::default());
         let px = |x: usize, y: usize| buf[y * w + x] & 0xff;
         // Lejos del borde, igual que antes; en el borde, un gris intermedio; a lo largo, suave.
         assert!(px(120, 40) < 4 && px(120, 360) > 250, "{} {}", px(120, 40), px(120, 360));
@@ -656,5 +747,30 @@ mod tests {
         assert_eq!(buf[200 * w + 5], 0xff0000);
         assert_eq!(buf[(h / 2 - 1) * w + 20] & 0xff, 0);
         assert_eq!(buf[(h / 2) * w + 20] & 0xff, 0xff);
+    }
+
+    /// Con lo de debajo igual, el segundo desenfoque copia el primero (y da lo mismo que
+    /// calcularlo); si cambia un solo píxel de lo que entra en él, se calcula otra vez.
+    #[test]
+    fn desenfoque_recordado() {
+        let (w, h) = (300usize, 300usize);
+        let base: Vec<u32> = (0..w * h).map(|i| if (i % w) < w / 2 { 0x204060 } else { 0xc08040 }).collect();
+        let rect = egui::Rect::from_min_max(egui::pos2(60.0, 60.0), egui::pos2(240.0, 240.0));
+        let b = BackdropBlur { sigma: 10.0, corner: 6.0 };
+        let memo = std::sync::Mutex::new(Vec::new());
+        let mut a = base.clone();
+        backdrop_blur(&mut a, w, h, 1.0, rect, &b, &memo);
+        let mut c = base.clone();
+        backdrop_blur(&mut c, w, h, 1.0, rect, &b, &memo);
+        assert_eq!(a, c);
+        assert_eq!(memo.lock().unwrap().len(), 1);
+        // Un píxel distinto en el margen (fuera del rectángulo pero dentro del desenfoque).
+        let mut d = base.clone();
+        d[30 * w + 150] = 0xffffff;
+        let mut fresh = d.clone();
+        backdrop_blur(&mut d, w, h, 1.0, rect, &b, &memo);
+        backdrop_blur(&mut fresh, w, h, 1.0, rect, &b, &Default::default());
+        assert_eq!(d, fresh);
+        assert_ne!(d, a);
     }
 }

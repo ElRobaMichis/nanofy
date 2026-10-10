@@ -924,6 +924,12 @@ impl App {
                 self.follow_track_page(&old, &to, &np);
                 ok()
             }
+            // Explicaciones de Genius de la página de canción.
+            "track_notes" => {
+                self.track_notes = b(cmd, "on", !self.track_notes);
+                self.track_note_pick = None;
+                ok()
+            }
             "track_scroll" => match n(cmd, "px") {
                 Some(px) => {
                     self.track_scroll.set = Some(px as f32);
@@ -1629,6 +1635,17 @@ impl App {
                 _ => Value::Null,
             },
             "track_pages_loaded": self.track_pages.keys().collect::<Vec<_>>(),
+            "genius": match self.page() {
+                Page::Track(id) => json!({
+                    "on": self.track_notes,
+                    "failed": self.genius_failed.contains(id),
+                    "loaded": self.genius.contains_key(id),
+                    "notes": self.genius.get(id).and_then(|g| g.as_ref()).map(|g| g.notes.len()),
+                    "spans": self.genius_spans.as_ref().filter(|s| s.0 == *id).map(|s| s.2.len()),
+                    "pick": self.track_note_pick.as_ref().filter(|p| p.0 == *id).map(|p| p.1),
+                }),
+                _ => Value::Null,
+            },
             "autoplay": self.settings.autoplay,
             "song_menu": self.song_more.as_ref().map(|m| json!({"list": m.row.0, "i": m.row.1, "uri": m.track.uri, "sub": m.sub, "remove_from": m.remove_from})),
             "library_filter": self.library_filter,

@@ -1040,6 +1040,14 @@ pub struct App {
     /// Abierta desde la portada con la sincronización: la página de esta canción salta a lo que
     /// suena en cuanto tiene la letra (sin pasar por arriba) y la sigue desde ahí.
     track_jump: Option<String>,
+    /// Explicaciones de Genius (botón de comentarios de la letra): activas, por canción (`None`:
+    /// Genius no la tiene), las que fallaron, dónde va cada una en la letra (canción, renglones
+    /// de la letra, tramos) y el tramo que eligió el usuario (canción, índice).
+    track_notes: bool,
+    genius: HashMap<String, Option<crate::genius::GeniusSong>>,
+    genius_failed: HashSet<String>,
+    genius_spans: Option<(String, usize, Vec<crate::genius::NoteSpan>)>,
+    track_note_pick: Option<(String, usize)>,
     /// Letra pedida para una canción que no suena (y cuándo), para no pedirla en cada fotograma.
     track_lyrics_asked: Option<(String, Instant)>,
     /// Canciones cuya letra ya se pidió por adelantado.
@@ -1444,6 +1452,11 @@ impl App {
             track_follow_now: false,
             track_pinned: false,
             track_jump: None,
+            track_notes: false,
+            genius: HashMap::new(),
+            genius_failed: HashSet::new(),
+            genius_spans: None,
+            track_note_pick: None,
             track_lyrics_asked: None,
             lyrics_prefetched: HashSet::new(),
             lyrics_for: None,
@@ -4287,6 +4300,10 @@ impl App {
                         log::warn!("página de la canción {id}: {e}");
                         self.track_page_failed.insert(id.clone());
                     }
+                    Req::Genius { ref id, .. } => {
+                        log::info!("[genius] {id}: {e}");
+                        self.genius_failed.insert(id.clone());
+                    }
                     // «Ver álbum» de una canción sin su álbum: que no se quede en «Buscando».
                     Req::TrackInfo(ref id) if self.album_of_pending.as_deref() == Some(id.as_str()) => {
                         self.album_of_pending = None;
@@ -4949,6 +4966,10 @@ impl App {
                 };
                 self.track_page_failed.remove(&id);
                 self.track_pages.insert(id, *p);
+            }
+            Resp::Genius { id, song } => {
+                self.genius_failed.remove(&id);
+                self.genius.insert(id, song);
             }
             Resp::Genres { key, genres } => {
                 // También en las páginas de canción de ese álbum (o de ese artista, sin los del álbum).

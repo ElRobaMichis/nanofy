@@ -9,6 +9,7 @@ mod cache;
 mod config;
 mod control;
 mod fonts;
+mod genius;
 mod images;
 mod lyrics_sources;
 mod media;

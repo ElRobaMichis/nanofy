@@ -256,6 +256,8 @@ pub enum Req {
     TrackInfo(String),
     /// Página de canción: escuchas y artistas (pathfinder), créditos y recomendadas.
     TrackPage(String),
+    /// Explicaciones de Genius de la canción `id` (ver `crate::genius`).
+    Genius { id: String, name: String, artist: String },
     /// Radio de una canción: Spotify la genera como playlist; devuelve su id.
     RadioPlaylist(String),
     /// Playlists creadas por el propio artista (búsqueda filtrada por propietario).
@@ -446,6 +448,8 @@ pub enum Resp {
     ArtistTop(Vec<Track>),
     TrackInfo(Track),
     TrackPage(Box<TrackPage>),
+    /// `None`: Genius no tiene esa canción (o no la encontramos con seguridad).
+    Genius { id: String, song: Option<crate::genius::GeniusSong> },
     RadioPlaylist { playlist_id: String },
     ArtistPlaylists { id: String, playlists: Vec<Playlist> },
     ArtistAlbums(Vec<AlbumRef>),
@@ -2959,6 +2963,53 @@ impl Client {
         Ok(page)
     }
 
+    /// GET a la API de la web de genius.com (JSON), como un navegador. Un fallo de conexión se
+    /// reintenta una vez.
+    fn genius_get(&self, url: &str) -> Result<Value, String> {
+        const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+        let call = || {
+            self.ext_agent
+                .get(url)
+                .config()
+                .timeout_global(Some(Duration::from_secs(8)))
+                .build()
+                .header("User-Agent", UA)
+                .header("Accept", "application/json")
+                .call()
+        };
+        let mut resp = call().or_else(|_| call()).map_err(|e| format!("genius: {e}"))?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(format!("genius: HTTP {status}"));
+        }
+        let text = resp.body_mut().read_to_string().map_err(|e| format!("genius: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("genius: {e}"))
+    }
+
+    /// `Req::Genius`: la canción en la búsqueda de Genius (título sin «feat.» y el primer artista)
+    /// y sus anotaciones, hasta 4 páginas de 50. `None` si no está o no es seguro que sea esa.
+    fn genius(&self, name: &str, artist: &str) -> Result<Option<crate::genius::GeniusSong>, String> {
+        let t0 = Instant::now();
+        let first = artist.split(',').next().unwrap_or(artist).trim();
+        let q = format!("{} {first}", crate::lyrics_sources::search_title(name));
+        let search = self.genius_get(&format!("https://genius.com/api/search/multi?q={}", urlencode(q.trim())))?;
+        let Some((song_id, url)) = crate::genius::pick_song(&search, name, first) else {
+            log::info!("[genius] «{name}» de {first}: no está");
+            return Ok(None);
+        };
+        let mut notes = Vec::new();
+        for page in 1..=4 {
+            let v = self.genius_get(&format!("https://genius.com/api/referents?song_id={song_id}&text_format=plain&per_page=50&page={page}"))?;
+            let (mut more_notes, more) = crate::genius::notes_from_referents(&v);
+            notes.append(&mut more_notes);
+            if !more {
+                break;
+            }
+        }
+        log::info!("[genius] «{name}» de {first}: canción {song_id}, {} anotaciones en {} ms", notes.len(), t0.elapsed().as_millis());
+        Ok(Some(crate::genius::GeniusSong { url, notes }))
+    }
+
     fn spclient(&self, method: http::Method, endpoint: &str) -> Result<String, String> {
         let session = self.session()?;
         let bytes = self.block(sp_timeout(&method), session.spclient().request(&method, endpoint, None, None))?;
@@ -3553,6 +3604,7 @@ impl Client {
                 v.pop().map(Resp::TrackInfo).ok_or_else(|| "pista no encontrada".to_string())
             }
             Req::TrackPage(id) => self.track_page(id).map(|p| Resp::TrackPage(Box::new(p))),
+            Req::Genius { id, name, artist } => self.genius(name, artist).map(|song| Resp::Genius { id: id.clone(), song }),
             Req::ArtistTop(id) => {
                 // /artists/{id}/top-tracks está restringido: usamos los metadatos internos. La
                 // página de artista ya no lo pide (salen con Req::ArtistView); queda para el

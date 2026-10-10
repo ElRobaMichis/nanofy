@@ -122,6 +122,57 @@ const FOLLOW_PAUSE: f64 = 3.0;
 /// Hueco que deja el área de desplazamiento debajo de cada página (app/mod.rs).
 const PAGE_TAIL: f32 = 24.0;
 
+/// Icono activo de la columna de la letra (sincronizar, comentarios): verde y un punto de radio
+/// 1,9 a 15,5 bajo su centro, como sincronizar en el panel de la letra.
+const ICON_DOT_DY: f32 = 15.5;
+const ICON_DOT_R: f32 = 1.9;
+
+/// Explicaciones de Genius (referencia 1.webp: cliente = ref / 1,206 + (267,25, 57,25)).
+/// Resaltado del verso explicado: blanco al 14 %, un rectángulo por renglón de 38 sobre la línea
+/// base a 15 bajo ella, 10,8 a la izquierda de la tinta y 12 a la derecha, esquinas de 10 (la
+/// interior de un escalón, recta).
+const HL_FILL: Color32 = Color32::from_rgba_premultiplied(36, 36, 36, 36);
+const HL_HOVER: Color32 = Color32::from_rgba_premultiplied(15, 15, 15, 15);
+const HL_UP: f32 = 38.0;
+const HL_DOWN: f32 = 15.0;
+const HL_PAD_L: f32 = 10.8;
+const HL_PAD_R: f32 = 12.0;
+const HL_RADIUS: u8 = 10;
+/// La tarjeta: marco blanco al 17 % de 1,4 sin relleno, esquinas de 10, 403 de ancho con su borde
+/// derecho a 111 del panel y el de arriba 1,5 bajo el resaltado. Cabecera «De Genius ↗» (14) con
+/// la línea base a 32,4, divisoria a 53,8, explicación (16) con la primera línea base a 39,7 de la
+/// divisoria y una cada 22,3 (como mucho 14), 32,7 hasta el borde de abajo; 21 a los lados; todo
+/// en Semilight (el trazo fino de la referencia; con la normal salía un 28 % más grueso). La
+/// letra parte sus renglones a 40 de la tarjeta.
+const CARD_W: f32 = 403.0;
+const CARD_RIGHT: f32 = 111.0;
+const CARD_GAP: f32 = 40.0;
+const CARD_TOP_DY: f32 = 1.5;
+const CARD_RADIUS: u8 = 10;
+const CARD_STROKE: f32 = 1.4;
+const CARD_LINE: Color32 = Color32::from_rgba_premultiplied(43, 43, 43, 43);
+const CARD_PAD: f32 = 21.0;
+const CARD_HEAD_BASE: f32 = 32.4;
+const CARD_RULE: f32 = 53.8;
+const CARD_BODY_FIRST: f32 = 39.7;
+const CARD_PITCH: f32 = 22.3;
+const CARD_BOTTOM: f32 = 32.7;
+const CARD_MAX_ROWS: usize = 14;
+const CARD_HEAD_FONT: f32 = 14.0;
+const CARD_BODY_FONT: f32 = 16.0;
+/// Flecha ↗ de la cabecera: 16 tras «Genius», 11 de ancho, brazos de 7,5.
+const CARD_ARROW_GAP: f32 = 16.0;
+
+/// Lo que hay de Genius para la canción de la página.
+enum Notes {
+    Off,
+    Loading,
+    Failed,
+    /// Genius no la tiene (o no la encontramos con seguridad).
+    Missing,
+    Ready(crate::genius::GeniusSong, Vec<crate::genius::NoteSpan>),
+}
+
 /// Colores de la referencia (la página va siempre sobre su fondo oscuro, también en el tema
 /// claro).
 struct Ink {
@@ -653,7 +704,7 @@ impl App {
         let icons: [(&'static str, &LibMask, &str); 4] = [
             ("song-lyr-sync", &sm::LYR_SYNC, ""),
             ("song-lyr-translate", &sm::LYR_TRANSLATE, "Traducir (pronto)"),
-            ("song-lyr-comment", &sm::LYR_COMMENT, "Comentarios (pronto)"),
+            ("song-lyr-comment", &sm::LYR_COMMENT, ""),
             ("song-lyr-size", &sm::LYR_SIZE, "Tamaño del texto (pronto)"),
         ];
         let on = self.settings.lyrics_sync;
@@ -663,17 +714,19 @@ impl App {
         let following = on && self.track_pinned && now >= self.track_scroll.paused_until;
         for (k, (name, mask, tip)) in icons.into_iter().enumerate() {
             let c = pos2(o.x + LYR_ICON_X, rule_y + LYR_ICON_DY + k as f32 * LYR_ICON_PITCH);
-            let tip = if k == 0 {
-                match (on, following || !current) {
+            let tip = match k {
+                0 => match (on, following || !current) {
                     (true, true) => "La letra sigue a la canción (pulsa para moverte libremente)",
                     (true, false) => "Ir a lo que suena",
                     (false, _) => "Seguir la canción",
-                }
-            } else {
-                tip
+                },
+                2 if self.track_notes => "Ocultar las explicaciones de Genius",
+                2 => "Explicaciones de Genius",
+                _ => tip,
             };
             let r = ui.interact(Rect::from_center_size(c, vec2(40.0, 40.0)), ui.id().with(("track_lyr_icon", k)), Sense::click()).on_hover_text(tip);
-            let base = if k == 0 && on { GREEN } else { INK.icon };
+            let active = (k == 0 && on) || (k == 2 && self.track_notes);
+            let base = if active { GREEN } else { INK.icon };
             let color = if r.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 base.lerp_to_gamma(Color32::WHITE, 0.3)
@@ -681,6 +734,18 @@ impl App {
                 base
             };
             paint_mask(painter, name, mask, px(painter, c), color);
+            if active {
+                painter.circle_filled(pos2(c.x + 0.7, c.y + ICON_DOT_DY), ICON_DOT_R, color);
+            }
+            if k == 2 && r.clicked() {
+                self.track_notes = !self.track_notes;
+                self.track_note_pick = None;
+                ui.ctx().request_repaint();
+                // Si la última vez falló, se vuelve a intentar.
+                if self.track_notes && self.genius_failed.remove(&page.id) {
+                    self.requested.remove(&format!("genius:{}", page.id));
+                }
+            }
             if k == 0 && r.clicked() {
                 // Encendida pero sin seguir (arriba, en la ficha, o tras mover la rueda): el
                 // clic baja hasta lo que suena en vez de apagarla. Si ya la sigue, la apaga.
@@ -747,8 +812,18 @@ impl App {
         let follow = self.settings.lyrics_sync && synced && current;
         let playing = current && self.player.state == PlayState::Playing;
 
+        // Explicaciones de Genius: la tarjeta va a la derecha y la letra parte antes de llegar.
+        let width = ui.max_rect().width();
+        let notes = self.track_notes_state(page, &lyrics);
+        let card_w = CARD_W.min((width * CARD_W / REF_PANEL_W).max(260.0));
+        let card_right = o.x + width - (CARD_RIGHT * width / REF_PANEL_W).clamp(MARGIN, CARD_RIGHT);
+        let card_left = card_right - card_w;
+
         // Maqueta (desde la línea).
-        let wrap = (o.x + ui.max_rect().width() - MARGIN) - (o.x + line_x);
+        let wrap = match notes {
+            Notes::Off => (o.x + width - MARGIN) - (o.x + line_x),
+            _ => (card_left - CARD_GAP - (o.x + line_x)).max(160.0),
+        };
         let font = theme::semibold(LINE_FONT);
         let mut rows: Vec<(f32, Option<std::sync::Arc<egui::Galley>>)> = Vec::with_capacity(lyrics.lines.len());
         let mut y = LINE_FIRST;
@@ -823,6 +898,33 @@ impl App {
         // Renglones.
         let clip = Rect::from_min_max(pos2(view.min.x, view.min.y), view.max);
         let mut seek_to = None;
+        // Cada renglón, en qué tramo de Genius cae; el tramo elegido (el pulsado, el de lo que
+        // suena o el primero) y el que tiene el puntero encima.
+        let (spans, sel) = match &notes {
+            Notes::Ready(_, spans) if !spans.is_empty() => {
+                let picked = self.track_note_pick.as_ref().filter(|(pid, k)| *pid == id && *k < spans.len()).map(|(_, k)| *k);
+                let playing_span = if follow { cur_line.and_then(|c| spans.iter().rposition(|s| s.first <= c)) } else { None };
+                (spans.clone(), picked.or(playing_span).or(Some(0)))
+            }
+            _ => (Vec::new(), None),
+        };
+        let span_of = |i: usize| spans.iter().position(|s| s.first <= i && i <= s.last);
+        let line_area = |i: usize| -> Option<Rect> {
+            let g = rows[i].1.as_ref()?;
+            let base = o.y + rule_nat + rows[i].0;
+            let lead = ink_left(g);
+            let min = pos2((o.x + line_x - lead).round(), (base - first_base(g)).round());
+            Some(Rect::from_min_size(min, g.size()))
+        };
+        let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| clip.contains(*p));
+        let hovered_span = pointer.and_then(|p| (0..rows.len()).find(|&i| line_area(i).is_some_and(|a| a.expand2(vec2(HL_PAD_L, 8.0)).contains(p)))).and_then(span_of);
+        for (k, fill) in [(sel, HL_FILL), (hovered_span.filter(|h| Some(*h) != sel), HL_HOVER)] {
+            if let Some(span) = k.map(|k| spans[k]) {
+                for (r, corners) in highlight_rects(&rows, span.first, span.last, o, rule_nat, line_x) {
+                    painter.rect_filled(r, corners, fill);
+                }
+            }
+        }
         for (i, (base, g)) in rows.iter().enumerate() {
             let Some(g) = g else { continue };
             let base = o.y + rule_nat + base;
@@ -838,7 +940,8 @@ impl App {
             };
             let sung = (follow && cur_line == Some(i)).then(|| sung_chars(&lyrics.lines[i], pos, line_end(i)));
             let past = !follow || cur_line.is_some_and(|c| i < c) || matches!(sung, Some(None));
-            let hit = (synced && current).then(|| ui.interact(area.expand2(vec2(4.0, 6.0)), ui.id().with(("track_line", i)), Sense::click()));
+            let in_span = span_of(i);
+            let hit = (in_span.is_some() || (synced && current)).then(|| ui.interact(area.expand2(vec2(4.0, 6.0)), ui.id().with(("track_line", i)), Sense::click()));
             let hovered = hit.as_ref().is_some_and(|r| r.hovered());
             if hovered {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -857,8 +960,36 @@ impl App {
                 }
             }
             if hit.is_some_and(|r| r.clicked()) {
-                seek_to = Some(lyrics.lines[i].start_ms);
+                // Con las explicaciones, un verso explicado se elige; si no, se salta a él.
+                // (Se dibuja en el fotograma siguiente: este ya pintó el resaltado y la tarjeta.)
+                match in_span {
+                    Some(k) => {
+                        self.track_note_pick = Some((id.clone(), k));
+                        ui.ctx().request_repaint();
+                    }
+                    None => seek_to = Some(lyrics.lines[i].start_ms),
+                }
             }
+        }
+        // La tarjeta, junto al verso elegido (o junto al primer renglón mientras no hay tramo).
+        let first_line = rows.iter().position(|r| r.1.is_some()).unwrap_or(0);
+        let top_line = sel.map(|k| spans[k].first).unwrap_or(first_line);
+        let card_top = o.y + rule_nat + rows.get(top_line).map_or(LINE_FIRST, |r| r.0) - HL_UP + CARD_TOP_DY;
+        let card = match &notes {
+            Notes::Off => None,
+            Notes::Loading => Some(("Buscando en Genius…".to_string(), None)),
+            Notes::Failed => Some(("No se pudo consultar Genius.".to_string(), None)),
+            Notes::Missing => Some(("Genius no tiene explicaciones de esta canción.".to_string(), None)),
+            Notes::Ready(song, _) => match sel {
+                Some(k) => {
+                    let n = &song.notes[spans[k].note];
+                    Some((n.body.clone(), Some(n.url.clone())))
+                }
+                None => Some(("Genius no tiene explicaciones de los versos de esta letra.".to_string(), Some(song.url.clone()))),
+            },
+        };
+        if let Some((body, link)) = card {
+            self.genius_card(ui, &painter, Rect::from_min_max(pos2(card_left, card_top), pos2(card_right, card_top)), &body, link, clip);
         }
         if let Some(ms) = seek_to {
             self.seek(ms);
@@ -874,6 +1005,83 @@ impl App {
             }
         }
         end
+    }
+
+    /// Lo que hay de Genius para la canción de la página, pidiéndolo si hace falta, con dónde va
+    /// cada explicación en esta letra (se calcula una vez por canción y letra).
+    fn track_notes_state(&mut self, page: &TrackPage, lyrics: &Lyrics) -> Notes {
+        if !self.track_notes {
+            return Notes::Off;
+        }
+        let id = page.id.clone();
+        if self.genius_failed.contains(&id) {
+            return Notes::Failed;
+        }
+        let Some(song) = self.genius.get(&id).cloned() else {
+            let artist = page.artists.first().map(|a| a.name.clone()).unwrap_or_default();
+            self.request_once(&format!("genius:{id}"), Req::Genius { id: id.clone(), name: page.name.clone(), artist });
+            return Notes::Loading;
+        };
+        let Some(song) = song else { return Notes::Missing };
+        let n = lyrics.lines.len();
+        let fresh = matches!(&self.genius_spans, Some((sid, len, _)) if *sid == id && *len == n);
+        if !fresh {
+            let lines: Vec<&str> = lyrics.lines.iter().map(|l| l.words.as_str()).collect();
+            let spans = crate::genius::match_notes(&lines, &song.notes);
+            self.genius_spans = Some((id, n, spans));
+        }
+        let spans = self.genius_spans.as_ref().map(|s| s.2.clone()).unwrap_or_default();
+        Notes::Ready(song, spans)
+    }
+
+    /// La tarjeta de Genius con la esquina de arriba en `at.min` y el borde derecho en `at.max.x`:
+    /// «De Genius ↗» (pulsarla abre `link` en el navegador), la divisoria y `body`.
+    fn genius_card(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, at: Rect, body: &str, link: Option<String>, clip: Rect) {
+        let (left, top, w) = (at.min.x, at.min.y, at.width());
+        let painter = painter.with_clip_rect(clip);
+        // Cabecera.
+        let mut job = egui::text::LayoutJob::default();
+        job.append("De ", 0.0, egui::TextFormat::simple(theme::semilight(CARD_HEAD_FONT), INK.tab_off));
+        job.append("Genius", 0.0, egui::TextFormat::simple(theme::semilight(CARD_HEAD_FONT), INK.title));
+        let g = painter.layout_job(job);
+        let (l, r) = (ink_left(&g), ink_right(&g));
+        let head_base = top + CARD_HEAD_BASE;
+        let head = text_on_baseline(&painter, pos2(left + CARD_PAD - l, head_base), g, INK.title);
+        let ax = left + CARD_PAD + (r - l) + CARD_ARROW_GAP;
+        let hit = Rect::from_min_max(pos2(left, top), pos2(ax + 14.0, top + CARD_RULE));
+        let resp = ui.interact(hit, ui.id().with("genius_link"), Sense::click());
+        let hovered = link.is_some() && resp.hovered();
+        let arrow = if hovered { Color32::WHITE } else { INK.icon };
+        let corner = pos2(ax + 11.2, head_base - 9.2);
+        let s = egui::Stroke::new(1.5, arrow);
+        painter.line_segment([pos2(ax + 0.8, head_base + 0.4), corner], s);
+        painter.add(egui::Shape::line(vec![pos2(corner.x - 7.5, corner.y), corner, pos2(corner.x, corner.y + 7.5)], s));
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            painter.line_segment([pos2(head.min.x, head.max.y - 2.0), pos2(head.max.x, head.max.y - 2.0)], egui::Stroke::new(1.0, INK.title));
+        }
+        let clicked = resp.clicked();
+        if link.is_some() {
+            resp.on_hover_text("Abrir en Genius");
+        }
+        if let (Some(url), true) = (link, clicked) {
+            self.actions.push(Action::OpenLink(url));
+        }
+        // Divisoria y explicación.
+        let rule = top + CARD_RULE;
+        painter.rect_filled(Rect::from_min_max(pos2(left, rule - CARD_STROKE / 2.0), pos2(left + w, rule + CARD_STROKE / 2.0)), CornerRadius::ZERO, CARD_LINE);
+        let mut fmt = egui::TextFormat::simple(theme::semilight(CARD_BODY_FONT), INK.title);
+        fmt.line_height = Some(CARD_PITCH);
+        let mut job = egui::text::LayoutJob::single_section(body.to_string(), fmt);
+        job.wrap.max_width = w - 2.0 * CARD_PAD;
+        job.wrap.max_rows = CARD_MAX_ROWS;
+        let g = painter.layout_job(job);
+        let rows = g.rows.len().max(1) as f32;
+        let first = rule + CARD_BODY_FIRST;
+        let lb = ink_left(&g);
+        text_on_baseline(&painter, pos2(left + CARD_PAD - lb, first), g, INK.title);
+        let bottom = first + (rows - 1.0) * CARD_PITCH + CARD_BOTTOM;
+        painter.rect_stroke(Rect::from_min_max(pos2(left, top), pos2(left + w, bottom)), CornerRadius::same(CARD_RADIUS), egui::Stroke::new(CARD_STROKE, CARD_LINE), egui::StrokeKind::Middle);
     }
 
     /// Créditos por grupos (Interpretada por, Escrita por, Producida por…).
@@ -943,6 +1151,41 @@ impl App {
         );
         top + c.min_rect().height() + 24.0
     }
+}
+
+/// Rectángulos del resaltado de los renglones `first..=last` (uno por renglón con letra; un
+/// renglón vacío parte el resaltado), con las esquinas redondeadas solo donde la forma tiene una
+/// esquina hacia fuera: arriba y abajo del todo, y a la derecha donde un renglón es más ancho que
+/// el de al lado (la esquina interior del escalón queda recta).
+fn highlight_rects(rows: &[(f32, Option<std::sync::Arc<egui::Galley>>)], first: usize, last: usize, o: egui::Pos2, rule: f32, line_x: f32) -> Vec<(Rect, CornerRadius)> {
+    let mut boxes: Vec<Option<Rect>> = Vec::new();
+    for (base, g) in rows.iter().take(last + 1).skip(first) {
+        boxes.push(g.as_ref().map(|g| {
+            let base = o.y + rule + base;
+            let last_base = base
+                + match (g.rows.first(), g.rows.last()) {
+                    (Some(a), Some(b)) => b.pos.y - a.pos.y,
+                    _ => 0.0,
+                };
+            let w = if g.rows.len() == 1 { ink_right(g) - ink_left(g) } else { g.size().x - ink_left(g) };
+            Rect::from_min_max(pos2(o.x + line_x - HL_PAD_L, base - HL_UP), pos2(o.x + line_x + w + HL_PAD_R, last_base + HL_DOWN))
+        }));
+    }
+    let mut out = Vec::new();
+    for (k, b) in boxes.iter().enumerate() {
+        let Some(b) = b else { continue };
+        let prev = k.checked_sub(1).and_then(|p| boxes[p]);
+        let next = boxes.get(k + 1).copied().flatten();
+        let r = HL_RADIUS;
+        let corners = CornerRadius {
+            nw: if prev.is_none() { r } else { 0 },
+            sw: if next.is_none() { r } else { 0 },
+            ne: if prev.is_none_or(|p| b.max.x > p.max.x + 0.5) { r } else { 0 },
+            se: if next.is_none_or(|n| b.max.x > n.max.x + 0.5) { r } else { 0 },
+        };
+        out.push((*b, corners));
+    }
+    out
 }
 
 /// Desplazamiento que deja el renglón que suena (`line`: su línea base desde la línea de las

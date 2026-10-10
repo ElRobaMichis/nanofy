@@ -70,11 +70,17 @@ const NOW_Y: f32 = 98.0;
 const NEXT_DY: f32 = 79.0;
 const NEXT_FONT: f32 = 17.0;
 const HEAD_DY: f32 = 33.0;
-/// Cabecera de grupo: icono (17) centrado en 33,5; nombre (Semilight 16) desde 50 con la línea
+/// Cabecera de grupo: icono (16) centrado en 33,5; nombre (Semilight 16) desde 50 con la línea
 /// base 7,8 bajo el centro; aleatorio en 305, repetir en 351,5 y X en 397. La primera fila, 62
-/// por debajo; tras la última, la cabecera siguiente a 67,4.
+/// por debajo; tras la última, la cabecera siguiente a 67,4. Los iconos van a la altura del
+/// centro de las mayúsculas del nombre (como en la referencia): cada uno con su ajuste vertical
+/// desde el centro de la cabecera, porque su dibujo no está centrado en su cuadro.
 const HEAD_ICON_X: f32 = 33.5;
-const HEAD_ICON: f32 = 17.0;
+const HEAD_ICON: f32 = 16.0;
+const HEAD_ICON_DY: f32 = 1.5;
+const SHUFFLE_DY: f32 = 1.0;
+const REPEAT_DY: f32 = 2.2;
+const HEAD_CLOSE_DY: f32 = 0.5;
 const HEAD_TEXT_X: f32 = 50.0;
 const HEAD_BASE_DY: f32 = 7.8;
 const HEAD_FONT: f32 = 16.0;
@@ -444,7 +450,7 @@ impl App {
     fn queue_group_head(&mut self, ui: &mut egui::Ui, o: Pos2, cy: f32, g: &Group, gi: usize, ink: &Ink) {
         let painter = ui.painter().clone();
         let y = o.y + cy;
-        icons::paint(&painter, Rect::from_center_size(pos2(o.x + HEAD_ICON_X, y), vec2(HEAD_ICON, HEAD_ICON)), ink.icon, g.icon);
+        icons::paint(&painter, Rect::from_center_size(pos2(o.x + HEAD_ICON_X, y + HEAD_ICON_DY), vec2(HEAD_ICON, HEAD_ICON)), ink.icon, g.icon);
         let end = if g.context { SHUFFLE_X - 22.0 } else { CLOSE_X - 22.0 };
         let r = text_at(&painter, &g.name, theme::semilight(HEAD_FONT), ink.head, o.x + HEAD_TEXT_X, y + HEAD_BASE_DY, end - HEAD_TEXT_X);
         if let Some(page) = &g.page {
@@ -459,7 +465,7 @@ impl App {
         }
         if g.context {
             let shuffle = if self.player.shuffle { GREEN } else { ink.icon };
-            if icon_button(ui, egui::Id::new(("queue_shuffle", gi)), pos2(o.x + SHUFFLE_X, y + 0.5), BAR_ICON, Icon::Shuffle, shuffle, "Aleatorio").clicked() {
+            if icon_button(ui, egui::Id::new(("queue_shuffle", gi)), pos2(o.x + SHUFFLE_X, y + SHUFFLE_DY), BAR_ICON, Icon::Shuffle, shuffle, "Aleatorio").clicked() {
                 self.toggle_shuffle();
             }
             let (icon, color) = match self.player.repeat {
@@ -467,14 +473,14 @@ impl App {
                 Repeat::Context => (Icon::Repeat, GREEN),
                 Repeat::Track => (Icon::RepeatOne, GREEN),
             };
-            if icon_button(ui, egui::Id::new(("queue_repeat", gi)), pos2(o.x + REPEAT_X, y + 1.5), BAR_ICON, icon, color, "Repetir").clicked() {
+            if icon_button(ui, egui::Id::new(("queue_repeat", gi)), pos2(o.x + REPEAT_X, y + REPEAT_DY), BAR_ICON, icon, color, "Repetir").clicked() {
                 self.cycle_repeat();
             }
             let tip = format!("Quitar lo que queda de {}", g.name);
-            if icon_button(ui, egui::Id::new(("queue_drop", gi)), pos2(o.x + CLOSE_X, y), CLOSE, Icon::Close, ink.icon, &tip).clicked() {
+            if icon_button(ui, egui::Id::new(("queue_drop", gi)), pos2(o.x + CLOSE_X, y + HEAD_CLOSE_DY), CLOSE, Icon::Close, ink.icon, &tip).clicked() {
                 self.queue_drop_context();
             }
-        } else if icon_button(ui, egui::Id::new(("queue_clear", gi)), pos2(o.x + CLOSE_X, y), CLOSE, Icon::Close, ink.icon, "Vaciar la cola").clicked() {
+        } else if icon_button(ui, egui::Id::new(("queue_clear", gi)), pos2(o.x + CLOSE_X, y + HEAD_CLOSE_DY), CLOSE, Icon::Close, ink.icon, "Vaciar la cola").clicked() {
             self.queue_clear();
         }
     }

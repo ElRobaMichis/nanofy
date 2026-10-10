@@ -3,7 +3,7 @@
 //! API pide (api.rs, `Client::genius`) y la página dibuja (app/track_page.rs).
 //!
 //! Se usa la API de la propia web de genius.com (`genius.com/api/…`), que no pide clave; la
-//! documentada (`api.genius.com`) exige un token de aplicación. Ver docs/modulo-genius.pdf.
+//! documentada (`api.genius.com`) exige un token de aplicación.
 
 use serde_json::Value;
 

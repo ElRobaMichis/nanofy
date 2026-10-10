@@ -374,6 +374,7 @@ impl App {
                     .or_else(|| self.artist_views.get(id).map(|v| v.name.clone()).filter(|n| !n.is_empty()))
                     .unwrap_or_else(|| "Artista".into()),
             ),
+            Page::Track(id) => (Icon::Album, self.track_pages.get(id).map(|p| p.name.clone()).unwrap_or_else(|| "Canción".into())),
             Page::User(id) => (
                 Icon::Person,
                 self.users.get(id).map(|u| u.name().to_string()).unwrap_or_else(|| "Perfil".into()),
@@ -910,9 +911,12 @@ impl App {
             }
             _ => r,
         };
+        // La portada abre la página de la canción (los episodios, su álbum o programa).
         if r.clicked() {
-            if let Some(id) = &np.album_id {
-                self.actions.push(Action::Go(Page::Album(id.clone())));
+            match (&np.id, &np.album_id) {
+                (Some(id), _) if np.uri.starts_with("spotify:track:") => self.actions.push(Action::Go(Page::Track(id.clone()))),
+                (_, Some(id)) => self.actions.push(Action::Go(Page::Album(id.clone()))),
+                _ => {}
             }
         }
         // Clic derecho: el menú de cristal de los tres puntos, desde el puntero.

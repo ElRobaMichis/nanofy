@@ -64,6 +64,9 @@ pub enum Size {
     Max(u32),
     Fit(u32, u32),
     Hero(u32, u32),
+    /// Fondo de la página de canción de `w`×`h` (`backdrop_compose`) con el color de base
+    /// (0xRRGGBB).
+    Backdrop(u32, u32, u32),
 }
 
 struct Job {
@@ -251,6 +254,12 @@ impl Images {
     /// Cabecera de artista de `w`×`h` píxeles compuesta a partir de su retrato (`hero_compose`).
     pub fn texture_hero(&mut self, url: &str, w: u32, h: u32) -> Option<SizedTexture> {
         self.texture_sized(url, Size::Hero(w.max(1), h.max(1)))
+    }
+
+    /// Fondo difuminado de la página de canción, de `w`×`h` píxeles (`backdrop_compose`).
+    pub fn texture_backdrop(&mut self, url: &str, w: u32, h: u32, base: [u8; 3]) -> Option<SizedTexture> {
+        let rgb = (base[0] as u32) << 16 | (base[1] as u32) << 8 | base[2] as u32;
+        self.texture_sized(url, Size::Backdrop(w.max(1), h.max(1), rgb))
     }
 
     fn texture_sized(&mut self, url: &str, size: Size) -> Option<SizedTexture> {
@@ -488,6 +497,7 @@ fn key(url: &str, size: Size) -> String {
         Size::Max(s) => format!("{s}|{url}"),
         Size::Fit(w, h) => format!("{w}x{h}|{url}"),
         Size::Hero(w, h) => format!("hero{w}x{h}|{url}"),
+        Size::Backdrop(w, h, rgb) => format!("fondo{w}x{h}#{rgb:06x}|{url}"),
     }
 }
 
@@ -516,7 +526,7 @@ fn load(agent: &ureq::Agent, dir: &Path, url: &str, size: Size, stale: impl Fn()
     // la ventana se pide una por fotograma y las anteriores no vuelven a pedirse. Decodificar y
     // escalar cada una a hasta 1280 px cuesta decenas de ms y una textura de varios MB que solo
     // iría a desalojarse.
-    if matches!(size, Size::Fit(..) | Size::Hero(..)) && stale() {
+    if matches!(size, Size::Fit(..) | Size::Hero(..) | Size::Backdrop(..)) && stale() {
         return Loaded::Dropped;
     }
     let file = dir.join(cache_name(url));
@@ -573,6 +583,7 @@ fn load(agent: &ureq::Agent, dir: &Path, url: &str, size: Size, stale: impl Fn()
         }
         Size::Fit(w, h) => fit_crop(&img, w, h),
         Size::Hero(w, h) => hero_compose(&img, w, h),
+        Size::Backdrop(w, h, rgb) => backdrop_compose(&img, w, h, [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]),
     };
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -657,6 +668,37 @@ fn hero_compose(img: &image::DynamicImage, w: u32, h: u32) -> image::DynamicImag
             };
             out.put_pixel(x, y, image::Rgba([px[0].round() as u8, px[1].round() as u8, px[2].round() as u8, 255]));
         }
+    }
+    image::DynamicImage::ImageRgba8(out)
+}
+
+/// Fondo de la página de canción de `w`×`h`, como el de la referencia (5.webp, ajustado por
+/// mínimos cuadrados con error medio 1,6/255): la portada en un cuadrado de 0,9665·w de lado
+/// centrado en (w/2, 0,631·h) —fuera de él, sus bordes prolongados—, desenfocada con sigma
+/// 0,0555 del lado y oscurecida: 0,159·`base` + 0,229·portada. Se calcula a 1/8 y se amplía:
+/// tan desenfocado, no se nota.
+pub fn backdrop_compose(img: &image::DynamicImage, w: u32, h: u32, base: [u8; 3]) -> image::DynamicImage {
+    const DOWN: f32 = 8.0;
+    let (sw, sh) = (((w as f32 / DOWN).ceil() as u32).max(2), ((h as f32 / DOWN).ceil() as u32).max(2));
+    let side = 0.9665 * w as f32 / DOWN;
+    let s = (side.round() as u32).max(2);
+    let cover = img.resize_exact(s, s, image::imageops::FilterType::Triangle).to_rgb8();
+    let ox = w as f32 / 2.0 / DOWN - s as f32 / 2.0;
+    let oy = 0.631 * h as f32 / DOWN - s as f32 / 2.0;
+    let mut small = image::RgbImage::new(sw, sh);
+    for y in 0..sh {
+        let cy = ((y as f32 - oy).round() as i64).clamp(0, s as i64 - 1) as u32;
+        for x in 0..sw {
+            let cx = ((x as f32 - ox).round() as i64).clamp(0, s as i64 - 1) as u32;
+            small.put_pixel(x, y, *cover.get_pixel(cx, cy));
+        }
+    }
+    let blurred = image::imageops::blur(&small, (0.0555 * side).max(0.5));
+    let big = image::imageops::resize(&blurred, w, h, image::imageops::FilterType::Triangle);
+    let mut out = image::RgbaImage::new(w, h);
+    for (o, p) in out.pixels_mut().zip(big.pixels()) {
+        let c = |k: usize| (0.159 * base[k] as f32 + 0.229 * p[k] as f32).round().clamp(0.0, 255.0) as u8;
+        *o = image::Rgba([c(0), c(1), c(2), 255]);
     }
     image::DynamicImage::ImageRgba8(out)
 }

@@ -179,7 +179,7 @@ struct EnrichQueue {
     prefetch: Option<Req>,
     /// Géneros por buscar: (clave, artista, álbum). Se sirven de la más nueva a la más vieja,
     /// para que la página abierta los tenga antes que las que ya se dejaron atrás.
-    genres: std::collections::VecDeque<(String, String, Option<String>)>,
+    genres: std::collections::VecDeque<(String, String, Option<String>, Option<String>)>,
     /// Claves en cola o en curso: abrir dos veces la misma página no las busca dos veces.
     queued: std::collections::HashSet<String>,
     /// La app se cierra: el hilo termina (como los otros carriles al soltar su canal).
@@ -215,6 +215,7 @@ fn interno(req: &Req) -> bool {
             | Req::ArtistView(_)
             | Req::User(_)
             | Req::TrackInfo(_)
+            | Req::TrackPage(_)
             | Req::ArtistThumbs(_)
             | Req::JamQueue { .. }
     )
@@ -253,6 +254,8 @@ pub enum Req {
     ArtistTop(String),
     /// Pista completa (álbum, portada) por los metadatos internos.
     TrackInfo(String),
+    /// Página de canción: escuchas y artistas (pathfinder), créditos y recomendadas.
+    TrackPage(String),
     /// Radio de una canción: Spotify la genera como playlist; devuelve su id.
     RadioPlaylist(String),
     /// Playlists creadas por el propio artista (búsqueda filtrada por propietario).
@@ -442,6 +445,7 @@ pub enum Resp {
     Genres { key: String, genres: Vec<String> },
     ArtistTop(Vec<Track>),
     TrackInfo(Track),
+    TrackPage(Box<TrackPage>),
     RadioPlaylist { playlist_id: String },
     ArtistPlaylists { id: String, playlists: Vec<Playlist> },
     ArtistAlbums(Vec<AlbumRef>),
@@ -788,7 +792,7 @@ impl Api {
             let enrich = enrich.clone();
             enum Job {
                 Lyrics(Req),
-                Genres(String, String, Option<String>),
+                Genres(String, String, Option<String>, Option<String>),
             }
             std::thread::Builder::new()
                 .name("nanofy-enrich".into())
@@ -806,8 +810,8 @@ impl Api {
                             if let Some(req) = q.lyrics.take().or_else(|| q.prefetch.take()) {
                                 break Job::Lyrics(req);
                             }
-                            if let Some((key, artist, album)) = q.genres.pop_back() {
-                                break Job::Genres(key, artist, album);
+                            if let Some((key, artist, album, song)) = q.genres.pop_back() {
+                                break Job::Genres(key, artist, album, song);
                             }
                             q = cv.wait(q).unwrap();
                         }
@@ -816,7 +820,7 @@ impl Api {
                         // Cada letra en su hilo: la de una canción ya saltada, esperando a una
                         // fuente lenta, no retrasa la de la siguiente.
                         Job::Lyrics(req) => spawn_lyrics(req, &client, &ui),
-                        Job::Genres(key, artist, album) => {
+                        Job::Genres(key, artist, album, song) => {
                             let t0 = Instant::now();
                             let lyrics_waiting = || {
                                 let req = enrich.0.lock().unwrap().lyrics.take();
@@ -824,7 +828,7 @@ impl Api {
                                     spawn_lyrics(req, &client, &ui);
                                 }
                             };
-                            let genres = client.external_genres(&key, &artist, album.as_deref(), &lyrics_waiting);
+                            let genres = client.external_genres(&key, &artist, album.as_deref(), song.as_deref(), &lyrics_waiting);
                             // Después de guardarlos: quien la encargue otra vez ya los encuentra.
                             enrich.0.lock().unwrap().queued.remove(&key);
                             log::debug!("[generos] {key} en {} ms", t0.elapsed().as_millis());
@@ -2081,15 +2085,20 @@ impl Client {
     /// se encargan al carril de enriquecimiento, que los manda aparte (Resp::Genres). Antes se
     /// buscaban aquí mismo y uno de los dos hilos comunes quedaba ocupado tras dibujar la página.
     fn genres_or_queue(&self, key: &str, artist: &str, album: Option<&str>) -> Vec<String> {
+        self.genres_or_queue_song(key, artist, album, None)
+    }
+
+    /// Como `genres_or_queue`, con el título de la canción para las claves "song:<id>".
+    fn genres_or_queue_song(&self, key: &str, artist: &str, album: Option<&str>, song: Option<&str>) -> Vec<String> {
         if let Some(g) = self.cached_genres(key) {
             return g;
         }
         let (lock, cv) = &*self.enrich;
         let mut q = lock.lock().unwrap();
         if q.queued.insert(key.to_string()) {
-            q.genres.push_back((key.to_string(), artist.to_string(), album.map(str::to_string)));
+            q.genres.push_back((key.to_string(), artist.to_string(), album.map(str::to_string), song.map(str::to_string)));
             if q.genres.len() > ENRICH_GENRES_MAX {
-                if let Some((old, _, _)) = q.genres.pop_front() {
+                if let Some((old, _, _, _)) = q.genres.pop_front() {
                     q.queued.remove(&old);
                 }
             }
@@ -2098,12 +2107,13 @@ impl Client {
         Vec::new()
     }
 
-    /// Géneros cacheados o consultados a fuentes externas. `key` = "artist:<id>" o "album:<id>".
+    /// Géneros cacheados o consultados a fuentes externas. `key` = "artist:<id>", "album:<id>" o
+    /// "song:<id>" (con `song`, el título).
     /// Spotify dejó de exponer géneros (Web API y metadatos internos vienen vacíos), así que se
     /// combinan iTunes Search (género principal), Deezer (géneros de álbum) y MusicBrainz (etiquetas).
     /// Solo desde el carril de enriquecimiento (genres_or_queue); `between` se llama antes de
     /// cada consulta para atender ahí las letras que esperen.
-    fn external_genres(&self, key: &str, artist: &str, album: Option<&str>, between: &dyn Fn()) -> Vec<String> {
+    fn external_genres(&self, key: &str, artist: &str, album: Option<&str>, song: Option<&str>, between: &dyn Fn()) -> Vec<String> {
         if let Some(g) = self.genres.lock().unwrap().get(key) {
             return g.clone();
         }
@@ -2132,6 +2142,24 @@ impl Client {
                 out.push(g);
             }
         };
+        // Una canción (página de canción): sus géneros en Wikidata y, hasta cinco, los de su
+        // álbum allí; sin nada, los de su álbum de siempre (abajo).
+        if let (Some(song), true) = (song, key.starts_with("song:")) {
+            for g in self.wikidata_genres(crate::lyrics_sources::search_title(song), artist, &["song", "single"], &get) {
+                push(&g, &mut out);
+            }
+            if out.len() < 5 {
+                if let Some(album) = album {
+                    for g in self.wikidata_genres(crate::lyrics_sources::search_title(album), artist, &["album"], &get) {
+                        push(&g, &mut out);
+                    }
+                }
+            }
+            out.truncate(5);
+            if !out.is_empty() {
+                return self.keep_genres(key, artist, album, out, failed.get());
+            }
+        }
         match album {
             Some(album) => {
                 // Deezer: búsqueda del álbum y géneros del álbum (varios).
@@ -2205,14 +2233,20 @@ impl Client {
                 }
             }
         }
+        self.keep_genres(key, artist, album, out, failed.get())
+    }
+
+    /// Lo encontrado para `key`, al registro y a la caché (en memoria y en disco); vacío, como
+    /// «sin géneros» (con fecha solo si ninguna fuente falló: si no, se volverá a buscar).
+    fn keep_genres(&self, key: &str, artist: &str, album: Option<&str>, out: Vec<String>, failed: bool) -> Vec<String> {
         log::info!("[generos] {key} ({artist}{}): {out:?}", album.map(|a| format!(" — {a}")).unwrap_or_default());
         if out.is_empty() {
             let text = {
                 let mut miss = self.genres_miss.lock().unwrap();
-                miss.insert(key.to_string(), (!failed.get()).then(crate::cache::now_secs));
+                miss.insert(key.to_string(), (!failed).then(crate::cache::now_secs));
                 // Al disco solo las que tienen fecha; se escribe sin el cerrojo, que los hilos
                 // comunes miran en cada álbum o artista.
-                (!failed.get())
+                (!failed)
                     .then(|| {
                         let disk: std::collections::HashMap<&String, u64> = miss.iter().filter_map(|(k, at)| Some((k, (*at)?))).collect();
                         serde_json::to_string(&disk).ok()
@@ -2235,6 +2269,50 @@ impl Client {
             }
         }
         out
+    }
+
+    /// Géneros de Wikidata (propiedad P136, en su orden; etiqueta en español o, si no hay, en
+    /// inglés) de la obra `name` de `artist`: la primera de la búsqueda cuya descripción en inglés
+    /// diga una de `kinds` («song», «single», «album») y el artista («2013 single by Daft Punk…»).
+    fn wikidata_genres(&self, name: &str, artist: &str, kinds: &[&str], get: &dyn Fn(&str) -> Option<Value>) -> Vec<String> {
+        const API: &str = "https://www.wikidata.org/w/api.php";
+        let (name, artist) = (name.trim(), artist.trim().to_lowercase());
+        if name.is_empty() || artist.is_empty() {
+            return Vec::new();
+        }
+        let Some(v) = get(&format!("{API}?action=wbsearchentities&search={}&language=en&uselang=en&type=item&limit=10&format=json", urlencode(name))) else {
+            return Vec::new();
+        };
+        let fits = |s: &Value| {
+            let d = s["description"].as_str().unwrap_or_default().to_lowercase();
+            let label = s["label"].as_str().unwrap_or_default();
+            kinds.iter().any(|k| d.contains(k)) && d.contains(&artist) && label.eq_ignore_ascii_case(name)
+        };
+        let Some(qid) = v["search"].as_array().into_iter().flatten().find(|s| fits(s)).and_then(|s| s["id"].as_str()).map(str::to_string) else {
+            return Vec::new();
+        };
+        let Some(e) = get(&format!("{API}?action=wbgetentities&ids={qid}&props=claims&format=json")) else {
+            return Vec::new();
+        };
+        let ids: Vec<String> = e["entities"][&qid]["claims"]["P136"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c["mainsnak"]["datavalue"]["value"]["id"].as_str().map(str::to_string))
+            .take(8)
+            .collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let Some(l) = get(&format!("{API}?action=wbgetentities&ids={}&props=labels&languages=es|en&format=json", ids.join("|"))) else {
+            return Vec::new();
+        };
+        ids.iter()
+            .filter_map(|id| {
+                let labels = &l["entities"][id]["labels"];
+                labels["es"]["value"].as_str().or_else(|| labels["en"]["value"].as_str()).map(str::to_string)
+            })
+            .collect()
     }
 
     /// Álbum completo (con pistas) por los metadatos internos.
@@ -2808,6 +2886,79 @@ impl Client {
 
     /// Petición a un endpoint interno de Spotify a través de librespot (spclient), con el plazo
     /// de su método (`sp_timeout`).
+    /// `Req::TrackPage`: getTrack, los créditos y las recomendadas a la vez. Sin getTrack (hash
+    /// rechazado, pathfinder caído) la canción sale de los metadatos internos, sin escuchas ni
+    /// fotos (la página las pide aparte). Los géneros, del álbum o del artista principal: los ya
+    /// conocidos van aquí y los demás llegan después (`Resp::Genres`).
+    fn track_page(&self, id: &str) -> Result<TrackPage, String> {
+        let t0 = Instant::now();
+        let uri = format!("spotify:track:{id}");
+        let (info, credits, related) = std::thread::scope(|s| {
+            let info = s.spawn(|| self.pf.query(crate::pathfinder::GET_TRACK, serde_json::json!({ "uri": uri })));
+            let credits = s.spawn(|| self.spclient(http::Method::GET, &format!("/track-credits-view/v0/experimental/{id}/credits")));
+            let related = s.spawn(|| self.pf.query(crate::pathfinder::TRACK_RECOMMEND, serde_json::json!({ "uri": uri, "limit": 20 })));
+            let join = |h: std::thread::ScopedJoinHandle<'_, Result<String, String>>| h.join().unwrap_or_else(|_| Err("el hilo falló".into()));
+            let joinv = |h: std::thread::ScopedJoinHandle<'_, Result<Value, String>>| h.join().unwrap_or_else(|_| Err("el hilo falló".into()));
+            (joinv(info), join(credits), joinv(related))
+        });
+        let mut page = match info.as_ref().ok().and_then(crate::pathfinder::map_track_page) {
+            Some(p) => p,
+            None => {
+                log::info!("[canción] {id}: sin getTrack ({}); de los metadatos internos", info.as_ref().err().map_or("respuesta sin pista", |e| e.as_str()));
+                let t = self.tracks_by_ids(std::slice::from_ref(&id.to_string()))?.pop().ok_or_else(|| "pista no encontrada".to_string())?;
+                TrackPage {
+                    id: id.to_string(),
+                    uri: t.uri.clone(),
+                    name: t.name.clone(),
+                    duration_ms: t.duration_ms,
+                    album: t.album.clone(),
+                    artists: t
+                        .artists
+                        .iter()
+                        .filter_map(|a| {
+                            let aid = a.id.clone()?;
+                            Some(Artist { uri: format!("spotify:artist:{aid}"), id: aid, name: a.name.clone(), ..Default::default() })
+                        })
+                        .collect(),
+                    ..Default::default()
+                }
+            }
+        };
+        match credits.and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| e.to_string())) {
+            Ok(v) => page.credits = credits_from_json(&v),
+            Err(e) => log::info!("[canción] {id}: sin créditos ({e})"),
+        }
+        match related {
+            Ok(v) => page.related = crate::pathfinder::map_recommended(&v),
+            Err(e) => log::info!("[canción] {id}: sin recomendadas ({e})"),
+        }
+        // Los de la canción (Wikidata, y si no, los de su álbum); mientras se buscan, los ya
+        // conocidos de su álbum o de su artista.
+        let first = page.artists.first().map(|a| (a.id.clone(), a.name.clone()));
+        if let Some((aid, artist)) = &first {
+            let album = page.album.as_ref().map(|a| a.name.as_str());
+            page.genres = self.genres_or_queue_song(&format!("song:{id}"), artist, album, Some(&page.name));
+            if page.genres.is_empty() {
+                page.genres = page
+                    .album
+                    .as_ref()
+                    .and_then(|a| a.id.as_ref())
+                    .and_then(|al| self.cached_genres(&format!("album:{al}")))
+                    .or_else(|| self.cached_genres(&format!("artist:{aid}")))
+                    .unwrap_or_default();
+            }
+        }
+        log::info!(
+            "[canción] {id} en {} ms: {} escuchas, {} grupos de créditos, {} recomendadas, {} géneros",
+            t0.elapsed().as_millis(),
+            page.playcount.map_or("sin".to_string(), |n| n.to_string()),
+            page.credits.len(),
+            page.related.len(),
+            page.genres.len()
+        );
+        Ok(page)
+    }
+
     fn spclient(&self, method: http::Method, endpoint: &str) -> Result<String, String> {
         let session = self.session()?;
         let bytes = self.block(sp_timeout(&method), session.spclient().request(&method, endpoint, None, None))?;
@@ -3401,6 +3552,7 @@ impl Client {
                 let mut v = self.tracks_by_ids(std::slice::from_ref(id))?;
                 v.pop().map(Resp::TrackInfo).ok_or_else(|| "pista no encontrada".to_string())
             }
+            Req::TrackPage(id) => self.track_page(id).map(|p| Resp::TrackPage(Box::new(p))),
             Req::ArtistTop(id) => {
                 // /artists/{id}/top-tracks está restringido: usamos los metadatos internos. La
                 // página de artista ya no lo pide (salen con Req::ArtistView); queda para el
@@ -3838,8 +3990,20 @@ impl Client {
                 Ok(Resp::Done)
             }
             Req::Probe(endpoint) => {
-                let text = self.spclient(http::Method::GET, endpoint)?;
-                let name = endpoint.trim_start_matches('/').replace(['/', '?', '&', '='], "_");
+                // «pf:getTrack:<id>» o «pf:internalLinkRecommenderTrack:<id>»: una consulta de la
+                // página de canción.
+                let text = match endpoint.strip_prefix("pf:").and_then(|r| r.split_once(':')) {
+                    Some((op, id)) => {
+                        let uri = format!("spotify:track:{id}");
+                        let (op, vars) = match op {
+                            "getTrack" => (crate::pathfinder::GET_TRACK, serde_json::json!({"uri": uri})),
+                            _ => (crate::pathfinder::TRACK_RECOMMEND, serde_json::json!({"uri": uri, "limit": 20})),
+                        };
+                        self.pf.query(op, vars)?.to_string()
+                    }
+                    None => self.spclient(http::Method::GET, endpoint)?,
+                };
+                let name = endpoint.trim_start_matches('/').replace(['/', '?', '&', '=', ':'], "_");
                 let _ = std::fs::write(std::env::temp_dir().join(format!("nanofy_probe_{name}.json")), &text);
                 log::info!("[probe] {endpoint}: {} bytes: {}", text.len(), text.chars().take(300).collect::<String>());
                 Ok(Resp::Done)

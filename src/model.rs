@@ -1322,6 +1322,147 @@ pub struct SavedEpisode {
     pub show_id: String,
 }
 
+/// Página de canción: la pista con sus escuchas (pathfinder, getTrack), quién la hizo y con qué
+/// papel (créditos de spclient) y las recomendadas a partir de ella.
+#[derive(Clone, Debug, Default)]
+pub struct TrackPage {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub duration_ms: u32,
+    /// Reproducciones; `None` si no llegaron (sin getTrack).
+    pub playcount: Option<u64>,
+    pub album: Option<AlbumRef>,
+    /// Color de la portada que extrae Spotify (`extractedColors.colorRaw`): tiñe el fondo.
+    pub color: Option<[u8; 3]>,
+    /// Artistas de la canción, el principal primero, con su foto.
+    pub artists: Vec<Artist>,
+    pub credits: Vec<CreditGroup>,
+    /// «Más como esta».
+    pub related: Vec<Track>,
+    /// Géneros del álbum o, si no tiene, del artista principal (pueden llegar después).
+    pub genres: Vec<String>,
+}
+
+/// Un grupo de créditos («Performers», «Writers», «Producers»… tal cual los manda Spotify).
+#[derive(Clone, Debug, Default)]
+pub struct CreditGroup {
+    pub title: String,
+    pub people: Vec<Credit>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Credit {
+    pub name: String,
+    pub id: Option<String>,
+    /// Papeles en minúsculas, como los manda Spotify («main artist», «composer»…).
+    pub roles: Vec<String>,
+}
+
+impl TrackPage {
+    /// Papeles de un artista en toda la canción, sin repetir y en el orden de los créditos; uno
+    /// de la canción que no salga en ellos es artista principal.
+    pub fn roles_of(&self, artist: &Artist) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in self.credits.iter().flat_map(|g| &g.people) {
+            let same = match &c.id {
+                Some(id) => *id == artist.id,
+                None => c.name.eq_ignore_ascii_case(&artist.name),
+            };
+            if same {
+                for r in &c.roles {
+                    if !out.contains(r) {
+                        out.push(r.clone());
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push("main artist".to_string());
+        }
+        out
+    }
+}
+
+/// Créditos de spclient (`/track-credits-view/v0/experimental/{id}/credits`): `roleCredits` con
+/// sus artistas y papeles. Los grupos vacíos no cuentan.
+pub fn credits_from_json(v: &serde_json::Value) -> Vec<CreditGroup> {
+    v["roleCredits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| {
+            let people: Vec<Credit> = g["artists"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| {
+                    let name = a["name"].as_str().filter(|n| !n.is_empty())?.to_string();
+                    let id = a["uri"].as_str().filter(|u| u.starts_with("spotify:artist:")).map(|u| u.trim_start_matches("spotify:artist:").to_string());
+                    let roles = a["subroles"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).map(|r| r.trim().to_lowercase()).filter(|r| !r.is_empty()).collect();
+                    Some(Credit { name, id, roles })
+                })
+                .collect();
+            let title = g["roleTitle"].as_str().unwrap_or_default().to_string();
+            (!people.is_empty()).then_some(CreditGroup { title, people })
+        })
+        .collect()
+}
+
+/// Un papel de los créditos en español («main artist» → «Artista principal»); los que no se
+/// conocen, tal cual con la primera en mayúscula.
+pub fn role_es(role: &str) -> String {
+    let es = match role.trim().to_lowercase().as_str() {
+        "main artist" => "Artista principal",
+        "featured artist" => "Artista invitado",
+        "composer" => "Compositor",
+        "lyricist" => "Letrista",
+        "writer" | "songwriter" => "Autor",
+        "producer" => "Productor",
+        "co-producer" => "Coproductor",
+        "executive producer" => "Productor ejecutivo",
+        "additional production" | "additional producer" => "Producción adicional",
+        "remixer" => "Remezclador",
+        "arranger" => "Arreglista",
+        "engineer" => "Ingeniero",
+        "mixing engineer" | "mixer" => "Ingeniero de mezcla",
+        "mastering engineer" => "Ingeniero de masterización",
+        "recording engineer" => "Ingeniero de grabación",
+        "programmer" | "programming" => "Programación",
+        "vocals" | "vocalist" | "lead vocals" => "Voz",
+        "background vocals" | "backing vocals" => "Coros",
+        "guitar" => "Guitarra",
+        "bass" | "bass guitar" => "Bajo",
+        "drums" => "Batería",
+        "keyboards" => "Teclados",
+        "piano" => "Piano",
+        "synthesizer" => "Sintetizador",
+        "percussion" => "Percusión",
+        "performer" => "Intérprete",
+        other => return capitalize(other),
+    };
+    es.to_string()
+}
+
+/// Título de un grupo de créditos en español.
+pub fn credit_group_es(title: &str) -> String {
+    match title.trim().to_lowercase().as_str() {
+        "performers" => "Interpretada por".to_string(),
+        "writers" => "Escrita por".to_string(),
+        "producers" => "Producida por".to_string(),
+        other => capitalize(other),
+    }
+}
+
+/// La primera letra en mayúscula («electronic music» → «Electronic music»).
+pub fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
 /// Forma de /me/episodes: el episodio lleva el podcast anidado.
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -1334,6 +1475,38 @@ pub struct EpisodeWithShow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creditos_y_papeles_de_cada_artista() {
+        // Recorte de la respuesta real de Get Lucky (oct 2026).
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"roleCredits":[
+                {"roleTitle":"Performers","artists":[
+                    {"uri":"spotify:artist:4tZwfgrHOc3mvqYlEYSvVi","name":"Daft Punk","subroles":["main artist"]},
+                    {"uri":"spotify:artist:2RdwBSPQiwcmiDo9kixcl8","name":"Pharrell Williams","subroles":["main artist"]}]},
+                {"roleTitle":"Writers","artists":[
+                    {"uri":"spotify:artist:2RdwBSPQiwcmiDo9kixcl8","name":"Pharrell Williams","subroles":["composer","lyricist"]},
+                    {"name":"Thomas Bangalter","subroles":["Composer"]}]},
+                {"roleTitle":"Producers","artists":[]}]}"#,
+        )
+        .unwrap();
+        let credits = credits_from_json(&v);
+        assert_eq!(credits.len(), 2, "el grupo vacío no cuenta");
+        assert_eq!(credits[1].people[1].id, None);
+        assert_eq!(credits[1].people[1].roles, ["composer"]);
+        let page = TrackPage { credits, ..Default::default() };
+        let artist = |id: &str, name: &str| Artist { id: id.into(), name: name.into(), ..Default::default() };
+        assert_eq!(page.roles_of(&artist("4tZwfgrHOc3mvqYlEYSvVi", "Daft Punk")), ["main artist"]);
+        assert_eq!(page.roles_of(&artist("2RdwBSPQiwcmiDo9kixcl8", "Pharrell Williams")), ["main artist", "composer", "lyricist"]);
+        // Sin id en los créditos, por el nombre; y uno que no sale, principal.
+        assert_eq!(page.roles_of(&artist("x", "thomas bangalter")), ["composer"]);
+        assert_eq!(page.roles_of(&artist("y", "Nile Rodgers")), ["main artist"]);
+        let es: Vec<String> = page.roles_of(&artist("2RdwBSPQiwcmiDo9kixcl8", "")).iter().map(|r| role_es(r)).collect();
+        assert_eq!(es, ["Artista principal", "Compositor", "Letrista"]);
+        assert_eq!(role_es("vocal arranger"), "Vocal arranger");
+        assert_eq!(credit_group_es("Writers"), "Escrita por");
+        assert_eq!(capitalize("électro"), "Électro");
+    }
 
     #[test]
     fn estado_del_reproductor_con_numeros_raros() {

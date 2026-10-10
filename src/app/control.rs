@@ -56,6 +56,7 @@ pub fn parse_page(spec: &str) -> Option<Page> {
         s if s.starts_with("playlist:") => Page::Playlist(s[9..].to_string()),
         s if s.starts_with("album:") => Page::Album(s[6..].to_string()),
         s if s.starts_with("artist:") => Page::Artist(s[7..].to_string()),
+        s if s.starts_with("track:") => Page::Track(s[6..].to_string()),
         s if s.starts_with("user:") => Page::User(s[5..].to_string()),
         s if s.starts_with("show:") => Page::Show(s[5..].to_string()),
         _ => return None,
@@ -79,6 +80,7 @@ pub(super) fn page_spec(p: &Page) -> String {
         Page::Playlist(id) => format!("playlist:{id}"),
         Page::Album(id) => format!("album:{id}"),
         Page::Artist(id) => format!("artist:{id}"),
+        Page::Track(id) => format!("track:{id}"),
         Page::User(id) => format!("user:{id}"),
         Page::Show(id) => format!("show:{id}"),
     }
@@ -906,6 +908,19 @@ impl App {
                 self.settings.lyrics_sync = b(cmd, "on", !self.settings.lyrics_sync);
                 ok()
             }
+            // Pestaña de la página de canción (0 Letra, 1 Créditos, 2 Más como esta) y su
+            // desplazamiento (px desde arriba).
+            "track_tab" => {
+                self.track_tab = n(cmd, "i").unwrap_or(0).clamp(0, 2) as u8;
+                ok()
+            }
+            "track_scroll" => match n(cmd, "px") {
+                Some(px) => {
+                    self.track_scroll.set = Some(px as f32);
+                    ok()
+                }
+                None => err("falta px"),
+            },
             // Desplazamiento del panel de la letra (px desde arriba), para medir su animación.
             "lyrics_offset" => match n(cmd, "px") {
                 Some(px) => {
@@ -1586,6 +1601,23 @@ impl App {
             "queue_recent": self.queue_recent,
             "lyrics_sync": self.settings.lyrics_sync,
             "lyrics_offset": self.lyrics_offset,
+            "track_page": match self.page() {
+                Page::Track(id) => match self.track_pages.get(id) {
+                    Some(p) => json!({
+                        "id": id,
+                        "name": p.name,
+                        "playcount": p.playcount,
+                        "artists": p.artists.iter().map(|a| json!({"name": a.name, "roles": p.roles_of(a), "photo": a.cover(160).is_some()})).collect::<Vec<_>>(),
+                        "credits": p.credits.len(),
+                        "related": p.related.len(),
+                        "genres": p.genres,
+                        "color": p.color,
+                        "tab": self.track_tab,
+                    }),
+                    None => json!({"id": id, "failed": self.track_page_failed.contains(id)}),
+                },
+                _ => Value::Null,
+            },
             "autoplay": self.settings.autoplay,
             "song_menu": self.song_more.as_ref().map(|m| json!({"list": m.row.0, "i": m.row.1, "uri": m.track.uri, "sub": m.sub, "remove_from": m.remove_from})),
             "library_filter": self.library_filter,

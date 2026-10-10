@@ -42,6 +42,25 @@ const LOG_FIRST: usize = 2 * 1024;
 const WEB_PLAYER: &str = "https://open.spotify.com/";
 const CDN: &str = "https://open.spotifycdn.com/cdn/build/web-player/";
 
+/// Otra consulta persistida del reproductor web (las de la página de canción). `route`: el
+/// trozo del reproductor web que la lleva, si no está en el paquete principal.
+#[derive(Clone, Copy, Debug)]
+pub struct Op {
+    pub name: &'static str,
+    hash: &'static str,
+    route: &'static str,
+}
+
+/// Una canción: escuchas, fecha, artistas con foto.
+pub const GET_TRACK: Op =
+    Op { name: "getTrack", hash: "a8ef9e9f02b836feb0da3003c31dbb30decc6f4b473ef89ca88c882386d668de", route: "xpui-routes-track-v2" };
+/// «Recomendadas según esta canción» de la página de canción del reproductor web.
+pub const TRACK_RECOMMEND: Op = Op {
+    name: "internalLinkRecommenderTrack",
+    hash: "c77098ee9d6ee8ad3eb844938722db60570d040b49f41f5ec6e7be9160a7c86b",
+    route: "xpui-routes-track-v2",
+};
+
 pub enum PfErr {
     /// El hash ya no vale (PersistedQueryNotFound).
     UnknownHash,
@@ -99,6 +118,9 @@ pub struct Pathfinder {
     handle: tokio::runtime::Handle,
     state: Arc<Mutex<State>>,
     file: PathBuf,
+    /// Hashes de las otras consultas (`Op`) descubiertos en esta sesión, y las que ya se
+    /// buscaron (una vez por sesión cada una).
+    ops: Arc<Mutex<std::collections::HashMap<&'static str, Option<String>>>>,
 }
 
 impl Pathfinder {
@@ -135,6 +157,7 @@ impl Pathfinder {
                 tried_at,
             })),
             file,
+            ops: Arc::default(),
         }
     }
 
@@ -245,28 +268,6 @@ impl Pathfinder {
     /// Busca `q` con `hash`. Bloquea el hilo que llama (el carril de búsqueda) hasta la
     /// respuesta o el plazo.
     pub fn search(&self, q: &str, hash: &str) -> Result<SearchResult, PfErr> {
-        self.acquire();
-        let session = self
-            .shared
-            .session
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| PfErr::Failed("no has iniciado sesión".to_string()))?;
-        // Con plazo: si alguno caducó se pide de nuevo por el http_client de librespot, que no
-        // tiene plazo propio, y una sesión colgada (reconectando) dejaría el carril de búsqueda
-        // parado sin llegar nunca a la Web API.
-        let token = self
-            .handle
-            .block_on(async { tokio::time::timeout(TIMEOUT, session.login5().auth_token()).await })
-            .map_err(|_| PfErr::Failed("token: sin respuesta".to_string()))?
-            .map_err(|e| PfErr::Failed(format!("token: {e}")))?
-            .access_token;
-        let client_token = self
-            .handle
-            .block_on(async { tokio::time::timeout(TIMEOUT, session.spclient().client_token()).await })
-            .map_err(|_| PfErr::Failed("client-token: sin respuesta".to_string()))?
-            .map_err(|e| PfErr::Failed(format!("client-token: {e}")))?;
         let body = json!({
             "operationName": "searchDesktop",
             "variables": {
@@ -283,34 +284,7 @@ impl Pathfinder {
             "extensions": {"persistedQuery": {"version": 1, "sha256Hash": hash}},
         })
         .to_string();
-        // El agente propio (y no el http_client de librespot): ese comparte el límite de
-        // *.spotify.com con los metadatos y descarta el cuerpo de los errores, donde viene
-        // PersistedQueryNotFound. ureq pide y descomprime gzip solo.
-        let resp = self
-            .agent
-            .post(URL)
-            .config()
-            .timeout_global(Some(TIMEOUT))
-            .build()
-            .header("Authorization", &format!("Bearer {token}"))
-            .header("client-token", &client_token)
-            .header("app-platform", "WebPlayer")
-            .header("spotify-app-version", APP_VERSION)
-            .header("Content-Type", "application/json;charset=UTF-8")
-            .header("Accept", "application/json")
-            .header("Accept-Language", "es")
-            .header("User-Agent", USER_AGENT)
-            .send(body.as_bytes());
-        let mut resp = resp.map_err(net_err)?;
-        let status = resp.status().as_u16();
-        let retry_after = resp
-            .headers()
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(5)
-            .clamp(1, DOWN.as_secs());
-        let text = resp.body_mut().read_to_string().map_err(net_err)?;
+        let (status, retry_after, text) = self.post(&body)?;
         self.log_first(status, &text);
         let v: Option<Value> = serde_json::from_str(&text).ok();
         if unknown_hash(v.as_ref(), &text) {
@@ -353,6 +327,111 @@ impl Pathfinder {
         Ok(result)
     }
 
+    /// Otra consulta persistida (`op`) con estas variables: su `data`, aunque traiga errores
+    /// parciales. Si Spotify ya no conoce el hash, se busca el nuevo en el reproductor web (una
+    /// vez por sesión) y se repite. No toca el estado de la búsqueda.
+    pub fn query(&self, op: Op, variables: Value) -> Result<Value, String> {
+        let known = self.ops.lock().unwrap().get(op.name).cloned();
+        let mut hash = known.flatten().unwrap_or_else(|| op.hash.to_string());
+        loop {
+            let body = json!({
+                "operationName": op.name,
+                "variables": variables,
+                "extensions": {"persistedQuery": {"version": 1, "sha256Hash": hash}},
+            })
+            .to_string();
+            let (status, _, text) = self.post(&body).map_err(|e| match e {
+                PfErr::Down(e) | PfErr::Failed(e) => e,
+                _ => "sin respuesta".to_string(),
+            })?;
+            let v: Option<Value> = serde_json::from_str(&text).ok();
+            if unknown_hash(v.as_ref(), &text) {
+                let tried = self.ops.lock().unwrap().contains_key(op.name);
+                if tried {
+                    return Err(format!("Spotify ya no conoce el hash de {}", op.name));
+                }
+                self.ops.lock().unwrap().insert(op.name, None);
+                log::warn!("pathfinder: Spotify ya no conoce el hash de {}; se busca el nuevo en el reproductor web", op.name);
+                match self.find_hash(op.name, op.route) {
+                    Ok(h) if h != hash => {
+                        self.ops.lock().unwrap().insert(op.name, Some(h.clone()));
+                        hash = h;
+                        continue;
+                    }
+                    Ok(_) => return Err(format!("el reproductor web usa el mismo hash de {}", op.name)),
+                    Err(e) => return Err(format!("sin hash nuevo de {}: {e}", op.name)),
+                }
+            }
+            if !(200..=299).contains(&status) {
+                return Err(format!("HTTP {status}: {}", snippet(&text)));
+            }
+            let v = v.ok_or_else(|| "respuesta que no es JSON".to_string())?;
+            if let Some(e) = v["errors"].as_array().filter(|e| !e.is_empty()) {
+                log::info!("pathfinder {}: errores: {}", op.name, snippet(&Value::Array(e.clone()).to_string()));
+            }
+            return match &v["data"] {
+                Value::Null => Err(format!("{} sin data", op.name)),
+                d => Ok(d.clone()),
+            };
+        }
+    }
+
+    /// POST a pathfinder con el token de login5 y el client-token de la sesión: (estado,
+    /// Retry-After en segundos, cuerpo).
+    fn post(&self, body: &str) -> Result<(u16, u64, String), PfErr> {
+        self.acquire();
+        let session = self
+            .shared
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| PfErr::Failed("no has iniciado sesión".to_string()))?;
+        // Con plazo: si alguno caducó se pide de nuevo por el http_client de librespot, que no
+        // tiene plazo propio, y una sesión colgada (reconectando) dejaría el carril de búsqueda
+        // parado sin llegar nunca a la Web API.
+        let token = self
+            .handle
+            .block_on(async { tokio::time::timeout(TIMEOUT, session.login5().auth_token()).await })
+            .map_err(|_| PfErr::Failed("token: sin respuesta".to_string()))?
+            .map_err(|e| PfErr::Failed(format!("token: {e}")))?
+            .access_token;
+        let client_token = self
+            .handle
+            .block_on(async { tokio::time::timeout(TIMEOUT, session.spclient().client_token()).await })
+            .map_err(|_| PfErr::Failed("client-token: sin respuesta".to_string()))?
+            .map_err(|e| PfErr::Failed(format!("client-token: {e}")))?;
+        // El agente propio (y no el http_client de librespot): ese comparte el límite de
+        // *.spotify.com con los metadatos y descarta el cuerpo de los errores, donde viene
+        // PersistedQueryNotFound. ureq pide y descomprime gzip solo.
+        let resp = self
+            .agent
+            .post(URL)
+            .config()
+            .timeout_global(Some(TIMEOUT))
+            .build()
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("client-token", &client_token)
+            .header("app-platform", "WebPlayer")
+            .header("spotify-app-version", APP_VERSION)
+            .header("Content-Type", "application/json;charset=UTF-8")
+            .header("Accept", "application/json")
+            .header("Accept-Language", "es")
+            .header("User-Agent", USER_AGENT)
+            .send(body.as_bytes());
+        let mut resp = resp.map_err(net_err)?;
+        let status = resp.status().as_u16();
+        let retry_after = resp
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(5)
+            .clamp(1, DOWN.as_secs());
+        let text = resp.body_mut().read_to_string().map_err(net_err)?;
+        Ok((status, retry_after, text))
+    }
+
     /// Espera lo justo para no pasar del ritmo propio de pathfinder.
     fn acquire(&self) {
         let wait = {
@@ -391,7 +470,7 @@ impl Pathfinder {
     /// usarlo. Solo se guarda en disco si esa búsqueda responde bien.
     fn discover(&self, old: &str, q: &str) {
         let t0 = Instant::now();
-        let found = match self.find_hash() {
+        let found = match self.find_hash("searchDesktop", "xpui-routes-search") {
             Ok(h) if h == old => {
                 log::warn!("pathfinder: el reproductor web usa el mismo hash de searchDesktop; la búsqueda sigue por la Web API");
                 None
@@ -445,9 +524,9 @@ impl Pathfinder {
         self.state.lock().unwrap().discovering = false;
     }
 
-    /// Hash actual de searchDesktop en el reproductor web: está en su paquete principal o en el
-    /// trozo de la ruta de búsqueda, que se carga aparte.
-    fn find_hash(&self) -> Result<String, String> {
+    /// Hash actual de la consulta `name` en el reproductor web: está en su paquete principal o en
+    /// el trozo de su ruta (`route`), que se carga aparte.
+    fn find_hash(&self, name: &str, route: &str) -> Result<String, String> {
         let html = self.fetch(WEB_PLAYER, 4 << 20)?;
         let scripts = script_urls(&html);
         if scripts.is_empty() {
@@ -462,14 +541,14 @@ impl Pathfinder {
                     continue;
                 }
             };
-            if let Some(h) = search_hash(&js) {
+            if let Some(h) = op_hash(&js, name) {
                 return Ok(h);
             }
-            for chunk in route_chunks(&js, "xpui-routes-search") {
+            for chunk in route_chunks(&js, route) {
                 // De los candidatos (hay un mapa para JS y otro para CSS) uno da 404: normal.
                 match self.fetch(&format!("{CDN}{chunk}"), 8 << 20) {
                     Ok(js) => {
-                        if let Some(h) = search_hash(&js) {
+                        if let Some(h) = op_hash(&js, name) {
                             return Ok(h);
                         }
                     }
@@ -477,7 +556,7 @@ impl Pathfinder {
                 }
             }
         }
-        Err(if last_err.is_empty() { "searchDesktop no aparece en el paquete".to_string() } else { last_err })
+        Err(if last_err.is_empty() { format!("{name} no aparece en el paquete") } else { last_err })
     }
 
     fn fetch(&self, url: &str, limit: u64) -> Result<String, String> {
@@ -547,11 +626,11 @@ fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// El hash de searchDesktop tal como lo lleva el paquete: `"searchDesktop","query","<64 hex>"`.
-fn search_hash(js: &str) -> Option<String> {
-    const NEEDLE: &str = "\"searchDesktop\",\"query\",\"";
-    js.match_indices(NEEDLE).find_map(|(i, _)| {
-        let rest = &js[i + NEEDLE.len()..];
+/// El hash de la consulta `name` tal como lo lleva el paquete: `"searchDesktop","query","<64 hex>"`.
+fn op_hash(js: &str, name: &str) -> Option<String> {
+    let needle = format!("\"{name}\",\"query\",\"");
+    js.match_indices(&needle).find_map(|(i, _)| {
+        let rest = &js[i + needle.len()..];
         let h = rest.get(..64)?;
         (is_hex(h, 64) && rest[64..].starts_with('"')).then(|| h.to_string())
     })
@@ -796,6 +875,63 @@ fn artist(d: &Value) -> Option<Artist> {
     })
 }
 
+/// Respuesta de getTrack -> página de canción (sin créditos, recomendadas ni géneros, que van
+/// aparte). `None` si no es una pista.
+pub fn map_track_page(data: &Value) -> Option<TrackPage> {
+    let t = data.get("trackUnion").filter(|t| t["__typename"].as_str() == Some("Track"))?;
+    let uri = t["uri"].as_str()?;
+    let a = &t["albumOfTrack"];
+    let album = a["uri"].as_str().map(|auri| AlbumRef {
+        id: Some(last_seg(auri)),
+        name: text(&a["name"]),
+        uri: Some(auri.to_string()),
+        images: images(&a["coverArt"]),
+        artists: Vec::new(),
+        release_date: match &a["date"]["year"] {
+            Value::Number(y) => Some(y.to_string()),
+            _ => iso_day(&a["date"]),
+        },
+        total_tracks: a["tracks"]["totalCount"].as_u64().map(|n| n as u32),
+        album_type: a["type"].as_str().map(|t| t.to_ascii_lowercase()),
+    });
+    let color = a["coverArt"]["extractedColors"]["colorRaw"]["hex"].as_str().and_then(|h| {
+        let h = h.trim_start_matches('#');
+        let n = u32::from_str_radix(h.get(..6)?, 16).ok()?;
+        Some([(n >> 16) as u8, (n >> 8) as u8, n as u8])
+    });
+    let artists = ["firstArtist", "otherArtists"]
+        .iter()
+        .flat_map(|k| t[*k]["items"].as_array().into_iter().flatten())
+        .filter_map(artist)
+        .collect();
+    Some(TrackPage {
+        id: last_seg(uri),
+        uri: uri.to_string(),
+        name: text(&t["name"]),
+        duration_ms: duration_ms(t),
+        playcount: match &t["playcount"] {
+            Value::String(s) => s.parse().ok(),
+            v => v.as_u64(),
+        },
+        album,
+        color,
+        artists,
+        ..Default::default()
+    })
+}
+
+/// Respuesta de internalLinkRecommenderTrack -> canciones recomendadas.
+pub fn map_recommended(data: &Value) -> Vec<Track> {
+    data["seoRecommendedTrack"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|it| &it["data"])
+        .filter(|d| d["__typename"].as_str() == Some("Track"))
+        .filter_map(track)
+        .collect()
+}
+
 fn playlist(d: &Value) -> Option<Playlist> {
     let id = last_seg(d["uri"].as_str()?);
     let owner = &d["ownerV2"]["data"];
@@ -878,6 +1014,44 @@ fn audiobook(d: &Value) -> Option<Audiobook> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recorte de las respuestas reales de getTrack e internalLinkRecommenderTrack (Get Lucky,
+    /// oct 2026).
+    #[test]
+    fn pagina_de_cancion() {
+        let v: Value = serde_json::from_str(
+            r##"{"trackUnion":{"__typename":"Track","uri":"spotify:track:69kOkLUCkxIZYexIgSG8rq","name":"Get Lucky (feat. Pharrell Williams and Nile Rodgers)",
+            "playcount":"733015177","duration":{"totalMilliseconds":369626},
+            "albumOfTrack":{"uri":"spotify:album:4m2880jivSbbyEGAKfITCa","name":"Random Access Memories","type":"ALBUM","tracks":{"totalCount":13},
+              "date":{"isoString":"2013-05-20T00:00:00Z","precision":"DAY","year":2013},
+              "coverArt":{"extractedColors":{"colorRaw":{"hex":"#98A8C8"}},"sources":[{"height":640,"url":"https://i.scdn.co/image/a","width":640}]}},
+            "firstArtist":{"items":[{"uri":"spotify:artist:4tZwfgrHOc3mvqYlEYSvVi","profile":{"name":"Daft Punk"},"visuals":{"avatarImage":{"sources":[{"height":160,"url":"https://i.scdn.co/image/d","width":160}]}}}]},
+            "otherArtists":{"items":[{"uri":"spotify:artist:2RdwBSPQiwcmiDo9kixcl8","profile":{"name":"Pharrell Williams"},"visuals":{"avatarImage":null}}]}}}"##,
+        )
+        .unwrap();
+        let p = map_track_page(&v).unwrap();
+        assert_eq!(p.id, "69kOkLUCkxIZYexIgSG8rq");
+        assert_eq!(p.playcount, Some(733_015_177));
+        assert_eq!(p.duration_ms, 369_626);
+        assert_eq!(p.color, Some([0x98, 0xA8, 0xC8]));
+        let album = p.album.unwrap();
+        assert_eq!((album.id.as_deref(), album.name.as_str(), album.year()), (Some("4m2880jivSbbyEGAKfITCa"), "Random Access Memories", "2013"));
+        assert_eq!(p.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Daft Punk", "Pharrell Williams"]);
+        assert!(p.artists[0].cover(64).is_some() && p.artists[1].cover(64).is_none());
+        assert!(map_track_page(&serde_json::json!({"trackUnion": {"__typename": "NotFound"}})).is_none());
+
+        let r: Value = serde_json::from_str(
+            r#"{"seoRecommendedTrack":{"items":[{"data":{"__typename":"Track","uri":"spotify:track:5JVbvCHX10U2pLa5DEqGav","name":"Safe and Sound",
+            "albumOfTrack":{"coverArt":{"sources":[{"height":300,"url":"https://i.scdn.co/image/b","width":300}]},"id":"3rLiil7YBkoGXLrFtwYcju","uri":"spotify:album:3rLiil7YBkoGXLrFtwYcju"},
+            "artists":{"items":[{"uri":"spotify:artist:4gwpcMTbLWtBUlOijbVpuu","profile":{"name":"Capital Cities"}}]},"duration":{"totalMilliseconds":192789}}},
+            {"data":{"__typename":"NotFound"}}]}}"#,
+        )
+        .unwrap();
+        let rel = map_recommended(&r);
+        assert_eq!(rel.len(), 1);
+        assert_eq!(rel[0].artists_str(), "Capital Cities");
+        assert!(rel[0].cover(300).is_some());
+    }
 
     /// Una respuesta real (consulta «cafe tacvba»). Está en qa/, que no se publica: sin ella la
     /// prueba se salta.
@@ -1005,8 +1179,9 @@ mod tests {
     fn hash_en_el_reproductor_web() {
         let h = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let js = format!(r#"a=new o("searchUsers","query","{}",null),b=new o("searchDesktop","query","{h}",null)"#, "f".repeat(64));
-        assert_eq!(search_hash(&js).as_deref(), Some(h));
-        assert_eq!(search_hash(r#"("searchDesktop","query","abc")"#), None);
+        assert_eq!(op_hash(&js, "searchDesktop").as_deref(), Some(h));
+        assert_eq!(op_hash(&js, "getTrack"), None);
+        assert_eq!(op_hash(r#"("searchDesktop","query","abc")"#, "searchDesktop"), None);
 
         let html = format!(r#"<script src="{CDN}vendor~web-player.1.js"></script><script src="{CDN}web-player.abc.js"></script><link href="{CDN}web-player.abc.css">"#);
         assert_eq!(script_urls(&html), vec![format!("{CDN}web-player.abc.js"), format!("{CDN}vendor~web-player.1.js")]);

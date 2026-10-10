@@ -106,19 +106,19 @@ fn glass(painter: &egui::Painter, rect: Rect, ink: &Ink) {
 }
 
 /// Línea base de la primera fila de un texto ya maquetado (desde su esquina).
-fn first_base(g: &egui::Galley) -> f32 {
+pub(super) fn first_base(g: &egui::Galley) -> f32 {
     g.rows.first().and_then(|r| r.row.glyphs.first().map(|gl| r.pos.y + gl.pos.y)).unwrap_or(g.size().y * 0.8)
 }
 
 /// Donde empieza la tinta del primer carácter (para alinear tinta, no cajas).
-fn ink_left(g: &egui::Galley) -> f32 {
+pub(super) fn ink_left(g: &egui::Galley) -> f32 {
     g.rows.first().and_then(|r| r.row.glyphs.first()).map(|gl| gl.uv_rect.offset.x.max(0.0) + gl.pos.x).unwrap_or(0.0)
 }
 
 /// Caracteres ya cantados de un renglón con tiempos por sílaba (con decimales: la sílaba que suena
 /// se va llenando hasta que empieza la siguiente); `None` si la letra solo trae el comienzo de
 /// cada renglón, que entonces se ilumina entero. `end`: cuando acaba el renglón.
-fn sung_chars(line: &LyricLine, pos: u32, end: u32) -> Option<f32> {
+pub(super) fn sung_chars(line: &LyricLine, pos: u32, end: u32) -> Option<f32> {
     if line.syllables.is_empty() {
         return None;
     }
@@ -141,7 +141,7 @@ fn sung_chars(line: &LyricLine, pos: u32, end: u32) -> Option<f32> {
 
 /// Hasta dónde llega lo cantado en cada fila del texto maquetado: (fila, x desde la esquina del
 /// texto), las filas enteras primero y la que va a medias al final.
-fn sung_rows(g: &egui::Galley, mut chars: f32) -> Vec<(usize, f32)> {
+pub(super) fn sung_rows(g: &egui::Galley, mut chars: f32) -> Vec<(usize, f32)> {
     let mut out = Vec::new();
     for (k, r) in g.rows.iter().enumerate() {
         if chars <= 0.0 {
@@ -164,7 +164,7 @@ fn sung_rows(g: &egui::Galley, mut chars: f32) -> Vec<(usize, f32)> {
 const SCROLL_SECS: f64 = 0.45;
 
 /// Desplazamiento a los `t` segundos de ir de `from` a `to` (frenando al final), y si ya llegó.
-fn scroll_step(from: f32, to: f32, t: f64) -> (f32, bool) {
+pub(super) fn scroll_step(from: f32, to: f32, t: f64) -> (f32, bool) {
     let k = (t / SCROLL_SECS).clamp(0.0, 1.0) as f32;
     let e = 1.0 - (1.0 - k).powi(3);
     (from + (to - from) * e, k >= 1.0)

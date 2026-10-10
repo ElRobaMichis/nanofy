@@ -18,7 +18,9 @@ mod player_bar;
 mod player_menu;
 mod lyrics_panel;
 mod queue_panel;
+mod song_masks;
 mod theme;
+mod track_page;
 mod warm;
 mod watchdog;
 mod widgets;
@@ -115,6 +117,8 @@ pub enum Page {
     Playlist(String),
     Album(String),
     Artist(String),
+    /// Página de una canción (la abre la portada del reproductor).
+    Track(String),
     User(String),
     Settings,
 }
@@ -1018,6 +1022,20 @@ pub struct App {
     /// Letras ya pedidas en esta sesión (también «sin letra»), por id de canción; las que tienen
     /// letra se guardan además en disco (`lyrics_from_disk`).
     lyrics_cache: HashMap<String, Option<Lyrics>>,
+    /// Páginas de canción ya cargadas, las que no se pudieron cargar y la pestaña elegida (0
+    /// Letra, 1 Créditos, 2 Más como esta).
+    track_pages: HashMap<String, TrackPage>,
+    track_page_failed: HashSet<String>,
+    track_tab: u8,
+    /// Desplazamiento y seguimiento de la letra de la página de canción (ver `track_page`).
+    track_scroll: track_page::TrackScroll,
+    /// La zona visible y el panel del contenido de la página de canción, de este fotograma.
+    track_view: Option<egui::Rect>,
+    track_panel: Option<egui::Rect>,
+    /// Recién encendida la sincronización: bajar hasta lo que suena aunque no se esté en la letra.
+    track_follow_now: bool,
+    /// Letra pedida para una canción que no suena (y cuándo), para no pedirla en cada fotograma.
+    track_lyrics_asked: Option<(String, Instant)>,
     /// Canciones cuya letra ya se pidió por adelantado.
     lyrics_prefetched: HashSet<String>,
     /// Panel de la letra: el botón de la letra en este fotograma (para ponerse encima), lo
@@ -1411,6 +1429,14 @@ impl App {
             queue_at: Instant::now() - Duration::from_secs(60),
             lyrics: None,
             lyrics_cache: HashMap::new(),
+            track_pages: HashMap::new(),
+            track_page_failed: HashSet::new(),
+            track_tab: 0,
+            track_scroll: Default::default(),
+            track_view: None,
+            track_panel: None,
+            track_follow_now: false,
+            track_lyrics_asked: None,
             lyrics_prefetched: HashSet::new(),
             lyrics_for: None,
             lyrics_loading: false,
@@ -4130,7 +4156,7 @@ impl App {
     }
 
     /// La letra guardada de una canción, si tiene menos de 30 días.
-    fn lyrics_from_disk(&self, id: &str) -> Option<Lyrics> {
+    pub(super) fn lyrics_from_disk(&self, id: &str) -> Option<Lyrics> {
         let path = self.lyrics_file(id);
         let age = std::fs::metadata(&path).ok()?.modified().ok()?.elapsed().unwrap_or_default();
         if age > Duration::from_secs(30 * 24 * 3600) {
@@ -4241,6 +4267,10 @@ impl App {
                 match r.req {
                     Req::PlayerState | Req::Devices | Req::Queue => {
                         log::warn!("{e}")
+                    }
+                    Req::TrackPage(ref id) => {
+                        log::warn!("página de la canción {id}: {e}");
+                        self.track_page_failed.insert(id.clone());
                     }
                     // «Ver álbum» de una canción sin su álbum: que no se quede en «Buscando».
                     Req::TrackInfo(ref id) if self.album_of_pending.as_deref() == Some(id.as_str()) => {
@@ -4897,7 +4927,25 @@ impl App {
                     }
                 }
             }
+            Resp::TrackPage(p) => {
+                let id = match &r.req {
+                    Req::TrackPage(id) => id.clone(),
+                    _ => p.id.clone(),
+                };
+                self.track_page_failed.remove(&id);
+                self.track_pages.insert(id, *p);
+            }
             Resp::Genres { key, genres } => {
+                // También en las páginas de canción de ese álbum (o de ese artista, sin los del álbum).
+                // Los de la propia canción mandan; los de su álbum o artista, solo si no tiene.
+                for tp in self.track_pages.values_mut() {
+                    let own = key == format!("song:{}", tp.id);
+                    let album = tp.album.as_ref().and_then(|a| a.id.as_deref()).is_some_and(|a| key == format!("album:{a}"));
+                    let artist = tp.artists.first().is_some_and(|a| key == format!("artist:{}", a.id));
+                    if own || (tp.genres.is_empty() && (album || artist)) {
+                        tp.genres = genres.clone();
+                    }
+                }
                 // Del carril de enriquecimiento, cuando la página ya se ve. Lo que no esté en
                 // memoria no importa: la próxima respuesta del álbum o artista ya los trae.
                 if let Some(id) = key.strip_prefix("album:") {
@@ -8568,14 +8616,19 @@ impl crate::shell::UiApp for App {
                 let page_now = self.page().clone();
                 let library = page_now == Page::Library && self.signed_in();
                 let black = library || matches!(page_now, Page::Artist(_) | Page::Home | Page::Search);
-                if black && p.dark {
+                if matches!(page_now, Page::Track(_)) {
+                    // La de una canción, sobre su portada desenfocada (fija: no se desplaza).
+                    self.track_panel = Some(panel);
+                    self.track_view = Some(panel);
+                    self.track_backdrop(ui.painter(), panel, panel, None);
+                } else if black && p.dark {
                     ui.painter().rect_filled(panel, egui::CornerRadius::same(8), bg);
                     ui.painter().rect_stroke(panel, egui::CornerRadius::same(8), egui::Stroke::new(1.0, ARTIST_PANEL_EDGE), egui::StrokeKind::Inside);
                 } else {
                     paint_content_panel(ui.painter(), panel, tint, p.card, bg);
                 }
                 let (pad_l, pad_r, pad_t) = match page_now {
-                    Page::Artist(_) => (0.0, 0.0, 0.0),
+                    Page::Artist(_) | Page::Track(_) => (0.0, 0.0, 0.0),
                     Page::Home | Page::Search => (HOME_PAD_LEFT, HOME_PAD_RIGHT, HOME_PAD_TOP),
                     _ => (CONTENT_PAD_LEFT, CONTENT_PAD_RIGHT, CONTENT_PAD_TOP),
                 };
@@ -8592,10 +8645,14 @@ impl crate::shell::UiApp for App {
                 );
                 let mut c = ui.new_child(egui::UiBuilder::new().max_rect(inner));
                 c.set_clip_rect(panel.shrink(1.0));
-                egui::ScrollArea::vertical()
-                    .id_salt(page_key)
-                    .auto_shrink([false, false])
-                    .show(&mut c, |ui| {
+                let mut area = egui::ScrollArea::vertical().id_salt(page_key).auto_shrink([false, false]);
+                // La página de canción sigue a la letra moviendo el desplazamiento.
+                if matches!(page_now, Page::Track(_)) {
+                    if let Some(off) = self.track_scroll.set.take() {
+                        area = area.vertical_scroll_offset(off);
+                    }
+                }
+                area.show(&mut c, |ui| {
                         self.page_ui(ui);
                         ui.add_space(24.0);
                     });

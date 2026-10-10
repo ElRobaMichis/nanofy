@@ -58,6 +58,7 @@ impl App {
             Page::Playlist(id) => self.playlist_page(ui, id),
             Page::Album(id) => self.album_page(ui, id),
             Page::Artist(id) => self.artist_page(ui, id),
+            Page::Track(id) => self.track_page(ui, id),
             Page::Show(id) => self.show_page(ui, id),
             Page::User(id) => self.user_page(ui, id),
             Page::Settings => self.settings_page(ui),

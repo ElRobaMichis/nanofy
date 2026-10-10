@@ -17,6 +17,7 @@ use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
 use super::widgets::{galley_truncated, text_on_baseline, uri_to_link};
 use super::{Action, App, PlayState};
+use crate::model::LyricLine;
 
 /// Tamaño del panel; el borde derecho, a 27,5 px del centro del botón de la letra (como «Añadir
 /// a una playlist») y el de abajo, a 96,5 del borde de la ventana. Esquinas de 8.
@@ -114,11 +115,49 @@ fn ink_left(g: &egui::Galley) -> f32 {
     g.rows.first().and_then(|r| r.row.glyphs.first()).map(|gl| gl.uv_rect.offset.x.max(0.0) + gl.pos.x).unwrap_or(0.0)
 }
 
-/// Cuánto del renglón que suena se ha cantado (0..=1): el tiempo desde su comienzo sobre lo que
-/// dura hasta el siguiente. Sin siguiente, hasta el final de la canción.
-fn sung_fraction(pos: u32, start: u32, next: Option<u32>, duration: u32) -> f32 {
-    let end = next.unwrap_or(duration).max(start + 1);
-    ((pos.saturating_sub(start)) as f32 / (end - start) as f32).clamp(0.0, 1.0)
+/// Caracteres ya cantados de un renglón con tiempos por sílaba (con decimales: la sílaba que suena
+/// se va llenando hasta que empieza la siguiente); `None` si la letra solo trae el comienzo de
+/// cada renglón, que entonces se ilumina entero. `end`: cuando acaba el renglón.
+fn sung_chars(line: &LyricLine, pos: u32, end: u32) -> Option<f32> {
+    if line.syllables.is_empty() {
+        return None;
+    }
+    let mut done = 0.0;
+    for (k, syl) in line.syllables.iter().enumerate() {
+        if pos < syl.start_ms {
+            break;
+        }
+        let next = line.syllables.get(k + 1).map(|n| n.start_ms).unwrap_or(end).max(syl.start_ms + 1);
+        let f = ((pos - syl.start_ms) as f32 / (next - syl.start_ms) as f32).min(1.0);
+        done += syl.chars as f32 * f;
+        if f < 1.0 {
+            break;
+        }
+    }
+    // Los espacios del principio no se pintan (el renglón se pinta recortado).
+    let lead = line.words.chars().count() - line.words.trim_start().chars().count();
+    Some((done - lead as f32).max(0.0))
+}
+
+/// Hasta dónde llega lo cantado en cada fila del texto maquetado: (fila, x desde la esquina del
+/// texto), las filas enteras primero y la que va a medias al final.
+fn sung_rows(g: &egui::Galley, mut chars: f32) -> Vec<(usize, f32)> {
+    let mut out = Vec::new();
+    for (k, r) in g.rows.iter().enumerate() {
+        if chars <= 0.0 {
+            break;
+        }
+        let n = r.row.glyphs.len() as f32;
+        if chars >= n {
+            out.push((k, r.pos.x + r.row.size.x));
+            chars -= n;
+            continue;
+        }
+        let gl = &r.row.glyphs[chars.floor() as usize];
+        out.push((k, r.pos.x + gl.pos.x + chars.fract() * gl.advance_width));
+        break;
+    }
+    out
 }
 
 /// Desplazamiento que deja la línea base `base` (desde arriba de la lista) a `FOLLOW_AT`, sin
@@ -281,6 +320,7 @@ impl App {
             self.lyrics_follow_track = lyrics.track_id.clone();
             self.lyrics_offset = 0.0;
         }
+        // Sin sincronizar (apagado, o letra sin tiempos): toda en blanco y quieta.
         let follow = self.settings.lyrics_sync && synced;
         if follow {
             let target = current.map(|i| follow_offset(rows[i].0, max_off)).unwrap_or(0.0);
@@ -308,9 +348,15 @@ impl App {
             if area.max.y < list.min.y || area.min.y > list.max.y {
                 continue;
             }
-            // Pasados y el que suena, en blanco; los que faltan, en gris (sin sincronizar, todo
-            // en blanco). El que suena: gris y, encima, la parte cantada en blanco.
-            let past = !synced || current.is_some_and(|c| i < c);
+            // Siguiendo la canción: lo ya cantado en blanco y lo que falta en gris; el renglón que
+            // suena, con tiempos por sílaba, se llena según se canta, y si no, entero en blanco.
+            // Sin seguirla, toda en blanco.
+            let line_end = |i: usize| {
+                let l = &lyrics.lines[i];
+                l.end_ms.or_else(|| lyrics.lines.get(i + 1).map(|n| n.start_ms)).unwrap_or(np.duration_ms)
+            };
+            let sung = (follow && current == Some(i)).then(|| sung_chars(&lyrics.lines[i], pos, line_end(i)));
+            let past = !follow || current.is_some_and(|c| i < c) || matches!(sung, Some(None));
             let hit = synced.then(|| ui.interact(area.expand2(vec2(4.0, 6.0)), egui::Id::new(("lyrics_line", i)), Sense::click()));
             let hovered = hit.as_ref().is_some_and(|r| r.hovered());
             if hovered {
@@ -321,21 +367,11 @@ impl App {
             } else {
                 let ahead = if hovered { ink.ahead.gamma_multiply(1.8) } else { ink.ahead };
                 painter.galley_with_override_text_color(min, g.clone(), ahead);
-                if current == Some(i) {
-                    let next = lyrics.lines.get(i + 1).map(|l| l.start_ms);
-                    let frac = sung_fraction(pos, lyrics.lines[i].start_ms, next, np.duration_ms);
-                    // Por anchura de texto a lo largo de sus filas.
-                    let total: f32 = g.rows.iter().map(|r| r.rect().width()).sum();
-                    let mut left = frac * total;
-                    for r in &g.rows {
-                        if left <= 0.0 {
-                            break;
-                        }
-                        let rr = r.rect().translate(min.to_vec2());
-                        let w = left.min(rr.width());
-                        let clip = Rect::from_min_max(pos2(rr.min.x - 2.0, rr.min.y - 2.0), pos2(rr.min.x + w, rr.max.y + 6.0)).intersect(list);
+                if let Some(Some(chars)) = sung {
+                    for (k, x) in sung_rows(g, chars) {
+                        let rr = g.rows[k].rect().translate(min.to_vec2());
+                        let clip = Rect::from_min_max(pos2(rr.min.x - 3.0, rr.min.y - 2.0), pos2(min.x + x, rr.max.y + 6.0)).intersect(list);
                         painter.with_clip_rect(clip).galley_with_override_text_color(min, g.clone(), ink.sung);
-                        left -= rr.width();
                     }
                 }
             }
@@ -346,9 +382,16 @@ impl App {
         if let Some(ms) = seek_to {
             self.seek(ms);
         }
-        // El renglón que suena se rellena: un fotograma cada 100 ms mientras suena.
-        if synced && playing && current.is_some() {
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        // Mientras suena y se sigue: con tiempos por sílaba, un fotograma cada 50 ms (se llena);
+        // si no, uno justo cuando empieza el renglón siguiente.
+        if follow && playing {
+            let by_syllable = current.is_some_and(|c| !lyrics.lines[c].syllables.is_empty());
+            let next = lyrics.lines.iter().map(|l| l.start_ms).find(|&t| t > pos);
+            if by_syllable {
+                ui.ctx().request_repaint_after(Duration::from_millis(50));
+            } else if let Some(t) = next {
+                ui.ctx().request_repaint_after(Duration::from_millis(((t - pos) as u64).max(30)));
+            }
         }
     }
 }
@@ -374,15 +417,32 @@ fn paint_sync(painter: &egui::Painter, c: Pos2, color: Color32) {
 mod tests {
     use super::*;
 
+    use crate::model::Syllable;
+
+    fn line(words: &str, syl: &[(u32, usize)]) -> LyricLine {
+        LyricLine {
+            start_ms: syl.first().map(|s| s.0).unwrap_or(0),
+            words: words.into(),
+            syllables: syl.iter().map(|&(start_ms, chars)| Syllable { start_ms, chars }).collect(),
+            end_ms: None,
+        }
+    }
+
     #[test]
-    fn relleno_del_renglon() {
-        assert_eq!(sung_fraction(1000, 1000, Some(3000), 9000), 0.0);
-        assert_eq!(sung_fraction(2000, 1000, Some(3000), 9000), 0.5);
-        assert_eq!(sung_fraction(5000, 1000, Some(3000), 9000), 1.0);
-        // El último: hasta el final de la canción.
-        assert_eq!(sung_fraction(5000, 1000, None, 9000), 0.5);
-        // Antes de empezar (no debería pasar) o con el siguiente a la vez: sin dividir por cero.
-        assert_eq!(sung_fraction(500, 1000, Some(1000), 9000), 0.0);
+    fn relleno_por_silabas() {
+        // Cada palabra (con su espacio) cuando se canta, no a ritmo fijo.
+        let l = line("Hemos llegado tan lejos", &[(1000, 6), (1200, 8), (3000, 4), (3100, 5)]);
+        assert_eq!(sung_chars(&l, 900, 4000), Some(0.0));
+        assert_eq!(sung_chars(&l, 1000, 4000), Some(0.0));
+        assert_eq!(sung_chars(&l, 1100, 4000), Some(3.0));
+        // «llegado » se alarga hasta los 3 s: a mitad, 6 + 4.
+        assert_eq!(sung_chars(&l, 2100, 4000), Some(10.0));
+        assert_eq!(sung_chars(&l, 3100, 4000), Some(18.0));
+        assert_eq!(sung_chars(&l, 5000, 4000), Some(23.0));
+        // Solo con el comienzo del renglón: sin relleno (se ilumina entero).
+        assert_eq!(sung_chars(&line("Sin tiempos", &[]), 5000, 9000), None);
+        // Espacios delante: no cuentan.
+        assert_eq!(sung_chars(&line("  ab", &[(0, 4)]), 9000, 9000), Some(2.0));
     }
 
     #[test]

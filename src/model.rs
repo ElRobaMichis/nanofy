@@ -956,20 +956,79 @@ pub struct QueueResponse {
 pub struct LyricLine {
     pub start_ms: u32,
     pub words: String,
+    /// Tiempos por sílaba (o por palabra), si la letra los trae: cada una empieza en su
+    /// `start_ms` y abarca sus `chars` caracteres de `words`, a continuación de la anterior. La
+    /// mayoría de las letras solo traen el comienzo de cada renglón (vacío).
+    pub syllables: Vec<Syllable>,
+    /// Final del renglón, si la letra lo da.
+    pub end_ms: Option<u32>,
+}
+
+/// Una sílaba de un renglón con tiempos por sílaba.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Syllable {
+    pub start_ms: u32,
+    pub chars: usize,
+}
+
+/// Milisegundos de un campo que Spotify da como texto o como número.
+fn ms_field(v: Option<&serde_json::Value>) -> Option<u32> {
+    let v = v?;
+    v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64().map(|n| n as u32))
+}
+
+/// `mm:ss.xx` → milisegundos.
+fn lrc_stamp(stamp: &str) -> Option<u32> {
+    let (m, s) = stamp.split_once(':')?;
+    let (m, s) = (m.trim().parse::<u32>().ok()?, s.trim().parse::<f32>().ok()?);
+    Some(m * 60_000 + (s * 1000.0).round() as u32)
+}
+
+/// Un renglón de LRC «mejorado» (`<mm:ss.xx>` delante de cada palabra): el texto sin las marcas y
+/// los tiempos de cada trozo. Sin marcas, el texto tal cual y sin sílabas. Los espacios a los dos
+/// lados de una marca quedan en uno, y los del principio, fuera (no se pintan).
+fn lrc_words(text: &str) -> (String, Vec<Syllable>) {
+    if !text.contains('<') {
+        return (text.trim().to_string(), Vec::new());
+    }
+    let mut words = String::new();
+    let mut syl: Vec<Syllable> = Vec::new();
+    // Añade un trozo de texto a la última sílaba.
+    let push = |words: &mut String, syl: &mut Vec<Syllable>, piece: &str| {
+        let piece = if words.is_empty() || words.ends_with(char::is_whitespace) { piece.trim_start() } else { piece };
+        if let Some(last) = syl.last_mut() {
+            last.chars += piece.chars().count();
+        }
+        words.push_str(piece);
+    };
+    let mut rest = text;
+    while let Some(i) = rest.find('<') {
+        push(&mut words, &mut syl, &rest[..i]);
+        let Some(j) = rest[i..].find('>') else { break };
+        match lrc_stamp(&rest[i + 1..i + j]) {
+            Some(t) => syl.push(Syllable { start_ms: t, chars: 0 }),
+            None => push(&mut words, &mut syl, &rest[i..i + j + 1]),
+        }
+        rest = &rest[i + j + 1..];
+    }
+    push(&mut words, &mut syl, rest);
+    syl.retain(|s| s.chars > 0);
+    (words.trim_end().to_string(), syl)
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Lyrics {
     pub track_id: String,
-    /// "LINE_SYNCED" o "UNSYNCED"
+    /// "LINE_SYNCED", "SYLLABLE_SYNCED" (con tiempos por sílaba) o "UNSYNCED"
     pub sync_type: String,
     pub lines: Vec<LyricLine>,
     pub provider: String,
 }
 
 impl Lyrics {
+    /// Con tiempos (por renglón o por sílaba).
     pub fn synced(&self) -> bool {
-        self.sync_type == "LINE_SYNCED"
+        self.sync_type == "LINE_SYNCED" || self.sync_type == "SYLLABLE_SYNCED"
     }
 
     pub fn from_json(track_id: &str, v: &serde_json::Value) -> Option<Self> {
@@ -979,15 +1038,25 @@ impl Lyrics {
             .as_array()?
             .iter()
             .map(|line| LyricLine {
-                start_ms: line
-                    .get("startTimeMs")
-                    .and_then(|s| s.as_str().and_then(|s| s.parse().ok()).or_else(|| s.as_u64().map(|n| n as u32)))
-                    .unwrap_or(0),
+                start_ms: ms_field(line.get("startTimeMs")).unwrap_or(0),
                 words: line
                     .get("words")
                     .and_then(|w| w.as_str())
                     .unwrap_or("")
                     .to_string(),
+                syllables: line
+                    .get("syllables")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| {
+                                let chars = s.get("numChars").and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|t| t.parse().ok())))?;
+                                Some(Syllable { start_ms: ms_field(s.get("startTimeMs"))?, chars: chars as usize })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                end_ms: ms_field(line.get("endTimeMs")).filter(|&e| e > 0),
             })
             .collect();
         Some(Self {
@@ -1013,13 +1082,9 @@ impl Lyrics {
             let raw = raw.trim();
             let Some(rest) = raw.strip_prefix('[') else { continue };
             let Some((stamp, text)) = rest.split_once(']') else { continue };
-            let mut parts = stamp.split(':');
-            let (Some(m), Some(s)) = (parts.next(), parts.next()) else { continue };
-            let (Ok(m), Ok(s)) = (m.parse::<u32>(), s.parse::<f32>()) else { continue };
-            lines.push(LyricLine {
-                start_ms: m * 60_000 + (s * 1000.0) as u32,
-                words: text.trim().to_string(),
-            });
+            let Some(start_ms) = lrc_stamp(stamp) else { continue };
+            let (words, syllables) = lrc_words(text);
+            lines.push(LyricLine { start_ms, words, syllables, end_ms: None });
         }
         lines.sort_by_key(|l| l.start_ms);
         Self {
@@ -1039,6 +1104,7 @@ impl Lyrics {
                 .map(|l| LyricLine {
                     start_ms: 0,
                     words: l.trim().to_string(),
+                    ..Default::default()
                 })
                 .collect(),
             provider: provider.to_string(),
@@ -1540,5 +1606,36 @@ mod tests {
         assert_eq!(b.public, Some(false));
         assert_eq!(b.snapshot_id, None);
         assert_eq!(list[2].public, None);
+    }
+
+    /// Letra de Spotify con tiempos por sílaba: cuenta como sincronizada y cada renglón trae sus
+    /// sílabas (números como texto o como número); un final 0 es «sin final».
+    #[test]
+    fn letra_con_silabas_de_spotify() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"lyrics":{"syncType":"SYLLABLE_SYNCED","lines":[
+                {"startTimeMs":"1000","words":"Hola mundo","syllables":[{"startTimeMs":"1000","numChars":5},{"startTimeMs":1400,"numChars":"5"}],"endTimeMs":"2000"},
+                {"startTimeMs":"2500","words":"adiós","syllables":[],"endTimeMs":"0"}]}}"#,
+        )
+        .unwrap();
+        let l = Lyrics::from_json("t", &v).unwrap();
+        assert!(l.synced());
+        assert_eq!(l.lines[0].syllables, vec![Syllable { start_ms: 1000, chars: 5 }, Syllable { start_ms: 1400, chars: 5 }]);
+        assert_eq!(l.lines[0].end_ms, Some(2000));
+        assert!(l.lines[1].syllables.is_empty());
+        assert_eq!(l.lines[1].end_ms, None);
+        assert_eq!(l.current_line(1500), Some(0));
+    }
+
+    /// LRC con marcas por palabra (`<mm:ss.xx>`): el texto queda limpio y cada palabra con su
+    /// tiempo; sin marcas, igual que siempre.
+    #[test]
+    fn lrc_con_tiempos_por_palabra() {
+        let l = Lyrics::from_lrc("t", "[00:01.00] <00:01.00> Hola <00:01.50> mundo\n[00:03.00]Sin marcas", "LRCLIB");
+        assert_eq!(l.lines[0].words, "Hola mundo");
+        assert_eq!(l.lines[0].syllables, vec![Syllable { start_ms: 1000, chars: 5 }, Syllable { start_ms: 1500, chars: 5 }]);
+        assert_eq!(l.lines[1].words, "Sin marcas");
+        assert!(l.lines[1].syllables.is_empty());
+        assert_eq!(l.lines[1].start_ms, 3000);
     }
 }

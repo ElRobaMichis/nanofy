@@ -1472,7 +1472,7 @@ impl App {
             })
         });
         let queue = self.queue.as_ref().map(|q| json!({"current": q.currently_playing.as_ref().map(|t| t.uri.clone()), "items": tracks_json(&q.queue)}));
-        let lyrics = self.lyrics.as_ref().map(|l| json!({"track_id": l.track_id, "sync": l.sync_type, "lines": l.lines.len(), "provider": l.provider, "first": l.lines.first().map(|x| x.words.clone())}));
+        let lyrics = self.lyrics.as_ref().map(|l| json!({"track_id": l.track_id, "sync": l.sync_type, "lines": l.lines.len(), "provider": l.provider, "first": l.lines.first().map(|x| x.words.clone()), "syllables": l.lines.iter().map(|x| x.syllables.len()).sum::<usize>()}));
         let artists: serde_json::Map<String, Value> = self
             .artists
             .iter()

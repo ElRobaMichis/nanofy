@@ -2689,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "nanofy"
-version = "1.20.3"
+version = "1.20.4"
 dependencies = [
  "base64 0.22.1",
  "directories",

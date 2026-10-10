@@ -728,8 +728,14 @@ impl App {
     }
 
     /// Icono del reproductor en su caja de 28 px; al pasar el ratón se aclara.
+    /// Id del botón `icon` de la barra en `rect`; el de su menú desplegable es este con
+    /// `.with("popup")` (`egui::Popup::default_response_id`).
+    fn bar_icon_id(ui: &egui::Ui, rect: Rect, icon: Icon) -> egui::Id {
+        ui.id().with(("bar_icon", rect.min.x as i32, icon))
+    }
+
     fn bar_icon(&mut self, ui: &mut egui::Ui, rect: Rect, icon: Icon, color: Color32, tip: &str) -> egui::Response {
-        let resp = ui.interact(rect, ui.id().with(("bar_icon", rect.min.x as i32, icon)), Sense::click()).on_hover_text(tip);
+        let resp = ui.interact(rect, Self::bar_icon_id(ui, rect, icon), Sense::click()).on_hover_text(tip);
         let color = if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             color.lerp_to_gamma(Color32::WHITE, 0.45)
@@ -1005,26 +1011,38 @@ impl App {
                 }
             }
         }
+        // Abiertos, los botones de la derecha se quedan en blanco (como el de añadir a playlist).
         if let Some(x) = lay.lyrics {
-            let color = if self.side == Some(SideTab::Lyrics) { GREEN } else { st.icon };
+            let color = if self.side == Some(SideTab::Lyrics) { Color32::WHITE } else { st.icon };
             if self.bar_icon(ui, boxed(x, 0.0), Icon::Lyrics, color, "Letra (L)").clicked() {
                 self.toggle_side(SideTab::Lyrics);
             }
         }
-        let dev_color = if self.player.remote.is_some() { theme::BLUE } else { st.icon };
+        // Dispositivos: azul mientras suena en otro (si su menú no está abierto).
+        let dev_rect = boxed(lay.devices, 0.0);
+        let dev_open = egui::Popup::is_id_open(ui.ctx(), Self::bar_icon_id(ui, dev_rect, Icon::Devices).with("popup"));
+        let dev_color = if dev_open {
+            Color32::WHITE
+        } else if self.player.remote.is_some() {
+            theme::BLUE
+        } else {
+            st.icon
+        };
         let dev_tip = match &self.player.remote {
             Some(d) => format!("Sonando en {}", d.name),
             None => "Dispositivos".to_string(),
         };
         if lay.devices != lay.more {
-            let r = self.bar_icon(ui, boxed(lay.devices, 0.0), Icon::Devices, dev_color, &dev_tip);
+            let r = self.bar_icon(ui, dev_rect, Icon::Devices, dev_color, &dev_tip);
             if r.clicked() {
                 self.api.send(Req::Devices);
             }
             egui::Popup::menu(&r).width(280.0).show(|ui| self.devices_menu(ui));
         }
         // Los tres puntos: el panel de cristal de `player_menu.rs`.
-        let more = self.bar_icon(ui, boxed(lay.more, 0.0), Icon::More, st.icon, "Más");
+        // Abierto desde la portada (clic derecho) no es este botón el que lo abrió.
+        let more_color = if self.player_more_open && self.player_more_at.is_none() { Color32::WHITE } else { st.icon };
+        let more = self.bar_icon(ui, boxed(lay.more, 0.0), Icon::More, more_color, "Más");
         if more.clicked() {
             self.player_more_open = !self.player_more_open || self.player_more_at.is_some();
             self.player_more_sub = None;
@@ -1041,7 +1059,7 @@ impl App {
         if let Some(x) = lay.dj {
             self.dj_orb(ui, pos2(xr - x, cy - 1.5));
         }
-        let q_color = if self.side == Some(SideTab::Queue) { GREEN } else { st.icon };
+        let q_color = if self.side == Some(SideTab::Queue) { Color32::WHITE } else { st.icon };
         if self.bar_icon(ui, boxed(lay.queue, 0.0), Icon::Queue, q_color, "Cola (Q)").clicked() {
             self.toggle_side(SideTab::Queue);
         }

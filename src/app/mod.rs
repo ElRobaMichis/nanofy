@@ -1037,6 +1037,9 @@ pub struct App {
     track_follow_now: bool,
     /// La página de canción estaba bajada hasta la letra (pestañas fijas) en el último fotograma.
     track_pinned: bool,
+    /// Abierta desde la portada con la sincronización: la página de esta canción salta a lo que
+    /// suena en cuanto tiene la letra (sin pasar por arriba) y la sigue desde ahí.
+    track_jump: Option<String>,
     /// Letra pedida para una canción que no suena (y cuándo), para no pedirla en cada fotograma.
     track_lyrics_asked: Option<(String, Instant)>,
     /// Canciones cuya letra ya se pidió por adelantado.
@@ -1440,6 +1443,7 @@ impl App {
             track_panel: None,
             track_follow_now: false,
             track_pinned: false,
+            track_jump: None,
             track_lyrics_asked: None,
             lyrics_prefetched: HashSet::new(),
             lyrics_for: None,

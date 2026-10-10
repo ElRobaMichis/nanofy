@@ -275,6 +275,9 @@ impl App {
     /// página aún no ha llegado, se enseña al momento con lo que ya se sabe de ella.
     pub(super) fn follow_track_page(&mut self, old: &str, new: &str, np: &NowPlaying) {
         let followed = follow_in_tabs(&mut self.tabs, old, new);
+        if followed && self.track_jump.as_deref() == Some(old) {
+            self.track_jump = Some(new.to_string());
+        }
         if followed && !self.track_pages.contains_key(new) {
             self.track_pages.insert(new.to_string(), provisional_page(new, np));
         }
@@ -428,6 +431,10 @@ impl App {
         self.track_pinned = pinned;
         let rule_y = if pinned { view.min.y + BAR_H } else { o.y + rule_nat };
 
+        // Abierta desde la portada en otra pestaña que no es la letra: no hay a dónde saltar.
+        if self.track_tab != 0 {
+            self.track_jump = None;
+        }
         // Contenido de la pestaña.
         let content_end = match self.track_tab {
             0 => self.track_lyrics(ui, page, o, rule_nat, rule_y, view, pinned),
@@ -770,6 +777,19 @@ impl App {
             self.track_scroll.anim = None;
         }
         let off = view.min.y - o.y;
+        // Recién abierta desde la portada: de golpe al renglón que suena (con la letra ya aquí).
+        if self.track_jump.as_deref() == Some(id.as_str()) {
+            self.track_jump = None;
+            if follow {
+                let target = follow_target(cur_line.map(|i| rows[i].0), rule_nat, end, view.height());
+                self.track_scroll.set = Some(target);
+                self.track_scroll.anim = None;
+                self.track_scroll.paused_until = 0.0;
+                self.track_follow_now = false;
+                ui.ctx().request_repaint();
+                return end;
+            }
+        }
         let engaged = follow && (pinned || self.track_follow_now) && now >= self.track_scroll.paused_until;
         if engaged {
             let target = follow_target(cur_line.map(|i| rows[i].0), rule_nat, end, view.height());

@@ -914,7 +914,13 @@ impl App {
         // La portada abre la página de la canción (los episodios, su álbum o programa).
         if r.clicked() {
             match (&np.id, &np.album_id) {
-                (Some(id), _) if np.uri.starts_with("spotify:track:") => self.actions.push(Action::Go(Page::Track(id.clone()))),
+                (Some(id), _) if np.uri.starts_with("spotify:track:") => {
+                    // Con la sincronización, directamente a lo que suena (ver `track_jump`).
+                    if self.settings.lyrics_sync {
+                        self.track_jump = Some(id.clone());
+                    }
+                    self.actions.push(Action::Go(Page::Track(id.clone())));
+                }
                 (_, Some(id)) => self.actions.push(Action::Go(Page::Album(id.clone()))),
                 _ => {}
             }

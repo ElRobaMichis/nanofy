@@ -106,11 +106,15 @@ pub enum Cmd {
     /// del inicio de sesión salta a ella, en la misma pestaña, si Spotify devolvió el código.
     Login { chain: Option<String> },
     /// La interfaz lleva demasiado tiempo en «cargando»: comprobar la sesión y reconectar si hace falta.
-    Stalled,
+    /// `generation`: la conexión que vio atascada (la de su último `LoggedIn`); si entretanto ya
+    /// se reconectó, la orden llega tarde y se ignora (si no, tiraría la sesión recién hecha).
+    /// `None`: la que haya (pruebas).
+    Stalled { generation: Option<u64> },
     /// La carga lleva un rato sin avanzar (vigilante de la interfaz, a los 8 s): si Spirc no
     /// contesta a un ping en 1 s, su bucle está atascado y se reconecta (como `Stalled`); si
-    /// contesta, se vuelve a pedir la carga pendiente, si la hay.
-    RetryLoad(Option<Box<Cmd>>),
+    /// contesta, se vuelve a pedir la carga pendiente, si la hay. `generation`, como en `Stalled`:
+    /// tras una reconexión la interfaz ya repitió la carga, y repetirla otra vez la cortaría.
+    RetryLoad { load: Option<Box<Cmd>>, generation: Option<u64> },
     Logout,
     /// Reinicia el reproductor (y la sesión) con ajustes que no se pueden cambiar en marcha:
     /// nombre del dispositivo y caché de audio.
@@ -211,7 +215,9 @@ pub enum Event {
     Error(String),
     /// Sesión conectada. `fresh`: se acaba de iniciar sesión en el navegador (no con credenciales
     /// guardadas ni al reconectar): la interfaz sigue entonces con la autorización de la biblioteca.
-    LoggedIn { username: String, device_id: String, fresh: bool },
+    /// `generation`: qué conexión es (sube con cada una); la interfaz la devuelve en `Cmd::Stalled`
+    /// y `Cmd::RetryLoad` para que no se apliquen a una conexión posterior.
+    LoggedIn { username: String, device_id: String, fresh: bool, generation: u64 },
     LoggedOut,
     /// El inicio de sesión en el navegador no se completó: `by_user` si se canceló (en Spotify, con
     /// «Cancelar» o porque pasó `LOGIN_TIMEOUT`), si no, falló. No hay sesión.
@@ -252,8 +258,11 @@ pub enum Event {
     Repeat { context: bool, track: bool },
     ShutdownDone,
     /// Se suelta la conexión con Spotify para reconectar: el audio se corta aquí, y la interfaz
-    /// guarda este punto para retomarlo tal cual.
-    Reconnecting,
+    /// guarda este punto para retomarlo tal cual. Sin aviso inmediato: la interfaz decide si
+    /// decir algo (casi siempre vuelve en un par de segundos).
+    Reconnecting { reason: ReconnectReason },
+    /// Un intento de reconectar falló; el siguiente, en `retry_in`.
+    ReconnectFailed { retry_in: Duration },
     /// La sesión con Spotify se perdió y se ha restablecido. El reproductor es nuevo y está
     /// vacío: la interfaz vuelve a cargar lo que sonaba.
     Reconnected,
@@ -278,6 +287,41 @@ pub enum Event {
     /// El locutor del DJ empieza a hablar antes (o después) de la canción, o termina (`None`).
     Narration(Option<Narration>),
 }
+
+/// Por qué se suelta la conexión para reconectar (`Event::Reconnecting`): para el registro y
+/// para que la interfaz decida qué decir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconnectReason {
+    /// La tarea de Spirc terminó sola (se cayó la conexión con el punto de acceso).
+    Lost,
+    /// La sesión quedó invalidada sin que la tarea avisara todavía.
+    Invalid,
+    /// El equipo estuvo dormido: la conexión suele quedar medio cerrada.
+    Slept,
+    /// La interfaz lleva demasiado en «cargando» (`Cmd::Stalled`).
+    Stalled,
+    /// La carga no avanza y Spirc no contesta a un ping (`Cmd::RetryLoad`).
+    Unresponsive,
+}
+
+impl ReconnectReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReconnectReason::Lost => "conexión perdida",
+            ReconnectReason::Invalid => "sesión invalidada",
+            ReconnectReason::Slept => "equipo dormido",
+            ReconnectReason::Stalled => "carga estancada",
+            ReconnectReason::Unresponsive => "Spotify no responde",
+        }
+    }
+}
+
+/// Aviso de `start` al conectar. La interfaz lo calla si ya hubo sesión (es una reconexión o un
+/// reinicio): sin esto, cada corte de un segundo decía «Conectando…».
+pub const CONNECTING: &str = "Conectando con Spotify…";
+/// Aviso de una orden que no se pudo ejecutar porque se está reconectando. La interfaz lo une al
+/// de la reconexión en marcha, que sale ya (alguien pidió algo) en vez de esperar.
+pub const RECONNECTING: &str = "Reconectando con Spotify…";
 
 /// Lo que se enseña mientras habla el locutor del DJ, como en la app de Spotify: su nombre
 /// («DJ Livi»), qué presenta («Up next») y su imagen.
@@ -678,12 +722,19 @@ fn forget_cached_tokens(paths: &Paths) {
     let _ = std::fs::remove_file(paths.credentials_dir().join("tokens.json"));
 }
 
+/// ¿Es `Cmd::Stalled` o `Cmd::RetryLoad` de una conexión que ya no es la última (`current`)? La
+/// interfaz la pidió viendo otra; las órdenes que llegan mientras `start` conecta se atienden
+/// después, con la conexión nueva ya en marcha, y la tirarían sin motivo (reconexión en cascada).
+fn stale_request(asked: Option<u64>, current: u64) -> bool {
+    asked.is_some_and(|g| g != current)
+}
+
 /// Suelta la conexión actual para volver a conectar. Se avisa antes de cerrarla: es cuando el
-/// audio se corta, y la interfaz fija ahí el punto que retomará.
-async fn drop_for_reconnect(active: &mut Option<Active>, shared: &Shared, ui: &UiTx, paths: &Paths) {
+/// audio se corta, y la interfaz fija ahí el punto que retomará (y decide si dice algo).
+async fn drop_for_reconnect(active: &mut Option<Active>, shared: &Shared, ui: &UiTx, paths: &Paths, reason: ReconnectReason) {
     forget_cached_tokens(paths);
     if let Some(a) = active.take() {
-        ui.send(Msg::Backend(Event::Reconnecting));
+        ui.send(Msg::Backend(Event::Reconnecting { reason }));
         a.stop(true).await;
     }
     *shared.session.lock().unwrap() = None;
@@ -780,7 +831,7 @@ async fn run(
                 mono.as_secs(),
                 wall.map_or(0, |w| w.as_secs())
             );
-            drop_for_reconnect(&mut active, &shared, &ui, &paths).await;
+            drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Slept).await;
             retry_at = Some(tokio::time::Instant::now());
         }
         let cmd = match next {
@@ -788,9 +839,9 @@ async fn run(
             Next::Dead(g) => {
                 // Solo cuenta si es la conexión actual; las paradas voluntarias ya vaciaron `active`.
                 if active.as_ref().map(|a| a.generation) == Some(g) {
+                    // Sin aviso aquí: la interfaz solo dice algo si la reconexión tarda.
                     log::warn!("la conexión con Spotify terminó sola; reconectando");
-                    ui.status("Se perdió la conexión con Spotify; reconectando…");
-                    drop_for_reconnect(&mut active, &shared, &ui, &paths).await;
+                    drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Lost).await;
                     retry_at = Some(tokio::time::Instant::now());
                 }
                 continue;
@@ -798,8 +849,7 @@ async fn run(
             Next::Health => {
                 if active.as_ref().map(|a| a.session.is_invalid()).unwrap_or(false) {
                     log::warn!("la sesión de Spotify está invalidada; reconectando");
-                    ui.status("Se perdió la conexión con Spotify; reconectando…");
-                    drop_for_reconnect(&mut active, &shared, &ui, &paths).await;
+                    drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Invalid).await;
                     retry_at = Some(tokio::time::Instant::now());
                 }
                 continue;
@@ -828,7 +878,9 @@ async fn run(
                     Err(e) => {
                         forget_cached_tokens(&paths);
                         log::warn!("reconexión fallida: {e}; reintento en {retry_delay:?}");
-                        ui.status(format!("Sin conexión con Spotify; reintentando en {} s…", retry_delay.as_secs()));
+                        // La interfaz lleva un solo aviso que se actualiza (cuenta atrás), en vez
+                        // de uno nuevo igual en cada intento.
+                        ui.send(Msg::Backend(Event::ReconnectFailed { retry_in: retry_delay }));
                         retry_at = Some(tokio::time::Instant::now() + retry_delay);
                         retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
                     }
@@ -837,23 +889,31 @@ async fn run(
             }
         };
         match cmd {
-            Cmd::Stalled => {
+            Cmd::Stalled { generation: asked } => {
+                // Pedida para una conexión anterior (llegó mientras se reconectaba, o justo
+                // después): la de ahora es nueva y no se tira.
+                if stale_request(asked, generation) {
+                    log::info!("aviso de carga estancada de la conexión {asked:?} (ahora {generation}); se ignora");
+                    continue;
+                }
                 // La interfaz lleva demasiado en «cargando»: si la sesión está caída (o
                 // parece viva pero no responde), se reconecta y se repite la última orden.
                 if let Some(a) = active.as_ref() {
                     log::warn!("reproducción estancada (sesión inválida: {}); reconectando", a.session.is_invalid());
-                    ui.status("Spotify no responde; reconectando…");
-                    drop_for_reconnect(&mut active, &shared, &ui, &paths).await;
+                    drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Stalled).await;
                 }
                 retry_at = Some(tokio::time::Instant::now());
             }
-            Cmd::RetryLoad(load) => {
+            Cmd::RetryLoad { load, generation: asked } => {
                 // Reconectando: al volver, la interfaz repite la carga pendiente por su cuenta.
                 let Some(a) = active.as_ref() else { continue };
+                if stale_request(asked, generation) {
+                    log::info!("reintento de carga de la conexión {asked:?} (ahora {generation}); se ignora");
+                    continue;
+                }
                 if a.session.is_invalid() || !spirc_alive(&a.spirc).await {
                     log::warn!("la carga no avanza y Spirc no contesta en {SPIRC_PING_TIMEOUT:?}; reconectando");
-                    ui.status("Spotify no responde; reconectando…");
-                    drop_for_reconnect(&mut active, &shared, &ui, &paths).await;
+                    drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Unresponsive).await;
                     retry_at = Some(tokio::time::Instant::now());
                 } else if let Some(cmd) = load {
                     // Spirc atiende: lo atascado es la carga (una petición que no vuelve). Se pide
@@ -995,7 +1055,7 @@ async fn run(
                 // repite la carga que aún no sonaba o retoma lo que sonaba en su punto exacto.
                 let Some(a) = active.as_ref() else {
                     if retry_at.is_some() {
-                        ui.status("Reconectando con Spotify…");
+                        ui.status(RECONNECTING);
                     } else {
                         ui.status("Inicia sesión para reproducir música");
                     }
@@ -1003,8 +1063,8 @@ async fn run(
                 };
                 if a.session.is_invalid() {
                     // La sesión murió sin que la tarea avisara todavía: reconectar ya.
-                    ui.status("Se perdió la conexión con Spotify; reconectando…");
-                    drop_for_reconnect(&mut active, &shared, &ui, &paths).await;
+                    log::warn!("la sesión de Spotify está invalidada al recibir una orden; reconectando");
+                    drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Invalid).await;
                     retry_at = Some(tokio::time::Instant::now());
                     continue;
                 }
@@ -1289,7 +1349,7 @@ async fn start(
     dead_tx: mpsc::UnboundedSender<u64>,
     fresh: bool,
 ) -> Result<Active, StartError> {
-    ui.status("Conectando con Spotify…");
+    ui.status(CONNECTING);
 
     let audio_dir = (settings.audio_cache_mb > 0).then(|| paths.audio_cache_dir());
     let cache = Cache::new(
@@ -1461,6 +1521,7 @@ async fn start(
         username: session.username(),
         device_id: session.device_id().to_string(),
         fresh,
+        generation,
     }));
     audio_backend::set_output_volume(initial_volume as f32 / u16::MAX as f32);
     ui.send(Msg::Backend(Event::Volume(initial_volume)));
@@ -2292,9 +2353,18 @@ mod tests {
         ] {
             assert!(is_playback(&c), "{c:?}");
         }
-        for c in [Cmd::Pause, Cmd::Volume(1), Cmd::Shuffle(true), Cmd::Stalled, Cmd::RetryLoad(None), Cmd::Logout] {
+        for c in [Cmd::Pause, Cmd::Volume(1), Cmd::Shuffle(true), Cmd::Stalled { generation: None }, Cmd::RetryLoad { load: None, generation: Some(1) }, Cmd::Logout] {
             assert!(!is_playback(&c), "{c:?}");
         }
+    }
+
+    /// Un «carga estancada» pedido viendo la conexión anterior no tira la nueva; sin conexión
+    /// conocida (modo de control) vale para la que haya.
+    #[test]
+    fn ordenes_de_otra_conexion() {
+        assert!(!stale_request(Some(3), 3));
+        assert!(stale_request(Some(2), 3));
+        assert!(!stale_request(None, 3));
     }
 
     /// La precarga inteligente: ráfaga, una ficha más cada tanto (sin pasar de la ráfaga) y

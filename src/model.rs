@@ -946,8 +946,16 @@ pub struct FollowedArtists {
 pub struct QueueResponse {
     #[serde(default)]
     pub currently_playing: Option<Track>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "skip_null_items")]
     pub queue: Vec<Track>,
+}
+
+/// Una lista en la que Spotify mete `null` entre los elementos (la cola de /me/player/queue con el
+/// DJ sonando). Se saltan: antes la respuesta entera fallaba («invalid type: null, expected struct
+/// Track») y la cola no llegaba nunca. Una lista que falta o es `null`, vacía.
+fn skip_null_items<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
+    let items: Option<Vec<Option<T>>> = Option::deserialize(d)?;
+    Ok(items.unwrap_or_default().into_iter().flatten().collect())
 }
 
 // ------------------------------------------------------------------ letras
@@ -1524,6 +1532,26 @@ mod tests {
         assert_eq!(st.progress_ms, Some(123_456));
         let st: PlaybackState = serde_json::from_str("{}").unwrap();
         assert_eq!(st.progress_ms, None);
+    }
+
+    #[test]
+    fn cola_del_dj_con_huecos_nulos() {
+        // Con el DJ sonando, /me/player/queue trae `null` entre las canciones: antes se perdía la
+        // respuesta entera y la interfaz la volvía a pedir cada 300 ms.
+        let q: QueueResponse = serde_json::from_str(
+            r#"{"currently_playing":{"uri":"spotify:track:a","name":"A"},
+                "queue":[null,{"uri":"spotify:track:b","name":"B"},null,{"uri":"spotify:track:c","name":"C"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(q.currently_playing.map(|t| t.uri), Some("spotify:track:a".to_string()));
+        assert_eq!(q.queue.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["B", "C"]);
+        // Solo huecos, la lista misma a `null` o sin ella: cola vacía, no un error.
+        let q: QueueResponse = serde_json::from_str(r#"{"currently_playing":null,"queue":[null,null]}"#).unwrap();
+        assert!(q.currently_playing.is_none() && q.queue.is_empty());
+        let q: QueueResponse = serde_json::from_str(r#"{"queue":null}"#).unwrap();
+        assert!(q.queue.is_empty());
+        let q: QueueResponse = serde_json::from_str("{}").unwrap();
+        assert!(q.queue.is_empty());
     }
 
     fn ogg(kbps: u16, requested: u16) -> AudioInfo {

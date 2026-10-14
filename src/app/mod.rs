@@ -18,6 +18,7 @@ mod player_bar;
 mod player_menu;
 mod lyrics_panel;
 mod queue_panel;
+mod reconnect;
 mod song_masks;
 mod theme;
 mod track_page;
@@ -432,6 +433,11 @@ const LIST_RETRY_DELAYS: [Duration; 3] = [Duration::from_secs(5), Duration::from
 /// cada 1,2 s sin límite, aunque la anterior siguiera en curso.
 const RESTORE_CTX_RETRY: [Duration; 3] = [Duration::from_millis(1200), Duration::from_millis(2400), Duration::from_millis(4800)];
 const RESTORE_CTX_DEADLINE: Duration = Duration::from_secs(60);
+/// Cola de la sesión restaurada (`queue_retry`): Spotify tarda unos segundos en reflejar el
+/// contexto cargado, así que se vuelve a pedir cada tanto, como mucho estas veces (unos 3,6 s), y
+/// se deja de pedir en cuanto llega con contenido.
+const QUEUE_RETRY_EVERY: Duration = Duration::from_millis(300);
+const QUEUE_RETRY_MAX: u8 = 12;
 
 /// Resultados de búsqueda recientes que se guardan en memoria (los usados hace más tiempo salen).
 const SEARCH_CACHE_MAX: usize = 50;
@@ -784,6 +790,13 @@ pub struct App {
     /// Se perdió la conexión con Spotify: al volver, se carga lo que sonaba en este punto. Sin
     /// esto la sesión nueva empezaría vacía (o, antes, con la canción desde el principio).
     reconnect_resume: Option<ResumePoint>,
+    /// Reconexión con Spotify en marcha (`Event::Reconnecting`) y su aviso, que solo sale si tarda
+    /// (`reconnect::Reconnect`). `None` también cuando la sesión ya volvió.
+    reconnect: Option<reconnect::Reconnect>,
+    /// Conexión con Spotify de la que habló el último `LoggedIn`: va en `Cmd::Stalled` y
+    /// `Cmd::RetryLoad` para que el backend ignore los que lleguen tarde, ya con otra conexión.
+    /// `None` hasta la primera sesión (y tras cerrarla): entonces los avisos de conectar sí salen.
+    conn_generation: Option<u64>,
     /// Última orden de reproducción que aún no ha empezado a sonar: si la conexión cae antes,
     /// se repite al reconectar.
     pending_load: Option<Cmd>,
@@ -1304,6 +1317,8 @@ impl App {
             pause_after_restore: false,
             play_after_restore: false,
             reconnect_resume: None,
+            reconnect: None,
+            conn_generation: None,
             pending_load: None,
             now_optimistic: false,
             now_placeholder: false,
@@ -3643,6 +3658,16 @@ impl App {
             self.pending_load = None;
         }
         match e {
+            Event::Status(s) if s == crate::backend::RECONNECTING => match self.reconnect.as_mut() {
+                // Una orden no se pudo ejecutar: el aviso de la reconexión sale ya, sin esperar.
+                Some(r) => r.ask(Instant::now(), &mut self.status),
+                None => self.status(s),
+            },
+            // Ya hubo sesión: es una reconexión o un reinicio, que no necesitan aviso (si la
+            // reconexión tarda, lo dice `reconnect`).
+            Event::Status(s) if s == crate::backend::CONNECTING && (self.reconnect.is_some() || self.conn_generation.is_some()) => {
+                log::debug!("[reconexión] aviso «{s}» callado");
+            }
             Event::Status(s) => self.status(s),
             Event::Error(s) => {
                 if matches!(self.auth, Auth::LoggingIn | Auth::Connecting { .. }) {
@@ -3654,8 +3679,19 @@ impl App {
                 username,
                 device_id,
                 fresh,
+                generation,
             } => {
                 self.login_cancel_at = None;
+                // ¿Ya había sesión? Entonces es una reconexión o un reinicio: sin «Conectado».
+                let had_session = self.conn_generation.replace(generation).is_some();
+                if had_session {
+                    // Conexión nueva: el vigilante de «cargando» cuenta desde aquí. Sin esto, entre
+                    // este aviso y `Reconnected` (que cierran la reconexión) podía ver los segundos
+                    // que duró y pedir otra reconexión de la conexión recién hecha.
+                    if let Some(w) = self.load_watch.as_mut() {
+                        w.restart(Instant::now(), librespot_core::ttfs::activity());
+                    }
+                }
                 // Foto y nombre del perfil por el protocolo interno (no gasta cuota de la Web API).
                 // Sale la primera, antes de la tanda de refresh_from_network; su clave se marca
                 // después de esa (que vacía `requested`), para que Resp::Me no lo pida otra vez.
@@ -3722,7 +3758,18 @@ impl App {
                     let ids = std::mem::take(&mut self.pending_downloads);
                     self.download(ids);
                 }
-                self.status("Conectado a Spotify");
+                if let Some(r) = self.reconnect.take() {
+                    // La sesión volvió: solo se dice si antes se avisó de que se reconectaba.
+                    log::info!(
+                        "[reconexión] sesión de nuevo tras {} ms ({}, {} intentos fallidos)",
+                        r.age(Instant::now()).as_millis(),
+                        r.reason.as_str(),
+                        r.failures
+                    );
+                    r.finish(Instant::now(), true, &mut self.status);
+                } else if !had_session {
+                    self.status("Conectado a Spotify");
+                }
                 self.after_login_library(fresh);
             }
             Event::LoginAborted { reason, by_user } => {
@@ -3811,6 +3858,10 @@ impl App {
                     ..Default::default()
                 };
                 self.reconnect_resume = None;
+                if let Some(r) = self.reconnect.take() {
+                    r.finish(Instant::now(), false, &mut self.status);
+                }
+                self.conn_generation = None;
                 self.pending_load = None;
                 self.playback_error = None;
                 self.load_retry = None;
@@ -3942,6 +3993,10 @@ impl App {
                 if matches!(self.auth, Auth::LoggingIn | Auth::Connecting { .. }) {
                     self.auth = Auth::LoggedOut;
                 }
+                // Si se estaba reconectando, el backend ya no insiste: el aviso sobra.
+                if let Some(r) = self.reconnect.take() {
+                    r.finish(Instant::now(), false, &mut self.status);
+                }
                 self.not_premium = true;
                 self.pending_load = None;
                 self.load_retry = None;
@@ -4007,7 +4062,20 @@ impl App {
                     self.restore_local();
                 }
             }
-            Event::Reconnecting => {
+            Event::Reconnecting { reason } => {
+                let now = Instant::now();
+                log::info!("[reconexión] empieza ({})", reason.as_str());
+                // Sin aviso todavía: casi siempre vuelve en un par de segundos (ver `reconnect`).
+                // Una que ya estaba en marcha sigue contando, con su aviso si ya salió.
+                match self.reconnect.as_mut() {
+                    Some(r) => r.reason = reason,
+                    None => self.reconnect = Some(reconnect::Reconnect::new(reason, now)),
+                }
+                // El vigilante de «cargando» vuelve a contar desde aquí, y mientras dure la
+                // reconexión ni reintenta ni reconecta (`tick_reconnecting`).
+                if let Some(w) = self.load_watch.as_mut() {
+                    w.restart(now, librespot_core::ttfs::activity());
+                }
                 // El audio se corta aquí: la barra se detiene en el punto que se retomará.
                 let pos = self.player.position();
                 self.reconnect_resume = match self.player.state {
@@ -4033,9 +4101,27 @@ impl App {
                 }
                 self.media_dirty = true;
             }
+            Event::ReconnectFailed { retry_in } => {
+                let now = Instant::now();
+                log::info!("[reconexión] intento fallido; el siguiente en {} s", retry_in.as_secs());
+                // Sin `Reconnecting` antes (un `Cmd::Stalled` sin sesión): el backend reintenta
+                // igual, así que también hay aviso si tarda.
+                self.reconnect
+                    .get_or_insert_with(|| reconnect::Reconnect::new(crate::backend::ReconnectReason::Lost, now))
+                    .on_failed(retry_in, now);
+            }
             Event::Reconnected => {
-                self.status("Conexión con Spotify restablecida");
-                // El vigilante de «cargando» sigue contando: una reconexión no le da otros 30 s.
+                let now = Instant::now();
+                // Normalmente ya la cerró `LoggedIn`, que llega justo antes.
+                if let Some(r) = self.reconnect.take() {
+                    r.finish(now, true, &mut self.status);
+                }
+                // El vigilante de «cargando» vuelve a contar desde aquí: la carga que se repite
+                // ahora va por la conexión nueva (sin olvidar si ya reconectó él por esta carga,
+                // para no reconectar en bucle; ver `LoadWatchdog::restart`).
+                if let Some(w) = self.load_watch.as_mut() {
+                    w.restart(now, librespot_core::ttfs::activity());
+                }
                 // Las miniaturas de artistas que fallaron con la sesión caída siguen marcadas como
                 // pedidas (para no repetirlas en cada fotograma): se pueden volver a pedir. Las
                 // que ya tienen imagen no se piden; el resto, en un lote por tarjeta a la vista.
@@ -5934,14 +6020,15 @@ impl App {
                 ctx.request_repaint_after(at - now);
             }
         }
-        // Cola tras restaurar: reintentos cada ~1,2 s hasta que llegue con contenido (máx. 8).
+        // Cola tras restaurar: reintentos cada 300 ms hasta que llegue con contenido (como mucho
+        // `QUEUE_RETRY_MAX`; `Resp::Queue` los corta al llegar una con canciones).
         if let Some((at, n)) = self.queue_retry {
             if Instant::now() >= at {
                 self.api.send(Req::Queue);
                 self.queue_at = Instant::now();
-                self.queue_retry = if n < 12 { Some((Instant::now() + Duration::from_millis(300), n + 1)) } else { None };
+                self.queue_retry = (n < QUEUE_RETRY_MAX).then(|| (Instant::now() + QUEUE_RETRY_EVERY, n + 1));
             }
-            ctx.request_repaint_after(Duration::from_millis(300));
+            ctx.request_repaint_after(QUEUE_RETRY_EVERY);
         }
         // Transferencia aceptada pero sin pista (sesión vacía o sin contexto): copia local.
         if let Some(t) = self.restore_fallback_at {
@@ -5982,7 +6069,7 @@ impl App {
             if t.elapsed() > Duration::from_secs(6) {
                 self.stall_test = None;
                 log::info!("[stall] simulando sesión estancada");
-                self.backend.send(Cmd::Stalled);
+                self.backend.send(Cmd::Stalled { generation: None });
             }
             ctx.request_repaint_after(Duration::from_secs(1));
         }
@@ -5999,7 +6086,9 @@ impl App {
             let now = Instant::now();
             let activity = librespot_core::ttfs::activity();
             let watch = self.load_watch.get_or_insert_with(|| watchdog::LoadWatchdog::new(now, activity));
-            match watch.tick(now, activity) {
+            // Reconectando, ni reintento ni reconexión: la reconexión en marcha ya repite la carga.
+            let stage = if self.reconnect.is_some() { watch.tick_reconnecting(now, activity) } else { watch.tick(now, activity) };
+            match stage {
                 watchdog::Stage::Wait => {}
                 watchdog::Stage::Slow => self.prefetch_pending_context(),
                 watchdog::Stage::Retry => {
@@ -6007,14 +6096,14 @@ impl App {
                     self.skip_stuck_context();
                     // En una Jam, volver a pedir la carga la repetiría para todos: solo el ping.
                     let again = self.pending_load.clone().filter(|_| self.jam.is_none()).map(Box::new);
-                    self.backend.send(Cmd::RetryLoad(again));
+                    self.backend.send(Cmd::RetryLoad { load: again, generation: self.conn_generation });
                 }
                 watchdog::Stage::Reconnect => {
                     log::warn!("[vigilante] 15 s cargando sin avanzar: se reconecta");
                     // Las pistas del contexto pudieron llegar después de los 8 s: al volver, la
                     // carga que se repite ya no espera al contexto.
                     self.skip_stuck_context();
-                    self.backend.send(Cmd::Stalled);
+                    self.backend.send(Cmd::Stalled { generation: self.conn_generation });
                 }
                 watchdog::Stage::GiveUp => self.give_up_loading(),
             }
@@ -6150,6 +6239,12 @@ impl App {
                 }
             }
             ctx.request_repaint_after(delay);
+        }
+        // Reconexión que tarda: un solo aviso, que se actualiza y no caduca mientras dure.
+        if let Some(r) = self.reconnect.as_mut() {
+            let now = Instant::now();
+            r.show(now, &mut self.status);
+            ctx.request_repaint_after(r.next_check(now));
         }
         if let Some((_, at, _)) = &self.status {
             if at.elapsed() > Duration::from_secs(8) {

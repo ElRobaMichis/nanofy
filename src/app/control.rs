@@ -1034,7 +1034,7 @@ impl App {
             }
             "stall" => {
                 // Simula «lleva demasiado cargando»: fuerza la reconexión del backend.
-                self.backend.send(Cmd::Stalled);
+                self.backend.send(Cmd::Stalled { generation: None });
                 ok()
             }
             // Como «Buscar actualizaciones» de Ajustes; con `manual: false`, como la consulta
@@ -1573,6 +1573,15 @@ impl App {
             "can_back": self.can_back(),
             "can_forward": self.can_forward(),
             "status": self.status.as_ref().map(|(t, at, e)| json!({"text": t, "error": e, "age_ms": at.elapsed().as_millis() as u64})),
+            // Reconexión en marcha (su aviso solo sale si tarda) y la conexión que conoce la interfaz.
+            "reconnect": self.reconnect.as_ref().map(|r| json!({
+                "reason": r.reason.as_str(),
+                "age_ms": r.age(t_now).as_millis() as u64,
+                "shown": r.shown(),
+                "failures": r.failures,
+                "retry_in_ms": r.retry_in(t_now).map(|d| d.as_millis() as u64),
+            })),
+            "conn_generation": self.conn_generation,
             "player": player,
             "devices": self.devices.iter().map(|d| json!({"name": d.name, "id": d.id, "active": d.is_active, "kind": d.kind, "self": d.id.as_deref() == Some(self.device_id.as_str())})).collect::<Vec<_>>(),
             "queue": queue,

@@ -117,8 +117,9 @@ struct PlayerInternal {
     warm: PlayerPreload,
     /// Cuándo se pidió lo que hay en `warm` (ver `WARM_TTL`).
     warm_since: Instant,
-    /// La última precarga que falló y cuándo (ver `PRELOAD_RETRY_AFTER`).
-    preload_failed: Option<(SpotifyUri, Instant)>,
+    /// La última precarga que falló, cuándo (ver `PRELOAD_RETRY_AFTER`) y si fue por algo
+    /// pasajero (la red, el enlace con el AP, el freno de Spotify; ver `Player::link_renewed`).
+    preload_failed: Option<(SpotifyUri, Instant, bool)>,
     sink: Box<dyn Sink>,
     sink_status: SinkStatus,
     /// Audio que la salida aún tenía en cola sin sonar cuando se pausó la canción (`Paused`). El
@@ -469,6 +470,8 @@ enum PlayerCommand {
         intro: Option<NarrationRequest>,
         outro: Option<NarrationRequest>,
     },
+    /// Ver `Player::link_renewed`.
+    LinkRenewed,
 }
 
 #[derive(Debug, Clone)]
@@ -1083,6 +1086,12 @@ impl Player {
 
     pub fn preload(&self, track_id: SpotifyUri) {
         self.command(PlayerCommand::Preload { track_id });
+    }
+
+    /// El enlace con el punto de acceso se acaba de renovar (Nanofy): una precarga que falló por
+    /// algo pasajero se repite ya (ver `PlayerCommand::LinkRenewed`).
+    pub fn link_renewed(&self) {
+        self.command(PlayerCommand::LinkRenewed);
     }
 
     /// Prepara por adelantado la canción que casi seguro va a sonar enseguida (Nanofy): la que se
@@ -2374,7 +2383,8 @@ impl Future for PlayerInternal {
                         // el turno; mientras tanto no se vuelve a precargar enseguida.
                         info!("Unable to preload {track_id:?}: {reason}");
                         self.preload = PlayerPreload::None;
-                        self.preload_failed = Some((track_id, Instant::now()));
+                        self.preload_failed =
+                            Some((track_id, Instant::now(), reason.is_transient()));
                     }
                     Poll::Pending => (),
                 }
@@ -4464,7 +4474,7 @@ impl PlayerInternal {
         // estado y, si Spotify está frenando, cada intento es otra clave. Se carga al llegarle
         // el turno.
         if preload_track
-            && self.preload_failed.as_ref().is_some_and(|(failed, at)| {
+            && self.preload_failed.as_ref().is_some_and(|(failed, at, _)| {
                 *failed == track_id && at.elapsed() < PRELOAD_RETRY_AFTER
             })
         {
@@ -4629,6 +4639,24 @@ impl PlayerInternal {
             } => self.handle_command_load(track_id, None, play, position_ms, transition)?,
 
             PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
+
+            PlayerCommand::LinkRenewed => {
+                // La precarga de la siguiente que falló porque el enlace con el AP se cayó (su
+                // clave no llegó) se repite ahora, con el enlace nuevo, en vez de al cabo de
+                // `PRELOAD_RETRY_AFTER`: así la siguiente sigue entrando sin hueco.
+                let retry = matches!(self.preload_failed, Some((_, _, true)))
+                    && matches!(self.preload, PlayerPreload::None)
+                    && matches!(
+                        self.state,
+                        PlayerState::Playing { .. } | PlayerState::Paused { .. }
+                    );
+                if retry {
+                    if let Some((track_id, _, _)) = self.preload_failed.take() {
+                        info!("[ap] se repite la precarga de {track_id:?} con el enlace renovado");
+                        self.handle_command_preload(track_id);
+                    }
+                }
+            }
 
             PlayerCommand::Warm { track_id, for_play } => {
                 self.handle_command_warm(track_id, for_play)
@@ -4950,6 +4978,7 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::Preload { track_id } => {
                 f.debug_tuple("Preload").field(&track_id).finish()
             }
+            PlayerCommand::LinkRenewed => f.debug_tuple("LinkRenewed").finish(),
             PlayerCommand::Warm { track_id, for_play } => f
                 .debug_tuple("Warm")
                 .field(&track_id)

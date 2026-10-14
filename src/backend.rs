@@ -10,6 +10,7 @@ use librespot_connect::{
     PlayingTrack, Spirc,
 };
 use librespot_core::{
+    ap_link::{LinkState, LinkStatus, RenewFailure},
     authentication::Credentials,
     cache::Cache,
     config::{DeviceType, SessionConfig},
@@ -27,6 +28,7 @@ use librespot_playback::{
 };
 use tokio::sync::mpsc;
 
+use crate::ap_keeper::{Action as LinkAction, Keeper, Outcome as LinkOutcome};
 use crate::bus::{Msg, UiTx};
 use crate::config::{vol_pct_to_raw, Loudness, Paths, Settings};
 use crate::model::{AudioInfo, NowPlaying};
@@ -40,6 +42,10 @@ const HEALTH_EVERY: Duration = Duration::from_secs(30);
 const SLEEP_GAP: Duration = Duration::from_secs(45);
 /// Lo que se espera a que Spirc conteste un ping antes de darlo por atascado (`Cmd::RetryLoad`).
 const SPIRC_PING_TIMEOUT: Duration = Duration::from_secs(1);
+/// Mientras el enlace con el AP lleva menos que esto con problemas (renovándose), el vigilante de
+/// la carga no reconecta ni repite la carga (`Cmd::Stalled`, `Cmd::RetryLoad`): la clave que
+/// espera la carga sale en cuanto haya enlace nuevo, y reconectar cortaría el audio.
+const LINK_GRACE: Duration = Duration::from_secs(20);
 /// Cada cuánto se mira si vuelve a haber salida de audio mientras falta.
 const OUTPUT_PROBE_EVERY: Duration = Duration::from_millis(1500);
 /// Lo que se espera a saber el tipo de cuenta tras conectar, si aún no había llegado.
@@ -266,6 +272,10 @@ pub enum Event {
     /// La sesión con Spotify se perdió y se ha restablecido. El reproductor es nuevo y está
     /// vacío: la interfaz vuelve a cargar lo que sonaba.
     Reconnected,
+    /// El enlace con el punto de acceso se renovó sin reconectar (en `took_ms`): nada se cortó,
+    /// pero un reintento pendiente de la interfaz (una carga que falló o espera su clave) puede ir
+    /// ya. Sin aviso.
+    ApLinkRenewed { took_ms: u32 },
     /// Resultado de `Cmd::ResumeSession`: Spotify tenía (o no) una sesión que restaurar.
     SessionResumed(bool),
     /// Estado del clúster de Spotify Connect (llega por el dealer al conectar y con cada cambio):
@@ -729,6 +739,80 @@ fn stale_request(asked: Option<u64>, current: u64) -> bool {
     asked.is_some_and(|g| g != current)
 }
 
+/// Lo que llega al bucle de órdenes sobre el enlace con el AP de una conexión: su estado (de la
+/// vigilancia que lanza `start`) y el final de cada renovación (`LinkCare::renew`).
+enum LinkMsg {
+    Status(LinkStatus),
+    /// La generación del enlace nuevo, o por qué falló, y lo que tardó.
+    Done(Result<u64, RenewFailure>, Duration),
+}
+
+/// El cuidado del enlace con el AP de la conexión actual. Perderlo ya no tira la sesión
+/// (`Session::renew_link`): se abre otro enlace y nada más se entera. `Keeper` decide cuándo;
+/// aquí se lanza la renovación (una sola a la vez) y se guarda la hora del reintento.
+#[derive(Default)]
+struct LinkCare {
+    keeper: Keeper,
+    job: Option<tokio::task::JoinHandle<()>>,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+impl LinkCare {
+    /// Conexión nueva, o la actual se suelta: la renovación en marcha se abandona (la sesión
+    /// deja el enlace como estaba) y se empieza de cero.
+    fn reset(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.abort();
+        }
+        self.keeper.reset();
+        self.retry_at = None;
+    }
+
+    /// Renueva el enlace `from` de la conexión `a`, salvo que ya haya una renovación en marcha.
+    fn renew(&mut self, a: &Active, from: u64, tx: &mpsc::UnboundedSender<(u64, LinkMsg)>) {
+        if self.job.is_some() || a.session.is_invalid() {
+            return;
+        }
+        self.keeper.started();
+        let session = a.session.clone();
+        let generation = a.generation;
+        let tx = tx.clone();
+        self.job = Some(tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            let r = session.renew_link(from).await;
+            if let Err(e) = &r {
+                log::info!("[ap] la renovación del enlace {from} falló: {e}");
+            }
+            let r = r.map_err(|e| Session::renew_failure(&e));
+            let _ = tx.send((generation, LinkMsg::Done(r, t0.elapsed())));
+        }));
+    }
+
+    /// Un estado del enlace de `a`: renovar ya, más tarde o nada.
+    fn on_status(&mut self, a: &Active, st: LinkStatus, tx: &mpsc::UnboundedSender<(u64, LinkMsg)>) {
+        match self.keeper.on_status(st, std::time::Instant::now()) {
+            LinkAction::RenewNow => self.renew(a, st.generation, tx),
+            LinkAction::RenewAt(t) => {
+                let t = tokio::time::Instant::from_std(t);
+                self.retry_at = Some(self.retry_at.map_or(t, |r| r.min(t)));
+            }
+            LinkAction::Nothing => {}
+        }
+    }
+
+    /// ¿Lleva el enlace poco rato con problemas? Entonces lo que no avanza lo espera a él (ver
+    /// `LINK_GRACE`).
+    fn grace(&self) -> bool {
+        match self.keeper.waiting_for(std::time::Instant::now()) {
+            Some(w) if w < LINK_GRACE => {
+                log::info!("[ap] la carga espera al enlace renovado ({} s)", w.as_secs());
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Suelta la conexión actual para volver a conectar. Se avisa antes de cerrarla: es cuando el
 /// audio se corta, y la interfaz fija ahí el punto que retomará (y decide si dice algo).
 async fn drop_for_reconnect(active: &mut Option<Active>, shared: &Shared, ui: &UiTx, paths: &Paths, reason: ReconnectReason) {
@@ -756,6 +840,9 @@ async fn run(
     // Vigilancia de la conexión: la tarea de Spirc avisa por aquí cuando termina (la sesión
     // caducó, se perdió la red, el equipo durmió…). Si no la paramos nosotros, se reconecta.
     let (dead_tx, mut dead_rx) = mpsc::unbounded_channel::<u64>();
+    // El enlace con el AP de la conexión actual: sus estados y renovaciones llegan por aquí.
+    let (link_tx, mut link_rx) = mpsc::unbounded_channel::<(u64, LinkMsg)>();
+    let mut link = LinkCare::default();
     let mut generation: u64 = 0;
     let mut retry_at: Option<tokio::time::Instant> = None;
     let mut retry_delay = Duration::from_secs(2);
@@ -771,8 +858,11 @@ async fn run(
     // Inicio de sesión automático con las credenciales guardadas.
     if let Some(creds) = cached_credentials(&paths) {
         generation += 1;
-        match start(&paths, &settings, crossfade, creds, &ui, &shared, generation, dead_tx.clone(), false).await {
-            Ok(a) => active = Some(a),
+        match start(&paths, &settings, crossfade, creds, &ui, &shared, generation, dead_tx.clone(), link_tx.clone(), false).await {
+            Ok(a) => {
+                link.reset();
+                active = Some(a);
+            }
             Err(e) => {
                 forget_cached_tokens(&paths);
                 report_start_error(&ui, "No se pudo conectar con Spotify", e)
@@ -793,12 +883,21 @@ async fn run(
             Dead(u64),
             Retry,
             Health,
+            Link(u64, LinkMsg),
+            LinkRetry,
         }
         // Desde aquí el bucle solo espera. Lo que tarden las órdenes (una conexión puede llevar
         // 25 s) no cuenta como tiempo dormido: solo lo esperado hasta el vistazo siguiente.
         let idle_from = (std::time::Instant::now(), std::time::SystemTime::now());
         let retry = async {
             match retry_at {
+                Some(t) => tokio::time::sleep_until(t).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let link_at = link.retry_at;
+        let link_retry = async move {
+            match link_at {
                 Some(t) => tokio::time::sleep_until(t).await,
                 None => std::future::pending::<()>().await,
             }
@@ -812,7 +911,12 @@ async fn run(
                 Some(g) => Next::Dead(g),
                 None => continue,
             },
+            m = link_rx.recv() => match m {
+                Some((g, m)) => Next::Link(g, m),
+                None => continue,
+            },
             _ = retry => Next::Retry,
+            _ = link_retry => Next::LinkRetry,
             _ = health.tick() => Next::Health,
         };
         // ¿Durmió el equipo mientras se esperaba? Con el vistazo de salud cada 30 s, despierto
@@ -831,6 +935,7 @@ async fn run(
                 mono.as_secs(),
                 wall.map_or(0, |w| w.as_secs())
             );
+            link.reset();
             drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Slept).await;
             retry_at = Some(tokio::time::Instant::now());
         }
@@ -841,6 +946,7 @@ async fn run(
                 if active.as_ref().map(|a| a.generation) == Some(g) {
                     // Sin aviso aquí: la interfaz solo dice algo si la reconexión tarda.
                     log::warn!("la conexión con Spotify terminó sola; reconectando");
+                    link.reset();
                     drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Lost).await;
                     retry_at = Some(tokio::time::Instant::now());
                 }
@@ -849,8 +955,72 @@ async fn run(
             Next::Health => {
                 if active.as_ref().map(|a| a.session.is_invalid()).unwrap_or(false) {
                     log::warn!("la sesión de Spotify está invalidada; reconectando");
+                    link.reset();
                     drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Invalid).await;
                     retry_at = Some(tokio::time::Instant::now());
+                } else if let Some(a) = active.as_ref() {
+                    // Red de seguridad: un enlace caído que nadie está renovando ni va a renovar
+                    // (un estado que se perdió por el camino) se renueva aquí.
+                    if link.job.is_none() && link.retry_at.is_none() && a.session.link_state() == LinkState::Down {
+                        log::warn!("[ap] enlace caído sin renovación en curso");
+                        link.renew(a, a.session.link_gen(), &link_tx);
+                    }
+                }
+                continue;
+            }
+            Next::Link(g, m) => {
+                // Solo cuenta lo de la conexión actual.
+                let Some(a) = active.as_ref().filter(|a| a.generation == g) else { continue };
+                let now = std::time::Instant::now();
+                let mut escalate = None;
+                match m {
+                    LinkMsg::Status(st) => link.on_status(a, st, &link_tx),
+                    LinkMsg::Done(r, took) => {
+                        link.job = None;
+                        match (link.keeper.on_result(r, now), r) {
+                            (LinkOutcome::Renewed, Ok(new_gen)) => {
+                                let took_ms = took.as_millis().min(u32::MAX as u128) as u32;
+                                log::info!("[ap] enlace renovado en {took_ms} ms (enlace {new_gen})");
+                                // Nada se cortó: sin aviso. Solo se adelanta lo que esperaba al
+                                // enlace (la precarga de la siguiente, los reintentos de la interfaz).
+                                a.player.link_renewed();
+                                ui.send(Msg::Backend(Event::ApLinkRenewed { took_ms }));
+                                link.retry_at = None;
+                                // Lo que el enlace nuevo haya publicado mientras terminaba la
+                                // renovación (se ignoró entonces) se mira ahora: si ya se cayó,
+                                // se renueva otra vez.
+                                let st = *a.session.link_status().borrow();
+                                link.on_status(a, st, &link_tx);
+                            }
+                            (LinkOutcome::RetryAt(t), Err(kind)) => {
+                                log::warn!(
+                                    "[ap] renovación fallida ({kind:?}); reintento en {} s",
+                                    t.saturating_duration_since(now).as_secs()
+                                );
+                                link.retry_at = Some(tokio::time::Instant::from_std(t));
+                            }
+                            (LinkOutcome::Escalate, Err(kind)) => escalate = Some(kind),
+                            // `Keeper::on_result` no da otras combinaciones.
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(kind) = escalate {
+                    // Lo de siempre antes de que el enlace se renovara solo; la interfaz decide
+                    // qué decir (`Event::Reconnecting`).
+                    log::warn!("[ap] el enlace no se recupera ({kind:?}); se reconecta la sesión entera");
+                    link.reset();
+                    drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Lost).await;
+                    retry_at = Some(tokio::time::Instant::now());
+                }
+                continue;
+            }
+            Next::LinkRetry => {
+                link.retry_at = None;
+                if let Some(a) = active.as_ref() {
+                    if a.session.link_state() != LinkState::Up {
+                        link.renew(a, a.session.link_gen(), &link_tx);
+                    }
                 }
                 continue;
             }
@@ -861,13 +1031,14 @@ async fn run(
                 }
                 let Some(creds) = cached_credentials(&paths) else { continue };
                 generation += 1;
-                match start(&paths, &settings, crossfade, creds, &ui, &shared, generation, dead_tx.clone(), false).await {
+                match start(&paths, &settings, crossfade, creds, &ui, &shared, generation, dead_tx.clone(), link_tx.clone(), false).await {
                     Ok(a) => {
                         retry_delay = Duration::from_secs(2);
                         ui.send(Msg::Backend(Event::Reconnected));
                         if let Some(v) = volume.wanted {
                             let _ = a.spirc.set_volume(v);
                         }
+                        link.reset();
                         active = Some(a);
                     }
                     Err(StartError::NotPremium) => {
@@ -896,10 +1067,16 @@ async fn run(
                     log::info!("aviso de carga estancada de la conexión {asked:?} (ahora {generation}); se ignora");
                     continue;
                 }
+                // El enlace con el AP se está renovando: la carga espera a su clave, que sale en
+                // cuanto haya enlace nuevo. Reconectar ahora cortaría el audio para nada.
+                if link.grace() {
+                    continue;
+                }
                 // La interfaz lleva demasiado en «cargando»: si la sesión está caída (o
                 // parece viva pero no responde), se reconecta y se repite la última orden.
                 if let Some(a) = active.as_ref() {
                     log::warn!("reproducción estancada (sesión inválida: {}); reconectando", a.session.is_invalid());
+                    link.reset();
                     drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Stalled).await;
                 }
                 retry_at = Some(tokio::time::Instant::now());
@@ -911,8 +1088,14 @@ async fn run(
                     log::info!("reintento de carga de la conexión {asked:?} (ahora {generation}); se ignora");
                     continue;
                 }
+                // Como en `Stalled`: ni se reconecta ni se repite la carga mientras el enlace se
+                // renueva (repetirla pediría otra clave por un enlace que aún no está).
+                if link.grace() {
+                    continue;
+                }
                 if a.session.is_invalid() || !spirc_alive(&a.spirc).await {
                     log::warn!("la carga no avanza y Spirc no contesta en {SPIRC_PING_TIMEOUT:?}; reconectando");
+                    link.reset();
                     drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Unresponsive).await;
                     retry_at = Some(tokio::time::Instant::now());
                 } else if let Some(cmd) = load {
@@ -939,9 +1122,12 @@ async fn run(
                 match creds {
                     Ok(c) => match {
                         generation += 1;
-                        start(&paths, &settings, crossfade, c, &ui, &shared, generation, dead_tx.clone(), fresh).await
+                        start(&paths, &settings, crossfade, c, &ui, &shared, generation, dead_tx.clone(), link_tx.clone(), fresh).await
                     } {
-                        Ok(a) => active = Some(a),
+                        Ok(a) => {
+                            link.reset();
+                            active = Some(a);
+                        }
                         Err(e) => {
                             forget_cached_tokens(&paths);
                             report_start_error(&ui, "No se pudo conectar con Spotify", e)
@@ -957,6 +1143,8 @@ async fn run(
             }
             Cmd::Logout => {
                 retry_at = None;
+                // Ninguna renovación del enlace compite con el cierre.
+                link.reset();
                 if let Some(a) = active.take() {
                     a.stop(false).await;
                 }
@@ -974,14 +1162,16 @@ async fn run(
             }
             Cmd::Restart(new_settings) => {
                 settings = new_settings;
+                link.reset();
                 if let Some(a) = active.take() {
                     a.stop(true).await;
                 }
                 if let Some(creds) = cached_credentials(&paths) {
                     generation += 1;
-                    match start(&paths, &settings, crossfade, creds, &ui, &shared, generation, dead_tx.clone(), false).await {
+                    match start(&paths, &settings, crossfade, creds, &ui, &shared, generation, dead_tx.clone(), link_tx.clone(), false).await {
                         Ok(a) => {
                             ui.status("Ajustes de reproducción aplicados");
+                            link.reset();
                             active = Some(a);
                         }
                         Err(e) => report_start_error(&ui, "No se pudo reiniciar la reproducción", e),
@@ -1022,7 +1212,13 @@ async fn run(
             Cmd::Warm(uri) => {
                 // Sin aviso si no se puede: es por adelantado, nadie la ha pedido aún.
                 let Some(a) = active.as_ref() else { continue };
-                if a.session.is_invalid() || !a.session.is_premium() || librespot_core::key_policy::keys_throttled() {
+                // Con el enlace con el AP renovándose, tampoco: la clave esperaría al enlace nuevo
+                // por delante de la de lo que de verdad suena.
+                if a.session.is_invalid()
+                    || !a.session.is_premium()
+                    || librespot_core::key_policy::keys_throttled()
+                    || a.session.link_state() != LinkState::Up
+                {
                     continue;
                 }
                 warm.push(WarmJob {
@@ -1033,7 +1229,12 @@ async fn run(
             }
             Cmd::WarmHead(uri) => {
                 let Some(a) = active.as_ref() else { continue };
-                if a.session.is_invalid() || !a.session.is_premium() || librespot_core::key_policy::keys_throttled() {
+                // Como en `Warm`, tampoco con el enlace con el AP renovándose.
+                if a.session.is_invalid()
+                    || !a.session.is_premium()
+                    || librespot_core::key_policy::keys_throttled()
+                    || a.session.link_state() != LinkState::Up
+                {
                     continue;
                 }
                 if let Ok(uri) = librespot_core::SpotifyUri::from_uri(&uri) {
@@ -1042,6 +1243,7 @@ async fn run(
                 }
             }
             Cmd::Shutdown => {
+                link.reset();
                 if let Some(mut a) = active.take() {
                     a.fast_stop = true;
                     a.stop(true).await;
@@ -1064,6 +1266,7 @@ async fn run(
                 if a.session.is_invalid() {
                     // La sesión murió sin que la tarea avisara todavía: reconectar ya.
                     log::warn!("la sesión de Spotify está invalidada al recibir una orden; reconectando");
+                    link.reset();
                     drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Invalid).await;
                     retry_at = Some(tokio::time::Instant::now());
                     continue;
@@ -1347,6 +1550,7 @@ async fn start(
     shared: &Arc<Shared>,
     generation: u64,
     dead_tx: mpsc::UnboundedSender<u64>,
+    link_tx: mpsc::UnboundedSender<(u64, LinkMsg)>,
     fresh: bool,
 ) -> Result<Active, StartError> {
     ui.status(CONNECTING);
@@ -1514,6 +1718,21 @@ async fn start(
     tokio::spawn(async move {
         task.await;
         let _ = dead_tx.send(generation);
+    });
+    // Vigilancia del enlace con el AP: cada estado nuevo va al bucle de órdenes, que decide si
+    // renovarlo (`LinkCare`). Se empieza por el actual: un enlace perdido mientras `Spirc::new`
+    // conectaba también se renueva. Un `watch` no pierde el último estado.
+    let mut link_rx = session.link_status();
+    tokio::spawn(async move {
+        loop {
+            let st = *link_rx.borrow_and_update();
+            if link_tx.send((generation, LinkMsg::Status(st))).is_err() {
+                break;
+            }
+            if link_rx.changed().await.is_err() {
+                break;
+            }
+        }
     });
 
     *shared.session.lock().unwrap() = Some(session.clone());
@@ -1951,6 +2170,21 @@ mod tests {
 
     fn with_level(l: Loudness) -> Settings {
         Settings { loudness: l, ..Settings::default() }
+    }
+
+    /// Una clave sin respuesta porque el enlace con el AP se perdió se reintenta como cualquier
+    /// respuesta que no llega (el siguiente intento va por el enlace renovado) y, si aun así no
+    /// llega, la carga falla como algo pasajero: no se salta la canción.
+    #[test]
+    fn clave_con_enlace_perdido_se_reintenta() {
+        use librespot_core::audio_key::{classify, AudioKeyError};
+        use librespot_core::key_policy::{retryable, Attempt};
+        let e: librespot_core::Error = AudioKeyError::LinkLost.into();
+        assert_eq!(classify(&e), Attempt::Timeout);
+        assert!(retryable(classify(&e)));
+        let failure = LoadFailure::from_key_error(&e);
+        assert_eq!(failure, LoadFailure::KeyTimeout);
+        assert!(failure.is_transient());
     }
 
     /// La despedida a Spotify antes de cerrar la sesión: con la sesión viva y Spirc atendiendo, lo

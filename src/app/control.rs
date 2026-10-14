@@ -1582,6 +1582,8 @@ impl App {
                 "retry_in_ms": r.retry_in(t_now).map(|d| d.as_millis() as u64),
             })),
             "conn_generation": self.conn_generation,
+            // Renovaciones del enlace con el AP sin reconectar (`conn_generation` no cambia).
+            "ap_renewals": self.ap_renewals,
             "player": player,
             "devices": self.devices.iter().map(|d| json!({"name": d.name, "id": d.id, "active": d.is_active, "kind": d.kind, "self": d.id.as_deref() == Some(self.device_id.as_str())})).collect::<Vec<_>>(),
             "queue": queue,

@@ -1,8 +1,6 @@
 #![recursion_limit = "512"]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-// Hasta que lo use el backend (commit siguiente).
-#[allow(dead_code)]
 mod ap_keeper;
 mod api;
 mod app;

@@ -1,16 +1,20 @@
 use std::{
     collections::HashMap,
     future::Future,
-    io,
+    io, mem,
     pin::Pin,
-    sync::{Arc, OnceLock, RwLock, Weak},
+    sync::{
+        Arc, OnceLock, RwLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::dealer::manager::DealerManager;
 use crate::{
     Error,
+    ap_link::{self, LinkLoss, LinkSlot, LinkState, LinkStatus, LinkWait, RenewFailure},
     apresolve::{ApResolver, SocketAddress},
     audio_key::AudioKeyManager,
     authentication::Credentials,
@@ -36,7 +40,8 @@ use pin_project_lite::pin_project;
 use quick_xml::events::Event;
 use thiserror::Error;
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, watch},
+    task::JoinHandle,
     time::{Duration as TokioDuration, Instant as TokioInstant, Sleep, sleep},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -115,12 +120,30 @@ struct SessionData {
     autoplay_live: Option<bool>,
 }
 
+/// El enlace con el punto de acceso en uso (Nanofy): su estado y, mientras está enlazado, la cola
+/// de envío y las tareas que escriben y leen. Al renovarse se sustituye entero; Mercury y los
+/// canales no se migran: Nanofy no los usa (todo va por spclient y el dealer).
+struct Link {
+    slot: LinkSlot,
+    tx: Option<mpsc::UnboundedSender<(u8, Vec<u8>)>>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
 struct SessionInternal {
     config: SessionConfig,
     data: RwLock<SessionData>,
 
     http_client: HttpClient,
-    tx_connection: OnceLock<mpsc::UnboundedSender<(u8, Vec<u8>)>>,
+    /// Nunca se retiene a través de un `await` (ver `Session::lock_link`).
+    link: std::sync::Mutex<Link>,
+    /// El estado del enlace para quien lo vigila (Nanofy, para renovarlo; las claves, para esperar
+    /// al nuevo). Un `watch`: el último estado nunca se pierde, aunque nadie escuche en ese momento.
+    link_watch: watch::Sender<LinkStatus>,
+    /// Una sola renovación a la vez.
+    renew_lock: tokio::sync::Mutex<()>,
+    born: Instant,
+    /// Último paquete llegado del AP, en µs desde `born` más 1 (0: ninguno aún).
+    rx_at_us: AtomicU64,
 
     apresolver: OnceLock<ApResolver>,
     audio_key: OnceLock<AudioKeyManager>,
@@ -142,8 +165,11 @@ struct SessionInternal {
 /// this structs interface directly or hand it to a
 /// `Player`.
 ///
-/// *Note*: [Session] instances cannot yet be reused once invalidated. After
-/// an unexpectedly closed connection, you'll need to create a new [Session].
+/// *Note*: [Session] instances cannot yet be reused once invalidated.
+///
+/// Nanofy: perder el enlace con el punto de acceso ya no invalida la sesión. El enlace se
+/// renueva dentro de la misma sesión ([Session::renew_link]) y solo [Session::shutdown], un
+/// cierre deliberado, la deja inservible.
 #[derive(Clone)]
 pub struct Session(Arc<SessionInternal>);
 
@@ -164,7 +190,15 @@ impl Session {
             config,
             data: RwLock::new(session_data),
             http_client,
-            tx_connection: OnceLock::new(),
+            link: std::sync::Mutex::new(Link {
+                slot: LinkSlot::new(Instant::now()),
+                tx: None,
+                tasks: Vec::new(),
+            }),
+            link_watch: watch::Sender::new(LinkStatus::initial()),
+            renew_lock: tokio::sync::Mutex::new(()),
+            born: Instant::now(),
+            rx_at_us: AtomicU64::new(0),
             cache: cache.map(Arc::new),
             apresolver: OnceLock::new(),
             audio_key: OnceLock::new(),
@@ -221,11 +255,14 @@ impl Session {
         Ok((reusable_credentials, transport))
     }
 
-    pub async fn connect(
+    /// Abre un enlace con un punto de acceso y se autentica: prueba los AP que da el resolvedor
+    /// (cada llamada saca el siguiente) hasta que uno acepta, y guarda las credenciales
+    /// reutilizables que devuelve.
+    async fn open_link(
         &self,
         credentials: Credentials,
         store_credentials: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<Transport, Error> {
         // There currently happen to be 6 APs but anything will do to avoid an infinite loop.
         const MAX_AP_TRIES: u8 = 6;
         let mut num_ap_tries = 0;
@@ -276,49 +313,251 @@ impl Session {
             }
         }
 
+        Ok(transport)
+    }
+
+    /// Pone en servicio un enlace ya autenticado, en lugar del que hubiera: devuelve su
+    /// generación. Lo que iba por el anterior (su cola, sus tareas, las claves pendientes) se
+    /// suelta aquí.
+    fn attach_link(&self, transport: Transport) -> u64 {
         // This channel serves as a buffer for packets and serializes access to the TcpStream, such
         // that `self.send_packet` can return immediately and needs no additional synchronization.
-        let (tx_connection, rx_connection) = mpsc::unbounded_channel();
-        self.0
-            .tx_connection
-            .set(tx_connection)
-            .map_err(|_| SessionError::NotConnected)?;
-
+        let (tx, rx) = mpsc::unbounded_channel();
         let (sink, stream) = transport.split();
-        let sender_task = UnboundedReceiverStream::new(rx_connection)
-            .map(Ok)
-            .forward(sink);
-        let session_weak = self.weak();
-        tokio::spawn(async move {
-            if let Err(e) = sender_task.await {
-                error!("{e}");
-                if let Some(session) = session_weak.try_upgrade() {
-                    if !session.is_invalid() {
-                        session.shutdown();
+        let sender_task = UnboundedReceiverStream::new(rx).map(Ok).forward(sink);
+        // Las tareas se lanzan con el cerrojo tomado: una pérdida que vean enseguida no puede
+        // adelantarse a que este enlace quede apuntado como el actual.
+        let (generation, old_tx, old_tasks) = self.lock_link(|link| {
+            let generation = link.slot.attach(Instant::now());
+            let weak = self.weak();
+            let sender = self.0.handle.spawn(async move {
+                if let Err(e) = sender_task.await {
+                    error!("{e}");
+                    if let Some(session) = weak.try_upgrade() {
+                        session.link_lost(generation, LinkLoss::WriteError);
                     }
                 }
-            }
+            });
+            let weak = self.weak();
+            let dispatch = self.0.handle.spawn(async move {
+                let _ = DispatchTask::new(weak, stream, generation).await;
+            });
+            let old_tx = link.tx.replace(tx);
+            let old_tasks = mem::replace(&mut link.tasks, vec![sender, dispatch]);
+            (generation, old_tx, old_tasks)
         });
-
-        tokio::spawn(DispatchTask::new(self.weak(), stream));
+        // Soltar las tareas del enlace anterior lo cierra (el sospechoso que seguía abierto).
+        drop(old_tx);
+        for task in old_tasks {
+            task.abort();
+        }
+        // Lo pendiente se pidió por el enlace anterior: su respuesta ya no llegará por este.
+        self.audio_key().fail_pending();
 
         // Pruebas (`NANOFY_FAULT=ap_drop:<ms>`): el enlace con el AP se corta de golpe ese tiempo
-        // después, con lo mismo que un error de lectura (ver `DispatchTask::poll`).
+        // después, con lo mismo que un error de lectura (ver `DispatchTask::poll`). Va por enlace:
+        // con `ap_drop_every` cada enlace renovado se vuelve a cortar.
         if let Some((after, every)) = crate::fault::ap_drop_after() {
             let weak = self.weak();
-            tokio::spawn(async move {
+            self.0.handle.spawn(async move {
                 tokio::time::sleep(after).await;
                 if let Some(session) = weak.try_upgrade() {
-                    if !session.is_invalid() && crate::fault::ap_drop_claim(every) {
+                    // Solo si sigue siendo el enlace actual: el corte de uno ya sustituido no
+                    // gastaría el de `ap_drop` (una vez por proceso) en nada.
+                    if !session.is_invalid()
+                        && session.link_gen() == generation
+                        && crate::fault::ap_drop_claim(every)
+                    {
                         error!("NANOFY_FAULT: el enlace con el AP se corta (ConnectionReset)");
                         error!("Connection to server closed.");
-                        session.shutdown();
+                        session.link_lost(generation, LinkLoss::Fault);
                     }
                 }
             });
         }
 
+        self.publish(None);
+        if generation > 1 {
+            info!("[ap] enlace {generation} conectado");
+        }
+        generation
+    }
+
+    pub async fn connect(
+        &self,
+        credentials: Credentials,
+        store_credentials: bool,
+    ) -> Result<(), Error> {
+        // Una sola vez por sesión, como antes; los enlaces siguientes los abre `renew_link`.
+        if self.link_gen() != 0 {
+            return Err(SessionError::NotConnected.into());
+        }
+        let transport = self.open_link(credentials, store_credentials).await?;
+        self.attach_link(transport);
         Ok(())
+    }
+
+    /// Abre otro enlace con el AP (el siguiente que dé el resolvedor) para sustituir al enlace
+    /// `from_gen`, perdido o sospechoso, sin tocar la sesión: Spirc, el dealer, el registro del
+    /// dispositivo y el reproductor no se enteran. Devuelve la generación del enlace nuevo.
+    pub async fn renew_link(&self, from_gen: u64) -> Result<u64, Error> {
+        let _single = self.0.renew_lock.lock().await;
+        if self.is_invalid() {
+            return Err(SessionError::NotConnected.into());
+        }
+        let (current, state) = self.lock_link(|l| (l.slot.generation(), l.slot.state()));
+        if current > from_gen && state == LinkState::Up {
+            // Otro ya lo renovó mientras se esperaba el turno.
+            return Ok(current);
+        }
+        self.lock_link(|l| l.slot.renewing(Instant::now()));
+        self.publish(None);
+        // Si esta renovación se abandona a medias (la tarea se aborta al cerrar o reconectar) o
+        // falla, el enlace no puede quedarse en `Renewing` para siempre: las claves esperarían
+        // a un enlace que nadie va a abrir.
+        let mut guard = RenewGuard(Some(self));
+
+        let opened = if crate::fault::ap_renew_fail() {
+            warn!("NANOFY_FAULT: la renovación del enlace con el AP falla (sin red)");
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "NANOFY_FAULT: sin red").into())
+        } else {
+            let credentials = Credentials {
+                username: Some(self.username()),
+                auth_type: AuthenticationType::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS,
+                auth_data: self.auth_data(),
+            };
+            match tokio::time::timeout(ap_link::RENEW_TIMEOUT, self.open_link(credentials, true))
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(Error::deadline_exceeded(format!(
+                    "el AP no completó la conexión en {} s",
+                    ap_link::RENEW_TIMEOUT.as_secs()
+                ))),
+            }
+        };
+        let transport = opened?;
+        // Se cerró mientras se conectaba: el enlace nuevo no se usa (se suelta aquí).
+        if self.is_invalid() {
+            return Err(SessionError::NotConnected.into());
+        }
+        guard.0 = None;
+        Ok(self.attach_link(transport))
+    }
+
+    /// Por qué falló una renovación (`renew_link`), para decidir si insistir o reconectar de cero.
+    pub fn renew_failure(e: &Error) -> RenewFailure {
+        let auth = e.error.downcast_ref::<AuthenticationError>().or_else(|| {
+            match e.error.downcast_ref::<SessionError>() {
+                Some(SessionError::AuthenticationError(a)) => Some(a),
+                _ => None,
+            }
+        });
+        match auth {
+            // «Prueba otro AP» solo llega aquí si se agotaron todos: es cosa del servidor, no de
+            // las credenciales.
+            Some(AuthenticationError::LoginFailed(ErrorCode::TryAnotherAP)) => {
+                RenewFailure::Network
+            }
+            Some(AuthenticationError::LoginFailed(_)) => RenewFailure::Rejected,
+            Some(AuthenticationError::Packet(_) | AuthenticationError::Transport) => {
+                RenewFailure::Protocol
+            }
+            // TCP, DNS, el plazo de la renovación…
+            None => RenewFailure::Network,
+        }
+    }
+
+    /// Acceso al enlace actual. El cerrojo no se retiene nunca a través de un `await`; si una
+    /// tarea entró en pánico con él, se sigue igual (el estado del enlace no queda a medias).
+    fn lock_link<R>(&self, f: impl FnOnce(&mut Link) -> R) -> R {
+        let mut link = self.0.link.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut link)
+    }
+
+    /// El enlace `generation` se perdió (o es sospechoso) por `why`. Lo de un enlace ya
+    /// sustituido, o lo que ya se sabía, no cambia nada.
+    pub(crate) fn link_lost(&self, generation: u64, why: LinkLoss) {
+        let fatal = why.fatal();
+        let taken = self.lock_link(|l| {
+            if !l.slot.lost(generation, why, Instant::now()) {
+                return None;
+            }
+            Some(if fatal {
+                (l.tx.take(), mem::take(&mut l.tasks))
+            } else {
+                (None, Vec::new())
+            })
+        });
+        let Some((tx, tasks)) = taken else { return };
+        // Abortar desde dentro de la propia tarea de lectura es inocuo: vuelve justo después.
+        drop(tx);
+        for task in tasks {
+            task.abort();
+        }
+        if fatal {
+            // Las claves pendientes no van a llegar: que fallen ya y se reintenten por el nuevo.
+            self.audio_key().fail_pending();
+            warn!("[ap] enlace {generation} perdido ({why:?})");
+        } else {
+            warn!("[ap] sospecha sobre el enlace {generation}: {why:?}");
+        }
+        self.publish(Some(why));
+    }
+
+    /// Publica el estado actual del enlace. Con el cerrojo tomado: dos avisos seguidos no pueden
+    /// llegar en el orden contrario y dejar publicado uno viejo.
+    fn publish(&self, why: Option<LinkLoss>) {
+        self.lock_link(|l| {
+            self.0.link_watch.send_replace(l.slot.status(why));
+        });
+    }
+
+    /// Los cambios de estado del enlace (el actual se lee al momento con `borrow`).
+    pub fn link_status(&self) -> watch::Receiver<LinkStatus> {
+        self.0.link_watch.subscribe()
+    }
+
+    pub fn link_state(&self) -> LinkState {
+        self.lock_link(|l| l.slot.state())
+    }
+
+    pub fn link_gen(&self) -> u64 {
+        self.lock_link(|l| l.slot.generation())
+    }
+
+    /// Llegó un paquete del AP (cualquiera): está vivo.
+    pub(crate) fn note_inbound(&self) {
+        let us = self.0.born.elapsed().as_micros() as u64 + 1;
+        self.0.rx_at_us.store(us, Ordering::Relaxed);
+    }
+
+    /// Cuándo llegó el último paquete del AP; `None` si aún ninguno.
+    pub fn last_inbound(&self) -> Option<Instant> {
+        match self.0.rx_at_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(self.0.born + Duration::from_micros(us - 1)),
+        }
+    }
+
+    /// La generación de un enlace por el que se puede pedir algo ya, esperando como mucho `wait`
+    /// a que lo haya (mientras se renueva). Con la sesión cerrada, al momento `Closed`.
+    pub(crate) async fn usable_link(&self, wait: Duration) -> Result<u64, LinkWait> {
+        // Primero se escucha y luego se mira: un cambio entre medias despierta igual.
+        let mut rx = self.link_status();
+        let deadline = TokioInstant::now() + wait;
+        loop {
+            if self.is_invalid() {
+                return Err(LinkWait::Closed);
+            }
+            if let Some(g) = self.lock_link(|l| l.slot.usable().then(|| l.slot.generation())) {
+                return Ok(g);
+            }
+            match tokio::time::timeout_at(deadline, rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return Err(LinkWait::TimedOut),
+            }
+        }
     }
 
     pub fn apresolver(&self) -> &ApResolver {
@@ -424,10 +663,12 @@ impl Session {
         self.account_type().is_none_or(|t| t == "premium")
     }
 
+    /// Por el enlace actual; sin enlace (perdido, aún sin renovar), `NotConnected`.
     pub fn send_packet(&self, cmd: PacketType, data: Vec<u8>) -> Result<(), Error> {
-        match self.0.tx_connection.get() {
-            Some(tx) => Ok(tx.send((cmd as u8, data))?),
-            None => Err(SessionError::NotConnected.into()),
+        let sent = self.lock_link(move |l| l.tx.as_ref().map(|tx| tx.send((cmd as u8, data))));
+        match sent {
+            Some(Ok(())) => Ok(()),
+            _ => Err(SessionError::NotConnected.into()),
         }
     }
 
@@ -698,6 +939,17 @@ impl Session {
     pub fn shutdown(&self) {
         debug!("Shutdown: Invalidating session");
         self.0.data.write().expect(SESSION_DATA_POISON_MSG).invalid = true;
+        // Nanofy: el enlace con el AP se cierra aquí, y quien espera uno para pedir una clave
+        // (`usable_link`) se despierta y ve la sesión cerrada.
+        let (tx, tasks) = self.lock_link(|l| {
+            l.slot.close();
+            (l.tx.take(), mem::take(&mut l.tasks))
+        });
+        drop(tx);
+        for task in tasks {
+            task.abort();
+        }
+        self.publish(None);
         self.mercury().shutdown();
         self.channel().shutdown();
         // Nanofy: también las claves de audio en espera (ver `AudioKeyManager::shutdown`).
@@ -706,6 +958,19 @@ impl Session {
 
     pub fn is_invalid(&self) -> bool {
         self.0.data.read().expect(SESSION_DATA_POISON_MSG).invalid
+    }
+}
+
+/// Una renovación en marcha (`Session::renew_link`): si no termina con el enlace nuevo en
+/// servicio (falla, o se abandona a medias), el enlace vuelve a lo que había y se publica.
+struct RenewGuard<'a>(Option<&'a Session>);
+
+impl Drop for RenewGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(session) = self.0 {
+            session.lock_link(|l| l.slot.renew_failed(Instant::now()));
+            session.publish(None);
+        }
     }
 }
 
@@ -770,7 +1035,9 @@ pin_project! {
         stream: S,
         #[pin]
         timeout: Sleep,
-        // Para las pruebas (`NANOFY_FAULT=ap_silent`): qué sesión es y desde cuándo.
+        // Nanofy: el enlace que lee; sus pérdidas llevan esta generación (`Session::link_lost`).
+        generation: u64,
+        // Para las pruebas (`NANOFY_FAULT=ap_silent`): qué enlace es y desde cuándo.
         fault_id: u64,
         started: std::time::Instant,
     }
@@ -789,12 +1056,13 @@ impl<S> DispatchTask<S>
 where
     S: TryStream<Ok = (u8, Bytes)>,
 {
-    fn new(session: SessionWeak, stream: S) -> Self {
+    fn new(session: SessionWeak, stream: S, generation: u64) -> Self {
         Self {
             session,
             keep_alive_state: KeepAliveState::ExpectingPing,
             stream,
             timeout: sleep(INITIAL_PING_TIMEOUT),
+            generation,
             fault_id: crate::fault::next_session_id(),
             started: std::time::Instant::now(),
         }
@@ -958,19 +1226,23 @@ where
                     if crate::fault::ap_silent(self.fault_id, self.started) {
                         continue;
                     }
+                    // Nanofy: el AP está vivo (cualquier paquete vale, también una clave negada;
+                    // ver `ap_link::key_timeout_suspect`).
+                    session.note_inbound();
                     let result = self.as_mut().dispatch(&session, cmd, data);
                     if let Err(e) = result {
                         debug!("could not dispatch command: {e}");
                     }
                 }
+                // Nanofy: se pierde el enlace, no la sesión; se renueva (`Session::renew_link`).
                 Poll::Ready(None) => {
                     warn!("Connection to server closed.");
-                    session.shutdown();
+                    session.link_lost(self.generation, LinkLoss::Eof);
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Some(Err(e))) => {
                     error!("Connection to server closed.");
-                    session.shutdown();
+                    session.link_lost(self.generation, LinkLoss::ReadError);
                     return Poll::Ready(Err(e));
                 }
                 Poll::Pending => break,
@@ -998,10 +1270,9 @@ where
         if let Poll::Ready(()) = this.timeout.as_mut().poll(cx) {
             match this.keep_alive_state {
                 ExpectingPing | ExpectingPongAck => {
-                    if !session.is_invalid() {
-                        session.shutdown();
-                    }
-                    // TODO: Optionally reconnect (with cached/last credentials?)
+                    // Nanofy: el enlace se da por perdido y se renueva (una vez por enlace: lo
+                    // repetido no cambia nada).
+                    session.link_lost(*this.generation, LinkLoss::KeepAlive);
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, io::Write, sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    io::Write,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use bytes::Bytes;
@@ -7,6 +12,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     Error, FileId, SpotifyId,
+    ap_link::{self, LinkLoss, LinkWait},
     key_policy::{self, Attempt, Lru},
     packet::PacketType,
     session::SessionError,
@@ -30,6 +36,9 @@ pub enum AudioKeyError {
     Sequence(u32),
     #[error("audio key response timeout")]
     Timeout,
+    /// El enlace con el AP se perdió antes de la respuesta (Nanofy: se renueva y se reintenta).
+    #[error("el enlace con el AP se perdió antes de la respuesta")]
+    LinkLost,
 }
 
 impl From<AudioKeyError> for Error {
@@ -40,6 +49,7 @@ impl From<AudioKeyError> for Error {
             AudioKeyError::Sequence(_) => Error::aborted(err),
             AudioKeyError::Packet(_) => Error::unimplemented(err),
             AudioKeyError::Timeout => Error::aborted(err),
+            AudioKeyError::LinkLost => Error::unavailable(err),
         }
     }
 }
@@ -56,7 +66,9 @@ impl AudioKeyError {
 pub fn classify(error: &Error) -> Attempt {
     match AudioKeyError::of(error) {
         Some(AudioKeyError::AesKey(code)) => Attempt::Denied(*code),
-        Some(AudioKeyError::Timeout) => Attempt::Timeout,
+        // Un enlace perdido se reintenta como una respuesta que no llegó: el siguiente intento va
+        // por el enlace renovado.
+        Some(AudioKeyError::Timeout | AudioKeyError::LinkLost) => Attempt::Timeout,
         _ => Attempt::Other,
     }
 }
@@ -130,6 +142,17 @@ impl AudioKeyManager {
 
     fn is_closed(&self) -> bool {
         self.lock(|inner| inner.closed)
+    }
+
+    /// El enlace con el AP se perdió o se sustituyó (`Session::link_lost`, `attach_link`): las
+    /// respuestas pendientes ya no llegarán por él. Fallan ya con `LinkLost`, que se reintenta por
+    /// el enlace nuevo, en vez de agotar su plazo. No cierra nada: `closed` es solo para el
+    /// cierre de la sesión (`shutdown`).
+    pub(crate) fn fail_pending(&self) {
+        let pending: Vec<_> = self.lock(|inner| inner.pending.drain().map(|(_, tx)| tx).collect());
+        for tx in pending {
+            let _ = tx.send(Err(AudioKeyError::LinkLost.into()));
+        }
     }
 
     pub(crate) fn dispatch(&self, cmd: PacketType, mut data: Bytes) -> Result<(), Error> {
@@ -210,7 +233,8 @@ impl AudioKeyManager {
         Ok(())
     }
 
-    /// Un solo intento: envía la petición y espera la respuesta como mucho 1,5 s.
+    /// Un solo intento: envía la petición y espera la respuesta como mucho 1,5 s (antes, con el
+    /// enlace con el AP renovándose, hasta `ap_link::KEY_LINK_WAIT` a que haya uno).
     async fn request_once(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
         // Pruebas (`NANOFY_FAULT=key_err:N|key_timeout:N`): la clave se niega o no llega sin
         // pedirla de verdad, para no gastar el cupo de claves que Spotify vigila. Cada intento
@@ -228,10 +252,23 @@ impl AudioKeyManager {
             return Err(AudioKeyError::Timeout.into());
         }
 
+        // Con la sesión cerrada no se pide: nadie contestaría.
+        if self.is_closed() {
+            return Err(SessionError::NotConnected.into());
+        }
+        // Nanofy: hace falta un enlace con el AP por el que pedirla. Mientras se renueva se espera
+        // al nuevo (como mucho `KEY_LINK_WAIT`); si no llega, el intento falla como una respuesta
+        // que no llegó y se reintenta. Con la sesión cerrada, al momento y sin reintentos.
+        let generation = match self.session().usable_link(ap_link::KEY_LINK_WAIT).await {
+            Ok(g) => g,
+            Err(LinkWait::Closed) => return Err(SessionError::NotConnected.into()),
+            Err(LinkWait::TimedOut) => return Err(AudioKeyError::LinkLost.into()),
+        };
+
         let (tx, rx) = oneshot::channel();
 
-        // Con la sesión cerrada no se pide: nadie contestaría. Se mira con el mismo cerrojo con
-        // el que se apunta la petición, para que un cierre justo después la despierte igual.
+        // Se vuelve a mirar con el mismo cerrojo con el que se apunta la petición, para que un
+        // cierre justo después la despierte igual.
         let seq = self
             .lock(move |inner| {
                 if inner.closed {
@@ -244,13 +281,24 @@ impl AudioKeyManager {
             .ok_or(SessionError::NotConnected)?;
         let _pending = PendingGuard { manager: self, seq };
 
-        self.send_key_request(seq, track, file)?;
+        let sent_at = Instant::now();
+        // Sin enlace por el que enviarla (se acaba de perder): como un enlace perdido.
+        if self.send_key_request(seq, track, file).is_err() {
+            return Err(AudioKeyError::LinkLost.into());
+        }
         match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
             Err(_) => {
                 error!("Audio key response timeout");
                 crate::ttfs::count(crate::ttfs::Counter::KeyTimeouts);
+                // Nanofy: si desde que se pidió no ha llegado nada del AP, probablemente enmudeció:
+                // el enlace pasa a sospechoso y se renueva mientras se reintenta.
+                let session = self.session();
+                if ap_link::key_timeout_suspect(sent_at, session.last_inbound()) {
+                    session.link_lost(generation, LinkLoss::KeyTimeout);
+                }
                 Err(AudioKeyError::Timeout.into())
             }
+            // Un `LinkLost` de `fail_pending` sigue tal cual (se reintenta).
             Ok(Ok(k)) => k,
             // El extremo de envío solo se suelta sin contestar al cerrarse la sesión (`shutdown`).
             // Es la conexión y no la clave: la carga lo cuenta como fallo de red, sin reintentarlo

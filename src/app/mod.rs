@@ -797,6 +797,9 @@ pub struct App {
     /// `Cmd::RetryLoad` para que el backend ignore los que lleguen tarde, ya con otra conexión.
     /// `None` hasta la primera sesión (y tras cerrarla): entonces los avisos de conectar sí salen.
     conn_generation: Option<u64>,
+    /// Veces que el enlace con el punto de acceso se renovó sin reconectar (`Event::ApLinkRenewed`),
+    /// para las pruebas.
+    ap_renewals: u32,
     /// Última orden de reproducción que aún no ha empezado a sonar: si la conexión cae antes,
     /// se repite al reconectar.
     pending_load: Option<Cmd>,
@@ -1319,6 +1322,7 @@ impl App {
             reconnect_resume: None,
             reconnect: None,
             conn_generation: None,
+            ap_renewals: 0,
             pending_load: None,
             now_optimistic: false,
             now_placeholder: false,
@@ -4138,6 +4142,23 @@ impl App {
                     self.player.state = PlayState::Stopped;
                 }
                 self.media_dirty = true;
+            }
+            Event::ApLinkRenewed { took_ms } => {
+                // El enlace con el AP se renovó sin reconectar: nada se cortó y no se dice nada.
+                // Solo se adelanta lo que esperaba a un enlace que ya está.
+                self.ap_renewals += 1;
+                log::debug!("[ap] enlace renovado en {took_ms} ms ({} en esta sesión)", self.ap_renewals);
+                let now = Instant::now();
+                // El reintento automático de una carga que falló sin enlace sale ya
+                // (`tick_failed_load`), sin esperar su turno.
+                if let Some(r) = self.load_retry.as_mut().filter(|r| r.at.is_some()) {
+                    r.at = Some(now);
+                }
+                // Una carga que esperaba su clave tiene enlace desde ahora: el vigilante de
+                // «cargando» le da su tiempo entero otra vez.
+                if let Some(w) = self.load_watch.as_mut() {
+                    w.restart(now, librespot_core::ttfs::activity());
+                }
             }
             Event::Shuffle(s) => self.player.shuffle = s,
             Event::Repeat { context, track } => {

@@ -1018,7 +1018,14 @@ async fn run(
             Next::LinkRetry => {
                 link.retry_at = None;
                 if let Some(a) = active.as_ref() {
-                    if a.session.link_state() != LinkState::Up {
+                    let state = a.session.link_state();
+                    if state != LinkState::Up {
+                        // Con el enlace aún sospechoso (una sospecha aplazada que se cumple, o el
+                        // reintento de una renovación por sospecha), es otra renovación por
+                        // sospecha: cuenta para su límite (`SUSPECT_EVERY`).
+                        if link.job.is_none() && state == LinkState::Suspect {
+                            link.keeper.proactive_started(std::time::Instant::now());
+                        }
                         link.renew(a, a.session.link_gen(), &link_tx);
                     }
                 }

@@ -61,7 +61,9 @@ pub enum RenewFailure {
     /// TCP, DNS o tiempo agotado: lo más probable es que no haya red, y reconectar la sesión
     /// entera tampoco llegaría al AP.
     Network,
-    /// La conexión se abrió pero el saludo o la autenticación se rompieron por el camino.
+    /// El saludo cifrado se completó, pero la autenticación se rompió por el camino (un paquete
+    /// inesperado o la conexión cerrada a medias). Un fallo del propio saludo cuenta como
+    /// `Network`: reconectar de cero pasaría por el mismo saludo.
     Protocol,
     /// El AP rechazó el inicio de sesión (`LoginFailed`: credenciales malas o revocadas, cuenta
     /// sin Premium).

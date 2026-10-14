@@ -100,10 +100,13 @@ pub fn forget_cached_keys() {
     key_cache().clear();
 }
 
+/// Por donde llega a quien la pidió la respuesta a una petición de clave.
+pub(crate) type KeyReply = oneshot::Sender<Result<AudioKey, Error>>;
+
 component! {
     AudioKeyManager : AudioKeyManagerInner {
         sequence: SeqGenerator<u32> = SeqGenerator::new(0),
-        pending: HashMap<u32, oneshot::Sender<Result<AudioKey, Error>>> = HashMap::new(),
+        pending: HashMap<u32, KeyReply> = HashMap::new(),
         // La sesión se cerró (`shutdown`): ya no se piden claves por ella.
         closed: bool = false,
     }
@@ -144,12 +147,19 @@ impl AudioKeyManager {
         self.lock(|inner| inner.closed)
     }
 
-    /// El enlace con el AP se perdió o se sustituyó (`Session::link_lost`, `attach_link`): las
-    /// respuestas pendientes ya no llegarán por él. Fallan ya con `LinkLost`, que se reintenta por
-    /// el enlace nuevo, en vez de agotar su plazo. No cierra nada: `closed` es solo para el
-    /// cierre de la sesión (`shutdown`).
-    pub(crate) fn fail_pending(&self) {
-        let pending: Vec<_> = self.lock(|inner| inner.pending.drain().map(|(_, tx)| tx).collect());
+    /// El enlace con el AP se pierde o se sustituye (`Session::link_lost`, `attach_link`): saca
+    /// las peticiones pendientes, cuya respuesta ya no llegará por él. Se llama con el cerrojo del
+    /// enlace tomado y antes de cambiarlo: quien pide una clave solo ve un enlace usable con ese
+    /// cerrojo, así que lo que se saca se pidió por el enlace que se va, nunca por el nuevo. Lo
+    /// sacado se falla luego, ya sin el cerrojo, con `fail_link_lost`. No cierra nada: `closed` es
+    /// solo para el cierre de la sesión (`shutdown`).
+    pub(crate) fn take_pending(&self) -> Vec<KeyReply> {
+        self.lock(|inner| inner.pending.drain().map(|(_, tx)| tx).collect())
+    }
+
+    /// Lo sacado con `take_pending` falla ya con `LinkLost`, que se reintenta por el enlace nuevo,
+    /// en vez de agotar su plazo.
+    pub(crate) fn fail_link_lost(pending: Vec<KeyReply>) {
         for tx in pending {
             let _ = tx.send(Err(AudioKeyError::LinkLost.into()));
         }
@@ -298,7 +308,7 @@ impl AudioKeyManager {
                 }
                 Err(AudioKeyError::Timeout.into())
             }
-            // Un `LinkLost` de `fail_pending` sigue tal cual (se reintenta).
+            // Un `LinkLost` de `fail_link_lost` sigue tal cual (se reintenta).
             Ok(Ok(k)) => k,
             // El extremo de envío solo se suelta sin contestar al cerrarse la sesión (`shutdown`).
             // Es la conexión y no la clave: la carga lo cuenta como fallo de red, sin reintentarlo

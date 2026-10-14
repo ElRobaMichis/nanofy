@@ -317,9 +317,9 @@ impl Session {
     }
 
     /// Pone en servicio un enlace ya autenticado, en lugar del que hubiera: devuelve su
-    /// generación. Lo que iba por el anterior (su cola, sus tareas, las claves pendientes) se
-    /// suelta aquí.
-    fn attach_link(&self, transport: Transport) -> u64 {
+    /// generación, o `None` si la sesión ya se cerró (el enlace se suelta sin usarse). Lo que iba
+    /// por el anterior (su cola, sus tareas, las claves pendientes) se suelta aquí.
+    fn attach_link(&self, transport: Transport) -> Option<u64> {
         // This channel serves as a buffer for packets and serializes access to the TcpStream, such
         // that `self.send_packet` can return immediately and needs no additional synchronization.
         let (tx, rx) = mpsc::unbounded_channel();
@@ -327,7 +327,19 @@ impl Session {
         let sender_task = UnboundedReceiverStream::new(rx).map(Ok).forward(sink);
         // Las tareas se lanzan con el cerrojo tomado: una pérdida que vean enseguida no puede
         // adelantarse a que este enlace quede apuntado como el actual.
-        let (generation, old_tx, old_tasks) = self.lock_link(|link| {
+        let attached = self.lock_link(|link| {
+            // La sesión se cerró mientras se abría este enlace. Se mira con el cerrojo tomado:
+            // `shutdown` marca la sesión antes de tomarlo para cerrar el enlace, así que o cierra
+            // este ya puesto o aquí se ve la marca. Mirarlo antes, sin el cerrojo, dejaba un
+            // hueco en el que el enlace nuevo quedaba en servicio, con sus tareas, en una sesión
+            // ya cerrada que nadie iba a volver a cerrar.
+            if self.is_invalid() {
+                return None;
+            }
+            // Lo pendiente se pidió por el enlace anterior: su respuesta ya no llegará por este.
+            // Se saca antes de poner el nuevo y con el cerrojo; después se llevaría también una
+            // clave pedida ya por el nuevo.
+            let pending = self.audio_key().take_pending();
             let generation = link.slot.attach(Instant::now());
             let weak = self.weak();
             let sender = self.0.handle.spawn(async move {
@@ -344,15 +356,17 @@ impl Session {
             });
             let old_tx = link.tx.replace(tx);
             let old_tasks = mem::replace(&mut link.tasks, vec![sender, dispatch]);
-            (generation, old_tx, old_tasks)
+            Some((generation, old_tx, old_tasks, pending))
         });
+        // Con la sesión cerrada no se lanzó nada: soltar aquí el emisor y la lectura cierra la
+        // conexión, sin publicar ni registrar nada.
+        let (generation, old_tx, old_tasks, pending) = attached?;
         // Soltar las tareas del enlace anterior lo cierra (el sospechoso que seguía abierto).
         drop(old_tx);
         for task in old_tasks {
             task.abort();
         }
-        // Lo pendiente se pidió por el enlace anterior: su respuesta ya no llegará por este.
-        self.audio_key().fail_pending();
+        AudioKeyManager::fail_link_lost(pending);
 
         // Pruebas (`NANOFY_FAULT=ap_drop:<ms>`): el enlace con el AP se corta de golpe ese tiempo
         // después, con lo mismo que un error de lectura (ver `DispatchTask::poll`). Va por enlace:
@@ -380,7 +394,7 @@ impl Session {
         if generation > 1 {
             info!("[ap] enlace {generation} conectado");
         }
-        generation
+        Some(generation)
     }
 
     pub async fn connect(
@@ -393,7 +407,8 @@ impl Session {
             return Err(SessionError::NotConnected.into());
         }
         let transport = self.open_link(credentials, store_credentials).await?;
-        self.attach_link(transport);
+        // Cerrada mientras se conectaba: el enlace no se usa.
+        self.attach_link(transport).ok_or(SessionError::NotConnected)?;
         Ok(())
     }
 
@@ -437,12 +452,11 @@ impl Session {
             }
         };
         let transport = opened?;
-        // Se cerró mientras se conectaba: el enlace nuevo no se usa (se suelta aquí).
-        if self.is_invalid() {
-            return Err(SessionError::NotConnected.into());
-        }
+        // Si se cerró mientras se conectaba, el enlace nuevo no se usa: `attach_link` lo suelta
+        // (lo mira con el cerrojo del enlace, sin hueco frente a `shutdown`).
+        let generation = self.attach_link(transport).ok_or(SessionError::NotConnected)?;
         guard.0 = None;
-        Ok(self.attach_link(transport))
+        Ok(generation)
     }
 
     /// Por qué falló una renovación (`renew_link`), para decidir si insistir o reconectar de cero.
@@ -463,7 +477,7 @@ impl Session {
             Some(AuthenticationError::Packet(_) | AuthenticationError::Transport) => {
                 RenewFailure::Protocol
             }
-            // TCP, DNS, el plazo de la renovación…
+            // TCP, DNS, el saludo cifrado, el plazo de la renovación…
             None => RenewFailure::Network,
         }
     }
@@ -484,12 +498,15 @@ impl Session {
                 return None;
             }
             Some(if fatal {
-                (l.tx.take(), mem::take(&mut l.tasks))
+                // Las claves pendientes se sacan con el cerrojo, como en `attach_link`: si no, un
+                // enlace nuevo puesto entre medias perdería las que ya se pidieron por él.
+                let pending = self.audio_key().take_pending();
+                (l.tx.take(), mem::take(&mut l.tasks), pending)
             } else {
-                (None, Vec::new())
+                (None, Vec::new(), Vec::new())
             })
         });
-        let Some((tx, tasks)) = taken else { return };
+        let Some((tx, tasks, pending)) = taken else { return };
         // Abortar desde dentro de la propia tarea de lectura es inocuo: vuelve justo después.
         drop(tx);
         for task in tasks {
@@ -497,7 +514,7 @@ impl Session {
         }
         if fatal {
             // Las claves pendientes no van a llegar: que fallen ya y se reintenten por el nuevo.
-            self.audio_key().fail_pending();
+            AudioKeyManager::fail_link_lost(pending);
             warn!("[ap] enlace {generation} perdido ({why:?})");
         } else {
             warn!("[ap] sospecha sobre el enlace {generation}: {why:?}");

@@ -115,6 +115,13 @@ impl Keeper {
         }
     }
 
+    /// Va a lanzarse ahora la renovación por sospecha que se aplazó (`Action::RenewAt`): cuenta
+    /// para el límite de `SUSPECT_EVERY` igual que una inmediata. Sin esto, otra sospecha justo
+    /// después volvía a renovar al momento: dos inicios de sesión en el AP casi seguidos.
+    pub fn proactive_started(&mut self, now: Instant) {
+        self.last_proactive = Some(now);
+    }
+
     /// Se lanzó una renovación.
     pub fn started(&mut self) {
         self.renewing = true;
@@ -208,6 +215,23 @@ mod tests {
         // Pasado el plazo, otra vez ya.
         assert_eq!(k.on_status(st(2, LinkState::Suspect), t0 + secs(31)), Action::RenewNow);
         assert_eq!(k.on_status(st(2, LinkState::Suspect), t0 + secs(40)), Action::RenewAt(t0 + secs(61)));
+    }
+
+    #[test]
+    fn sospecha_aplazada_cuenta_para_el_limite() {
+        let t0 = Instant::now();
+        let mut k = Keeper::default();
+        assert_eq!(k.on_status(st(1, LinkState::Suspect), t0), Action::RenewNow);
+        k.started();
+        assert_eq!(k.on_result(Ok(2), t0 + secs(1)), Outcome::Renewed);
+        assert_eq!(k.on_status(st(2, LinkState::Suspect), t0 + secs(10)), Action::RenewAt(t0 + SUSPECT_EVERY));
+        // Llega la hora: el backend la lanza (`Next::LinkRetry`).
+        k.proactive_started(t0 + secs(30));
+        k.started();
+        assert_eq!(k.on_result(Ok(3), t0 + secs(31)), Outcome::Renewed);
+        // El AP nuevo tampoco contesta enseguida: se espera desde la renovación aplazada, no
+        // desde la sospecha anterior.
+        assert_eq!(k.on_status(st(3, LinkState::Suspect), t0 + secs(32)), Action::RenewAt(t0 + secs(60)));
     }
 
     #[test]

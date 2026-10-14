@@ -117,8 +117,8 @@ struct PlayerInternal {
     warm: PlayerPreload,
     /// Cuándo se pidió lo que hay en `warm` (ver `WARM_TTL`).
     warm_since: Instant,
-    /// La última precarga que falló, cuándo (ver `PRELOAD_RETRY_AFTER`) y si fue por algo
-    /// pasajero (la red, el enlace con el AP, el freno de Spotify; ver `Player::link_renewed`).
+    /// La última precarga que falló, cuándo (ver `PRELOAD_RETRY_AFTER`) y si fue por el enlace con
+    /// el AP o la red, de modo que se repite al renovarse el enlace (ver `Player::link_renewed`).
     preload_failed: Option<(SpotifyUri, Instant, bool)>,
     sink: Box<dyn Sink>,
     sink_status: SinkStatus,
@@ -1088,8 +1088,8 @@ impl Player {
         self.command(PlayerCommand::Preload { track_id });
     }
 
-    /// El enlace con el punto de acceso se acaba de renovar (Nanofy): una precarga que falló por
-    /// algo pasajero se repite ya (ver `PlayerCommand::LinkRenewed`).
+    /// El enlace con el punto de acceso se acaba de renovar (Nanofy): una precarga que acaba de
+    /// fallar por el enlace o la red se repite ya (ver `PlayerCommand::LinkRenewed`).
     pub fn link_renewed(&self) {
         self.command(PlayerCommand::LinkRenewed);
     }
@@ -2383,8 +2383,13 @@ impl Future for PlayerInternal {
                         // el turno; mientras tanto no se vuelve a precargar enseguida.
                         info!("Unable to preload {track_id:?}: {reason}");
                         self.preload = PlayerPreload::None;
-                        self.preload_failed =
-                            Some((track_id, Instant::now(), reason.is_transient()));
+                        // Solo lo que un enlace renovado puede arreglar: la clave que no llegó (un
+                        // enlace perdido cuenta así) o la red. Una negativa pasajera o un 429 son
+                        // el freno de Spotify, y repetirla en cuanto se renueva el enlace pediría
+                        // otra clave justo mientras frena.
+                        let link_related =
+                            matches!(reason, LoadFailure::KeyTimeout | LoadFailure::Network(_));
+                        self.preload_failed = Some((track_id, Instant::now(), link_related));
                     }
                     Poll::Pending => (),
                 }
@@ -4041,6 +4046,20 @@ impl PlayerInternal {
         // reutiliza: se quedó a medias de una lectura y su fichero apunta a ese enlace.
         let was_stalled = self.stalled.take().is_some();
 
+        // Otra canción: la precarga que falló era la siguiente de la que sonaba y puede que ya no
+        // lo sea (otro contexto, un salto). La renovación del enlace ya no la repite; la espera de
+        // `PRELOAD_RETRY_AFTER` antes de volver a precargarla sigue igual.
+        let same_track = matches!(
+            &self.state,
+            PlayerState::Playing { track_id: current, .. }
+                | PlayerState::Paused { track_id: current, .. } if *current == track_id
+        );
+        if !same_track {
+            if let Some((_, _, retry)) = self.preload_failed.as_mut() {
+                *retry = false;
+            }
+        }
+
         // ¿Es la carga de una orden medida (`ttfs`)? Una búsqueda durante la carga la repite con
         // el mismo `play_request_id`: sigue siendo la misma carga y conserva su medida.
         let claimed = ttfs::claim(|| track_id.to_string());
@@ -4643,8 +4662,14 @@ impl PlayerInternal {
             PlayerCommand::LinkRenewed => {
                 // La precarga de la siguiente que falló porque el enlace con el AP se cayó (su
                 // clave no llegó) se repite ahora, con el enlace nuevo, en vez de al cabo de
-                // `PRELOAD_RETRY_AFTER`: así la siguiente sigue entrando sin hueco.
-                let retry = matches!(self.preload_failed, Some((_, _, true)))
+                // `PRELOAD_RETRY_AFTER`: así la siguiente sigue entrando sin hueco. Solo si el
+                // fallo es de dentro de ese plazo: pasado, Spirc ya la vuelve a pedir por su
+                // cuenta, y un fallo viejo puede ser de una canción que ya no es la siguiente.
+                let recent = matches!(
+                    self.preload_failed,
+                    Some((_, at, true)) if at.elapsed() < PRELOAD_RETRY_AFTER
+                );
+                let retry = recent
                     && matches!(self.preload, PlayerPreload::None)
                     && matches!(
                         self.state,

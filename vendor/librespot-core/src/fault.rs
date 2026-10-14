@@ -127,7 +127,8 @@ pub struct Spec {
     pub limiter_exhaust: bool,
     /// `Some(None)`: nunca hay salida; `Some(Some(d))`: vuelve a haberla tras `d`.
     pub no_output: Option<Option<Duration>>,
-    /// (tras cuánto de abrirse la sesión, en cada sesión).
+    /// (tras cuánto de abrirse cada enlace con el AP; `true`: en cada enlace, también los
+    /// renovados).
     pub ap_drop: Option<(Duration, bool)>,
     pub ap_silent: Option<Duration>,
     /// Renovaciones del enlace con el AP que fallan sin red.

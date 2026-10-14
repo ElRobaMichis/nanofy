@@ -128,6 +128,11 @@ pub(super) struct ConnectState {
 
     /// a context to keep track of the autoplay context
     autoplay_context: Option<StateContext>,
+    /// Nanofy: si el autoplay está activado (y no somos participantes de una Jam). Lo pone Spirc
+    /// en cada vuelta de su bucle: el estado no conoce los ajustes de la sesión.
+    pub autoplay_enabled: bool,
+    /// Nanofy: ya sonó alguna canción del autoplay de ahora (ver `forget_heard_autoplay`).
+    autoplay_heard: bool,
 
     /// The volume adjustment per step when handling individual volume adjustments.
     pub volume_step_size: u16,
@@ -400,6 +405,18 @@ impl ConnectState {
         self.update_current_index(|i| i.track = new_index as u32);
         self.update_context_index(self.active_context, new_index + 1)?;
         self.fill_up_context = self.active_context;
+        // Nanofy: la cola se rehace entera desde aquí, así que lo del autoplay que ya estaba en
+        // ella se pierde; su índice vuelve al principio (como en `update_context` al recargar el
+        // mismo contexto). Si no, tras pulsar otra canción del contexto que ya sonaba (o al
+        // restaurarlo al abrir) el autoplay parecía gastado y, al acabarse el contexto, la música
+        // se paraba en vez de seguir con canciones parecidas. Con el autoplay desactivado se deja
+        // como está: lo que ya había llegado no debe volver a la cola.
+        if self.autoplay_enabled && !matches!(self.active_context, ContextType::Autoplay) {
+            if let Some(autoplay) = self.autoplay_context.as_mut() {
+                autoplay.index.track = 0;
+                autoplay.index.page = 0;
+            }
+        }
 
         if !self.current_track(|t| t.is_queue() || self.is_skip_track(t, None)) {
             self.set_current_track(new_index)?;

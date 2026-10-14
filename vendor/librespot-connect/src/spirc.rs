@@ -649,6 +649,11 @@ impl SpircTask {
             // because of that the context resolving has to wait, so that the other tasks can finish
             let allow_context_resolving = !self.update_state && !self.update_volume;
 
+            // Nanofy: el estado de la cola necesita saber si el autoplay está activado (ver
+            // `reset_playback_to_position`); cambia por órdenes, atributos de la cuenta o la Jam.
+            self.connect_state.autoplay_enabled =
+                self.session.autoplay() && !self.jam_participant;
+
             tokio::select! {
                 // startup of the dealer requires a connection_id, which is retrieved at the very beginning
                 connection_id_update = self.connection_id_update.next() => unwrap! {
@@ -1920,6 +1925,9 @@ impl SpircTask {
         // se sigue esperando lo que iba a venir detrás de lo anterior.
         self.skip_breaker.reset();
         self.awaiting_tracks = None;
+        if let PlayContext::Uri(ref uri) = cmd.context {
+            self.connect_state.forget_heard_autoplay(uri);
+        }
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                 ResetContext::WhenDifferent(uri)

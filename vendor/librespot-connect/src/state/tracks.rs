@@ -139,6 +139,7 @@ impl<'ct> ConnectState {
             None
         } else if new_track.is_autoplay() {
             self.set_active_context(ContextType::Autoplay);
+            self.autoplay_heard = true;
             None
         } else {
             match new_track.get_context_index() {

@@ -108,6 +108,22 @@ impl ConnectState {
         self.context_uri() != uri || uri.starts_with(SEARCH_IDENTIFIER)
     }
 
+    /// Nanofy: se vuelve a cargar `uri` (otra canción del contexto que suena). Con el autoplay de
+    /// ese contexto ya sonando, se descarta: al acabarse otra vez se pide uno nuevo (con lo que
+    /// sonó hace poco), en vez de repetir desde el principio las que ya se oyeron (ver
+    /// `reset_playback_to_position`, que lo vuelve a poner al principio).
+    /// También si ya sonó y se volvió al contexto con «anterior» (el activo vuelve a ser el
+    /// principal, pero lo oído sigue al principio del autoplay).
+    pub fn forget_heard_autoplay(&mut self, uri: &str) {
+        if !self.different_context_uri(uri)
+            && (self.autoplay_heard || matches!(self.active_context, ContextType::Autoplay))
+        {
+            debug!("se vuelve a {uri} con su autoplay ya oído: se pedirá uno nuevo");
+            self.autoplay_context = None;
+            self.autoplay_heard = false;
+        }
+    }
+
     pub fn reset_context(&mut self, mut reset_as: ResetContext) {
         if matches!(reset_as, ResetContext::WhenDifferent(ctx) if self.different_context_uri(ctx)) {
             reset_as = ResetContext::Completely
@@ -124,6 +140,7 @@ impl ConnectState {
             ResetContext::Completely => {
                 self.context = None;
                 self.autoplay_context = None;
+                self.autoplay_heard = false;
 
                 let player = self.player_mut();
                 player.context_uri.clear();
@@ -252,10 +269,20 @@ impl ConnectState {
                         };
 
                         // enforce reloading the context
-                        if let Ok(autoplay_ctx) = self.get_context_mut(ContextType::Autoplay) {
-                            autoplay_ctx.index.track = 0
+                        // Nanofy: salvo con el autoplay sonando: la cola es suya y el contexto
+                        // principal no la cambia. Antes se vaciaba al modificarse la playlist y
+                        // nada la rellenaba (`try_finish` no termina un Default que no es el
+                        // activo): silencio al acabar la canción hasta pedir más autoplay.
+                        if !matches!(self.active_context, ContextType::Autoplay) {
+                            if let Ok(autoplay_ctx) = self.get_context_mut(ContextType::Autoplay) {
+                                autoplay_ctx.index.track = 0
+                            }
+                            self.clear_next_tracks();
+                            // El relleno puede haber pasado ya al autoplay (quedaba poco de la
+                            // lista): vuelve a la lista, o lo que queda de ella (y lo recién
+                            // añadido) se saltaría.
+                            self.fill_up_context = ContextType::Default;
                         }
-                        self.clear_next_tracks();
                     }
                 }
 
@@ -269,6 +296,7 @@ impl ConnectState {
                 self.player_mut().context_uri = context.uri.take().unwrap_or_default();
             }
             ContextType::Autoplay => {
+                self.autoplay_heard = false;
                 self.autoplay_context = Some(self.state_context_from_page(
                     page,
                     context.metadata,
@@ -525,6 +553,42 @@ impl ConnectState {
             ctx.tracks.push(t)
         }
         ctx.next_page_url = context.next_page_url;
+
+        Ok(())
+    }
+
+    /// Nanofy: más canciones de autoplay (se pidieron con las anteriores ya en la cola): van al
+    /// final del contexto de autoplay, sin las que ya tenía. Antes iban a parar al contexto
+    /// principal (`fill_context_from_page`), donde el relleno, que ya tiraba del autoplay, no las
+    /// veía: tras unas 50 canciones de autoplay la música se paraba.
+    pub fn fill_autoplay_from_page(&mut self, page: ContextPage) -> Result<(), Error> {
+        // Sin índice de contexto, como el primer lote (`update_context`): `handle_shuffle` lo
+        // leería como posición en el contexto principal.
+        let context = self.state_context_from_page(
+            page,
+            HashMap::new(),
+            None,
+            None,
+            None,
+            Some(Provider::Autoplay),
+        );
+
+        let ctx = self
+            .autoplay_context
+            .as_mut()
+            .ok_or(StateError::NoContext(ContextType::Autoplay))?;
+
+        let before = ctx.tracks.len();
+        for t in context.tracks {
+            if !ctx.tracks.iter().any(|c| c.uri == t.uri) {
+                ctx.tracks.push(t)
+            }
+        }
+        debug!(
+            "autoplay: {} canciones nuevas ({} en total)",
+            ctx.tracks.len() - before,
+            ctx.tracks.len()
+        );
 
         Ok(())
     }

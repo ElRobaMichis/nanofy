@@ -430,9 +430,25 @@ impl ContextResolver {
         let (next, _, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
         let remaining = match next.action {
-            ContextAction::Append if context.pages.len() == 1 => state
-                .fill_context_from_page(context.pages.remove(0))
-                .map(|_| None),
+            // Nanofy: más autoplay va al contexto de autoplay, no al principal (ver
+            // `fill_autoplay_from_page`).
+            ContextAction::Append if context.pages.len() == 1 => match next.update {
+                // Pedido para lo que sonaba antes (una transferencia a otro contexto mientras
+                // llegaba): ya no sirve.
+                ContextType::Autoplay if next.context_uri() != state.context_uri().as_str() => {
+                    debug!("autoplay de otro contexto ({}), se descarta", next.context_uri());
+                    Ok(None)
+                }
+                ContextType::Autoplay if state.get_context(ContextType::Autoplay).is_ok() => state
+                    .fill_autoplay_from_page(context.pages.remove(0))
+                    .map(|_| None),
+                // El autoplay se descartó mientras se pedía (se volvió a cargar el contexto con
+                // el autoplay ya sonando, ver `reset_context`): llega como uno nuevo.
+                ContextType::Autoplay => state.update_context(context, ContextType::Autoplay),
+                ContextType::Default => state
+                    .fill_context_from_page(context.pages.remove(0))
+                    .map(|_| None),
+            },
             ContextAction::Replace => {
                 let remaining = state.update_context(context, next.update);
                 if let Resolve::Context(ref ctx) = next.resolve {

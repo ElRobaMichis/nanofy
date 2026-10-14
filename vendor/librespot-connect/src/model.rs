@@ -23,6 +23,9 @@ impl Deref for LoadRequest {
 pub(super) enum PlayContext {
     Uri(String),
     Tracks(Vec<String>),
+    /// Nanofy: una lista de pistas que pertenece a un contexto (p. ej. lo de un artista): suena
+    /// tal cual, y el contexto da nombre a la cola y semilla al autoplay de después.
+    TracksIn(String, Vec<String>),
 }
 
 /// The parameters for creating a load request
@@ -109,6 +112,19 @@ impl LoadRequest {
     pub fn from_tracks(tracks: Vec<String>, options: LoadRequestOptions) -> Self {
         Self {
             context: PlayContext::Tracks(tracks),
+            options,
+        }
+    }
+
+    /// Nanofy: como `from_tracks`, pero las pistas son de `context_uri` (que no se resuelve: suenan
+    /// estas, en este orden). Al acabarse, el autoplay sigue con lo parecido a ese contexto.
+    pub fn from_tracks_in(
+        context_uri: String,
+        tracks: Vec<String>,
+        options: LoadRequestOptions,
+    ) -> Self {
+        Self {
+            context: PlayContext::TracksIn(context_uri, tracks),
             options,
         }
     }

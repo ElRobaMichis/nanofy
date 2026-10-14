@@ -565,6 +565,7 @@ impl App {
                     uris: rows.iter().map(|t| t.uri.clone()).collect(),
                     index: Some(i as u32),
                     shuffle: self.player.shuffle,
+                    context: None,
                 })),
                 _ => self.play_from_queue(&t.uri, rows, i),
             }

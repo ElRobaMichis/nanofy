@@ -203,6 +203,9 @@ pub enum Cmd {
         resume: Option<u32>,
         /// Como en `LoadContext`.
         first: Option<String>,
+        /// El contexto al que pertenecen (p. ej. un artista): da nombre a la cola y semilla al
+        /// autoplay de después. Sin él, pistas sueltas.
+        context: Option<String>,
     },
     /// Precarga inteligente: el ratón lleva un rato sobre esta canción. Metadatos y ubicación del
     /// fichero (y su clave si ya está en la caché del disco), sin bajar audio, con presupuesto
@@ -1416,6 +1419,7 @@ async fn run(
                         shuffle,
                         resume,
                         first,
+                        context,
                     } => {
                         warm_first(a, first.as_deref(), resume);
                         let _ = a.spirc.activate();
@@ -1424,20 +1428,21 @@ async fn run(
                                 volume.applied(a.generation, v);
                             }
                         }
-                        a.spirc.load(LoadRequest::from_tracks(
-                            uris,
-                            LoadRequestOptions {
-                                start_playing: resume.is_none(),
-                                seek_to: resume.unwrap_or(0),
-                                context_options: Some(LoadContextOptions::Options(ContextOptions {
-                                    shuffle,
-                                    repeat: false,
-                                    repeat_track: false,
-                                })),
-                                playing_track: index.map(PlayingTrack::Index),
-                                fallback_index: None,
-                            },
-                        ))
+                        let options = LoadRequestOptions {
+                            start_playing: resume.is_none(),
+                            seek_to: resume.unwrap_or(0),
+                            context_options: Some(LoadContextOptions::Options(ContextOptions {
+                                shuffle,
+                                repeat: false,
+                                repeat_track: false,
+                            })),
+                            playing_track: index.map(PlayingTrack::Index),
+                            fallback_index: None,
+                        };
+                        a.spirc.load(match context {
+                            Some(uri) => LoadRequest::from_tracks_in(uri, uris, options),
+                            None => LoadRequest::from_tracks(uris, options),
+                        })
                     }
                     _ => Ok(()),
                 };
@@ -2589,7 +2594,7 @@ mod tests {
             Cmd::TransferHere,
             Cmd::Preload("spotify:track:x".into()),
             Cmd::ResumeSession,
-            Cmd::LoadTracks { uris: vec![], index: None, shuffle: false, resume: None, first: None },
+            Cmd::LoadTracks { uris: vec![], index: None, shuffle: false, resume: None, first: None, context: None },
             Cmd::LoadContext { uri: "spotify:album:x".into(), track_uri: None, index: None, shuffle: false, resume: Some(0), first: None },
         ] {
             assert!(is_playback(&c), "{c:?}");

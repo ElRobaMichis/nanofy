@@ -641,7 +641,7 @@ impl App {
             } else {
                 let target = match page.album.as_ref().and_then(|a| a.uri.clone()) {
                     Some(uri) => PlayTarget::Context { uri, track_uri: Some(page.uri.clone()), index: None, shuffle: false },
-                    None => PlayTarget::Tracks { uris: vec![page.uri.clone()], index: Some(0), shuffle: false },
+                    None => PlayTarget::Tracks { uris: vec![page.uri.clone()], index: Some(0), shuffle: false, context: None },
                 };
                 self.actions.push(Action::Play(target));
             }

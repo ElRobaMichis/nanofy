@@ -336,6 +336,9 @@ pub enum PlayTarget {
         uris: Vec<String>,
         index: Option<u32>,
         shuffle: bool,
+        /// El contexto al que pertenecen (ver `Cmd::LoadTracks`); sin él, pistas sueltas.
+        #[serde(default)]
+        context: Option<String>,
     },
 }
 
@@ -1778,7 +1781,7 @@ impl App {
                 let tracks: Vec<Track> = self.lists.get(LIKED).map(|l| l.tracks.iter().take(9).cloned().collect()).unwrap_or_default();
                 if tracks.len() > 2 {
                     self.queued_local = vec![tracks[1].uri.clone()];
-                    self.last_play = Some(PlayTarget::Tracks { uris: tracks.iter().map(|t| t.uri.clone()).collect(), index: Some(0), shuffle: false });
+                    self.last_play = Some(PlayTarget::Tracks { uris: tracks.iter().map(|t| t.uri.clone()).collect(), index: Some(0), shuffle: false, context: None });
                     self.last_play_page = Some(Page::Liked);
                     self.queue = Some(QueueResponse { currently_playing: Some(tracks[0].clone()), queue: tracks[1..].to_vec() });
                     self.side = Some(SideTab::Queue);
@@ -5863,6 +5866,7 @@ impl App {
                 uris: vec!["spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_string()],
                 index: Some(0),
                 shuffle: false,
+                context: None,
             });
             self.diag_step = 1;
         } else if self.diag_step == 1 && t >= 12 {
@@ -6489,6 +6493,7 @@ impl App {
                     uris: vec![format!("spotify:track:{id}")],
                     index: Some(0),
                     shuffle,
+                    context: None,
                 })
             }
             "album" => self.go(Page::Album(id)),
@@ -6498,7 +6503,7 @@ impl App {
             "show" => self.go(Page::Show(id)),
             "episode" => {
                 let shuffle = self.player.shuffle;
-                self.play(PlayTarget::Tracks { uris: vec![format!("spotify:episode:{id}")], index: Some(0), shuffle })
+                self.play(PlayTarget::Tracks { uris: vec![format!("spotify:episode:{id}")], index: Some(0), shuffle, context: None })
             }
             "socialsession" => {
                 self.jam_open = true;
@@ -6538,7 +6543,7 @@ impl App {
                 *index = None;
                 *shuffle = self.player.shuffle;
             }
-            PlayTarget::Tracks { uris, index, shuffle } => {
+            PlayTarget::Tracks { uris, index, shuffle, .. } => {
                 *index = uris.iter().position(|u| u == &now.uri).map(|i| i as u32);
                 *shuffle = self.player.shuffle;
             }
@@ -6561,10 +6566,10 @@ impl App {
             Some(PlayTarget::Context { uri: ctx, .. }) if !self.queued_local.iter().any(|u| u == uri) => {
                 PlayTarget::Context { uri: ctx.clone(), track_uri: Some(uri.to_string()), index: None, shuffle }
             }
-            Some(PlayTarget::Tracks { uris, .. }) if uris.iter().any(|u| u == uri) => {
-                PlayTarget::Tracks { uris: uris.clone(), index: uris.iter().position(|u| u == uri).map(|p| p as u32), shuffle }
+            Some(PlayTarget::Tracks { uris, context, .. }) if uris.iter().any(|u| u == uri) => {
+                PlayTarget::Tracks { uris: uris.clone(), index: uris.iter().position(|u| u == uri).map(|p| p as u32), shuffle, context: context.clone() }
             }
-            _ => PlayTarget::Tracks { uris: rows.iter().skip(i).map(|t| t.uri.clone()).collect(), index: Some(0), shuffle },
+            _ => PlayTarget::Tracks { uris: rows.iter().skip(i).map(|t| t.uri.clone()).collect(), index: Some(0), shuffle, context: None },
         };
         self.play(target);
         // Saltar dentro de la cola no cambia el origen: se restaura EXACTAMENTE el que había
@@ -6607,7 +6612,7 @@ impl App {
         let Some(now) = self.player.now.clone() else { return };
         let keep = self.queued_local.clone();
         let pos = self.player.position();
-        self.play(PlayTarget::Tracks { uris: vec![now.uri.clone()], index: Some(0), shuffle: false });
+        self.play(PlayTarget::Tracks { uris: vec![now.uri.clone()], index: Some(0), shuffle: false, context: None });
         self.last_play_page = None;
         self.queued_local = keep.clone();
         self.pending_queue = Some((Instant::now() + Duration::from_millis(1500), Some(pos), keep));
@@ -6758,11 +6763,11 @@ impl App {
                 resume: Some(0),
                 first: None,
             },
-            _ => Cmd::LoadTracks { uris: vec![last.track_uri.clone()], index: Some(0), shuffle: false, resume: Some(0), first: None },
+            _ => Cmd::LoadTracks { uris: vec![last.track_uri.clone()], index: Some(0), shuffle: false, resume: Some(0), first: None, context: None },
         };
         self.last_play = match &last.context_uri {
             Some(uri) if !uri.is_empty() && uri != "-" => Some(PlayTarget::Context { uri: uri.clone(), track_uri: Some(last.track_uri.clone()), index: None, shuffle: self.player.shuffle }),
-            _ => Some(PlayTarget::Tracks { uris: vec![last.track_uri.clone()], index: Some(0), shuffle: false }),
+            _ => Some(PlayTarget::Tracks { uris: vec![last.track_uri.clone()], index: Some(0), shuffle: false, context: None }),
         };
         self.now_placeholder = false;
         self.restore_mark = true;
@@ -7037,12 +7042,12 @@ impl App {
                 resume: Some(pos),
                 first: None,
             },
-            None => Cmd::LoadTracks { uris: vec![item.uri.clone()], index: Some(0), shuffle: false, resume: Some(pos), first: None },
+            None => Cmd::LoadTracks { uris: vec![item.uri.clone()], index: Some(0), shuffle: false, resume: Some(pos), first: None, context: None },
         };
         if let Some(uri) = &ctx {
             self.last_play = Some(PlayTarget::Context { uri: uri.clone(), track_uri: Some(item.uri.clone()), index: None, shuffle });
         } else {
-            self.last_play = Some(PlayTarget::Tracks { uris: vec![item.uri.clone()], index: Some(0), shuffle: false });
+            self.last_play = Some(PlayTarget::Tracks { uris: vec![item.uri.clone()], index: Some(0), shuffle: false, context: None });
         }
         // La barra muestra ya la pista de la cuenta.
         let np = NowPlaying::from_track(&item);
@@ -7098,7 +7103,7 @@ impl App {
         } else {
             let mut uris = vec![info.track_uri.clone()];
             uris.extend(info.next.iter().filter(|u| !info.queue.contains(u)).cloned());
-            Cmd::LoadTracks { uris, index: Some(0), shuffle: false, resume: Some(pos), first: None }
+            Cmd::LoadTracks { uris, index: Some(0), shuffle: false, resume: Some(pos), first: None, context: None }
         };
         if let Cmd::LoadContext { uri, track_uri, index, shuffle, .. } = &cmd {
             self.last_play = Some(PlayTarget::Context { uri: uri.clone(), track_uri: track_uri.clone(), index: *index, shuffle: *shuffle });
@@ -7178,9 +7183,9 @@ impl App {
                 resume: Some(pos),
                 first: None,
             },
-            PlayTarget::Tracks { uris, index, shuffle } => {
+            PlayTarget::Tracks { uris, index, shuffle, context } => {
                 let index = uris.iter().position(|u| u == &saved.now.uri).map(|i| i as u32).or(index);
-                Cmd::LoadTracks { uris, index, shuffle, resume: Some(pos), first: None }
+                Cmd::LoadTracks { uris, index, shuffle, resume: Some(pos), first: None, context }
             }
         };
         self.backend.send(cmd);
@@ -7224,11 +7229,11 @@ impl App {
                 resume: Some(point.pos),
                 first: None,
             },
-            Some(PlayTarget::Tracks { uris, .. }) if uris.contains(&now.uri) => {
+            Some(PlayTarget::Tracks { uris, context, .. }) if uris.contains(&now.uri) => {
                 let index = uris.iter().position(|u| u == &now.uri).map(|i| i as u32);
-                Cmd::LoadTracks { uris, index, shuffle, resume: Some(point.pos), first: None }
+                Cmd::LoadTracks { uris, index, shuffle, resume: Some(point.pos), first: None, context }
             }
-            _ => Cmd::LoadTracks { uris: vec![now.uri.clone()], index: Some(0), shuffle: false, resume: Some(point.pos), first: None },
+            _ => Cmd::LoadTracks { uris: vec![now.uri.clone()], index: Some(0), shuffle: false, resume: Some(point.pos), first: None, context: None },
         };
         self.backend.send(cmd);
         let (context, track) = match self.player.repeat {
@@ -7722,7 +7727,8 @@ impl App {
             (None, Some(i)) => Some(*i),
             (None, None) => None,
         };
-        (!uris.is_empty()).then_some(Cmd::LoadTracks { uris, index, shuffle: *shuffle, resume: *resume, first: first.clone() })
+        // Con su contexto: el autoplay de después sigue saliendo de él.
+        (!uris.is_empty()).then_some(Cmd::LoadTracks { uris, index, shuffle: *shuffle, resume: *resume, first: first.clone(), context: Some(uri.clone()) })
     }
 
     /// La canción con la que empezará `t`, si ya la tenemos en pantalla (lista, álbum, cola,
@@ -7866,6 +7872,7 @@ impl App {
                     uris,
                     index,
                     shuffle,
+                    ..
                 } => {
                     if shuffle != self.player.shuffle {
                         self.api.send(Req::RemoteShuffle(shuffle));
@@ -7919,12 +7926,14 @@ impl App {
                     uris,
                     index,
                     shuffle,
+                    context,
                 } => Cmd::LoadTracks {
                     uris,
                     index,
                     shuffle,
                     resume: None,
                     first,
+                    context,
                 },
             };
             // Lo recién pedido manda sobre lo que sonaba si la conexión se cae antes de empezar.
@@ -8028,7 +8037,7 @@ impl App {
             // Aún no hay nada cargado en el reproductor: se reproduce la canción mostrada.
             if let Some(uri) = self.player.now.as_ref().map(|n| n.uri.clone()) {
                 self.now_placeholder = false;
-                self.play(PlayTarget::Tracks { uris: vec![uri], index: Some(0), shuffle: false });
+                self.play(PlayTarget::Tracks { uris: vec![uri], index: Some(0), shuffle: false, context: None });
                 return;
             }
         }

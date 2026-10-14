@@ -1028,7 +1028,7 @@ impl App {
                 let shuffle = self.player.shuffle;
                 self.actions.push(Action::Play(match ctx.clone() {
                     Some(c) => PlayTarget::Context { uri: c, track_uri: Some(uri.clone()), index: None, shuffle },
-                    None => PlayTarget::Tracks { uris: vec![uri.clone()], index: Some(0), shuffle },
+                    None => PlayTarget::Tracks { uris: vec![uri.clone()], index: Some(0), shuffle, context: None },
                 }));
             }
             r.context_menu(|ui| {
@@ -1687,7 +1687,7 @@ impl App {
         c.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if icons::round_button(ui, Icon::Play, 34.0, GREEN, Color32::BLACK).on_hover_text("Reproducir").clicked() {
-                self.actions.push(Action::Play(PlayTarget::Tracks { uris: uris.to_vec(), index: Some(i as u32), shuffle: false }));
+                self.actions.push(Action::Play(PlayTarget::Tracks { uris: uris.to_vec(), index: Some(i as u32), shuffle: false, context: None }));
             }
             let saved = self.saved_episodes.contains(&e.id);
             let (icon, color, tip) = if saved { (Icon::BookmarkFilled, GREEN, "Quitar de tus episodios") } else { (Icon::Bookmark, p.weak, "Guardar en tus episodios") };

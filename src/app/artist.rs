@@ -159,8 +159,10 @@ impl App {
         let top_uris: Vec<String> = page.top.iter().map(|t| t.uri.clone()).collect();
         let play = Rect::from_center_size(pos2(xr - 319.0, cy), vec2(41.0, 41.0));
         let mut c = child_in(ui, play, Layout::left_to_right(Align::Center));
-        if icons::round_button(&mut c, Icon::Play, 41.0, GREEN, Color32::BLACK).on_hover_text("Reproducir populares").clicked() && !top_uris.is_empty() {
-            self.actions.push(Action::Play(PlayTarget::Tracks { uris: top_uris.clone(), index: Some(0), shuffle: false }));
+        if icons::round_button(&mut c, Icon::Play, 41.0, GREEN, Color32::BLACK).on_hover_text("Reproducir").clicked() {
+            if let Some(t) = self.artist_play_target(id, page) {
+                self.actions.push(Action::Play(t));
+            }
         }
         self.follow_pill(ui, Rect::from_center_size(pos2(xr - 242.3, cy), vec2(86.0, 43.0)), "artist", id);
         let hid = ui.id().with(("artist_hero", id));
@@ -295,6 +297,41 @@ impl App {
         ui.painter().line_segment([pos2(row.min.x, sep_y), pos2(row.max.x, sep_y)], egui::Stroke::new(1.0, SEPARATOR));
     }
 
+    /// «Tus más escuchadas» de un artista, en el orden de la página: las 5 que más has escuchado
+    /// en Nanofy (registro local de reproducciones).
+    pub(crate) fn artist_mine(&self, id: &str) -> Vec<Track> {
+        let mut mine: Vec<(u32, Track)> = self
+            .play_log
+            .entries
+            .iter()
+            .filter(|e| e.track.artists.iter().any(|a| a.id.as_deref() == Some(id)))
+            .map(|e| (e.count, e.track.clone()))
+            .collect();
+        mine.sort_by(|a, b| b.0.cmp(&a.0));
+        mine.into_iter().take(5).map(|(_, t)| t).collect()
+    }
+
+    /// Lo que suena con el botón de reproducir del artista: primero «Tus más escuchadas» y luego
+    /// «Populares», cada una en el orden de la página (las populares que ya estaban entre las tuyas
+    /// no se repiten), y al acabarse el autoplay del artista. Sin nada suyo escuchado, solo las
+    /// populares. Antes sonaban solo las populares, como pistas sueltas: al acabarse no seguía
+    /// nada parecido.
+    pub(crate) fn artist_play_target(&self, id: &str, page: &super::ArtistPage) -> Option<PlayTarget> {
+        let mut uris: Vec<String> = self.artist_mine(id).into_iter().map(|t| t.uri).collect();
+        for t in &page.top {
+            if !uris.contains(&t.uri) {
+                uris.push(t.uri.clone());
+            }
+        }
+        (!uris.is_empty()).then(|| PlayTarget::Tracks {
+            uris,
+            index: Some(0),
+            // En orden, aunque el aleatorio esté activado (como pide el botón del artista).
+            shuffle: false,
+            context: Some(format!("spotify:artist:{id}")),
+        })
+    }
+
     fn artist_home(
         &mut self,
         ui: &mut egui::Ui,
@@ -312,22 +349,18 @@ impl App {
         let mut l = child_in(ui, Rect::from_min_size(top, vec2(left_w, f32::INFINITY)), Layout::top_down(Align::Min));
         l.set_width(left_w);
 
+        // Pulsar una canción de estas dos secciones sigue con las demás de la sección y luego con
+        // el autoplay del artista (ver `artist_play_target`).
+        let artist_uri = format!("spotify:artist:{id}");
+        let rows = RowOpts { source: Source::TracksIn(&artist_uri), ..RowOpts::tracks(true, false) };
+
         // Tus más escuchadas (registro local de reproducciones)
-        let mut mine: Vec<(u32, Track)> = self
-            .play_log
-            .entries
-            .iter()
-            .filter(|e| e.track.artists.iter().any(|a| a.id.as_deref() == Some(id)))
-            .filter(|e| matches(&e.track.name))
-            .map(|e| (e.count, e.track.clone()))
-            .collect();
-        mine.sort_by(|a, b| b.0.cmp(&a.0));
-        let mine: Vec<Track> = mine.into_iter().take(5).map(|(_, t)| t).collect();
+        let mine: Vec<Track> = self.artist_mine(id).into_iter().filter(|t| matches(&t.name)).collect();
         Self::section_title(&mut l, "Tus más escuchadas");
         if mine.is_empty() {
             l.label(RichText::new(format!("Todavía no has escuchado nada de {name} en Nanofy.")).small().color(p.weak));
         } else {
-            self.track_rows(&mut l, &format!("mine:{id}"), &mine, RowOpts::tracks(true, false));
+            self.track_rows(&mut l, &format!("mine:{id}"), &mine, rows);
         }
 
         // Populares
@@ -338,7 +371,7 @@ impl App {
                 Self::loading(&mut l, "Cargando");
             }
         } else {
-            self.track_rows(&mut l, &format!("top:{id}"), &popular, RowOpts::tracks(true, false));
+            self.track_rows(&mut l, &format!("top:{id}"), &popular, rows);
         }
 
         // Artistas relacionados

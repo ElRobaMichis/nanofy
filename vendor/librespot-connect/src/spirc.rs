@@ -1944,6 +1944,9 @@ impl SpircTask {
                     .await?
             }
             PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
+            PlayContext::TracksIn(uri, tracks) => {
+                self.load_context_from_tracks_in(Some(&uri), tracks)?
+            }
         }
         // Contexto resuelto (context-resolve, o la lista de pistas tal cual): aún no se ha pedido
         // nada al reproductor.
@@ -2146,11 +2149,21 @@ impl SpircTask {
     }
 
     fn load_context_from_tracks(&mut self, tracks: impl Into<ContextPage>) -> Result<(), Error> {
+        self.load_context_from_tracks_in(None, tracks)
+    }
+
+    /// Nanofy: las pistas como contexto `uri` (sin resolverlo), o el de la Web API si no hay.
+    fn load_context_from_tracks_in(
+        &mut self,
+        uri: Option<&str>,
+        tracks: impl Into<ContextPage>,
+    ) -> Result<(), Error> {
         const WEB_API_URI: &str = "spotify:web-api";
+        let uri = uri.unwrap_or(WEB_API_URI);
         let ctx = Context {
             // by providing values for uri/url the player in the official client's isn't frozen
-            uri: Some(WEB_API_URI.into()),
-            url: Some(format!("context://{WEB_API_URI}")),
+            uri: Some(uri.into()),
+            url: Some(format!("context://{uri}")),
             pages: vec![tracks.into()],
             ..Default::default()
         };
@@ -2860,7 +2873,7 @@ impl Drop for SpircTask {
 fn jam_play_json(command: &LoadRequest) -> Option<String> {
     let ctx = match &command.context {
         PlayContext::Uri(uri) => uri.clone(),
-        PlayContext::Tracks(_) => return None,
+        PlayContext::Tracks(_) | PlayContext::TracksIn(..) => return None,
     };
     let seek = command.options.seek_to;
     let skip_to = match &command.options.playing_track {

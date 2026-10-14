@@ -226,7 +226,7 @@ impl App {
                     if uris.is_empty() {
                         return err("hace falta context_uri o uris");
                     }
-                    PlayTarget::Tracks { uris, index, shuffle }
+                    PlayTarget::Tracks { uris, index, shuffle, context: s(cmd, "context").map(str::to_string) }
                 };
                 self.play(target);
                 ok()
@@ -1155,6 +1155,21 @@ impl App {
                 self.close_window(ctx);
                 ok()
             }
+            // El botón de reproducir de la página de un artista (ya cargada).
+            "artist_play" => match s(cmd, "id") {
+                Some(id) => match self.artists.get(id).and_then(|p| self.artist_play_target(id, p)) {
+                    Some(t) => {
+                        let out = match &t {
+                            PlayTarget::Tracks { uris, context, .. } => json!({"ok": true, "uris": uris, "context": context}),
+                            PlayTarget::Context { .. } => json!({"ok": true}),
+                        };
+                        self.play(t);
+                        out
+                    }
+                    None => err("el artista no está cargado (abre su página) o no tiene canciones"),
+                },
+                None => err("falta id"),
+            },
             _ => err(format!("operación desconocida: {op}")),
         }
     }
@@ -1426,7 +1441,7 @@ impl App {
             "muted": self.player.volume == 0,
             "last_play": self.last_play.as_ref().map(|t| match t {
                 PlayTarget::Context { uri, track_uri, index, shuffle } => json!({"context_uri": uri, "track_uri": track_uri, "index": index, "shuffle": shuffle}),
-                PlayTarget::Tracks { uris, index, shuffle } => json!({"uris": uris, "index": index, "shuffle": shuffle}),
+                PlayTarget::Tracks { uris, index, shuffle, context } => json!({"uris": uris, "index": index, "shuffle": shuffle, "context": context}),
             }),
         });
         // Aparte del json! de arriba, por su límite de recursión.

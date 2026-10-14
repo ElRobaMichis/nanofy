@@ -24,6 +24,9 @@ pub enum Source<'a> {
     Context(&'a str),
     /// Reproducir la lista tal cual (uris sueltas).
     Tracks,
+    /// La lista tal cual, como pistas del contexto `uri` (un artista): al acabarse, el autoplay
+    /// sigue con lo parecido a él.
+    TracksIn(&'a str),
 }
 
 /// Pistas a la vista de una lista (ver `App::filter_tracks`): todas, prestadas, o las que
@@ -85,6 +88,13 @@ impl<'a> RowOpts<'a> {
                 uris: tracks.iter().map(|t| t.uri.clone()).collect(),
                 index: Some(i as u32),
                 shuffle,
+                context: None,
+            },
+            Source::TracksIn(uri) => PlayTarget::Tracks {
+                uris: tracks.iter().map(|t| t.uri.clone()).collect(),
+                index: Some(i as u32),
+                shuffle,
+                context: Some(uri.to_string()),
             },
         }
     }
@@ -559,6 +569,7 @@ impl App {
                 uris: all.iter().map(|t| t.uri.clone()).collect(),
                 index: if shuffle { None } else { Some(0) },
                 shuffle,
+                context: None,
             },
         };
         let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), BAR_BUTTONS_H), Sense::hover());
@@ -702,7 +713,7 @@ impl App {
                     egui::Popup::menu(&more).show(|ui| {
                         ui.set_min_width(200.0);
                         if Self::menu_item(ui, Some(Icon::Play), "Reproducir la selección", false).clicked() {
-                            self.actions.push(Action::Play(PlayTarget::Tracks { uris: uris.clone(), index: Some(0), shuffle: false }));
+                            self.actions.push(Action::Play(PlayTarget::Tracks { uris: uris.clone(), index: Some(0), shuffle: false, context: None }));
                             ui.close();
                         }
                         if Self::menu_item(ui, Some(Icon::Check), "Seleccionar todo", false).clicked() {
@@ -794,7 +805,7 @@ impl App {
             // Las pistas de un álbum no traen su álbum: se toma del contexto de la página.
             album_id: match opts.source {
                 Source::Context(u) => u.strip_prefix("spotify:album:").map(|s| s.to_string()),
-                Source::Tracks => None,
+                Source::Tracks | Source::TracksIn(_) => None,
             },
             remove_from: opts.editable_playlist.map(|s| s.to_string()),
             row: (list_id.to_string(), i),

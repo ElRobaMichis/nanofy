@@ -2433,6 +2433,22 @@ impl SpircTask {
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
         let continue_playing = self.connect_state.is_playing();
 
+        // Nanofy: la pedida (un toque en la cola de otro dispositivo) tiene que ser la actual o
+        // estar, disponible, entre las que `next_track` irá sacando (`next_reaches`). Si no (una
+        // vista vieja de la cola, otro contexto, una que se quitó por no disponible), el bucle de
+        // abajo no la alcanzaba nunca y no salía: se vaciaba la cola o, con el contexto en
+        // repetición, le daba vueltas sin fin. Sin un solo `await`, la tarea de Spirc se quedaba
+        // así para siempre, ocupando un hilo del runtime. Se salta a la siguiente, como sin
+        // canción pedida.
+        let track_uri = track_uri.filter(|uri| {
+            let reachable = self.connect_state.current_track(|t| &t.uri) == uri
+                || self.connect_state.next_reaches(uri);
+            if !reachable {
+                warn!("se pidió saltar a {uri}, que no está en la cola: se salta a la siguiente");
+            }
+            reachable
+        });
+
         // Nanofy: sin nada más que sonar, pero con más canciones por llegar (el autoplay o la
         // página siguiente del DJ, pedidos ahora si aún no se habían pedido, o algo a la espera de
         // su reintento): se esperan en vez de dar la lista por acabada.

@@ -378,6 +378,16 @@ impl<'ct> ConnectState {
             .any(|t| !t.uid.starts_with(IDENTIFIER_DELIMITER) && !t.is_unavailable())
     }
 
+    /// Nanofy: ¿llegaría `next_track`, sacando una tras otra, a esta canción? Solo si ya está entre
+    /// las siguientes, sin ser una marca de fin de contexto ni estar no disponible (esas se
+    /// saltan). El relleno solo añade al final y nunca quita nada, así que llega como mucho en
+    /// tantos pasos como su posición más uno; lo que no está ahí puede no llegar nunca.
+    pub fn next_reaches(&self, uri: &str) -> bool {
+        self.next_tracks().iter().any(|t| {
+            t.uri == uri && !t.uid.starts_with(IDENTIFIER_DELIMITER) && !t.is_unavailable()
+        })
+    }
+
     pub fn recent_track_uris(&self) -> Vec<String> {
         let mut prev = self
             .prev_tracks()

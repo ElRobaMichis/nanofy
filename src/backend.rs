@@ -612,18 +612,38 @@ impl Active {
     /// del dispositivo en el servidor (y con él la sesión), así que al cerrar la app solo se
     /// desconecta; el borrado se reserva para cerrar sesión.
     async fn stop(self, keep_session: bool) {
-        if keep_session {
-            let _ = self.spirc.disconnect(true);
-            // Tiempo para que Spirc envíe la posición y el estado «inactivo» (una petición).
-            // Al cerrar la app el límite lo pone on_exit (unos 40 ms); al cerrar sesión o
-            // reconectar hay más margen.
-            tokio::time::sleep(Duration::from_millis(if self.fast_stop { 20 } else { 350 })).await;
+        let alive = !self.session.is_invalid();
+        let delivered = if keep_session {
+            self.spirc.disconnect(true).is_ok()
         } else {
-            let _ = self.spirc.shutdown();
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.spirc.shutdown().is_ok()
+        };
+        let wait = farewell_wait(keep_session, self.fast_stop, alive, delivered);
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
         }
+        // Las claves de audio que esperaba el reproductor acaban aquí (ver
+        // `AudioKeyManager::shutdown`): al soltarlo justo después no queda ninguna carga
+        // esperando a una sesión que ya no contesta.
         self.session.shutdown();
     }
+}
+
+/// Lo que se espera tras pedir a Spirc que se despida, antes de cerrar la sesión: tiempo para que
+/// envíe la posición y el estado «inactivo» (una petición). Al cerrar la app el límite lo pone
+/// on_exit (unos 40 ms); al cerrar sesión o reconectar hay más margen. Nada si no hay a quién
+/// esperar: con la sesión ya caída (el AP se cortó o enmudeció) cerrarla otra vez no cambia nada
+/// y Spirc se despide a su ritmo, y si la orden no le llegó es que su tarea ya terminó. Antes se
+/// esperaban 350 ms igual en cada reconexión, con el audio ya cortado.
+fn farewell_wait(keep_session: bool, fast_stop: bool, session_alive: bool, delivered: bool) -> Duration {
+    if !session_alive || !delivered {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(match (keep_session, fast_stop) {
+        (false, _) => 10,
+        (true, true) => 20,
+        (true, false) => 350,
+    })
 }
 
 /// Volumen de la interfaz frente al que ya tiene Spirc. Antes de cada carga se activa el
@@ -1870,6 +1890,28 @@ mod tests {
 
     fn with_level(l: Loudness) -> Settings {
         Settings { loudness: l, ..Settings::default() }
+    }
+
+    /// La despedida a Spotify antes de cerrar la sesión: con la sesión viva y Spirc atendiendo, lo
+    /// de siempre; con la sesión ya caída o la tarea de Spirc terminada, ni un milisegundo (antes,
+    /// 350 ms más de corte en cada reconexión).
+    #[test]
+    fn despedida_solo_si_hay_a_quien_esperar() {
+        let ms = Duration::from_millis;
+        // Sesión viva y orden entregada.
+        assert_eq!(farewell_wait(true, false, true, true), ms(350));
+        assert_eq!(farewell_wait(true, true, true, true), ms(20));
+        assert_eq!(farewell_wait(false, false, true, true), ms(10));
+        assert_eq!(farewell_wait(false, true, true, true), ms(10));
+        // Sesión caída (AP cortado o mudo), en cualquier caso.
+        for keep in [true, false] {
+            for fast in [true, false] {
+                assert_eq!(farewell_wait(keep, fast, false, true), Duration::ZERO);
+                // La tarea de Spirc ya había terminado (la orden no llegó).
+                assert_eq!(farewell_wait(keep, fast, true, false), Duration::ZERO);
+                assert_eq!(farewell_wait(keep, fast, false, false), Duration::ZERO);
+            }
+        }
     }
 
     /// Los niveles de Spotify traducidos a librespot: Normal y Bajo sin limitador (Bajo, −5 dB),

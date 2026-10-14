@@ -9,7 +9,7 @@ use std::{
     process::exit,
     sync::Mutex,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
@@ -40,6 +40,7 @@ use crate::{
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
     narration::{NarrationRequest, Narrations, Step},
+    thread_join,
 };
 use futures_util::{
     FutureExt, StreamExt, future::FusedFuture,
@@ -71,6 +72,15 @@ const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 
 const LOAD_HANDLES_POISON_MSG: &str = "load handles mutex should not be poisoned";
 
+/// Al soltar el reproductor (cerrar, reconectar, «Reiniciar»), lo que se espera a sus hilos de
+/// carga, ya abandonados (ver `PlayerInternal::drop`). Los que sigan están en una espera síncrona
+/// (una lectura de la CDN, hasta `download_timeout`): terminan solos, sin retener a nadie.
+const LOADERS_JOIN_GRACE: Duration = Duration::from_millis(200);
+/// Lo que `Player::drop` espera al hilo del reproductor (soltar la salida de audio y sus cargas).
+/// Se le suelta desde un hilo del runtime del backend: sin plazo, un hilo atascado retenía la
+/// reconexión, el cierre de la sesión y lo demás que corre en ese runtime de dos hilos.
+const PLAYER_JOIN_WAIT: Duration = Duration::from_millis(1000);
+
 pub type PlayerResult = Result<(), Error>;
 
 pub struct Player {
@@ -92,6 +102,12 @@ struct PlayerInternal {
     config: PlayerConfig,
     commands: mpsc::UnboundedReceiver<PlayerCommand>,
     load_handles: Arc<Mutex<HashMap<thread::ThreadId, thread::JoinHandle<()>>>>,
+    /// El runtime en el que corre este reproductor (lo tiene su hilo). Cada hilo de carga se lleva
+    /// una referencia fuerte: si sigue vivo cuando el reproductor ya se soltó, el runtime no se
+    /// cierra debajo de él (sus temporizadores entrarían en pánico, y en la versión publicada un
+    /// pánico cierra la app). Débil aquí: este futuro corre dentro de ese runtime y no debe ser
+    /// quien lo suelte.
+    runtime: Weak<tokio::runtime::Runtime>,
 
     state: PlayerState,
     preload: PlayerPreload,
@@ -958,11 +974,17 @@ impl Player {
                 create_local_file_lookup(config.local_file_directories.as_slice());
             let crossfader = Crossfader::new(mix_limiter(&config));
 
+            // While PlayerInternal is written as a future, it still contains blocking code.
+            // It must be run by using block_on() in a dedicated thread.
+            let runtime =
+                Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+
             let internal = PlayerInternal {
                 session,
                 config,
                 commands: cmd_rx,
                 load_handles: Arc::new(Mutex::new(HashMap::new())),
+                runtime: Arc::downgrade(&runtime),
 
                 state: PlayerState::Stopped,
                 preload: PlayerPreload::None,
@@ -1002,12 +1024,11 @@ impl Player {
                 local_file_lookup: Arc::new(local_file_lookup),
             };
 
-            // While PlayerInternal is written as a future, it still contains blocking code.
-            // It must be run by using block_on() in a dedicated thread.
-            let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
             runtime.block_on(internal);
 
             debug!("PlayerInternal thread finished.");
+            // Aquí se suelta `runtime`; si queda alguna carga que no terminó en su plazo, se
+            // cierra cuando termine la última (ver `PlayerInternal::runtime`).
         });
 
         Arc::new(Self {
@@ -1223,8 +1244,17 @@ impl Drop for Player {
         debug!("Shutting down player thread ...");
         self.commands = None;
         if let Some(handle) = self.thread_handle.take() {
-            if let Err(e) = handle.join() {
-                error!("Player thread Error: {e:?}");
+            // Con plazo: normalmente termina en milisegundos (suelta la salida y sus cargas); si
+            // está en una espera síncrona (una lectura de la CDN sin red), sigue solo y termina al
+            // volver de ella: sin órdenes, su bucle acaba en la vuelta siguiente, y su runtime y la
+            // salida de audio son suyos.
+            match thread_join::join_by(handle, Instant::now() + PLAYER_JOIN_WAIT) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => error!("Player thread Error: {e:?}"),
+                None => warn!(
+                    "el hilo del reproductor no terminó en {} ms; termina solo",
+                    PLAYER_JOIN_WAIT.as_millis()
+                ),
             }
         }
     }
@@ -4783,6 +4813,9 @@ impl PlayerInternal {
 
         let load_handles_clone = self.load_handles.clone();
         let handle = tokio::runtime::Handle::current();
+        // Ver `PlayerInternal::runtime`: si al soltar el reproductor esta carga no termina a
+        // tiempo, sigue sola, y el runtime que usa tiene que seguir vivo hasta que acabe.
+        let keep_runtime = self.runtime.upgrade();
 
         let load_handle = thread::spawn(move || {
             let mut result_tx = result_tx;
@@ -4812,8 +4845,13 @@ impl PlayerInternal {
                 None => debug!("Track load abandoned: nobody is waiting for it any more"),
             }
 
-            let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
-            load_handles.remove(&thread::current().id());
+            load_handles_clone
+                .lock()
+                .expect(LOAD_HANDLES_POISON_MSG)
+                .remove(&thread::current().id());
+            // Lo último, ya fuera de `block_on`: si el reproductor se soltó mientras tanto, esta
+            // es la última referencia y el runtime se cierra aquí (no puede cerrarse dentro).
+            drop(keep_runtime);
         });
 
         let mut load_handles = self.load_handles.lock().expect(LOAD_HANDLES_POISON_MSG);
@@ -4855,10 +4893,17 @@ impl PlayerInternal {
 impl Drop for PlayerInternal {
     fn drop(&mut self) {
         debug!("drop PlayerInternal[{}]", self.player_id);
-        // Lo preparado por adelantado ya no lo va a pedir nadie: soltarlo antes de esperar a los
-        // hilos de carga deja que el suyo se abandone en su próxima espera, en vez de terminar
-        // (hasta 10 s con una CDN que no contesta) mientras se cierra o se reconecta.
+        // Ninguna carga la va a recoger ya nadie: soltar sus receptores (lo preparado por
+        // adelantado, la precarga y la carga en curso) antes de esperar a los hilos hace que cada
+        // uno se abandone en su próxima espera (`result_tx.closed()`), también a mitad de los
+        // reintentos de una clave. Antes solo se soltaba `warm`: con el AP mudo, la carga de la
+        // siguiente canción y su precarga se esperaban hasta agotar sus tres intentos (6,5 s),
+        // y con ellas la reconexión, el cierre de la sesión o la salida de la app.
         self.warm = PlayerPreload::None;
+        self.preload = PlayerPreload::None;
+        if matches!(self.state, PlayerState::Loading { .. }) {
+            self.state = PlayerState::Stopped;
+        }
 
         let handles: Vec<thread::JoinHandle<()>> = {
             // waiting for the thread while holding the mutex would result in a deadlock
@@ -4870,8 +4915,19 @@ impl Drop for PlayerInternal {
                 .collect()
         };
 
-        for handle in handles {
-            let _ = handle.join();
+        // Con plazo: una carga en una espera síncrona (lectura de la CDN) no se entera hasta que
+        // vuelve de ella. Esa sigue sola con su propia referencia al runtime (`runtime`).
+        let deadline = Instant::now() + LOADERS_JOIN_GRACE;
+        let left = handles
+            .into_iter()
+            .map(|handle| thread_join::join_by(handle, deadline))
+            .filter(Option::is_none)
+            .count();
+        if left > 0 {
+            warn!(
+                "{left} carga(s) sin terminar al soltar el reproductor [{}]; terminan solas",
+                self.player_id
+            );
         }
     }
 }

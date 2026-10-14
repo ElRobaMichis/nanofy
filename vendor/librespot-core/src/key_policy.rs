@@ -52,6 +52,27 @@ pub async fn with_retries<T, E, F, Fut>(
     attempts: u32,
     delay: Duration,
     classify: impl Fn(&E) -> Attempt,
+    request: F,
+) -> Result<T, E>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    with_retries_until(attempts, delay, classify, || false, request).await
+}
+
+/// Cada cuánto mira `with_retries_until` si hay que dejarlo durante la espera entre intentos.
+const ABORT_POLL: Duration = Duration::from_millis(50);
+
+/// Como `with_retries`, pero sin más intentos en cuanto `stop()` diga que ya no tiene sentido
+/// (la sesión se cerró): se devuelve el último error, sin terminar la espera. Antes, con la
+/// sesión ya caída, una clave seguía sus tres intentos (6,5 s sin respuesta) y retenía la carga,
+/// y con ella el cierre del reproductor viejo en cada reconexión y la salida de la app.
+pub async fn with_retries_until<T, E, F, Fut>(
+    attempts: u32,
+    delay: Duration,
+    classify: impl Fn(&E) -> Attempt,
+    stop: impl Fn() -> bool,
     mut request: F,
 ) -> Result<T, E>
 where
@@ -71,7 +92,7 @@ where
             Err(e) => {
                 n += 1;
                 let kind = classify(&e);
-                if n >= attempts || !retryable(kind) {
+                if n >= attempts || !retryable(kind) || stop() {
                     return Err(e);
                 }
                 log::warn!(
@@ -79,7 +100,20 @@ where
                     n + 1,
                     delay.as_millis()
                 );
-                tokio::time::sleep(delay).await;
+                // A trozos: el cierre de la sesión no avisa, y esperar el segundo entero solo
+                // para rendirse después retrasaría lo mismo que se quiere evitar.
+                let until = tokio::time::Instant::now() + delay;
+                loop {
+                    let now = tokio::time::Instant::now();
+                    if now >= until {
+                        break;
+                    }
+                    tokio::time::sleep((until - now).min(ABORT_POLL)).await;
+                    if stop() {
+                        log::info!("Clave de audio: la sesión se cerró; sin más intentos");
+                        return Err(e);
+                    }
+                }
             }
         }
     }
@@ -292,6 +326,64 @@ mod tests {
         assert_eq!(r, Ok(()));
         // Dos esperas de 30 ms entre los tres intentos.
         assert!(t0.elapsed() >= ms(60), "{:?}", t0.elapsed());
+    }
+
+    #[tokio::test]
+    async fn con_la_sesion_cerrada_no_hay_mas_intentos() {
+        // Cerrada antes del primer fallo: ese fallo se devuelve sin esperar ni reintentar.
+        let intentos = Cell::new(0);
+        let t0 = Instant::now();
+        let r: Result<(), Fallo> = with_retries_until(ATTEMPTS, Duration::from_secs(10), clasifica, || true, |_| {
+            intentos.set(intentos.get() + 1);
+            async { Err(Fallo::SinRespuesta) }
+        })
+        .await;
+        assert_eq!(r, Err(Fallo::SinRespuesta));
+        assert_eq!(intentos.get(), 1);
+        assert!(t0.elapsed() < ms(1000), "{:?}", t0.elapsed());
+    }
+
+    #[tokio::test]
+    async fn el_cierre_durante_la_espera_corta_la_espera() {
+        // La sesión se cierra a los 100 ms de una espera de 10 s entre intentos: se deja ahí, sin
+        // terminar la espera ni pedir otra vez.
+        let cerrada = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = cerrada.clone();
+        let cierre = std::thread::spawn(move || {
+            std::thread::sleep(ms(100));
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let intentos = Cell::new(0);
+        let t0 = Instant::now();
+        let r: Result<(), Fallo> = with_retries_until(
+            ATTEMPTS,
+            Duration::from_secs(10),
+            clasifica,
+            || cerrada.load(std::sync::atomic::Ordering::Relaxed),
+            |_| {
+                intentos.set(intentos.get() + 1);
+                async { Err(Fallo::Codigo(TRANSIENT_DENIAL)) }
+            },
+        )
+        .await;
+        cierre.join().unwrap();
+        assert_eq!(r, Err(Fallo::Codigo(TRANSIENT_DENIAL)));
+        assert_eq!(intentos.get(), 1);
+        let tardado = t0.elapsed();
+        assert!(tardado >= ms(100) && tardado < ms(2000), "{tardado:?}");
+    }
+
+    #[tokio::test]
+    async fn sin_cierre_se_comporta_como_siempre() {
+        let intentos = Cell::new(0);
+        let r = with_retries_until(ATTEMPTS, ms(1), clasifica, || false, |n| {
+            intentos.set(intentos.get() + 1);
+            let r = if n < 2 { Err(Fallo::SinRespuesta) } else { Ok(5u8) };
+            async move { r }
+        })
+        .await;
+        assert_eq!(r, Ok(5));
+        assert_eq!(intentos.get(), 3);
     }
 
     #[test]

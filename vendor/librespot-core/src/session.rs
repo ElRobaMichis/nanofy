@@ -302,6 +302,22 @@ impl Session {
 
         tokio::spawn(DispatchTask::new(self.weak(), stream));
 
+        // Pruebas (`NANOFY_FAULT=ap_drop:<ms>`): el enlace con el AP se corta de golpe ese tiempo
+        // después, con lo mismo que un error de lectura (ver `DispatchTask::poll`).
+        if let Some((after, every)) = crate::fault::ap_drop_after() {
+            let weak = self.weak();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                if let Some(session) = weak.try_upgrade() {
+                    if !session.is_invalid() && crate::fault::ap_drop_claim(every) {
+                        error!("NANOFY_FAULT: el enlace con el AP se corta (ConnectionReset)");
+                        error!("Connection to server closed.");
+                        session.shutdown();
+                    }
+                }
+            });
+        }
+
         Ok(())
     }
 
@@ -752,6 +768,9 @@ pin_project! {
         stream: S,
         #[pin]
         timeout: Sleep,
+        // Para las pruebas (`NANOFY_FAULT=ap_silent`): qué sesión es y desde cuándo.
+        fault_id: u64,
+        started: std::time::Instant,
     }
 
     impl<S> PinnedDrop for DispatchTask<S>
@@ -774,6 +793,8 @@ where
             keep_alive_state: KeepAliveState::ExpectingPing,
             stream,
             timeout: sleep(INITIAL_PING_TIMEOUT),
+            fault_id: crate::fault::next_session_id(),
+            started: std::time::Instant::now(),
         }
     }
 
@@ -930,6 +951,11 @@ where
         loop {
             match self.as_mut().project().stream.try_poll_next(cx) {
                 Poll::Ready(Some(Ok((cmd, data)))) => {
+                    // Pruebas (`NANOFY_FAULT=ap_silent`): lo que llega se pierde, como con un
+                    // enlace muerto sin aviso (no hay Ping, ni respuestas de claves).
+                    if crate::fault::ap_silent(self.fault_id, self.started) {
+                        continue;
+                    }
                     let result = self.as_mut().dispatch(&session, cmd, data);
                     if let Err(e) = result {
                         debug!("could not dispatch command: {e}");

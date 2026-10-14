@@ -635,7 +635,8 @@ async fn connect(
 
                 sleep(PING_TIMEOUT).await;
 
-                if !pong_received.load(atomic::Ordering::SeqCst) {
+                // Pruebas (`NANOFY_FAULT=dealer_nopong`): un pong que no llega.
+                if !pong_received.load(atomic::Ordering::SeqCst) || crate::fault::dealer_skip_pong() {
                     // No response
                     warn!("Websocket peer does not respond.");
                     break;

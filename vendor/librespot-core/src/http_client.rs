@@ -203,6 +203,13 @@ impl HttpClient {
             }
         }
 
+        // Pruebas (`NANOFY_FAULT=spclient_err:<trozo>:<n>`): la petición falla como un error de
+        // red (conexión cortada mientras iba).
+        if crate::fault::spclient_error(req.uri().path()) {
+            warn!("NANOFY_FAULT: {} falla (conexión cortada)", req.uri().path());
+            return Err(Error::unknown("NANOFY_FAULT: conexión cortada"));
+        }
+
         // `Request` does not implement `Clone` because its `Body` may be a single-shot stream.
         // As correct as that may be technically, we now need all this boilerplate to clone it
         // ourselves, as any `Request` is moved in the loop.

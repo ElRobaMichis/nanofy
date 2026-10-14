@@ -21,6 +21,18 @@
 //!   (300 peticiones cada 30 s) aparece agotado, como tras cargar una biblioteca grande.
 //! - `no_output`: no hay ninguna salida de audio. `no_output:<ms>`: vuelve a haberla ese tiempo
 //!   después del primer intento de abrirla.
+//! - `ap_drop:<ms>`: una vez por proceso, el enlace con el punto de acceso (AP) se corta de golpe
+//!   `<ms>` después de abrirse la sesión, como un `ConnectionReset` (Wi-Fi que se va, NAT que
+//!   olvida la conexión): la sesión queda inválida. `ap_drop_every:<ms>`: en cada sesión.
+//! - `ap_silent:<ms>`: una vez por proceso, desde `<ms>` tras abrirse la sesión no llega nada del AP
+//!   (ni Ping ni respuestas de claves): muere en silencio y solo se nota al pedirle algo o cuando
+//!   vence la espera del Ping.
+//! - `dealer_nopong:<ms>`: una vez, el primer ping del dealer (websocket) tras `<ms>` se queda sin
+//!   pong, como un corte de unos segundos: el dealer se reconecta y Spirc vuelve a registrarse.
+//! - `spclient_err:<trozo>:<n>` (o `…:<n>@<saltar>`): tras dejar pasar `<saltar>` peticiones HTTP
+//!   cuya ruta contiene `<trozo>`, las `<n>` siguientes fallan como un error de red
+//!   (`autoplay`, `lexicon`, `connect-state`…). Con `…:<n>@t<ms>`, las `<n>` primeras desde
+//!   `<ms>` después de arrancar.
 //!
 //! Como `ttfs`, no usa nada del resto del crate, para que sus pruebas corran en el binario.
 
@@ -112,6 +124,12 @@ pub struct Spec {
     pub limiter_exhaust: bool,
     /// `Some(None)`: nunca hay salida; `Some(Some(d))`: vuelve a haberla tras `d`.
     pub no_output: Option<Option<Duration>>,
+    /// (tras cuánto de abrirse la sesión, en cada sesión).
+    pub ap_drop: Option<(Duration, bool)>,
+    pub ap_silent: Option<Duration>,
+    pub dealer_nopong: Option<Duration>,
+    /// (trozo de la ruta, cuántas fallan, cuántas se dejan pasar antes, desde cuándo).
+    pub spclient_err: Vec<(String, u32, u32, Option<Duration>)>,
 }
 
 impl Spec {
@@ -168,6 +186,24 @@ pub fn parse(s: &str) -> (Spec, Vec<String>) {
                 true
             }
             ("no_output", Some(v)) => parse_ms(v).map(|d| spec.no_output = Some(Some(d))).is_some(),
+            ("ap_drop", Some(v)) => parse_ms(v).map(|d| spec.ap_drop = Some((d, false))).is_some(),
+            ("ap_drop_every", Some(v)) => parse_ms(v).map(|d| spec.ap_drop = Some((d, true))).is_some(),
+            ("ap_silent", Some(v)) => parse_ms(v).map(|d| spec.ap_silent = Some(d)).is_some(),
+            ("dealer_nopong", Some(v)) => parse_ms(v).map(|d| spec.dealer_nopong = Some(d)).is_some(),
+            ("spclient_err", Some(v)) => {
+                let entry = v.rsplit_once(':').and_then(|(endpoint, n)| {
+                    let (n, skip, after) = match n.split_once('@') {
+                        Some((n, at)) => match at.trim().strip_prefix('t') {
+                            Some(ms) => (n.trim().parse::<u32>().ok()?, 0, Some(parse_ms(ms)?)),
+                            None => (n.trim().parse::<u32>().ok()?, at.trim().parse::<u32>().ok()?, None),
+                        },
+                        None => (n.trim().parse::<u32>().ok()?, 0, None),
+                    };
+                    let endpoint = endpoint.trim();
+                    (!endpoint.is_empty() && n > 0).then(|| (endpoint.to_string(), n, skip, after))
+                });
+                entry.map(|e| spec.spclient_err.push(e)).is_some()
+            }
             _ => false,
         };
         if !ok {
@@ -198,6 +234,12 @@ pub fn output_missing(
     }
 }
 
+/// Cuál de las peticiones con ese trozo falla: `saltar` primero pasan, luego fallan `n`. `seen` es
+/// cuántas ya se vieron antes de esta.
+pub fn err_hits(n: u32, skip: u32, seen: u32) -> bool {
+    seen >= skip && seen < skip.saturating_add(n)
+}
+
 struct Faults {
     raw: String,
     spec: Spec,
@@ -206,6 +248,13 @@ struct Faults {
     stall_started: Mutex<Option<Instant>>,
     limiter_armed: AtomicBool,
     no_output_since: Mutex<Option<Instant>>,
+    created: Instant,
+    ap_drop_fired: AtomicBool,
+    /// La sesión (número de `next_session_id`) que se quedó muda; 0: ninguna aún.
+    ap_silent_session: AtomicU64,
+    dealer_nopong_fired: AtomicBool,
+    /// Peticiones vistas por cada entrada de `spclient_err`.
+    spclient_err_seen: Mutex<Vec<u32>>,
 }
 
 static FAULTS: OnceLock<Option<Faults>> = OnceLock::new();
@@ -233,10 +282,15 @@ fn get() -> Option<&'static Faults> {
                 raw: raw.to_string(),
                 key_err_left: AtomicU32::new(spec.key_err),
                 key_timeout_left: AtomicU32::new(spec.key_timeout),
+                spclient_err_seen: Mutex::new(vec![0; spec.spclient_err.len()]),
                 spec,
                 stall_started: Mutex::new(None),
                 limiter_armed: AtomicBool::new(false),
                 no_output_since: Mutex::new(None),
+                created: Instant::now(),
+                ap_drop_fired: AtomicBool::new(false),
+                ap_silent_session: AtomicU64::new(0),
+                dealer_nopong_fired: AtomicBool::new(false),
             })
         })
         .as_ref()
@@ -319,6 +373,84 @@ pub fn no_output() -> bool {
         injected();
     }
     missing
+}
+
+/// Número para cada sesión con el AP (para `ap_silent`), desde 1.
+pub fn next_session_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Si hay que cortar el enlace con el AP de una sesión: tras cuánto de abrirse. Con `ap_drop` solo
+/// la primera sesión que llega a ese tiempo (`ap_drop_claim`); con `ap_drop_every`, todas.
+pub fn ap_drop_after() -> Option<(Duration, bool)> {
+    get()?.spec.ap_drop
+}
+
+/// La sesión que llegó al corte: ¿le toca? (`ap_drop` una sola vez por proceso).
+pub fn ap_drop_claim(every: bool) -> bool {
+    let Some(f) = get() else { return false };
+    let hit = every || !f.ap_drop_fired.swap(true, Ordering::Relaxed);
+    if hit {
+        injected();
+    }
+    hit
+}
+
+/// ¿Está muda la sesión `id`, abierta en `started`? La primera que pasa del tiempo de `ap_silent`
+/// se queda muda para siempre; las demás, nunca.
+pub fn ap_silent(id: u64, started: Instant) -> bool {
+    let Some(f) = get() else { return false };
+    let Some(after) = f.spec.ap_silent else { return false };
+    let claimed = f.ap_silent_session.load(Ordering::Relaxed);
+    if claimed != 0 {
+        return claimed == id;
+    }
+    if started.elapsed() < after {
+        return false;
+    }
+    let won = f
+        .ap_silent_session
+        .compare_exchange(0, id, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
+    if won {
+        injected();
+        log::warn!("NANOFY_FAULT: el enlace con el AP se queda mudo (no llega nada más)");
+    }
+    won
+}
+
+/// ¿Se ignora el pong de este ping del dealer? Solo el primero tras el tiempo de `dealer_nopong`.
+pub fn dealer_skip_pong() -> bool {
+    let Some(f) = get() else { return false };
+    let Some(after) = f.spec.dealer_nopong else { return false };
+    if f.created.elapsed() < after || f.dealer_nopong_fired.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    injected();
+    log::warn!("NANOFY_FAULT: el ping del dealer se queda sin pong");
+    true
+}
+
+/// ¿Debe fallar esta petición HTTP (`spclient_err`)?
+pub fn spclient_error(path: &str) -> bool {
+    let Some(f) = get() else { return false };
+    if f.spec.spclient_err.is_empty() {
+        return false;
+    }
+    let mut seen = f.spclient_err_seen.lock().unwrap_or_else(|e| e.into_inner());
+    let mut hit = false;
+    for (k, (endpoint, n, skip, after)) in f.spec.spclient_err.iter().enumerate() {
+        // Con hora de empezar, las de antes ni cuentan.
+        if path.contains(endpoint.as_str()) && after.is_none_or(|a| f.created.elapsed() >= a) {
+            hit |= err_hits(*n, *skip, seen[k]);
+            seen[k] += 1;
+        }
+    }
+    if hit {
+        injected();
+    }
+    hit
 }
 
 /// ¿Hay un corte de la CDN simulado? Para que el reproductor no compruebe nada más en cada lectura.
@@ -502,6 +634,38 @@ mod tests {
         assert_eq!(since, Some(t0));
         assert!(output_missing(vuelve, &mut since, t0 + ms(2999)));
         assert!(!output_missing(vuelve, &mut since, t0 + ms(3000)));
+    }
+
+    #[test]
+    fn fallos_de_red() {
+        let (spec, bad) = parse(
+            "ap_drop:60000,ap_silent:30000,dealer_nopong:45000,spclient_err:autoplay:2,\
+             spclient_err:connect-state:3@1,spclient_err:lexicon-session-provider/context-resolve:1",
+        );
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(spec.ap_drop, Some((ms(60_000), false)));
+        assert_eq!(spec.ap_silent, Some(ms(30_000)));
+        assert_eq!(spec.dealer_nopong, Some(ms(45_000)));
+        assert_eq!(
+            spec.spclient_err,
+            vec![
+                ("autoplay".to_string(), 2, 0, None),
+                ("connect-state".to_string(), 3, 1, None),
+                ("lexicon-session-provider/context-resolve".to_string(), 1, 0, None)
+            ]
+        );
+        assert_eq!(
+            parse("spclient_err:connect-state:3@t40000").0.spclient_err,
+            vec![("connect-state".to_string(), 3, 0, Some(ms(40_000)))]
+        );
+        assert_eq!(parse("spclient_err:x:1@t0").1, ["spclient_err:x:1@t0"]);
+        assert_eq!(parse("ap_drop_every:5000").0.ap_drop, Some((ms(5000), true)));
+        let (_, bad) = parse("ap_drop:0,ap_silent,spclient_err:autoplay,spclient_err::2,spclient_err:x:0,spclient_err:x:1@y");
+        assert_eq!(bad.len(), 6, "{bad:?}");
+        // Dejar pasar 1 y fallar 3: la 1.ª pasa, de la 2.ª a la 4.ª fallan, luego pasan.
+        let hits: Vec<bool> = (0..6).map(|seen| err_hits(3, 1, seen)).collect();
+        assert_eq!(hits, [false, true, true, true, false, false]);
+        assert!(err_hits(2, 0, 0) && err_hits(2, 0, 1) && !err_hits(2, 0, 2));
     }
 
     #[test]

@@ -87,10 +87,33 @@ impl LoadWatchdog {
         }
     }
 
+    /// Empieza o termina una reconexión con Spotify: se vuelve a contar desde cero, porque lo que
+    /// tarde la reconexión no es culpa de la carga (antes, al volver, el vigilante ya llevaba 15 s
+    /// y reconectaba otra vez en cuanto la carga repetida tardaba 2 s: reconexión en cascada). Lo
+    /// que no se olvida es si ya reconectó él por esta carga: así una canción que no puede sonar
+    /// no reconecta cada 15 s sin rendirse nunca.
+    pub fn restart(&mut self, now: Instant, activity: u64) {
+        let reconnected = self.reconnected;
+        *self = Self::new(now, activity);
+        self.reconnected = reconnected;
+        self.retried = reconnected;
+    }
+
     /// Se llama a menudo mientras carga, con el contador de actividad de ahora. Devuelve la etapa
     /// que toca, una vez cada una. Reintentar y reconectar solo si la carga no avanza: una que
     /// avanza despacio llega antes sola. Rendirse, siempre a los 30 s.
     pub fn tick(&mut self, now: Instant, activity: u64) -> Stage {
+        self.step(now, activity, true)
+    }
+
+    /// Como `tick`, mientras se reconecta con Spotify: ni reintento ni reconexión (la reconexión en
+    /// marcha ya repite la carga al volver; pedirlas ahora tiraría la sesión que está llegando).
+    /// Rendirse sí: nunca más de 30 s en «cargando» sin un aviso con [Reintentar].
+    pub fn tick_reconnecting(&mut self, now: Instant, activity: u64) -> Stage {
+        self.step(now, activity, false)
+    }
+
+    fn step(&mut self, now: Instant, activity: u64, connected: bool) -> Stage {
         if activity != self.activity {
             self.activity = activity;
             self.progress_at = now;
@@ -101,13 +124,13 @@ impl LoadWatchdog {
             self.gave_up = true;
             return Stage::GiveUp;
         }
-        if !self.reconnected && age >= RECONNECT_AFTER && stuck {
+        if connected && !self.reconnected && age >= RECONNECT_AFTER && stuck {
             self.reconnected = true;
             // Reconectar ya repite la carga: el reintento que no llegó a salir sobra.
             self.retried = true;
             return Stage::Reconnect;
         }
-        if !self.retried && age >= RETRY_AFTER && stuck {
+        if connected && !self.retried && age >= RETRY_AFTER && stuck {
             self.retried = true;
             return Stage::Retry;
         }
@@ -370,6 +393,60 @@ mod tests {
         w.tick(t0 + ms(2_600), 0);
         assert!(w.is_slow());
         assert_eq!(w.stage_name(), "slow");
+    }
+
+    #[test]
+    fn reconectando_solo_se_rinde() {
+        let t0 = Instant::now();
+        let mut w = LoadWatchdog::new(t0, 0);
+        let mut out = Vec::new();
+        for t in (0..=31_000).step_by(250) {
+            let stage = w.tick_reconnecting(t0 + ms(t), 0);
+            if stage != Stage::Wait {
+                out.push((t, stage));
+            }
+        }
+        assert_eq!(out, vec![(2_500, Stage::Slow), (30_000, Stage::GiveUp)]);
+    }
+
+    #[test]
+    fn la_reconexion_vuelve_a_contar_desde_cero() {
+        // 14 s cargando sin avanzar (ya reintentó) y empieza una reconexión que dura 10 s.
+        let t0 = Instant::now();
+        let mut w = LoadWatchdog::new(t0, 0);
+        assert_eq!(w.tick(t0 + ms(8_000), 0), Stage::Retry);
+        w.restart(t0 + ms(14_000), 0);
+        for t in (14_000..24_000).step_by(250) {
+            assert_eq!(w.tick_reconnecting(t0 + ms(t), 0), if t == 16_500 { Stage::Slow } else { Stage::Wait });
+        }
+        // Vuelve la sesión: la carga repetida tiene sus 8 s antes de reintentar y sus 15 antes de
+        // reconectar, no la reconexión inmediata de antes.
+        w.restart(t0 + ms(24_000), 0);
+        assert_eq!(w.stage_name(), "loading");
+        assert_eq!(w.tick(t0 + ms(26_000), 0), Stage::Wait);
+        assert_eq!(w.tick(t0 + ms(26_500), 0), Stage::Slow);
+        assert_eq!(w.tick(t0 + ms(32_000), 0), Stage::Retry);
+        assert_eq!(w.tick(t0 + ms(39_000), 0), Stage::Reconnect);
+    }
+
+    #[test]
+    fn tras_reconectar_por_la_carga_no_se_reconecta_otra_vez() {
+        // La canción no puede sonar: a los 15 s el vigilante reconecta. Tras volver solo queda
+        // rendirse a los 30 s (sin otra reconexión ni reintento: el de la reconexión ya lo fue).
+        let t0 = Instant::now();
+        let mut w = LoadWatchdog::new(t0, 0);
+        assert_eq!(w.tick(t0 + ms(8_000), 0), Stage::Retry);
+        assert_eq!(w.tick(t0 + ms(15_000), 0), Stage::Reconnect);
+        w.restart(t0 + ms(15_100), 0);
+        w.restart(t0 + ms(17_000), 0);
+        let mut out = Vec::new();
+        for t in (17_000..=48_000).step_by(250) {
+            let stage = w.tick(t0 + ms(t), 0);
+            if stage != Stage::Wait {
+                out.push((t, stage));
+            }
+        }
+        assert_eq!(out, vec![(19_500, Stage::Slow), (47_000, Stage::GiveUp)]);
     }
 
     #[test]

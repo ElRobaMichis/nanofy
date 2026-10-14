@@ -9,6 +9,7 @@ use crate::{
     Error, FileId, SpotifyId,
     key_policy::{self, Attempt, Lru},
     packet::PacketType,
+    session::SessionError,
     util::SeqGenerator,
 };
 
@@ -91,6 +92,8 @@ component! {
     AudioKeyManager : AudioKeyManagerInner {
         sequence: SeqGenerator<u32> = SeqGenerator::new(0),
         pending: HashMap<u32, oneshot::Sender<Result<AudioKey, Error>>> = HashMap::new(),
+        // La sesión se cerró (`shutdown`): ya no se piden claves por ella.
+        closed: bool = false,
     }
 }
 
@@ -112,6 +115,23 @@ impl Drop for PendingGuard<'_> {
 }
 
 impl AudioKeyManager {
+    /// La sesión se cierra (`Session::shutdown`): las peticiones en espera acaban ya, sin agotar
+    /// su plazo, y las siguientes fallan al momento, sin reintentos (como `MercuryManager` y
+    /// `ChannelManager`). Antes, con el AP mudo o caído, cada clave pendiente seguía sus tres
+    /// intentos (6,5 s) por una sesión que ya no iba a contestar y retenía la carga que la pedía,
+    /// y con ella el cierre del reproductor viejo al reconectar y la salida de la app.
+    pub(crate) fn shutdown(&self) {
+        self.lock(|inner| {
+            inner.closed = true;
+            // Soltar los extremos de envío despierta a quien espera (ver `request_once`).
+            inner.pending.clear();
+        });
+    }
+
+    fn is_closed(&self) -> bool {
+        self.lock(|inner| inner.closed)
+    }
+
     pub(crate) fn dispatch(&self, cmd: PacketType, mut data: Bytes) -> Result<(), Error> {
         let seq = BigEndian::read_u32(data.split_to(4).as_ref());
 
@@ -165,10 +185,11 @@ impl AudioKeyManager {
             trace!("Audio key from the in-memory cache");
             return Ok(key);
         }
-        let key = key_policy::with_retries(
+        let key = key_policy::with_retries_until(
             key_policy::ATTEMPTS,
             key_policy::RETRY_DELAY,
             classify,
+            || self.is_closed(),
             |_| self.request_once(track, file),
         )
         .await?;
@@ -209,11 +230,18 @@ impl AudioKeyManager {
 
         let (tx, rx) = oneshot::channel();
 
-        let seq = self.lock(move |inner| {
-            let seq = inner.sequence.get();
-            inner.pending.insert(seq, tx);
-            seq
-        });
+        // Con la sesión cerrada no se pide: nadie contestaría. Se mira con el mismo cerrojo con
+        // el que se apunta la petición, para que un cierre justo después la despierte igual.
+        let seq = self
+            .lock(move |inner| {
+                if inner.closed {
+                    return None;
+                }
+                let seq = inner.sequence.get();
+                inner.pending.insert(seq, tx);
+                Some(seq)
+            })
+            .ok_or(SessionError::NotConnected)?;
         let _pending = PendingGuard { manager: self, seq };
 
         self.send_key_request(seq, track, file)?;
@@ -223,7 +251,11 @@ impl AudioKeyManager {
                 crate::ttfs::count(crate::ttfs::Counter::KeyTimeouts);
                 Err(AudioKeyError::Timeout.into())
             }
-            Ok(k) => k?,
+            Ok(Ok(k)) => k,
+            // El extremo de envío solo se suelta sin contestar al cerrarse la sesión (`shutdown`).
+            // Es la conexión y no la clave: la carga lo cuenta como fallo de red, sin reintentarlo
+            // aquí y sin frenar la precarga (no es un `AudioKeyError`).
+            Ok(Err(_)) => Err(SessionError::NotConnected.into()),
         }
     }
 

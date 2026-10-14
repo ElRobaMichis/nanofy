@@ -8749,7 +8749,8 @@ impl crate::shell::UiApp for App {
         // El backend empieza a desconectar (avisa a Spotify de la pausa y del dispositivo
         // inactivo) mientras se escriben los ficheros. Van al hilo del disco detrás de lo que
         // ya tuviera encolado y se espera a que termine: así ninguna escritura periódica
-        // anterior queda encima de la última, y el process::exit no las corta a medias.
+        // anterior queda encima de la última, y terminar el proceso (shell.rs) no las corta a
+        // medias.
         self.backend.send(Cmd::Shutdown);
         if self.snapshot_dirty && self.logged_in() {
             self.snapshot_dirty = false;

@@ -17,6 +17,7 @@ pub mod mixer;
 pub mod narration;
 pub mod player;
 mod symphonia_util;
+mod thread_join;
 
 pub const SAMPLE_RATE: u32 = 44100;
 pub const NUM_CHANNELS: u8 = 2;

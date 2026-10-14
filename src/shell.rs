@@ -72,6 +72,20 @@ pub fn ui_phase(phase: &'static str, detail: impl FnOnce() -> String) {
     }
 }
 
+/// Termina el proceso ya, sin destructores ni avisos de descarga a las DLL. En Windows,
+/// `std::process::exit` (ExitProcess) mata primero los demás hilos, el seguro de 3 s incluido, y
+/// luego avisa a cada DLL y corre los destructores de los `thread_local` de este hilo: si algo ahí
+/// se queda esperando un cerrojo de un hilo ya muerto, el proceso no termina nunca y no queda
+/// nadie que lo corte. Lo persistente ya está escrito (el registro va directo al fichero).
+fn terminate_process() -> ! {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        let _ = TerminateProcess(GetCurrentProcess(), 0);
+    }
+    std::process::exit(0);
+}
+
 /// Vigilante: cada 2 s pide un latido a la interfaz; si no lo atiende en 10 s, deja en el registro
 /// en qué fase se quedó (y avisa de nuevo cuando se recupera). Sin esto, un bloqueo del hilo de la
 /// interfaz no deja rastro: la ventana simplemente deja de responder.
@@ -247,12 +261,7 @@ impl<A: UiApp> Shell<A> {
         let _ = std::thread::Builder::new().name("nanofy-salida".into()).stack_size(64 * 1024).spawn(|| {
             std::thread::sleep(Duration::from_secs(3));
             // Nada de registro aquí: si lo bloqueado fuese el propio registro, esto no llegaría.
-            #[cfg(windows)]
-            unsafe {
-                use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
-                let _ = TerminateProcess(GetCurrentProcess(), 0);
-            }
-            std::process::exit(0);
+            terminate_process();
         });
         let t = Instant::now();
         // La ventana desaparece al instante; la despedida a Spotify sigue en segundo plano.
@@ -266,7 +275,7 @@ impl<A: UiApp> Shell<A> {
         el.exit();
         // Los destructores (runtime de tokio, hilos de audio, SMTC) pueden tardar segundos o
         // bloquearse; todo lo persistente ya está guardado, así que terminamos aquí.
-        std::process::exit(0);
+        terminate_process();
     }
 
     /// Límite de fps vigente: el configurado si hay interacción reciente, si no `IDLE_FPS`.
@@ -494,12 +503,11 @@ impl<A: UiApp> ApplicationHandler<UserEvent> for Shell<A> {
         }
     }
 
-    fn exiting(&mut self, _el: &ActiveEventLoop) {
-        if !self.exited {
-            self.exited = true;
-            if let Some(app) = self.app.as_mut() {
-                app.on_exit();
-            }
-        }
+    fn exiting(&mut self, el: &ActiveEventLoop) {
+        // El bucle termina sin haber pasado por `exit` (p. ej. al apagar Windows): el mismo
+        // camino, con su seguro de 3 s. Antes se volvía de aquí y `main` soltaba la app con su
+        // runtime de tokio, que espera a sus hilos sin límite (uno podía estar soltando un
+        // reproductor con cargas atascadas).
+        self.exit(el);
     }
 }

@@ -87,6 +87,11 @@ mod cdn_policy_tests;
 #[allow(dead_code)]
 #[path = "../vendor/librespot-connect/src/start_index.rs"]
 mod start_index_tests;
+// Y con la espera con plazo a los hilos del reproductor al soltarlo (cerrar, reconectar).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-playback/src/thread_join.rs"]
+mod thread_join_tests;
 
 /// Copia del registro en `<state_dir>/nanofy.log`, además de la salida de error habitual. La
 /// versión publicada corre sin consola: sin esto no queda rastro de los fallos que solo aparecen

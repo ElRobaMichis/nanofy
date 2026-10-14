@@ -4149,6 +4149,13 @@ impl App {
                 }
                 self.media_dirty = true;
             }
+            Event::WaitingRegistration => {
+                // La carga espera al registro del dispositivo, que Spirc reintenta: el vigilante
+                // empieza de nuevo en vez de reconectar o rendirse (y dejarla en pausa al salir).
+                if let Some(w) = self.load_watch.as_mut() {
+                    w.restart(Instant::now(), librespot_core::ttfs::activity());
+                }
+            }
             Event::ApLinkRenewed { took_ms } => {
                 // El enlace con el AP se renovó sin reconectar: nada se cortó y no se dice nada.
                 // Solo se adelanta lo que esperaba a un enlace que ya está.

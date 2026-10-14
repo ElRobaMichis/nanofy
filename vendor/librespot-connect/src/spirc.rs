@@ -43,7 +43,7 @@ use protobuf::MessageField;
 use std::{
     future::Future,
     sync::Arc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -166,6 +166,11 @@ struct SpircTask {
     registration_retry: Option<Instant>,
     /// Registros fallidos seguidos.
     registration_failures: u32,
+    /// Nanofy: el primer registro ya salió bien (lo mismo que `connect_established`, visible desde
+    /// `Spirc::registered`).
+    registered: Arc<AtomicBool>,
+    /// Nanofy: órdenes que llegaron antes del primer registro; se atienden en cuanto sale bien.
+    held_commands: Vec<SpircCommand>,
 
     spirc_id: usize,
 }
@@ -243,6 +248,7 @@ const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
 /// The spotify connect handle
 pub struct Spirc {
     commands: mpsc::UnboundedSender<SpircCommand>,
+    registered: Arc<AtomicBool>,
 }
 
 impl Spirc {
@@ -352,6 +358,8 @@ impl Spirc {
         let player_events = player.get_player_event_channel();
         let state_sender = StateSender::new(session.clone());
 
+        let registered = Arc::new(AtomicBool::new(false));
+
         let mut task = SpircTask {
             player,
             mixer,
@@ -402,11 +410,16 @@ impl Spirc {
             registration: None,
             registration_retry: None,
             registration_failures: 0,
+            registered: registered.clone(),
+            held_commands: Vec::new(),
 
             spirc_id,
         };
 
-        let spirc = Spirc { commands: cmd_tx };
+        let spirc = Spirc {
+            commands: cmd_tx,
+            registered,
+        };
 
         let initial_volume = task.connect_state.device_info().volume;
         task.connect_state.set_volume(0);
@@ -560,6 +573,12 @@ impl Spirc {
     /// cuando le toca el turno a esta, así que si tarda es que una orden anterior está atascada
     /// (una petición colgada tras suspender el equipo, por ejemplo) y lo que haya detrás no se
     /// atenderá: entonces conviene reconectar en vez de repetir la carga.
+    /// Nanofy: ¿salió ya el primer registro del dispositivo en Spotify Connect? Hasta entonces
+    /// Spirc contesta al ping pero las órdenes esperan (ver `hold_until_registered`).
+    pub fn registered(&self) -> bool {
+        self.registered.load(Ordering::Relaxed)
+    }
+
     pub fn ping(&self) -> Result<oneshot::Receiver<()>, Error> {
         let (tx, rx) = oneshot::channel();
         self.commands.send(SpircCommand::Ping(tx))?;
@@ -736,9 +755,14 @@ impl SpircTask {
                     session_update,
                     match |session_update| self.handle_session_update(session_update)
                 },
-                cmd = async { commands?.recv().await }, if commands.is_some() && self.connect_established => if let Some(cmd) = cmd {
-                    if let Err(e) = self.handle_command(cmd).await {
-                        debug!("could not dispatch command: {e}");
+                // Nanofy: también antes del primer registro (ver `hold_until_registered`): antes
+                // ni el ping contestaba, y la interfaz daba Spirc por colgado y reconectaba de
+                // cero cada ~11 s, con lo que el registro nunca llegaba a salir.
+                cmd = async { commands?.recv().await }, if commands.is_some() => if let Some(cmd) = cmd {
+                    if let Some(cmd) = self.hold_until_registered(cmd) {
+                        if let Err(e) = self.handle_command(cmd).await {
+                            debug!("could not dispatch command: {e}");
+                        }
                     }
                 },
                 event = async { player_events?.recv().await }, if player_events.is_some() => if let Some(event) = event {
@@ -798,6 +822,16 @@ impl SpircTask {
                     }
                 },
                 else => break
+            }
+
+            // Nanofy: registrado por fin, lo que esperaba sale en el orden en que llegó.
+            if self.connect_established && !self.held_commands.is_empty() {
+                info!("dispositivo registrado: se atienden {} órdenes que esperaban", self.held_commands.len());
+                for cmd in std::mem::take(&mut self.held_commands) {
+                    if let Err(e) = self.handle_command(cmd).await {
+                        debug!("could not dispatch command: {e}");
+                    }
+                }
             }
         }
 
@@ -1382,16 +1416,42 @@ impl SpircTask {
         self.registration = Some(self.state_sender.send_with_reply(new_device));
     }
 
+    /// Nanofy: antes del primer registro, el ping se contesta (Spirc está vivo, esperando a
+    /// Spotify), el cierre y la desconexión pasan, y lo demás espera a que salga el registro (sin
+    /// él, Spotify no acepta el estado de este dispositivo). `None` si la orden queda guardada.
+    fn hold_until_registered(&mut self, cmd: SpircCommand) -> Option<SpircCommand> {
+        if self.connect_established {
+            return Some(cmd);
+        }
+        match cmd {
+            SpircCommand::Ping(tx) => {
+                let _ = tx.send(());
+                None
+            }
+            SpircCommand::Shutdown | SpircCommand::Disconnect { .. } => Some(cmd),
+            cmd => {
+                // Una carga nueva deja sin sentido las anteriores que aún esperaban.
+                if matches!(cmd, SpircCommand::Load(_)) {
+                    self.held_commands.retain(|c| !matches!(c, SpircCommand::Load(_)));
+                }
+                if self.held_commands.len() < 64 {
+                    self.held_commands.push(cmd);
+                }
+                None
+            }
+        }
+    }
+
     /// Un registro que falló. Antes terminaba Spirc entero: tras un corte del dealer con el punto
     /// de acceso sano, Nanofy reconectaba de cero y el audio se cortaba. Ahora se repite con
     /// espera creciente (ver `retry`) mientras todo sigue sonando. Solo se rinde (`Err`, como
-    /// antes) sin sesión, o si nunca llegó a registrarse (sin registro no atiende órdenes).
+    /// antes) sin sesión. Tampoco si nunca llegó a registrarse: las órdenes esperan
+    /// (`hold_until_registered`), y reconectar de cero no arregla un error del servidor de
+    /// Spotify (500 en cada registro, visto el 14 oct 2026), solo lo repite más a menudo.
     fn registration_failed(&mut self) -> Result<(), Error> {
         self.registration_failures += 1;
         let failures = self.registration_failures;
-        if self.session.is_invalid()
-            || (!self.connect_established && failures >= retry::INITIAL_REGISTRATION_TRIES)
-        {
+        if self.session.is_invalid() {
             return Err(SpircError::FailedDealerSetup.into());
         }
         let wait = retry::delay(&retry::REGISTRATION_STEPS, failures);
@@ -1437,6 +1497,7 @@ impl SpircTask {
         );
 
         self.connect_established = true;
+        self.registered.store(true, Ordering::Relaxed);
 
         let same_session = cluster.player_state.session_id == self.session.session_id()
             || cluster.player_state.session_id.is_empty();

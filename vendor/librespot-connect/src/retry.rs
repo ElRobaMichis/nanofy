@@ -34,11 +34,6 @@ pub const REGISTRATION_STEPS: [Duration; 4] = [
     Duration::from_secs(30),
 ];
 
-/// Fallos del primer registro tras los que Spirc se rinde como antes (y Nanofy reconecta de
-/// cero): sin registro no atiende órdenes, así que no puede quedarse reintentando sin fin. Un
-/// registro posterior (el dealer reconectó) se reintenta siempre: mientras, todo sigue sonando.
-pub const INITIAL_REGISTRATION_TRIES: u32 = 4;
-
 /// Con la cola agotada a la espera de un reintento, este se adelanta a como mucho esto: ya no hay
 /// música que cubra la espera.
 pub const HURRY: Duration = Duration::from_secs(1);

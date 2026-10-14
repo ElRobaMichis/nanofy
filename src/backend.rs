@@ -279,6 +279,9 @@ pub enum Event {
     /// pero un reintento pendiente de la interfaz (una carga que falló o espera su clave) puede ir
     /// ya. Sin aviso.
     ApLinkRenewed { took_ms: u32 },
+    /// La carga espera a que Spotify acepte este dispositivo (su servidor falla al registrarlo y
+    /// Spirc lo reintenta): la interfaz no se rinde ni reconecta, y suena en cuanto salga.
+    WaitingRegistration,
     /// Resultado de `Cmd::ResumeSession`: Spotify tenía (o no) una sesión que restaurar.
     SessionResumed(bool),
     /// Estado del clúster de Spotify Connect (llega por el dealer al conectar y con cada cambio):
@@ -335,6 +338,9 @@ pub const CONNECTING: &str = "Conectando con Spotify…";
 /// Aviso de una orden que no se pudo ejecutar porque se está reconectando. La interfaz lo une al
 /// de la reconexión en marcha, que sale ya (alguien pidió algo) en vez de esperar.
 pub const RECONNECTING: &str = "Reconectando con Spotify…";
+/// Spirc vive pero Spotify aún no ha aceptado este dispositivo (su servidor falla al registrarlo):
+/// reconectar no lo arregla, así que se espera a que salga (lo reintenta Spirc).
+pub const WAITING_REGISTRATION: &str = "Spotify no acepta este dispositivo ahora mismo (fallo de sus servidores); se sigue intentando…";
 
 /// Lo que se enseña mientras habla el locutor del DJ, como en la app de Spotify: su nombre
 /// («DJ Livi»), qué presenta («Up next») y su imagen.
@@ -1082,6 +1088,17 @@ async fn run(
                 if link.grace() {
                     continue;
                 }
+                // Spirc contesta, pero Spotify aún no aceptó el dispositivo (el registro falla en
+                // su servidor y Spirc lo reintenta; la carga espera a que salga). Reconectar de
+                // cero solo volvería a empezar el registro: el 14 oct 2026, cada ~11 s.
+                if let Some(a) = active.as_ref() {
+                    if !a.session.is_invalid() && !a.spirc.registered() && spirc_alive(&a.spirc).await {
+                        log::warn!("[registro] la carga espera a que Spotify acepte el dispositivo; sin reconectar");
+                        ui.status(WAITING_REGISTRATION);
+                        ui.send(Msg::Backend(Event::WaitingRegistration));
+                        continue;
+                    }
+                }
                 // La interfaz lleva demasiado en «cargando»: si la sesión está caída (o
                 // parece viva pero no responde), se reconecta y se repite la última orden.
                 if let Some(a) = active.as_ref() {
@@ -1108,6 +1125,12 @@ async fn run(
                     link.reset();
                     drop_for_reconnect(&mut active, &shared, &ui, &paths, ReconnectReason::Unresponsive).await;
                     retry_at = Some(tokio::time::Instant::now());
+                } else if !a.spirc.registered() {
+                    // Spirc atiende, pero la carga espera al registro del dispositivo (ver
+                    // `Cmd::Stalled`): pedirla otra vez no adelantaría nada.
+                    log::warn!("[registro] la carga espera a que Spotify acepte el dispositivo");
+                    ui.status(WAITING_REGISTRATION);
+                    ui.send(Msg::Backend(Event::WaitingRegistration));
                 } else if let Some(cmd) = load {
                     // Spirc atiende: lo atascado es la carga (una petición que no vuelve). Se pide
                     // otra vez por el camino de siempre, detrás de lo que ya esperaba.

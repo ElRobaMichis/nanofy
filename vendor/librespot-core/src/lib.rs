@@ -6,6 +6,8 @@ use librespot_protocol as protocol;
 #[macro_use]
 mod component;
 
+/// El enlace con el punto de acceso, que se renueva sin tirar la sesión (Nanofy).
+pub mod ap_link;
 pub mod apresolve;
 pub mod audio_key;
 pub mod authentication;

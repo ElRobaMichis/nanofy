@@ -22,11 +22,14 @@
 //! - `no_output`: no hay ninguna salida de audio. `no_output:<ms>`: vuelve a haberla ese tiempo
 //!   después del primer intento de abrirla.
 //! - `ap_drop:<ms>`: una vez por proceso, el enlace con el punto de acceso (AP) se corta de golpe
-//!   `<ms>` después de abrirse la sesión, como un `ConnectionReset` (Wi-Fi que se va, NAT que
-//!   olvida la conexión): la sesión queda inválida. `ap_drop_every:<ms>`: en cada sesión.
-//! - `ap_silent:<ms>`: una vez por proceso, desde `<ms>` tras abrirse la sesión no llega nada del AP
-//!   (ni Ping ni respuestas de claves): muere en silencio y solo se nota al pedirle algo o cuando
-//!   vence la espera del Ping.
+//!   `<ms>` después de abrirse, como un `ConnectionReset` (Wi-Fi que se va, NAT que olvida la
+//!   conexión): el enlace se pierde y se renueva dentro de la misma sesión (`ap_link`).
+//!   `ap_drop_every:<ms>`: cada enlace, también los renovados, así que se renueva una y otra vez.
+//! - `ap_silent:<ms>`: una vez por proceso, desde `<ms>` tras abrirse un enlace con el AP no llega
+//!   nada por él (ni Ping ni respuestas de claves): muere en silencio y solo se nota al pedirle
+//!   algo o cuando vence la espera del Ping. Le pasa a un solo enlace: el renovado va bien.
+//! - `ap_renew_fail:<n>`: las `<n>` siguientes renovaciones del enlace con el AP fallan al momento
+//!   como si no hubiera red, sin llegar a conectar (no gastan inicios de sesión en el AP).
 //! - `dealer_nopong:<ms>`: una vez, el primer ping del dealer (websocket) tras `<ms>` se queda sin
 //!   pong, como un corte de unos segundos: el dealer se reconecta y Spirc vuelve a registrarse.
 //! - `spclient_err:<trozo>:<n>` (o `…:<n>@<saltar>`): tras dejar pasar `<saltar>` peticiones HTTP
@@ -127,6 +130,8 @@ pub struct Spec {
     /// (tras cuánto de abrirse la sesión, en cada sesión).
     pub ap_drop: Option<(Duration, bool)>,
     pub ap_silent: Option<Duration>,
+    /// Renovaciones del enlace con el AP que fallan sin red.
+    pub ap_renew_fail: u32,
     pub dealer_nopong: Option<Duration>,
     /// (trozo de la ruta, cuántas fallan, cuántas se dejan pasar antes, desde cuándo).
     pub spclient_err: Vec<(String, u32, u32, Option<Duration>)>,
@@ -189,6 +194,7 @@ pub fn parse(s: &str) -> (Spec, Vec<String>) {
             ("ap_drop", Some(v)) => parse_ms(v).map(|d| spec.ap_drop = Some((d, false))).is_some(),
             ("ap_drop_every", Some(v)) => parse_ms(v).map(|d| spec.ap_drop = Some((d, true))).is_some(),
             ("ap_silent", Some(v)) => parse_ms(v).map(|d| spec.ap_silent = Some(d)).is_some(),
+            ("ap_renew_fail", Some(v)) => v.parse().map(|n| spec.ap_renew_fail = n).is_ok(),
             ("dealer_nopong", Some(v)) => parse_ms(v).map(|d| spec.dealer_nopong = Some(d)).is_some(),
             ("spclient_err", Some(v)) => {
                 let entry = v.rsplit_once(':').and_then(|(endpoint, n)| {
@@ -250,8 +256,9 @@ struct Faults {
     no_output_since: Mutex<Option<Instant>>,
     created: Instant,
     ap_drop_fired: AtomicBool,
-    /// La sesión (número de `next_session_id`) que se quedó muda; 0: ninguna aún.
+    /// El enlace (número de `next_session_id`) que se quedó mudo; 0: ninguno aún.
     ap_silent_session: AtomicU64,
+    ap_renew_fail_left: AtomicU32,
     dealer_nopong_fired: AtomicBool,
     /// Peticiones vistas por cada entrada de `spclient_err`.
     spclient_err_seen: Mutex<Vec<u32>>,
@@ -282,6 +289,7 @@ fn get() -> Option<&'static Faults> {
                 raw: raw.to_string(),
                 key_err_left: AtomicU32::new(spec.key_err),
                 key_timeout_left: AtomicU32::new(spec.key_timeout),
+                ap_renew_fail_left: AtomicU32::new(spec.ap_renew_fail),
                 spclient_err_seen: Mutex::new(vec![0; spec.spclient_err.len()]),
                 spec,
                 stall_started: Mutex::new(None),
@@ -375,19 +383,19 @@ pub fn no_output() -> bool {
     missing
 }
 
-/// Número para cada sesión con el AP (para `ap_silent`), desde 1.
+/// Número para cada enlace con el AP (para `ap_silent`), desde 1.
 pub fn next_session_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Si hay que cortar el enlace con el AP de una sesión: tras cuánto de abrirse. Con `ap_drop` solo
-/// la primera sesión que llega a ese tiempo (`ap_drop_claim`); con `ap_drop_every`, todas.
+/// Si hay que cortar un enlace con el AP: tras cuánto de abrirse. Con `ap_drop` solo el primer
+/// enlace que llega a ese tiempo (`ap_drop_claim`); con `ap_drop_every`, todos.
 pub fn ap_drop_after() -> Option<(Duration, bool)> {
     get()?.spec.ap_drop
 }
 
-/// La sesión que llegó al corte: ¿le toca? (`ap_drop` una sola vez por proceso).
+/// El enlace que llegó al corte: ¿le toca? (`ap_drop` una sola vez por proceso).
 pub fn ap_drop_claim(every: bool) -> bool {
     let Some(f) = get() else { return false };
     let hit = every || !f.ap_drop_fired.swap(true, Ordering::Relaxed);
@@ -397,8 +405,8 @@ pub fn ap_drop_claim(every: bool) -> bool {
     hit
 }
 
-/// ¿Está muda la sesión `id`, abierta en `started`? La primera que pasa del tiempo de `ap_silent`
-/// se queda muda para siempre; las demás, nunca.
+/// ¿Está mudo el enlace `id`, abierto en `started`? El primero que pasa del tiempo de `ap_silent`
+/// se queda mudo para siempre; los demás, nunca.
 pub fn ap_silent(id: u64, started: Instant) -> bool {
     let Some(f) = get() else { return false };
     let Some(after) = f.spec.ap_silent else { return false };
@@ -418,6 +426,15 @@ pub fn ap_silent(id: u64, started: Instant) -> bool {
         log::warn!("NANOFY_FAULT: el enlace con el AP se queda mudo (no llega nada más)");
     }
     won
+}
+
+/// ¿Debe fallar esta renovación del enlace con el AP como si no hubiera red (`ap_renew_fail`)?
+pub fn ap_renew_fail() -> bool {
+    let hit = get().is_some_and(|f| take(&f.ap_renew_fail_left));
+    if hit {
+        injected();
+    }
+    hit
 }
 
 /// ¿Se ignora el pong de este ping del dealer? Solo el primero tras el tiempo de `dealer_nopong`.
@@ -666,6 +683,21 @@ mod tests {
         let hits: Vec<bool> = (0..6).map(|seen| err_hits(3, 1, seen)).collect();
         assert_eq!(hits, [false, true, true, true, false, false]);
         assert!(err_hits(2, 0, 0) && err_hits(2, 0, 1) && !err_hits(2, 0, 2));
+    }
+
+    /// Renovaciones del enlace que fallan sin red: exactamente las pedidas.
+    #[test]
+    fn renovaciones_que_fallan() {
+        let (spec, bad) = parse("ap_drop:20000,ap_renew_fail:3");
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(spec.ap_renew_fail, 3);
+        assert_eq!(spec.ap_drop, Some((ms(20_000), false)));
+        let left = AtomicU32::new(spec.ap_renew_fail);
+        let fired = (0..10).filter(|_| take(&left)).count();
+        assert_eq!(fired, 3);
+        assert_eq!(parse("ap_renew_fail:x").1, ["ap_renew_fail:x"]);
+        assert_eq!(parse("ap_renew_fail").1, ["ap_renew_fail"]);
+        assert!(parse("").0.ap_renew_fail == 0);
     }
 
     #[test]

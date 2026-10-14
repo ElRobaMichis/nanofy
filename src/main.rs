@@ -1,6 +1,9 @@
 #![recursion_limit = "512"]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// Hasta que lo use el backend (commit siguiente).
+#[allow(dead_code)]
+mod ap_keeper;
 mod api;
 mod app;
 mod backend;
@@ -49,6 +52,11 @@ mod ttfs_tests;
 #[allow(dead_code)]
 #[path = "../vendor/librespot-core/src/fault.rs"]
 mod fault_tests;
+// Y con el enlace con el AP por generaciones, que se renueva sin tirar la sesión.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-core/src/ap_link.rs"]
+mod ap_link_tests;
 // Y con los reintentos, la caché y el freno de las claves de audio, y el cortacircuitos de
 // saltos automáticos de Spirc.
 #[cfg(test)]
@@ -92,7 +100,6 @@ mod start_index_tests;
 #[allow(dead_code)]
 #[path = "../vendor/librespot-playback/src/thread_join.rs"]
 mod thread_join_tests;
-
 // Y con los reintentos de Spirc tras un fallo pasajero (contextos y registro del dispositivo).
 #[cfg(test)]
 #[allow(dead_code)]

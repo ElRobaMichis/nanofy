@@ -76,9 +76,11 @@ impl StateSender {
         );
     }
 
-    /// Envía `request` detrás de lo que ya esté en cola y espera la respuesta de Spotify. Nunca se
-    /// sustituye: quien llama necesita su respuesta.
-    pub async fn send_and_wait(&self, request: PutStateRequest) -> SpClientResult {
+    /// Envía `request` detrás de lo que ya esté en cola y devuelve por dónde llegará la respuesta
+    /// de Spotify. Nunca se sustituye: quien llama necesita su respuesta. Spirc la espera como una
+    /// rama más de su bucle (el registro del dispositivo, ver `reply_result`): esperarla en línea
+    /// lo dejaba sin atender órdenes ni eventos mientras el PUT iba y venía con sus reintentos.
+    pub fn send_with_reply(&self, request: PutStateRequest) -> oneshot::Receiver<SpClientResult> {
         let (tx, rx) = oneshot::channel();
         self.push(
             Job {
@@ -87,8 +89,7 @@ impl StateSender {
             },
             false,
         );
-        rx.await
-            .unwrap_or_else(|_| Err(Error::aborted("connect state: el envío se interrumpió")))
+        rx
     }
 
     /// Espera a que salga todo lo encolado hasta ahora. Antes de pasar a inactivo o de borrar el
@@ -106,6 +107,13 @@ impl Drop for StateSender {
     fn drop(&mut self) {
         self.worker.abort();
     }
+}
+
+/// La respuesta que llegó por `send_with_reply`: si la tarea que envía terminó antes, un error.
+pub(crate) fn reply_result(
+    reply: Result<SpClientResult, oneshot::error::RecvError>,
+) -> SpClientResult {
+    reply.unwrap_or_else(|_| Err(Error::aborted("connect state: el envío se interrumpió")))
 }
 
 /// Un estado sin motivo propio (el de cada cambio), que el siguiente puede sustituir.

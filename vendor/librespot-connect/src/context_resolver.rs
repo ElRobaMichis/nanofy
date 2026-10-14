@@ -1,9 +1,10 @@
 use crate::{
-    core::{Error, Session},
+    core::{Error, Session, error::ErrorKind},
     protocol::{
         autoplay_context_request::AutoplayContextRequest, context::Context,
         transfer_state::TransferState,
     },
+    retry::{self, Retries},
     state::{ConnectState, context::ContextType},
 };
 use std::{
@@ -38,7 +39,25 @@ pub(super) struct ResolveContext {
     action: ContextAction,
 }
 
+/// Lo que identifica un reintento (Nanofy): todo menos la URI de reserva, que cambia con cada
+/// canción (el autoplay de un álbum se pide con la que suena) y haría del mismo autoplay dos
+/// reintentos.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct RetryKey {
+    resolve: Resolve,
+    update: ContextType,
+    action: ContextAction,
+}
+
 impl ResolveContext {
+    fn retry_key(&self) -> RetryKey {
+        RetryKey {
+            resolve: self.resolve.clone(),
+            update: self.update,
+            action: self.action.clone(),
+        }
+    }
+
     fn append_context(uri: impl Into<String>) -> Self {
         Self {
             resolve: Resolve::Uri(uri.into()),
@@ -103,6 +122,11 @@ impl ResolveContext {
             Resolve::Context(ref ctx) => ctx.uri.as_deref().unwrap_or_default(),
         }
     }
+
+    /// Qué contexto actualiza al resolverse: el principal o el del autoplay.
+    pub fn update(&self) -> ContextType {
+        self.update
+    }
 }
 
 impl Display for ResolveContext {
@@ -133,10 +157,31 @@ impl From<ContextResolverError> for Error {
     }
 }
 
+/// ¿Puede salir bien si se pide otra vez? Casi todo lo que falla al resolver un contexto es la red
+/// o Spotify un momento (sin respuesta, 5xx, límite de peticiones, token caducado). No: lo que
+/// Spotify dice que no existe o no está permitido, y lo que se descarta aquí mismo (el autoplay de
+/// un podcast).
+fn is_transient(err: &Error) -> bool {
+    if err.error.downcast_ref::<ContextResolverError>().is_some() {
+        return false;
+    }
+    !matches!(
+        err.kind,
+        ErrorKind::NotFound
+            | ErrorKind::PermissionDenied
+            | ErrorKind::InvalidArgument
+            | ErrorKind::OutOfRange
+            | ErrorKind::Unimplemented
+    )
+}
+
 pub struct ContextResolver {
     session: Session,
     queue: VecDeque<ResolveContext>,
     unavailable_contexts: HashMap<ResolveContext, Instant>,
+    /// Nanofy: lo que falló por algo pasajero, a la espera de volver a pedirse (ver `retry`).
+    /// Antes iba a `unavailable_contexts` y, al acabarse la cola, la música se paraba.
+    retries: Retries<RetryKey, ResolveContext>,
 }
 
 // time after which an unavailable context is retried
@@ -151,28 +196,30 @@ impl ContextResolver {
             session,
             queue: VecDeque::new(),
             unavailable_contexts: HashMap::new(),
+            retries: Retries::new(&retry::CONTEXT_STEPS),
         }
     }
 
     pub fn add(&mut self, resolve: ResolveContext) {
-        let last_try = self
-            .unavailable_contexts
-            .get(&resolve)
-            .map(|i| i.duration_since(Instant::now()));
-
-        let last_try = if matches!(last_try, Some(last_try) if last_try > RETRY_UNAVAILABLE) {
+        // Nanofy: antes `marca.duration_since(ahora)`, que con la marca en el pasado siempre da
+        // cero: un contexto no disponible no se volvía a pedir nunca, en vez de a la hora.
+        if let Some(marked) = self.unavailable_contexts.get(&resolve) {
+            let ago = marked.elapsed();
+            if ago < RETRY_UNAVAILABLE {
+                debug!("tried loading unavailable context: {resolve}");
+                return;
+            }
             let _ = self.unavailable_contexts.remove(&resolve);
             debug!(
                 "context was requested {}s ago, trying again to resolve the requested context",
-                last_try.expect("checked by condition").as_secs()
+                ago.as_secs()
             );
-            None
-        } else {
-            last_try
-        };
+        }
 
-        if last_try.is_some() {
-            debug!("tried loading unavailable context: {resolve}");
+        // Ya tiene un reintento pendiente (programado o de camino): pedirlo también ahora sería
+        // otra petición a la vez (esto se vuelve a pedir con cada canción que empieza).
+        if self.retries.pending(&resolve.retry_key()) {
+            debug!("{resolve} ya tiene un reintento pendiente");
             return;
         } else if self.queue.contains(&resolve) {
             debug!("update for {resolve} is already added");
@@ -185,6 +232,14 @@ impl ContextResolver {
         }
 
         self.queue.push_back(resolve)
+    }
+
+    /// Como `add`, para lo que pide el usuario (cargar un contexto): se intenta ya, aunque haya
+    /// fallado antes o espere su reintento.
+    pub fn add_now(&mut self, resolve: ResolveContext) {
+        let _ = self.unavailable_contexts.remove(&resolve);
+        self.retries.forget(&resolve.retry_key());
+        self.add(resolve)
     }
 
     pub fn add_list(&mut self, resolve: Vec<ResolveContext>) {
@@ -200,8 +255,10 @@ impl ContextResolver {
         self.queue.pop_front(); // remove used
     }
 
+    /// Vacía la cola y olvida los reintentos pendientes: eran de lo que sonaba hasta ahora.
     pub fn clear(&mut self) {
-        self.queue = VecDeque::new()
+        self.queue = VecDeque::new();
+        self.retries.clear();
     }
 
     fn find_next(&self) -> Option<(&ResolveContext, &str, usize)> {
@@ -303,11 +360,66 @@ impl ContextResolver {
         }
     }
 
-    pub fn mark_next_unavailable(&mut self) {
-        if let Some((next, _, _)) = self.find_next() {
-            self.unavailable_contexts
-                .insert(next.clone(), Instant::now());
+    /// Lo siguiente de la cola no se pudo resolver (`why`) mientras sonaba `owner`. Un fallo
+    /// pasajero se reintenta más tarde y devuelve la espera; uno definitivo (no existe, no está
+    /// permitido) lo deja no disponible como antes (`None`). Sale de la cola igualmente, con
+    /// `remove_used_and_invalid`.
+    pub fn next_failed(&mut self, why: &Error, owner: &str) -> Option<Duration> {
+        let next = self.find_next()?.0.clone();
+        let key = next.retry_key();
+        if is_transient(why) {
+            let at_least = retry::rate_limit_wait(&why.to_string());
+            let now = std::time::Instant::now();
+            Some(self.retries.failed(key, next, owner, now, at_least))
+        } else {
+            self.retries.forget(&key);
+            self.unavailable_contexts.insert(next, Instant::now());
+            None
         }
+    }
+
+    /// Lo siguiente de la cola se resolvió: si tenía un reintento pendiente (este u otro igual con
+    /// otra reserva), se olvida, para no pedirlo otra vez.
+    pub fn next_succeeded(&mut self) {
+        if let Some(next) = self.find_next().map(|(next, _, _)| next.clone()) {
+            if self.retries.succeeded(&next.retry_key()) {
+                debug!("{next} se resolvió al reintentarlo");
+            }
+        }
+    }
+
+    /// El próximo reintento programado (ver `requeue_due`).
+    pub fn next_retry_at(&self) -> Option<std::time::Instant> {
+        self.retries.next_at()
+    }
+
+    /// Vuelve a poner en la cola los reintentos a los que ya les toca, si aún hacen falta según
+    /// `needed(contexto, lo que sonaba al fallar)`; los que no, se olvidan.
+    pub fn requeue_due(&mut self, needed: impl Fn(&ResolveContext, &str) -> bool) {
+        for (key, resolve, owner) in self.retries.take_due(std::time::Instant::now()) {
+            if !needed(&resolve, &owner) {
+                debug!("ya no hace falta reintentar {resolve}");
+                self.retries.forget(&key);
+            } else if !self.queue.contains(&resolve) {
+                debug!(
+                    "se reintenta {resolve} ({} fallos)",
+                    self.retries.failures(&key)
+                );
+                self.queue.push_back(resolve);
+            }
+        }
+    }
+
+    /// Se acabaron las canciones esperando un reintento: se adelanta (ver `retry::HURRY`).
+    pub fn hurry_retries(&mut self) {
+        self.retries.hurry(std::time::Instant::now(), retry::HURRY);
+    }
+
+    /// ¿Pueden venir más canciones para `owner` (lo que suena)? Lo que haya en la cola (el
+    /// autoplay, la página siguiente del DJ, otra página o el contexto entero de nuevo), o lo que
+    /// falló mientras sonaba y espera su reintento.
+    pub fn more_tracks_pending(&self, owner: &str) -> bool {
+        self.has_next() || self.retries.items_for(owner).next().is_some()
     }
 
     pub fn apply_next_context(

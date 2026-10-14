@@ -370,6 +370,14 @@ impl<'ct> ConnectState {
         }
     }
 
+    /// Nanofy: ¿sacaría `next_track` alguna canción? Salta las marcas de fin de contexto y las no
+    /// disponibles, así que una cola con solo eso está agotada aunque no esté vacía.
+    pub fn has_playable_next(&self) -> bool {
+        self.next_tracks()
+            .iter()
+            .any(|t| !t.uid.starts_with(IDENTIFIER_DELIMITER) && !t.is_unavailable())
+    }
+
     pub fn recent_track_uris(&self) -> Vec<String> {
         let mut prev = self
             .prev_tracks()

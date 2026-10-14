@@ -52,7 +52,10 @@ impl From<WsError> for Error {
 const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
-const PING_TIMEOUT: Duration = Duration::from_secs(3);
+/// Nanofy: antes 3 s. Un bache corto de la wifi (o el equipo ocupado) retrasaba el pong lo justo
+/// para cerrar el websocket, y la reconexión obliga a registrar otra vez el dispositivo (que si
+/// fallaba terminaba Spirc entero). Un websocket muerto de verdad se nota igual, 7 s después.
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -704,13 +707,33 @@ where
                         break
                     },
                     e = get_url() => e
-                }?;
+                };
+                // Nanofy: sin la URL (el token de acceso no llegó: la red caída un momento) el
+                // dealer terminaba para siempre, sin que nadie lo notara: Spirc seguía sin recibir
+                // nada de Spotify Connect. Ahora se reintenta como un fallo al conectar. Las
+                // esperas se cortan al cerrar el dealer, para no retrasar el cierre.
+                let url = match url {
+                    Ok(url) => url,
+                    Err(e) => {
+                        error!(
+                            "Error while getting the dealer url: {e}; retrying in {} s",
+                            RECONNECT_INTERVAL.as_secs()
+                        );
+                        select! {
+                            () = shared.closed() => break,
+                            () = tokio::time::sleep(RECONNECT_INTERVAL) => continue,
+                        }
+                    }
+                };
 
                 match connect(&url, proxy.as_ref(), &shared).await {
                     Ok((s, r)) => tasks = (init_task(s), init_task(r)),
                     Err(e) => {
                         error!("Error while connecting: {e}");
-                        tokio::time::sleep(RECONNECT_INTERVAL).await;
+                        select! {
+                            () = shared.closed() => break,
+                            () = tokio::time::sleep(RECONNECT_INTERVAL) => (),
+                        }
                     }
                 }
             }

@@ -93,6 +93,12 @@ mod start_index_tests;
 #[path = "../vendor/librespot-playback/src/thread_join.rs"]
 mod thread_join_tests;
 
+// Y con los reintentos de Spirc tras un fallo pasajero (contextos y registro del dispositivo).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../vendor/librespot-connect/src/retry.rs"]
+mod retry_tests;
+
 /// Copia del registro en `<state_dir>/nanofy.log`, además de la salida de error habitual. La
 /// versión publicada corre sin consola: sin esto no queda rastro de los fallos que solo aparecen
 /// tras horas de uso. Al arrancar, el registro anterior pasa a `nanofy.log.1`, de modo que cerrar

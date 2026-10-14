@@ -11,6 +11,8 @@ use librespot_protocol as protocol;
 mod cascade;
 mod context_resolver;
 mod model;
+/// Reintentos con espera creciente de lo que falla por algo pasajero (Nanofy).
+mod retry;
 mod shuffle_vec;
 mod spirc;
 /// Con qué canción del contexto empieza una carga (Nanofy).

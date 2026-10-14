@@ -10,9 +10,10 @@ use crate::{
             protocol::{Command, FallbackWrapper, Message, Request},
         },
         session::UserAttributes,
-        spclient::TransferRequest,
+        spclient::{SpClientResult, TransferRequest},
     },
     model::{LoadRequest, PlayingTrack, SpircPlayStatus},
+    retry,
     start_index::{self, Wanted},
     playback::{
         crossfade::{self, FadeOffer},
@@ -34,7 +35,7 @@ use crate::{
         provider::IsProvider,
         {ConnectConfig, ConnectState},
     },
-    state_sender::StateSender,
+    state_sender::{self, StateSender},
 };
 use futures_util::StreamExt;
 use librespot_protocol::context_page::ContextPage;
@@ -48,7 +49,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
-    time::sleep,
+    time::{sleep, sleep_until},
 };
 
 #[derive(Debug, Error)]
@@ -149,10 +150,22 @@ struct SpircTask {
     /// La próxima carga es un salto (el botón del DJ o una canción elegida): el locutor del DJ
     /// la presenta con su frase de salto, si la tiene, en vez de la de llegar en orden.
     dj_jump: bool,
-    /// Última página siguiente del DJ pedida: la misma no se pide dos veces.
+    /// Última página siguiente del DJ pedida: la misma no se pide dos veces (si falla, la vuelve a
+    /// pedir su reintento, ver `retry`).
     dj_last_page: Option<String>,
     /// Envía el estado a Spotify en segundo plano (`notify`): ninguna orden espera a un PUT.
     state_sender: StateSender,
+
+    /// Se acabaron las canciones pero vienen más (ver `await_more_tracks`): la última sigue como
+    /// actual y, en cuanto lleguen, se sigue con la siguiente. `true` si entonces debe sonar.
+    awaiting_tracks: Option<bool>,
+    /// El registro del dispositivo (PUT con `NEW_DEVICE`) de camino: su respuesta se espera como
+    /// una rama más del bucle, sin dejar de atender órdenes ni eventos mientras tanto.
+    registration: Option<oneshot::Receiver<SpClientResult>>,
+    /// Cuándo se repite un registro que falló.
+    registration_retry: Option<Instant>,
+    /// Registros fallidos seguidos.
+    registration_failures: u32,
 
     spirc_id: usize,
 }
@@ -384,6 +397,11 @@ impl Spirc {
             dj_jump: false,
             dj_last_page: None,
             state_sender,
+
+            awaiting_tracks: None,
+            registration: None,
+            registration_retry: None,
+            registration_failures: 0,
 
             spirc_id,
         };
@@ -622,6 +640,10 @@ impl SpircTask {
         while !self.session.is_invalid() && !self.shutdown {
             let commands = self.commands.as_mut();
             let player_events = self.player_events.as_mut();
+            let registering = self.registration.is_some();
+            let registration = self.registration.as_mut();
+            let registration_retry = self.registration_retry;
+            let context_retry = self.context_resolver.next_retry_at();
 
             // when state and volume update have a higher priority than context resolving
             // because of that the context resolving has to wait, so that the other tasks can finish
@@ -631,11 +653,37 @@ impl SpircTask {
                 // startup of the dealer requires a connection_id, which is retrieved at the very beginning
                 connection_id_update = self.connection_id_update.next() => unwrap! {
                     connection_id_update,
-                    match |connection_id| if let Err(why) = self.handle_connection_id_update(connection_id).await {
+                    match |connection_id| self.handle_connection_id_update(connection_id)
+                },
+                // Nanofy: la respuesta al registro del dispositivo, sin frenar lo demás mientras
+                // llega (ver `handle_connection_id_update`).
+                reply = async {
+                    match registration {
+                        Some(rx) => rx.await,
+                        None => std::future::pending().await,
+                    }
+                }, if registering => {
+                    self.registration = None;
+                    if let Err(why) = self.handle_registration_reply(state_sender::reply_result(reply)) {
                         error!("failed handling connection id update: {why}");
                         break;
                     }
                 },
+                // Nanofy: un registro que falló, otra vez.
+                _ = async {
+                    if let Some(at) = registration_retry {
+                        sleep_until(at.into()).await
+                    }
+                }, if registration_retry.is_some() => {
+                    self.registration_retry = None;
+                    self.register_device();
+                },
+                // Nanofy: un contexto que falló por algo pasajero, otra vez (ver `retry`).
+                _ = async {
+                    if let Some(at) = context_retry {
+                        sleep_until(at.into()).await
+                    }
+                }, if context_retry.is_some() => self.requeue_context_retries(),
                 // main dealer update of any remote device updates
                 cluster_update = self.connect_state_update.next() => unwrap! {
                     cluster_update,
@@ -768,14 +816,21 @@ impl SpircTask {
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
         let next_context = match next_context {
             Err(why) => {
-                self.context_resolver.mark_next_unavailable();
+                // Nanofy: un fallo pasajero ya no deja el contexto como no disponible para
+                // siempre (el autoplay o la página del DJ que no llegaba paraba la música al
+                // acabarse la cola): se reintenta mientras siga sonando lo mismo.
+                let owner = self.connect_state.context_uri().clone();
+                match self.context_resolver.next_failed(&why, &owner) {
+                    Some(wait) => warn!("{why}; se reintenta en {} ms", wait.as_millis()),
+                    None => error!("{why}"),
+                }
                 self.context_resolver.remove_used_and_invalid();
-                error!("{why}");
-                return false;
+                return self.stop_if_nothing_coming();
             }
             Ok(ctx) => ctx,
         };
 
+        self.context_resolver.next_succeeded();
         debug!("handling next context {:?}", next_context.uri);
 
         match self
@@ -803,7 +858,91 @@ impl SpircTask {
         };
 
         self.context_resolver.remove_used_and_invalid();
-        update_state
+        let resumed = self.resume_awaited_tracks();
+        update_state || resumed
+    }
+
+    /// Nanofy: vuelve a la cola lo que falló por algo pasajero y ya toca reintentar, si aún hace
+    /// falta: solo mientras suena el contexto con el que falló (otra carga, una transferencia o
+    /// un cambio de playlist lo dejan sin sentido) y, el autoplay, mientras siga activado.
+    fn requeue_context_retries(&mut self) {
+        let current = self.connect_state.context_uri().clone();
+        let autoplay = self.session.autoplay() && !self.jam_participant;
+        self.context_resolver.requeue_due(|resolve, owner| {
+            owner == current && (resolve.update() != ContextType::Autoplay || autoplay)
+        });
+        if self.stop_if_nothing_coming() {
+            self.update_state = true;
+        }
+    }
+
+    /// Nanofy: se acabaron las canciones pero vienen más (el autoplay, la página siguiente del DJ
+    /// u otra del contexto, de camino o a la espera de su reintento tras un fallo pasajero; ver
+    /// `ContextResolver::more_tracks_pending`). Antes se detenía y
+    /// volvía al principio del contexto, y lo que llegara después ya no sonaba; ahora la que
+    /// sonaba sigue como actual, el reproductor se para (lo que quedaba en la salida suena hasta
+    /// el final) y en cuanto lleguen sigue la siguiente (`resume_awaited_tracks`). El reintento se
+    /// adelanta: ya no hay música que cubra la espera.
+    fn await_more_tracks(&mut self, play: bool) {
+        // Ya esperando (otro «siguiente»): se respeta lo que se decidió entonces.
+        let play = self.awaiting_tracks.unwrap_or(play);
+        info!("no quedan canciones, pero vienen más (autoplay, el DJ, otra página); se esperan");
+        let position_ms = self.position();
+        self.load_failed = false;
+        self.player.stop();
+        self.connect_state
+            .update_position(position_ms, self.now_ms());
+        self.play_status = SpircPlayStatus::Stopped;
+        self.awaiting_tracks = Some(play);
+        self.context_resolver.hurry_retries();
+    }
+
+    /// Nanofy: la cola se había agotado esperando más canciones (`await_more_tracks`) y ya han
+    /// llegado: sigue la siguiente, sonando si no se pausó mientras tanto. `true` si cambió algo.
+    fn resume_awaited_tracks(&mut self) -> bool {
+        let Some(play) = self.awaiting_tracks else {
+            return false;
+        };
+        if !self.connect_state.has_playable_next() {
+            // Llegó, pero sin canciones (una página vacía, un autoplay sin nada): si no queda
+            // nada más por llegar, se acabó.
+            return self.stop_if_nothing_coming();
+        }
+        info!("llegaron más canciones; se sigue con la siguiente");
+        self.awaiting_tracks = None;
+        let result = match self.connect_state.next_track() {
+            Ok(Some(_)) => {
+                self.add_autoplay_resolving_when_required();
+                self.load_track(play, 0)
+            }
+            Ok(None) => {
+                self.handle_stop();
+                Ok(())
+            }
+            Err(why) => Err(why),
+        };
+        if let Err(why) = result {
+            error!("could not continue with the next track: {why}");
+            self.handle_stop();
+        }
+        true
+    }
+
+    /// Nanofy: esperando más canciones, ya no va a llegar ninguna (un fallo definitivo, o lo
+    /// pendiente dejó de hacer falta): la parada de siempre al acabarse la lista. `true` si paró.
+    fn stop_if_nothing_coming(&mut self) -> bool {
+        if self.awaiting_tracks.is_none() || self.more_tracks_coming() {
+            return false;
+        }
+        info!("ya no vienen más canciones; se detiene");
+        self.handle_stop();
+        true
+    }
+
+    /// Nanofy: ¿viene algo que traiga más canciones a lo que suena? (ver `await_more_tracks`).
+    fn more_tracks_coming(&self) -> bool {
+        self.context_resolver
+            .more_tracks_pending(self.connect_state.context_uri())
     }
 
     // todo: is the time_delta still necessary?
@@ -1214,17 +1353,59 @@ impl SpircTask {
         Ok(())
     }
 
-    async fn handle_connection_id_update(&mut self, connection_id: String) -> Result<(), Error> {
+    /// Un connection id nuevo: al arrancar y cada vez que el dealer reconecta. Con él hay que
+    /// registrar otra vez el dispositivo (`register_device`).
+    fn handle_connection_id_update(&mut self, connection_id: String) {
         trace!("Received connection ID update: {connection_id:?}");
         self.session.set_connection_id(&connection_id);
+        // Un registro nuevo empieza de cero su cuenta de fallos; el que estuviera de camino ya
+        // no importa (saldría también con el id nuevo, que se lee al enviarlo).
+        self.registration_failures = 0;
+        self.registration_retry = None;
+        self.register_device();
+    }
 
-        let mut cluster_raw: Option<Vec<u8>> = None;
-        // Por la misma cola que el resto de avisos, para no adelantar ni quedar detrás de uno que
-        // aún esté de camino; se espera porque hace falta el clúster que devuelve.
+    /// Registra el dispositivo con el connection id actual (PUT con `NEW_DEVICE`). Por la misma
+    /// cola que el resto de avisos, para no adelantar ni quedar detrás de uno que aún esté de
+    /// camino. Nanofy: la respuesta (el clúster) ya no se espera aquí, sino como una rama más del
+    /// bucle (`handle_registration_reply`): esperarla en línea dejaba sin atender órdenes ni
+    /// eventos del reproductor durante los reintentos del PUT (12-18 s vistos).
+    fn register_device(&mut self) {
         let new_device = self
             .connect_state
             .state_request_with_reason(PutStateReason::NEW_DEVICE);
-        let cluster = match self.state_sender.send_and_wait(new_device).await {
+        self.registration = Some(self.state_sender.send_with_reply(new_device));
+    }
+
+    /// Un registro que falló. Antes terminaba Spirc entero: tras un corte del dealer con el punto
+    /// de acceso sano, Nanofy reconectaba de cero y el audio se cortaba. Ahora se repite con
+    /// espera creciente (ver `retry`) mientras todo sigue sonando. Solo se rinde (`Err`, como
+    /// antes) sin sesión, o si nunca llegó a registrarse (sin registro no atiende órdenes).
+    fn registration_failed(&mut self) -> Result<(), Error> {
+        self.registration_failures += 1;
+        let failures = self.registration_failures;
+        if self.session.is_invalid()
+            || (!self.connect_established && failures >= retry::INITIAL_REGISTRATION_TRIES)
+        {
+            return Err(SpircError::FailedDealerSetup.into());
+        }
+        let wait = retry::delay(&retry::REGISTRATION_STEPS, failures);
+        warn!(
+            "{} ({failures} seguidos); se reintenta en {} ms",
+            SpircError::FailedDealerSetup,
+            wait.as_millis()
+        );
+        self.registration_retry = Some(Instant::now() + wait);
+        Ok(())
+    }
+
+    /// La respuesta al registro del dispositivo: el clúster de la cuenta. `Err` si hay que
+    /// rendirse (ver `registration_failed`).
+    fn handle_registration_reply(&mut self, reply: SpClientResult) -> Result<(), Error> {
+        use protobuf::Message;
+
+        let mut cluster_raw: Option<Vec<u8>> = None;
+        let cluster = match reply {
             Ok(res) => {
                 cluster_raw = Some(res.to_vec());
                 Cluster::parse_from_bytes(&res).ok()
@@ -1233,8 +1414,11 @@ impl SpircTask {
                 error!("{why:?}");
                 None
             }
-        }
-        .ok_or(SpircError::FailedDealerSetup)?;
+        };
+        let Some(cluster) = cluster else {
+            return self.registration_failed();
+        };
+        self.registration_failures = 0;
         // Nanofy: el clúster inicial trae lo último que quedó en la cuenta (p. ej. en pausa en
         // el móvil) con su posición; se reenvía a la interfaz para restaurarlo.
         if let Some(raw) = cluster_raw.take() {
@@ -1242,8 +1426,9 @@ impl SpircTask {
         }
 
         debug!(
-            "successfully put connect state for {} with connection-id {connection_id}",
-            self.session.device_id()
+            "successfully put connect state for {} with connection-id {}",
+            self.session.device_id(),
+            self.session.connection_id()
         );
 
         self.connect_established = true;
@@ -1266,10 +1451,13 @@ impl SpircTask {
             )
         }
 
-        use protobuf::Message;
-
+        // Nanofy: si tomar el control falla, se sigue sin él (antes terminaba Spirc entero).
         match TransferState::parse_from_bytes(&cluster.transfer_data) {
-            Ok(transfer_state) => self.handle_transfer(transfer_state)?,
+            Ok(transfer_state) => {
+                if let Err(why) = self.handle_transfer(transfer_state) {
+                    error!("failed to take over control: {why}")
+                }
+            }
             Err(why) => error!("failed to take over control: {why}"),
         }
 
@@ -1508,6 +1696,9 @@ impl SpircTask {
             }
             SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri))?,
             SkipPrev(_) => self.handle_prev()?,
+            // Esperando más canciones (ver `await_more_tracks`): que suenen al llegar, en vez de
+            // repetir la que ya acabó.
+            Resume(_) if self.awaiting_tracks.is_some() => self.handle_play(),
             Resume(_) if matches!(self.play_status, SpircPlayStatus::Stopped) => {
                 self.load_track(true, 0)?
             }
@@ -1566,8 +1757,9 @@ impl SpircTask {
         let load_from_context_uri = ctx_uri.is_some();
 
         match ctx_uri {
+            // Una transferencia la pide alguien: se intenta ya, aunque esperara un reintento.
             Some(ref uri) => {
-                self.context_resolver.add(ResolveContext::from_uri(
+                self.context_resolver.add_now(ResolveContext::from_uri(
                     uri.clone(),
                     &fallback,
                     ContextType::Default,
@@ -1658,6 +1850,7 @@ impl SpircTask {
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
         self.context_resolver.clear();
+        self.awaiting_tracks = None;
 
         self.play_status = SpircPlayStatus::Stopped {};
         self.connect_state
@@ -1676,8 +1869,9 @@ impl SpircTask {
     }
 
     fn handle_stop(&mut self) {
-        // Parada: ya no hay nada que recargar al pulsar «reproducir».
+        // Parada: ya no hay nada que recargar al pulsar «reproducir» ni que seguir al llegar.
         self.load_failed = false;
+        self.awaiting_tracks = None;
         self.player.stop();
         self.connect_state.update_position(0, self.now_ms());
         self.connect_state.clear_next_tracks();
@@ -1722,8 +1916,10 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
-        // Algo nuevo que reproducir: los fallos de lo anterior ya no cuentan para la cascada.
+        // Algo nuevo que reproducir: los fallos de lo anterior ya no cuentan para la cascada, ni
+        // se sigue esperando lo que iba a venir detrás de lo anterior.
         self.skip_breaker.reset();
+        self.awaiting_tracks = None;
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                 ResetContext::WhenDifferent(uri)
@@ -1920,14 +2116,22 @@ impl SpircTask {
         } else {
             debug!("resolving context for load command");
             self.context_resolver.clear();
-            self.context_resolver.add(ResolveContext::from_uri(
+            // Lo pide el usuario: se intenta ya, aunque hubiera fallado antes.
+            self.context_resolver.add_now(ResolveContext::from_uri(
                 &context_uri,
                 fallback,
                 update_context,
                 ContextAction::Replace,
             ));
             let context = self.context_resolver.get_next_context(Vec::new).await;
+            let failed = context.is_err();
             self.handle_next_context(context);
+            if failed {
+                // La carga falla como siempre y quien la pidió decide si repetirla (Nanofy tiene
+                // su vigilante): un reintento por su cuenta cambiaría el contexto más tarde, sin
+                // cargar ninguna canción.
+                self.context_resolver.clear();
+            }
         }
 
         Ok(())
@@ -1977,6 +2181,13 @@ impl SpircTask {
                 self.player.play();
                 self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
             }
+            // Esperando más canciones (ver `await_more_tracks`): sonarán al llegar, y que lleguen
+            // cuanto antes.
+            SpircPlayStatus::Stopped if self.awaiting_tracks.is_some() => {
+                self.awaiting_tracks = Some(true);
+                self.context_resolver.hurry_retries();
+                return;
+            }
             _ => return,
         }
 
@@ -2003,6 +2214,8 @@ impl SpircTask {
             SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. } => {
                 self.handle_pause()
             }
+            // Esperando más canciones se ve parado: el botón es «reproducir».
+            SpircPlayStatus::Stopped if self.awaiting_tracks.is_some() => self.handle_play(),
             _ => (),
         }
     }
@@ -2025,6 +2238,10 @@ impl SpircTask {
             SpircPlayStatus::LoadingPlay { position_ms } => {
                 self.player.pause();
                 self.play_status = SpircPlayStatus::LoadingPause { position_ms };
+            }
+            // Esperando más canciones: la siguiente se cargará en pausa.
+            SpircPlayStatus::Stopped if self.awaiting_tracks.is_some() => {
+                self.awaiting_tracks = Some(false)
             }
             _ => (),
         }
@@ -2215,6 +2432,17 @@ impl SpircTask {
 
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
         let continue_playing = self.connect_state.is_playing();
+
+        // Nanofy: sin nada más que sonar, pero con más canciones por llegar (el autoplay o la
+        // página siguiente del DJ, pedidos ahora si aún no se habían pedido, o algo a la espera de
+        // su reintento): se esperan en vez de dar la lista por acabada.
+        if track_uri.is_none() && !self.connect_state.has_playable_next() {
+            self.add_autoplay_resolving_when_required();
+            if self.more_tracks_coming() {
+                self.await_more_tracks(continue_playing);
+                return Ok(());
+            }
+        }
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let mut has_next_track =
@@ -2484,8 +2712,10 @@ impl SpircTask {
         // Cada carga consume la transición pedida (un corte si nadie pidió otra), también cuando
         // al final no carga nada: no puede pasar a una carga posterior.
         let transition = std::mem::take(&mut self.next_load_transition);
-        // Una carga nueva (otra canción, o la misma otra vez) deja atrás la que falló.
+        // Una carga nueva (otra canción, o la misma otra vez) deja atrás la que falló, y la
+        // espera de más canciones si la había.
         self.load_failed = false;
+        self.awaiting_tracks = None;
 
         if self.connect_state.current_track(MessageField::is_none) {
             debug!("current track is none, stopping playback");

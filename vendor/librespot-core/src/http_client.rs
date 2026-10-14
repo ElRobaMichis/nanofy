@@ -231,6 +231,12 @@ impl HttpClient {
 
             let response = self.send(req).await;
 
+            // Pruebas (`NANOFY_FAULT=spclient_500:<trozo>:<n>`): llegó, pero se responde 500.
+            if response.is_ok() && crate::fault::spclient_500(parts.uri.path()) {
+                warn!("NANOFY_FAULT: {} llegó, pero se responde 500", parts.uri.path());
+                return Err(HttpClientError::StatusCode(StatusCode::INTERNAL_SERVER_ERROR).into());
+            }
+
             if let Ok(response) = &response {
                 let code = response.status();
 

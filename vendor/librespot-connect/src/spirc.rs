@@ -171,6 +171,10 @@ struct SpircTask {
     registered: Arc<AtomicBool>,
     /// Nanofy: órdenes que llegaron antes del primer registro; se atienden en cuanto sale bien.
     held_commands: Vec<SpircCommand>,
+    /// Nanofy: el desatasco del registro (ver `unstick_registration`): pendiente, y si ya se
+    /// intentó en este registro.
+    unstick_due: bool,
+    unstick_tried: bool,
 
     spirc_id: usize,
 }
@@ -412,6 +416,8 @@ impl Spirc {
             registration_failures: 0,
             registered: registered.clone(),
             held_commands: Vec::new(),
+            unstick_due: false,
+            unstick_tried: false,
 
             spirc_id,
         };
@@ -822,6 +828,14 @@ impl SpircTask {
                     }
                 },
                 else => break
+            }
+
+            // Nanofy: el registro falla en el servidor y aquí esperan reproducir: se desatasca.
+            if self.unstick_due {
+                self.unstick_due = false;
+                if !self.connect_established {
+                    self.unstick_registration().await;
+                }
             }
 
             // Nanofy: registrado por fin, lo que esperaba sale en el orden en que llegó.
@@ -1401,6 +1415,7 @@ impl SpircTask {
         // no importa (saldría también con el id nuevo, que se lee al enviarlo).
         self.registration_failures = 0;
         self.registration_retry = None;
+        self.unstick_tried = false;
         self.register_device();
     }
 
@@ -1437,9 +1452,52 @@ impl SpircTask {
                 if self.held_commands.len() < 64 {
                     self.held_commands.push(cmd);
                 }
+                self.want_unstick();
                 None
             }
         }
+    }
+
+    /// Nanofy: ¿se quiere reproducir aquí? (una orden de sonar espera al registro).
+    fn playback_waiting(&self) -> bool {
+        self.held_commands.iter().any(|c| {
+            matches!(
+                c,
+                SpircCommand::Load(_) | SpircCommand::Play | SpircCommand::PlayPause
+            )
+        })
+    }
+
+    /// Nanofy: el registro ya falló al menos dos veces y aquí esperan reproducir: toca desatascar
+    /// (una vez por registro; ver `unstick_registration`).
+    fn want_unstick(&mut self) {
+        if !self.connect_established
+            && !self.unstick_tried
+            && self.registration_failures >= 2
+            && self.playback_waiting()
+        {
+            self.unstick_due = true;
+        }
+    }
+
+    /// Nanofy: desatasca el registro como «enviar la música a Nanofy» desde la app de Spotify
+    /// (14 oct 2026, cuenta de la pareja). El servidor respondía 500 a cada registro (y 502 a la
+    /// Web API al leer el reproductor): guardaba el dispositivo (salía en la lista de la app
+    /// oficial) pero no podía devolver el estado guardado de la sesión de la cuenta. Al enviarle
+    /// la música desde la app oficial, Nanofy pasó a ser el dispositivo activo y escribió su
+    /// estado encima del estropeado, y todo volvió a funcionar. Aquí se hace lo mismo sin otra
+    /// app: se sigue sin la respuesta del registro y lo que esperaba (la canción pulsada) se
+    /// atiende: Nanofy se activa y escribe su estado. El registro se sigue reintentando (con su
+    /// respuesta llega el clúster). Solo si aquí quieren reproducir: como en la app oficial, se
+    /// lleva la reproducción a este dispositivo.
+    async fn unstick_registration(&mut self) {
+        self.unstick_tried = true;
+        warn!(
+            "[registro] Spotify no acepta el dispositivo ({} fallos): se sigue sin su respuesta y la reproducción de aquí reescribe el estado de la cuenta",
+            self.registration_failures
+        );
+        self.connect_established = true;
+        self.registered.store(true, Ordering::Relaxed);
     }
 
     /// Un registro que falló. Antes terminaba Spirc entero: tras un corte del dealer con el punto
@@ -1461,6 +1519,7 @@ impl SpircTask {
             wait.as_millis()
         );
         self.registration_retry = Some(Instant::now() + wait);
+        self.want_unstick();
         Ok(())
     }
 

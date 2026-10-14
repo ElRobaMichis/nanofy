@@ -32,6 +32,9 @@
 //!   como si no hubiera red, sin llegar a conectar (no gastan inicios de sesión en el AP).
 //! - `dealer_nopong:<ms>`: una vez, el primer ping del dealer (websocket) tras `<ms>` se queda sin
 //!   pong, como un corte de unos segundos: el dealer se reconecta y Spirc vuelve a registrarse.
+//! - `spclient_500:<trozo>:<n>` (mismo formato que `spclient_err`): la petición sí llega a
+//!   Spotify, pero la respuesta se cambia por un 500, como cuando su servidor guarda el registro
+//!   del dispositivo y falla al devolver el estado de la cuenta (14 oct 2026).
 //! - `spclient_err:<trozo>:<n>` (o `…:<n>@<saltar>`): tras dejar pasar `<saltar>` peticiones HTTP
 //!   cuya ruta contiene `<trozo>`, las `<n>` siguientes fallan como un error de red
 //!   (`autoplay`, `lexicon`, `connect-state`…). Con `…:<n>@t<ms>`, las `<n>` primeras desde
@@ -136,6 +139,8 @@ pub struct Spec {
     pub dealer_nopong: Option<Duration>,
     /// (trozo de la ruta, cuántas fallan, cuántas se dejan pasar antes, desde cuándo).
     pub spclient_err: Vec<(String, u32, u32, Option<Duration>)>,
+    /// Como `spclient_err`, pero tras enviarla (`spclient_500`).
+    pub spclient_500: Vec<(String, u32, u32, Option<Duration>)>,
 }
 
 impl Spec {
@@ -197,7 +202,7 @@ pub fn parse(s: &str) -> (Spec, Vec<String>) {
             ("ap_silent", Some(v)) => parse_ms(v).map(|d| spec.ap_silent = Some(d)).is_some(),
             ("ap_renew_fail", Some(v)) => v.parse().map(|n| spec.ap_renew_fail = n).is_ok(),
             ("dealer_nopong", Some(v)) => parse_ms(v).map(|d| spec.dealer_nopong = Some(d)).is_some(),
-            ("spclient_err", Some(v)) => {
+            (key @ ("spclient_err" | "spclient_500"), Some(v)) => {
                 let entry = v.rsplit_once(':').and_then(|(endpoint, n)| {
                     let (n, skip, after) = match n.split_once('@') {
                         Some((n, at)) => match at.trim().strip_prefix('t') {
@@ -209,7 +214,8 @@ pub fn parse(s: &str) -> (Spec, Vec<String>) {
                     let endpoint = endpoint.trim();
                     (!endpoint.is_empty() && n > 0).then(|| (endpoint.to_string(), n, skip, after))
                 });
-                entry.map(|e| spec.spclient_err.push(e)).is_some()
+                let list = if key == "spclient_500" { &mut spec.spclient_500 } else { &mut spec.spclient_err };
+                entry.map(|e| list.push(e)).is_some()
             }
             _ => false,
         };
@@ -263,6 +269,8 @@ struct Faults {
     dealer_nopong_fired: AtomicBool,
     /// Peticiones vistas por cada entrada de `spclient_err`.
     spclient_err_seen: Mutex<Vec<u32>>,
+    /// Y por cada una de `spclient_500`.
+    spclient_500_seen: Mutex<Vec<u32>>,
 }
 
 static FAULTS: OnceLock<Option<Faults>> = OnceLock::new();
@@ -292,6 +300,7 @@ fn get() -> Option<&'static Faults> {
                 key_timeout_left: AtomicU32::new(spec.key_timeout),
                 ap_renew_fail_left: AtomicU32::new(spec.ap_renew_fail),
                 spclient_err_seen: Mutex::new(vec![0; spec.spclient_err.len()]),
+                spclient_500_seen: Mutex::new(vec![0; spec.spclient_500.len()]),
                 spec,
                 stall_started: Mutex::new(None),
                 limiter_armed: AtomicBool::new(false),
@@ -453,12 +462,27 @@ pub fn dealer_skip_pong() -> bool {
 /// ¿Debe fallar esta petición HTTP (`spclient_err`)?
 pub fn spclient_error(path: &str) -> bool {
     let Some(f) = get() else { return false };
-    if f.spec.spclient_err.is_empty() {
+    spclient_hit(f, &f.spec.spclient_err, &f.spclient_err_seen, path)
+}
+
+/// ¿Se cambia por un 500 la respuesta de esta petición HTTP, ya enviada (`spclient_500`)?
+pub fn spclient_500(path: &str) -> bool {
+    let Some(f) = get() else { return false };
+    spclient_hit(f, &f.spec.spclient_500, &f.spclient_500_seen, path)
+}
+
+fn spclient_hit(
+    f: &Faults,
+    entries: &[(String, u32, u32, Option<Duration>)],
+    seen: &Mutex<Vec<u32>>,
+    path: &str,
+) -> bool {
+    if entries.is_empty() {
         return false;
     }
-    let mut seen = f.spclient_err_seen.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
     let mut hit = false;
-    for (k, (endpoint, n, skip, after)) in f.spec.spclient_err.iter().enumerate() {
+    for (k, (endpoint, n, skip, after)) in entries.iter().enumerate() {
         // Con hora de empezar, las de antes ni cuentan.
         if path.contains(endpoint.as_str()) && after.is_none_or(|a| f.created.elapsed() >= a) {
             hit |= err_hits(*n, *skip, seen[k]);
@@ -677,6 +701,10 @@ mod tests {
             vec![("connect-state".to_string(), 3, 0, Some(ms(40_000)))]
         );
         assert_eq!(parse("spclient_err:x:1@t0").1, ["spclient_err:x:1@t0"]);
+        assert_eq!(
+            parse("spclient_500:connect-state/v1/devices:4").0.spclient_500,
+            vec![("connect-state/v1/devices".to_string(), 4, 0, None)]
+        );
         assert_eq!(parse("ap_drop_every:5000").0.ap_drop, Some((ms(5000), true)));
         let (_, bad) = parse("ap_drop:0,ap_silent,spclient_err:autoplay,spclient_err::2,spclient_err:x:0,spclient_err:x:1@y");
         assert_eq!(bad.len(), 6, "{bad:?}");

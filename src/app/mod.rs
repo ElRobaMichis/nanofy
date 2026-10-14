@@ -1162,6 +1162,8 @@ pub struct App {
     liked_reload_ids: HashSet<String>,
     media_ready: bool,
     shutdown_done: bool,
+    /// Lo último pedido a la ventana, para cumplirlo también minimizada (ver `window_request`).
+    window_request: Option<crate::shell::WindowRequest>,
     /// Modo de diagnóstico (`--diag`): ejecuta pruebas y cierra.
     pub diag: bool,
     diag_started: Option<Instant>,
@@ -1538,6 +1540,7 @@ impl App {
             liked_reload_ids: HashSet::new(),
             media_ready: false,
             shutdown_done: false,
+            window_request: None,
             diag: false,
             diag_started: None,
             diag_step: 0,
@@ -2768,7 +2771,7 @@ impl App {
                 self.restart_resume = self.player.remote.is_none() && matches!(self.player.state, PlayState::Playing | PlayState::Loading);
                 log::info!("[update] ejecutable sustituido; reiniciando ({})", if self.restart_resume { "la música seguirá" } else { "sin música que retomar" });
                 self.restart_after_exit = Some(target);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.close_window(ctx);
             }
             Err(e) => {
                 // El motivo real: el aviso ya ofrece «Reintentar» y «Descargar a mano».
@@ -5884,7 +5887,7 @@ impl App {
                 self.lyrics.as_ref().map(|l| (l.sync_type.clone(), l.lines.len()))
             );
             log::info!("[diag] fin");
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.close_window(ctx);
             self.diag_step = 3;
         }
     }
@@ -8604,10 +8607,24 @@ impl App {
         }
     }
 
+    /// Cierra la aplicación (como la X de la ventana). Además de la orden a egui queda anotado:
+    /// minimizada, egui no la aplica y la cumple el shell (ver `shell::UiApp::take_window_request`).
+    pub(crate) fn close_window(&mut self, ctx: &egui::Context) {
+        self.window_request = Some(crate::shell::WindowRequest::Close);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Anota otra petición a la ventana; un cierre pendiente no se pisa.
+    pub(crate) fn request_window(&mut self, r: crate::shell::WindowRequest) {
+        if self.window_request != Some(crate::shell::WindowRequest::Close) {
+            self.window_request = Some(r);
+        }
+    }
+
     /// Ejecuta un atajo (teclado y modo de control comparten este camino).
     pub(crate) fn run_shortcut(&mut self, a: Shortcut, ctx: &egui::Context) {
         match a {
-            Shortcut::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Shortcut::Quit => self.close_window(ctx),
             // Desde cualquier página abre Búsqueda con el cursor en la caja. go() ya enfoca al
             // cambiar de página, pero vuelve sin hacer nada si Búsqueda ya está abierta.
             Shortcut::Search => {
@@ -8691,6 +8708,10 @@ impl crate::shell::UiApp for App {
     fn pump(&mut self, ctx: &egui::Context) {
         self.drain(ctx);
         self.tick(ctx);
+    }
+
+    fn take_window_request(&mut self) -> Option<crate::shell::WindowRequest> {
+        self.window_request.take()
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {

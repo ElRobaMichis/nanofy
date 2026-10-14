@@ -43,6 +43,22 @@ pub trait UiApp {
     fn on_exit(&mut self);
     /// Procesa lógica en segundo plano (ventana minimizada) sin pintar. Por defecto no hace nada.
     fn pump(&mut self, _ctx: &egui::Context) {}
+    /// Lo último que la app pidió a la ventana (además de mandarlo con `send_viewport_cmd`), y se
+    /// olvida: con la ventana minimizada no hay pasada de egui que aplique sus órdenes.
+    fn take_window_request(&mut self) -> Option<WindowRequest> {
+        None
+    }
+}
+
+/// Lo que la app pide a la ventana y debe cumplirse aunque esté minimizada (ver
+/// `UiApp::take_window_request`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowRequest {
+    /// Cerrar la aplicación (atajo, modo de control, reinicio tras actualizar, `--diag`).
+    Close,
+    /// Minimizarla (`true`) o volver a mostrarla (modo de control). Solo por aquí, no también
+    /// como orden de egui: esa se quedaría en su cola y se aplicaría tarde, al restaurar.
+    Minimized(bool),
 }
 
 pub struct WindowConfig {
@@ -314,6 +330,17 @@ impl<A: UiApp> Shell<A> {
             // de canción, posición, letra, controles de medios). Si no, al restaurar tras varias
             // canciones la posición quedaba desfasada.
             app.pump(&self.ctx);
+            // Las órdenes de ventana de la app se aplican al final de una pasada de egui, y
+            // minimizada no hay ninguna: cerrar se quedaba esperando a que alguien la restaurara
+            // (y el seguro de 3 s de `exit` ni se armaba). Así que estas dos se cumplen aquí.
+            match app.take_window_request() {
+                Some(WindowRequest::Close) => {
+                    self.exit(el);
+                    return;
+                }
+                Some(WindowRequest::Minimized(on)) => window.set_minimized(on),
+                None => {}
+            }
             self.schedule(Instant::now() + Duration::from_millis(500));
             return;
         }
@@ -326,6 +353,11 @@ impl<A: UiApp> Shell<A> {
 
         let mut full = self.ctx.run_ui(raw_input, |ui| app.ui(ui));
         let t_ui = t0.elapsed().as_secs_f32() * 1000.0;
+        // Con la ventana visible, egui aplica el cierre más abajo (la misma orden); minimizar o
+        // restaurar solo llegan por aquí.
+        if let Some(WindowRequest::Minimized(on)) = app.take_window_request() {
+            window.set_minimized(on);
+        }
 
         state.handle_platform_output(&window, full.platform_output);
 

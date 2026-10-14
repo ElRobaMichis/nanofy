@@ -431,7 +431,8 @@ impl App {
                 _ => err("faltan w y h"),
             },
             "minimize" => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(b(cmd, "on", true)));
+                // Lo cumple el shell (también con la ventana ya minimizada, sin pasada de egui).
+                self.request_window(crate::shell::WindowRequest::Minimized(b(cmd, "on", true)));
                 ok()
             }
             "queue_refresh" => {
@@ -1151,7 +1152,7 @@ impl App {
                 ok()
             }
             "quit" => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.close_window(ctx);
                 ok()
             }
             _ => err(format!("operación desconocida: {op}")),

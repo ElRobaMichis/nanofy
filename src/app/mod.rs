@@ -1101,6 +1101,9 @@ pub struct App {
     pub library_search_open: bool,
     /// El menú de «Agrupar» de la biblioteca, abierto.
     pub library_group_open: bool,
+    /// Menús de cristal de «Canciones que te gustan»: orden y filtro.
+    liked_sort_open: bool,
+    liked_filter_open: bool,
     /// El panel de los tres puntos del reproductor, abierto, y la fila cuyo submenú se ve.
     pub player_more_open: bool,
     pub player_more_sub: Option<usize>,
@@ -1507,6 +1510,8 @@ impl App {
             library_filter: String::new(),
             library_search_open: false,
             library_group_open: false,
+            liked_sort_open: false,
+            liked_filter_open: false,
             player_more_open: false,
             player_more_sub: None,
             player_more_at: None,

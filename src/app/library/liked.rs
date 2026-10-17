@@ -12,7 +12,7 @@ use super::super::icons::Icon;
 use super::super::theme;
 use super::super::widgets::{galley_truncated, text_on_baseline, RowOpts};
 use super::super::{Action, App, PlayTarget, CONTENT_PAD_LEFT, CONTENT_PAD_RIGHT, LIKED};
-use super::{ink_left, ink_right, lm, paint_mask, px, style, FolderDialog};
+use super::{glass_choice_menu, ink_left, ink_right, lm, paint_mask, px, style, FolderDialog, GM_LEFT, GM_TOP};
 use super::{BAR_BASE, BAR_FONT, CARD, COVER_W, GAP_GROUP_SEARCH, GAP_GROUP_TEXT, GAP_SORT_GROUP, GRID_C, GRID_LEFT, GRID_RIGHT, LIST_C};
 use super::{PITCH_X, PITCH_Y, SORT_TEXT_X, SUB_FONT, SUB_GAP, SUB_LINE, TITLE_FONT, VIEW_BG_DY, VIEW_BG_H, VIEW_BG_W};
 use crate::api::Req;
@@ -33,6 +33,10 @@ const GRID_FIRST: f32 = 20.48;
 /// Portada de una canción en la cuadrícula y línea base de su título (las de un álbum).
 const GRID_COVER_TOP: f32 = 9.0;
 const GRID_TITLE_BASE: f32 = 199.55;
+
+/// Izquierda del icono de orden, desde el borde del panel (434 − 275 en la referencia): de ahí
+/// cuelga su menú, como el de «Agrupar» del suyo.
+const SORT_ICON_X: f32 = 159.0;
 
 /// Órdenes del botón «Recientes» (`Settings::liked_sort`).
 const SORTS: [&str; 6] = ["Recientes", "Antiguas", "Título", "Artista", "Álbum", "Duración"];
@@ -197,20 +201,24 @@ impl App {
         let sort_r = ui.interact(sort_hit, ui.id().with("liked_sort"), Sense::click());
         hand(ui, &sort_r);
         let hov = sort_r.hovered();
-        paint_mask(&painter, "sort", &lm::SORT, px(&painter, o), if hov { st.hover } else { st.icon });
-        text_on_baseline(&painter, at(SORT_TEXT_X - ink, BAR_BASE), g, if hov { st.hover } else { st.bar_text });
-        let sort_r = sort_r.on_hover_text("Ordenar");
-        egui::Popup::menu(&sort_r).show(|ui| {
-            ui.set_min_width(200.0);
-            for (k, name) in SORTS.iter().enumerate() {
-                let icon = (k == sort).then_some(Icon::Check);
-                if Self::menu_item(ui, icon, name, false).clicked() {
-                    self.settings.liked_sort = k as u8;
-                    self.settings.save(&self.paths);
-                    ui.close();
-                }
+        let open = self.liked_sort_open;
+        paint_mask(&painter, "sort", &lm::SORT, px(&painter, o), if open { st.icon_on } else if hov { st.hover } else { st.icon });
+        text_on_baseline(&painter, at(SORT_TEXT_X - ink, BAR_BASE), g, if open { st.icon_on } else if hov { st.hover } else { st.bar_text });
+        if sort_r.clicked() {
+            self.liked_sort_open = !self.liked_sort_open;
+            self.liked_filter_open = false;
+        }
+        if self.liked_sort_open {
+            let ctx = ui.ctx().clone();
+            let (pick, close) = glass_choice_menu(&ctx, "liked_sort_menu", at(SORT_ICON_X + GM_LEFT, GM_TOP), sort_hit, &SORTS, sort);
+            if let Some(k) = pick {
+                self.settings.liked_sort = k as u8;
+                self.settings.save(&self.paths);
             }
-        });
+            if close {
+                self.liked_sort_open = false;
+            }
+        }
 
         // Filtro: su icono (el de «Agrupar» de la biblioteca) a 46 px del texto de orden.
         let filter = (self.settings.liked_filter as usize).min(FILTERS.len() - 1);
@@ -226,23 +234,26 @@ impl App {
         hand(ui, &filter_r);
         let hov = filter_r.hovered();
         // En blanco con un filtro puesto, como «Agrupar» con uno elegido.
-        let active = filter != 0;
+        let active = filter != 0 || self.liked_filter_open;
         let c = if active { st.icon_on } else if hov { st.hover } else { st.icon };
         paint_mask(&painter, "group", &lm::GROUP, px(&painter, at(dx, 0.0)), c);
         let tc = if active { st.icon_on } else if hov { st.hover } else { st.bar_text };
         text_on_baseline(&painter, at(ftext_x - fa_ink, BAR_BASE), fa, tc);
-        let filter_r = filter_r.on_hover_text("Filtrar");
-        egui::Popup::menu(&filter_r).show(|ui| {
-            ui.set_min_width(200.0);
-            for (k, name) in FILTERS.iter().enumerate() {
-                let icon = (k == filter).then_some(Icon::Check);
-                if Self::menu_item(ui, icon, name, false).clicked() {
-                    self.settings.liked_filter = k as u8;
-                    self.settings.save(&self.paths);
-                    ui.close();
-                }
+        if filter_r.clicked() {
+            self.liked_filter_open = !self.liked_filter_open;
+            self.liked_sort_open = false;
+        }
+        if self.liked_filter_open {
+            let ctx = ui.ctx().clone();
+            let (pick, close) = glass_choice_menu(&ctx, "liked_filter_menu", at(filter_x + GM_LEFT, GM_TOP), filter_hit, &FILTERS, filter);
+            if let Some(k) = pick {
+                self.settings.liked_filter = k as u8;
+                self.settings.save(&self.paths);
             }
-        });
+            if close {
+                self.liked_filter_open = false;
+            }
+        }
 
         // Lupa: la búsqueda de la lista (la misma de las demás listas de canciones).
         let search_x = ftext_x + fa_w + GAP_GROUP_SEARCH;

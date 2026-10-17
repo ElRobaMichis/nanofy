@@ -1191,6 +1191,55 @@ impl App {
     }
 }
 
+/// Menú de cristal con una lista de opciones, como el de «Agrupar» (mismo panel, desenfoque,
+/// filas y letra; ver `library_group_menu`): `min` es su esquina, `button` el botón que lo abre
+/// (pulsarlo no cuenta como pulsar fuera) y `selected` la opción en uso, en verde. Devuelve la
+/// opción pulsada y si hay que cerrarlo (fuera, Escape o al elegir).
+pub(super) fn glass_choice_menu(ctx: &egui::Context, id: &str, min: egui::Pos2, button: Rect, items: &[&str], selected: usize) -> (Option<usize>, bool) {
+    let p = theme::palette(ctx);
+    let dark = p.dark;
+    let n = items.len().max(1) as f32;
+    // Arriba y abajo, el mismo margen hasta el centro de la primera y la última fila.
+    let h = GM_FIRST_BASE + GM_ROW * (n - 1.0) - 6.0 + (GM_FIRST_BASE - 6.0);
+    let rect = Rect::from_min_size(pos2(min.x.round(), min.y.round()), vec2(GM_W, h));
+    let text_on = if dark { Color32::from_gray(224) } else { p.text };
+    let mut pick = None;
+    egui::Area::new(egui::Id::new(id))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .show(ctx, |ui| {
+            ui.allocate_rect(rect, Sense::click());
+            let painter = ui.painter().clone();
+            if dark {
+                painter.add(egui::Shape::Callback(egui::epaint::PaintCallback {
+                    rect,
+                    callback: std::sync::Arc::new(crate::raster::BackdropBlur { sigma: 56.0, corner: 7.0 }),
+                }));
+            }
+            let glass = if dark { Color32::from_rgba_unmultiplied(34, 34, 34, 191) } else { Color32::from_rgba_unmultiplied(250, 250, 250, 232) };
+            painter.rect_filled(rect, CornerRadius::same(7), glass);
+            for (k, name) in items.iter().enumerate() {
+                let base = rect.min.y + GM_FIRST_BASE + GM_ROW * k as f32;
+                let row = Rect::from_min_max(pos2(rect.min.x + 8.0, base - 6.0 - GM_ROW / 2.0 + 1.0), pos2(rect.max.x - 8.0, base - 6.0 + GM_ROW / 2.0 - 1.0));
+                let r = ui.interact(row, egui::Id::new((id, k)), Sense::click());
+                if r.hovered() {
+                    painter.rect_filled(row, CornerRadius::same(4), if dark { Color32::from_white_alpha(10) } else { p.hover });
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let color = if k == selected { theme::GREEN } else { text_on };
+                let g = painter.layout_no_wrap(name.to_string(), theme::semilight(GM_FONT), color);
+                let lead = ink_left(&g);
+                text_on_baseline(&painter, pos2(rect.min.x + GM_TEXT_X - lead, base), g, color);
+                if r.clicked() {
+                    pick = Some(k);
+                }
+            }
+        });
+    let outside = ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p) && !button.contains(p)));
+    let close = pick.is_some() || outside || ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    (pick, close)
+}
+
 /// Lo que hay a la izquierda de la tinta del primer glifo de `g` (su margen dentro del galley).
 fn ink_left(g: &egui::Galley) -> f32 {
     g.rows

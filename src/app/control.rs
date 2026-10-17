@@ -986,6 +986,20 @@ impl App {
                 self.library_group_open = b(cmd, "on", !self.library_group_open);
                 ok()
             }
+            // Menús de orden y filtro de «Canciones que te gustan».
+            "liked_menu" => match s(cmd, "which") {
+                Some("sort") => {
+                    self.liked_sort_open = b(cmd, "on", !self.liked_sort_open);
+                    self.liked_filter_open = false;
+                    ok()
+                }
+                Some("filter") => {
+                    self.liked_filter_open = b(cmd, "on", !self.liked_filter_open);
+                    self.liked_sort_open = false;
+                    ok()
+                }
+                _ => err("which debe ser sort o filter"),
+            },
             "library_filter" => {
                 self.library_filter = s(cmd, "q").unwrap_or("").to_string();
                 self.library_search_open = b(cmd, "open", !self.library_filter.is_empty());

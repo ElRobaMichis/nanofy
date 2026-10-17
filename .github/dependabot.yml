@@ -1,0 +1,13 @@
+# Keeps the GitHub Actions used by the workflows up to date (one grouped PR per month).
+# Rust dependencies are updated by hand: three librespot crates are vendored and patched.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

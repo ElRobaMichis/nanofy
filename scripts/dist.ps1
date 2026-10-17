@@ -1,9 +1,9 @@
 # Empaqueta Nanofy para repartirlo: compila en release y crea dist\Nanofy-<versión>-windows-x64.zip
-# con solo el ejecutable y el LEEME. Uso:  .\dist.ps1   (o dist.cmd)
+# con solo el ejecutable y el LEEME. Uso:  .\scripts\dist.ps1   (o scripts\dist.cmd)
 # Si defines $env:NANOFY_CLIENT_ID antes de compilar, ese Client ID queda como valor por defecto
 # en Ajustes → Web API (tus amigos solo tendrán que pulsar "Conectar").
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $root
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:LOCALAPPDATA\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin;$env:PATH"
 
@@ -15,7 +15,7 @@ $stage = Join-Path $root "dist\Nanofy"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item "target\release\nanofy.exe" (Join-Path $stage "nanofy.exe")
-Copy-Item "LEEME.txt" (Join-Path $stage "LEEME.txt")
+Copy-Item "packaging\LEEME.txt" (Join-Path $stage "LEEME.txt")
 
 $zip = Join-Path $root "dist\Nanofy-$version-windows-x64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }

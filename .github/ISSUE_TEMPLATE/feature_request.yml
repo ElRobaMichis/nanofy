@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest an idea or an improvement (English or Spanish)
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome. Please check [Limitations](https://github.com/ElRobaMichis/nanofy#limitations) first:
+        some things (lossless audio, playback without Premium) aren't possible from a third-party client.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like to do?
+      description: The problem or the use case, in your own words.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: How could it work?
+      description: How you imagine it in Nanofy. A sketch or a screenshot of another app helps.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What you do today instead, or other ways to solve it.
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd like to work on this myself.

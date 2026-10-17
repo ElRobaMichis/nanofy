@@ -13,6 +13,8 @@
 *.png
 !assets/nanofy.png
 !assets/resonancia-original.png
+!docs/screenshots/*.png
+!docs/social-preview.png
 assets/windows-icon-check.png
 
 # Restos del `cargo vendor` en las crates parcheadas (no hacen falta para compilar).

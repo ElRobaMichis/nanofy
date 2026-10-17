@@ -1,118 +1,156 @@
-<p align="center"><img src="assets/nanofy.png" width="112" alt="Icono de Nanofy"></p>
+<p align="center"><img src="assets/nanofy.png" width="112" alt="Nanofy icon"></p>
 
 <h1 align="center">Nanofy</h1>
 
-<p align="center">Cliente nativo de Spotify para escritorio, escrito en Rust.</p>
+<p align="center"><b>A native, lightweight Spotify client for the desktop, written in Rust.</b><br>
+No Electron, no webview, no GPU: ~14 MB of RAM and 0% CPU when idle.</p>
 
 <p align="center">
-  <a href="https://github.com/ElRobaMichis/nanofy/releases/latest"><img src="https://img.shields.io/github/v/release/ElRobaMichis/nanofy?label=versi%C3%B3n" alt="Última versión"></a>
+  <a href="https://github.com/ElRobaMichis/nanofy/releases/latest"><img src="https://img.shields.io/github/v/release/ElRobaMichis/nanofy?label=release&color=1db954" alt="Latest release"></a>
+  <a href="https://github.com/ElRobaMichis/nanofy/releases"><img src="https://img.shields.io/github/downloads/ElRobaMichis/nanofy/total?color=1db954" alt="Downloads"></a>
   <a href="https://github.com/ElRobaMichis/nanofy/actions/workflows/ci.yml"><img src="https://github.com/ElRobaMichis/nanofy/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-blue" alt="Licencia MIT"></a>
+  <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-555" alt="Windows, Linux and macOS">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
-<p align="center"><a href="#instalación">Instalar</a> · <a href="#compilar">Compilar</a> · <a href="#privacidad-y-datos">Privacidad</a> · <a href="CONTRIBUTING.md">Contribuir</a></p>
+<p align="center">
+  <a href="#download">Download</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#build-from-source">Build</a> ·
+  <a href="#privacy-and-data">Privacy</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="README.es.md">Español</a>
+</p>
 
-Nanofy reproduce Spotify en una ventana nativa, sin Electron ni webview. Dibuja la interfaz en la
-CPU, sin cargar el controlador gráfico, y en reposo no consume procesador. Aparece como un
-dispositivo Spotify Connect más, controla tus otros dispositivos y puede crear una Jam o unirse a
-una. Funciona en Windows, Linux y macOS, y la interfaz está en español. Para reproducir hace falta
-**Spotify Premium**.
+<p align="center"><img src="docs/screenshots/album.png" width="900" alt="Nanofy playing an album"></p>
 
-## Características
+Nanofy plays Spotify in a native window. It draws its interface on the CPU, so it doesn't wake up the
+graphics driver, and it uses no processor at all while idle. It shows up as one more Spotify Connect
+device: you can control it from your phone, control your other devices from it, and start or join a
+Jam. It runs on Windows, Linux and macOS. **Playback requires Spotify Premium.**
 
-### Reproducción y sonido
+> [!NOTE]
+> The interface is in **Spanish** for now. Everything in this README that you'll see on screen is
+> quoted in Spanish, with its meaning next to it.
 
-- Hasta 320 kbps, normalización de volumen con los tres niveles de Spotify, reproducción sin pausas y fundido de 1 a 12 s.
-- Remuestreo sinc cuando la salida no está a 44,1 kHz.
-- El audio sigue al dispositivo predeterminado del sistema (auriculares, Bluetooth), también si cambia en pausa.
-- Al abrir, recupera la última sesión, en pausa y en el mismo segundo, con la cola y los modos aleatorio y repetición.
-- Temporizador de apagado, reproducción automática al terminar una lista y opción de ocultar canciones para que se salten.
-- Letras sincronizadas (de Spotify cuando las ofrece y, si no, de LRCLIB); un clic en una línea salta a ese punto.
+## Screenshots
 
-### Biblioteca y navegación
+<table>
+  <tr>
+    <td><img src="docs/screenshots/artist.png" alt="Artist page"></td>
+    <td><img src="docs/screenshots/lyrics.png" alt="Synced lyrics"></td>
+  </tr>
+  <tr>
+    <td align="center">Artist page</td>
+    <td align="center">Word-by-word synced lyrics</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/song.png" alt="Song page with Genius annotations"></td>
+    <td><img src="docs/screenshots/search.png" alt="Search"></td>
+  </tr>
+  <tr>
+    <td align="center">Song page with Genius annotations</td>
+    <td align="center">Search with nine filters</td>
+  </tr>
+</table>
 
-- Playlists: crear, editar, cambiar la portada, hacerlas colaborativas, organizarlas en carpetas y añadir canciones a varias a la vez.
-- Me gusta, álbumes, artistas, podcasts e historial; las listas de canciones tienen selección múltiple y buscador propio.
-- Pestañas con historial propio, Inicio personalizable y búsqueda con nueve filtros.
-- Pegar en la búsqueda un enlace de `open.spotify.com` o una URI `spotify:` lo abre directamente.
+## Features
 
-### Control y social
+### Playback and sound
 
-- Se controla desde el móvil como cualquier dispositivo Connect, y el selector «Reproducir en» maneja los demás dispositivos.
-- Jam: crear, invitar y unirse con enlace o código.
+- Up to 320 kbps, volume normalization with Spotify's three levels, gapless playback and 1–12 s crossfade.
+- Sinc resampling when the output device isn't at 44.1 kHz.
+- Audio follows the system's default device (headphones, Bluetooth), even when it changes while paused.
+- On startup it restores the last session, paused at the same second, with the queue, shuffle and repeat.
+- **Spotify DJ**, with the host's voice between songs.
+- Autoplay when a list ends, a sleep timer, and hidden songs that are always skipped.
+- Pressing play on an artist plays your most-played songs by them first, then their popular ones, then similar music.
 
-### Sistema y fiabilidad
+### Lyrics and songs
 
-- Teclas multimedia y controles de reproducción del sistema, con título y portada, en Windows, Linux y macOS.
-- Miniplayer siempre visible y, en Windows, botones de reproducción en la miniatura de la barra de tareas.
-- Si se corta la red, se pausa en ese segundo y continúa cuando vuelve la conexión; si algo falla o tarda, avisa y ofrece reintentar.
-- Tema claro, oscuro o del sistema.
-- <kbd>Ctrl</kbd>+<kbd>/</kbd> (<kbd>Cmd</kbd>+<kbd>/</kbd> en macOS) muestra los atajos de teclado.
+- Synced lyrics, word by word when available, from BiniLyrics, Musixmatch (via Lyrics+), LRCLIB or Spotify, all asked at once. Click a line to jump there.
+- A page for every song: lyrics that follow the music, and Genius annotations on the verses that have them.
 
-## Rendimiento
+### Library and browsing
 
-Medido el 7 de octubre de 2026 con la versión 1.8.0 en un equipo con Windows 11, Intel Core i7 de
-16 hilos y RTX 3060 (la GPU no se usa). Memoria, CPU, arranque, cierre y fotogramas son la mediana
-de tres repeticiones; los tiempos de reproducción, carga de playlists y búsqueda dependen también de
-la red.
+- Playlists: create, edit, change the cover, make them collaborative, organize them in folders and add songs to several at once.
+- Liked songs, albums, artists, podcasts and history; song lists have multi-select and their own search box.
+- Tabs with their own history, a customizable Home and search with nine filters.
+- Paste an `open.spotify.com` link or a `spotify:` URI into the search box to open it directly.
 
-| Medida | Valor |
+### Control and social
+
+- Controllable from your phone like any Connect device; the «Reproducir en» (*Play on*) picker controls the others.
+- Jam: create one, invite people, or join with a link or a code.
+
+### System and reliability
+
+- Media keys and the system's playback controls (with title and cover art) on Windows, Linux and macOS.
+- An always-on-top miniplayer and, on Windows, playback buttons in the taskbar thumbnail.
+- Connection drops are repaired in the background without stopping the music. If the network goes away, it pauses at that second and resumes when it comes back.
+- Light, dark or system theme.
+- <kbd>Ctrl</kbd>+<kbd>/</kbd> (<kbd>Cmd</kbd>+<kbd>/</kbd> on macOS) lists the keyboard shortcuts.
+
+## Performance
+
+Measured on October 7, 2026 with version 1.8.0 on Windows 11, an Intel Core i7 with 16 threads and an
+RTX 3060 (the GPU isn't used). Memory, CPU, startup, exit and frame times are the median of three runs;
+playback, playlist and search times also depend on the network.
+
+| Measure | Value |
 |---|---|
-| Memoria en reposo con sesión (conjunto de trabajo / privada) | 14 MB / 26 MB |
-| Memoria reproduciendo (conjunto de trabajo / privada) | 22 MB / 55 MB |
-| CPU en reposo / reproduciendo (sobre el procesador entero) | 0 % / 0,4 % |
-| De crear el proceso a ver la ventana con contenido | 55 ms (66 ms con sesión) |
-| Del clic en la X al cierre del proceso | 26 ms (60 ms reproduciendo) |
-| De pulsar reproducir a oír la canción | ~0,3 s |
-| Abrir una playlist ya vista | < 0,1 s |
-| Cargar por primera vez una playlist entera de 9918 canciones | 2,6 s |
-| Búsqueda | ~1 s |
-| Tiempo por fotograma al desplazar una lista (ventana de 1920×1040) | ~2 ms |
-| Tamaño del ejecutable / del zip de Windows | ~17 MB / ~8 MB |
+| Idle memory, signed in (working set / private) | 14 MB / 26 MB |
+| Memory while playing (working set / private) | 22 MB / 55 MB |
+| CPU idle / playing (of the whole processor) | 0% / 0.4% |
+| From process start to a window with content | 55 ms (66 ms signed in) |
+| From clicking × to the process exiting | 26 ms (60 ms while playing) |
+| From pressing play to hearing the song | ~0.3 s |
+| Opening a playlist seen before | < 0.1 s |
+| Loading a whole 9,918-song playlist for the first time | 2.6 s |
+| Search | ~1 s |
+| Frame time while scrolling a list (1920×1040 window) | ~2 ms |
+| Executable / Windows zip size | ~17 MB / ~8 MB |
 
-## Instalación
+## Download
 
-Descarga el zip de tu sistema desde [Releases](https://github.com/ElRobaMichis/nanofy/releases/latest).
-No hay instalador.
+Get the zip for your system from [Releases](https://github.com/ElRobaMichis/nanofy/releases/latest).
+There's no installer.
 
-| Sistema | Archivo |
+| System | File |
 |---|---|
-| Windows 10 u 11, 64 bits | `Nanofy-windows-x64.zip` |
+| Windows 10 or 11, 64-bit | `Nanofy-windows-x64.zip` |
 | Linux, x86-64 | `Nanofy-linux-x64.zip` |
-| macOS 11 o posterior, Apple Silicon | `Nanofy-macos-arm64.zip` |
-| macOS 11 o posterior, Intel | `Nanofy-macos-x64.zip` |
+| macOS 11 or later, Apple Silicon | `Nanofy-macos-arm64.zip` |
+| macOS 11 or later, Intel | `Nanofy-macos-x64.zip` |
 
-Cada versión incluye `SHA256SUMS.txt` para comprobar la descarga (`sha256sum` en
-Linux, `shasum -a 256` en macOS, `Get-FileHash` en Windows).
+Every release includes `SHA256SUMS.txt` to verify the download (`sha256sum` on Linux,
+`shasum -a 256` on macOS, `Get-FileHash` on Windows).
 
-1. Descomprime el zip en una carpeta en la que tengas permiso de escritura, para que Nanofy se pueda
-   actualizar solo. En Windows, por ejemplo, en `%LOCALAPPDATA%\Programs` (el zip ya trae la
-   carpeta `Nanofy`), y no en Archivos de programa ni en OneDrive. No ejecutes Nanofy desde dentro
-   del zip.
-2. Abre Nanofy. En Linux hacen falta ALSA (`libasound2`) y OpenSSL 3; ejecútalo con
-   `chmod +x nanofy && ./nanofy`. Los binarios no están firmados, así que Windows y macOS avisan la
-   primera vez:
-   - Windows: en el aviso «Windows protegió tu PC», pulsa «Más información» y después «Ejecutar de
-     todas formas».
-   - macOS: intenta abrir `Nanofy.app` y pulsa «Abrir igualmente» en Ajustes del Sistema →
-     Privacidad y seguridad (en macOS 14 o anterior también sirve clic derecho → «Abrir»).
-3. Pulsa «Iniciar sesión con Spotify» y acepta los permisos en el navegador. El inicio de sesión usa
-   OAuth con PKCE: Nanofy no ve tu contraseña y no hace falta crear una app de desarrollador.
+1. Unzip it into a folder you can write to, so Nanofy can update itself. On Windows, for example,
+   `%LOCALAPPDATA%\Programs` (the zip already contains a `Nanofy` folder); not Program Files and not
+   OneDrive. Don't run Nanofy from inside the zip.
+2. Open Nanofy. On Linux it needs ALSA (`libasound2`) and OpenSSL 3; run it with
+   `chmod +x nanofy && ./nanofy`. The binaries aren't signed, so Windows and macOS warn the first time:
+   - Windows: on «Windows protected your PC», click «More info» and then «Run anyway».
+   - macOS: try to open `Nanofy.app`, then click «Open Anyway» in System Settings → Privacy & Security
+     (on macOS 14 or earlier, right-click → «Open» also works).
+3. Click «Iniciar sesión con Spotify» (*Sign in with Spotify*) and accept in the browser. Sign-in uses
+   OAuth with PKCE: Nanofy never sees your password, and you don't need to create a developer app.
 
-### Actualizaciones
+### Updates
 
-Nanofy busca versiones nuevas al arrancar y cada seis horas con una petición anónima a GitHub. En
-Windows y Linux descarga la actualización en segundo plano, comprueba su tamaño y su SHA-256 y
-muestra «Reiniciar para actualizar»; si la versión nueva no arranca, Nanofy vuelve solo a la
-anterior. En macOS solo avisa. Tanto la búsqueda como la instalación automática se pueden
-desactivar en Ajustes → Acerca de Nanofy.
+Nanofy checks for new versions on startup and every six hours with an anonymous request to GitHub. On
+Windows and Linux it downloads the update in the background, verifies its size and SHA-256 and shows
+«Reiniciar para actualizar» (*Restart to update*); if the new version doesn't start, Nanofy rolls back
+by itself. On macOS it only lets you know. Both checking and installing can be turned off in Settings →
+«Acerca de Nanofy» (*About Nanofy*).
 
-## Compilar
+## Build from source
 
-Hace falta Rust 1.95 o superior ([rustup](https://rustup.rs)) y, según el sistema:
+You need Rust 1.95 or newer ([rustup](https://rustup.rs)) and, depending on your system:
 
-- **Windows**: Visual Studio Build Tools con las herramientas de C++ y el SDK de Windows (toolchain
-  MSVC, la predeterminada).
+- **Windows**: Visual Studio Build Tools with the C++ tools and the Windows SDK (MSVC toolchain, the default).
+  Without admin rights, see [CONTRIBUTING.md](CONTRIBUTING.md#windows-without-admin-rights).
 - **Debian/Ubuntu**: `sudo apt install build-essential pkg-config libasound2-dev libssl-dev libxkbcommon-dev libdbus-1-dev`
 - **macOS**: `xcode-select --install`
 
@@ -122,68 +160,73 @@ cd nanofy
 cargo build --release
 ```
 
-El ejecutable queda en `target/release/nanofy` (`nanofy.exe` en Windows); en macOS es un binario
-suelto, no un `.app`. Las copias que se ejecutan desde `target/` no se actualizan solas: avisan de
-las versiones nuevas con «Instalar». Para compilar en Windows sin permisos de administrador,
-consulta [CONTRIBUTING.md](CONTRIBUTING.md#windows-sin-permisos-de-administrador).
+The executable ends up in `target/release/nanofy` (`nanofy.exe` on Windows); on macOS it's a plain
+binary, not an `.app`. Copies run from `target/` don't update themselves: they offer «Instalar»
+(*Install*) when there's a new version.
 
-## Privacidad y datos
+## Privacy and data
 
-Nanofy no tiene telemetría ni servidores propios y no acepta conexiones de otros equipos. Solo se
-conecta a estos servicios:
+Nanofy has no telemetry and no servers of its own, and it doesn't accept connections from other
+machines. It only talks to these services:
 
-| Servicio | Para qué | Qué recibe |
+| Service | What for | What it receives |
 |---|---|---|
-| Spotify | Sesión, audio, biblioteca, búsqueda, portadas, Spotify Connect, Jam y letras | Lo mismo que recibe de cualquier dispositivo Spotify Connect, incluido lo que suena |
-| [LRCLIB](https://lrclib.net) | Letras, solo con el panel abierto y si Spotify no las da | Título, artista, álbum y duración de la canción |
-| Deezer, iTunes y MusicBrainz | Géneros de álbumes y artistas | Solo los nombres del artista y del álbum |
-| GitHub | Buscar y descargar actualizaciones (desactivable) | La versión instalada, sin cuenta ni token |
+| Spotify | Session, audio, library, search, cover art, Spotify Connect, Jam, DJ | The same as from any Spotify Connect device, including what's playing |
+| [BiniLyrics](https://lrc.red), Lyrics+ (Musixmatch) and [LRCLIB](https://lrclib.net) | Lyrics, only while the lyrics panel or a song page is open | Title, artist, album and duration of the song (and of the next one, to have it ready) |
+| [Genius](https://genius.com) | Annotations on the song page, only when you turn them on | Title and artist |
+| Deezer, iTunes, MusicBrainz and Wikidata | Genres of albums, artists and songs | Only the artist, album or song names |
+| GitHub | Checking for and downloading updates (can be turned off) | The installed version, without any account or token |
 
-Como cualquier servidor, todos estos servicios ven tu dirección IP. El audio y las portadas se
-piden a las direcciones que indica Spotify, normalmente las de su CDN.
+Like any server, all of these services see your IP address. Audio and cover art are fetched from the
+addresses Spotify gives, normally its CDN.
 
-| Datos | Windows | Linux | macOS |
+| Data | Windows | Linux | macOS |
 |---|---|---|---|
-| Ajustes | `%APPDATA%\nanofy\config` | `~/.config/nanofy` | `~/Library/Application Support/nanofy` |
-| Sesión, credenciales, copia de la biblioteca y `nanofy.log` | `%LOCALAPPDATA%\nanofy\data` | `~/.local/state/nanofy` | `~/Library/Application Support/nanofy` |
-| Caché de audio, portadas y listas | `%LOCALAPPDATA%\nanofy\cache` | `~/.cache/nanofy` | `~/Library/Caches/nanofy` |
+| Settings | `%APPDATA%\nanofy\config` | `~/.config/nanofy` | `~/Library/Application Support/nanofy` |
+| Session, credentials, library copy and `nanofy.log` | `%LOCALAPPDATA%\nanofy\data` | `~/.local/state/nanofy` | `~/Library/Application Support/nanofy` |
+| Audio, cover art and list cache | `%LOCALAPPDATA%\nanofy\cache` | `~/.cache/nanofy` | `~/Library/Caches/nanofy` |
 
-Las credenciales y los tokens se guardan en JSON sin cifrar, no en el llavero del sistema.
-«Cerrar sesión» (Ajustes → Cuenta) borra la sesión guardada, pero no el acceso a la biblioteca, que
-se quita con «Desconectar» en Ajustes → Biblioteca.
+Credentials and tokens are stored as unencrypted JSON, not in the system keychain. «Cerrar sesión»
+(*Sign out*, in Settings → «Cuenta») deletes the saved session but not the library access, which is
+removed with «Desconectar» (*Disconnect*) in Settings → «Biblioteca».
 
-### Desinstalar
+### Uninstall
 
-Nanofy no escribe en el registro de Windows ni crea accesos directos. Para desinstalarlo, borra la
-carpeta donde lo descomprimiste y las de la tabla (en Windows, `%APPDATA%\nanofy` y
-`%LOCALAPPDATA%\nanofy`). Si quieres, revoca también su acceso en la página de aplicaciones de tu
-cuenta de Spotify.
+Nanofy doesn't write to the Windows registry or create shortcuts. Delete the folder you unzipped it
+into and the ones in the table above (on Windows, `%APPDATA%\nanofy` and `%LOCALAPPDATA%\nanofy`). If you
+want, also revoke its access on your Spotify account's apps page.
 
-## Limitaciones
+## Limitations
 
-- Sin Premium no se puede reproducir: solo explorar la biblioteca, buscar y gestionar playlists.
-- No hay calidad sin pérdida: el FLAC de Spotify está protegido por DRM. El máximo es 320 kbps.
-- La búsqueda, el Inicio, las playlists, las letras y la Jam usan API internas no documentadas que Spotify puede cambiar.
-- Las letras de Spotify no están disponibles para todas las cuentas, y LRCLIB no tiene todas las canciones.
-- «Descargar» guarda el audio en la caché de disco, pero no es un modo sin conexión: hace falta red para reproducirlo y la caché puede descartarlo cuando se llena.
-- No se pueden reordenar canciones arrastrando ni hay icono en la bandeja del sistema.
-- Las pruebas automáticas solo se ejecutan en Windows: los zips de Linux y macOS se compilan en cada versión, pero no se prueban.
+- Without Premium nothing plays: you can only browse your library, search and manage playlists.
+- No lossless audio: Spotify's FLAC is DRM-protected. The maximum is 320 kbps.
+- Search, Home, playlists, lyrics, DJ and Jam use internal, undocumented APIs that Spotify can change.
+- Lyrics aren't available for every song, and Genius doesn't have annotations for all of them.
+- «Descargar» (*Download*) keeps the audio in the disk cache, but it isn't an offline mode: playing it still needs the network, and the cache can drop it when it fills up.
+- Songs can't be reordered by dragging, and there's no system tray icon.
+- Automated tests only run on Windows; the Linux and macOS builds are compiled on every change but not tested.
 
-## Informar de un fallo
+## Reporting a bug
 
-Abre un [issue](https://github.com/ElRobaMichis/nanofy/issues) con la versión (Ajustes → Acerca de
-Nanofy), el sistema y los pasos para reproducirlo, y adjunta `nanofy.log` y `nanofy.log.1` (la
-carpeta aparece en [Privacidad y datos](#privacidad-y-datos)). Revísalos antes de publicarlos:
-incluyen tu nombre de usuario de Spotify y pueden incluir títulos de canciones. Más detalles en
-[CONTRIBUTING.md](CONTRIBUTING.md#informar-de-un-fallo).
+Open an [issue](https://github.com/ElRobaMichis/nanofy/issues/new/choose) (English or Spanish) with
+the version (Settings → «Acerca de Nanofy»), your system and the steps to reproduce it, and attach
+`nanofy.log` and `nanofy.log.1` from the data folder above. Review them before posting: they include
+your Spotify username and may include song titles. Security problems go
+[privately](SECURITY.md).
 
-## Créditos y licencia
+## Contributing
 
-Nanofy se apoya en [librespot](https://github.com/librespot-org/librespot) (con parches propios en
+Pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to build, test and send
+changes, and how the code is organized.
+
+## Credits and license
+
+Nanofy is built on [librespot](https://github.com/librespot-org/librespot) (with its own patches in
 `vendor/`), [egui](https://github.com/emilk/egui), [winit](https://github.com/rust-windowing/winit),
 [softbuffer](https://github.com/rust-windowing/softbuffer), [rodio](https://github.com/RustAudio/rodio),
-[Symphonia](https://github.com/pdeljanov/Symphonia) y [souvlaki](https://github.com/Sinono3/souvlaki).
-Letras de [LRCLIB](https://lrclib.net); géneros de Deezer, iTunes y MusicBrainz.
+[Symphonia](https://github.com/pdeljanov/Symphonia) and [souvlaki](https://github.com/Sinono3/souvlaki).
+Lyrics from BiniLyrics, Musixmatch (via Lyrics+) and [LRCLIB](https://lrclib.net); annotations from
+[Genius](https://genius.com); genres from Deezer, iTunes, MusicBrainz and Wikidata.
 
-Licencia [MIT](LICENSE). Nanofy es un proyecto independiente y no está afiliado a Spotify.
-Spotify es una marca de Spotify AB.
+[MIT](LICENSE) license. Nanofy is an independent project and isn't affiliated with Spotify. Spotify is
+a trademark of Spotify AB.

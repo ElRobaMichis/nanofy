@@ -53,7 +53,10 @@ jobs:
             target: aarch64-apple-darwin
             name: macos-arm64
             bin: nanofy
-          - os: macos-15-intel
+          # El de Intel se compila también en Apple Silicon, cruzado (el SDK de Xcode trae las dos
+          # arquitecturas): el runner Intel era el más lento con diferencia (15-19 min, frente a
+          # 6-9 del de Apple Silicon) y marcaba lo que tardaba cada versión en salir.
+          - os: macos-15
             target: x86_64-apple-darwin
             name: macos-x64
             bin: nanofy
@@ -103,7 +106,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist/Nanofy | Out-Null
           Copy-Item target/${{ matrix.target }}/release/nanofy.exe dist/Nanofy/
-          Copy-Item LEEME.txt dist/Nanofy/
+          Copy-Item packaging/LEEME.txt dist/Nanofy/
           Compress-Archive -Path dist/Nanofy -DestinationPath dist/Nanofy-${{ matrix.name }}.zip
 
       - name: Empaquetar (Linux)
@@ -111,7 +114,7 @@ jobs:
         run: |
           mkdir -p dist/Nanofy
           cp target/${{ matrix.target }}/release/nanofy dist/Nanofy/
-          cp LEEME.txt dist/Nanofy/
+          cp packaging/LEEME.txt dist/Nanofy/
           cat > dist/Nanofy/LEEME-linux.txt <<'EOF'
           Linux: necesita ALSA (libasound2) y OpenSSL 3 instalados, presentes en casi
           cualquier distribución. Ejecuta:  chmod +x nanofy && ./nanofy
@@ -141,7 +144,7 @@ jobs:
             <key>LSMinimumSystemVersion</key><string>11.0</string>
           </dict></plist>
           EOF
-          cp LEEME.txt dist/
+          cp packaging/LEEME.txt dist/
           cat > dist/LEEME-mac.txt <<'EOF'
           macOS: la app no está firmada. La primera vez, clic derecho sobre Nanofy.app →
           Abrir → Abrir. (O en Ajustes del Sistema → Privacidad y seguridad → "Abrir igualmente".)

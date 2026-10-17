@@ -1,21 +1,84 @@
-# Comprueba que Nanofy compila en Windows en cada push o pull request y pasa sus pruebas.
+# Comprueba cada push a main y cada pull request: las pruebas en Windows y que compile en Linux y
+# macOS. Las pruebas van en el perfil dev (dependencias en opt-level 3, ver Cargo.toml), que se
+# guarda en caché entre ejecuciones; antes se compilaba en release, con LTO completo y una sola
+# unidad de código, y se volvía a compilar así para las pruebas (~11 min). La compilación release
+# de verdad la hace `release.yml` al publicar.
 name: ci
 
 on:
   push:
     branches: ["main"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "packaging/LEEME.txt"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/pull_request_template.md"
+      - ".github/CODEOWNERS"
+      - ".github/dependabot.yml"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "packaging/LEEME.txt"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/pull_request_template.md"
+      - ".github/CODEOWNERS"
+      - ".github/dependabot.yml"
+  workflow_dispatch:
+
+# Un push nuevo a la misma rama o al mismo pull request cancela lo que aún estuviera en marcha.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
-  build:
+  test:
+    name: Pruebas (Windows)
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Compilar (release)
-        run: cargo build --release
-      # Solo las pruebas del binario nanofy (update.rs y demás). Las de los crates de vendor/
-      # quedan fuera: vendor/librespot-core/tests se conecta a Spotify y depende de la red.
+        with:
+          # Solo main guarda la caché: los pull requests la leen sin llenar el cupo del repositorio.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Solo las pruebas del binario nanofy (incluyen los módulos parcheados de vendor/ por
+      # #[path]). Las de los crates de vendor/ quedan fuera: librespot-core/tests se conecta a
+      # Spotify y depende de la red.
       - name: Pruebas unitarias
-        run: cargo test --release --bin nanofy
+        run: cargo test --locked --bin nanofy
+
+  check:
+    name: Compila (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: Linux
+          - os: macos-15
+            name: macOS
+    steps:
+      - uses: actions/checkout@v7
+      - name: Dependencias de Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libssl-dev libxkbcommon-dev libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Comprobar que compila
+        run: cargo check --locked --bin nanofy

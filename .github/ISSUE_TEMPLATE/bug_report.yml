@@ -1,0 +1,74 @@
+name: Bug report
+description: Something doesn't work as expected (you can write in English or Spanish)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. You can write in **English or Spanish**.
+        Gracias por avisar. Puedes escribir en **inglés o en español**.
+  - type: input
+    id: version
+    attributes:
+      label: Nanofy version
+      description: Settings → «Acerca de Nanofy»
+      placeholder: "1.26.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux (x86-64)
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+    validations:
+      required: true
+  - type: input
+    id: os-details
+    attributes:
+      label: OS details (optional)
+      description: Distribution, desktop environment, audio device… whatever seems relevant.
+      placeholder: "Ubuntu 24.04, GNOME, Bluetooth headphones"
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected and what happened instead.
+      placeholder: |
+        1. Opened an album and pressed play
+        2. The song stayed on «cargando» for 30 s
+        3. Expected it to start playing
+    validations:
+      required: true
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often does it happen?
+      options:
+        - Every time
+        - Sometimes
+        - Only once so far
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Attach `nanofy.log` (current session) and `nanofy.log.1` (previous one), right after the problem and before reopening Nanofy several times.
+        They are in `%LOCALAPPDATA%\nanofy\data` (Windows), `~/.local/state/nanofy` (Linux) or `~/Library/Application Support/nanofy` (macOS).
+        **Review them before posting:** they include your Spotify username and may include song titles. They never include your password or tokens.
+      placeholder: Drag and drop the files here.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and this hasn't been reported yet.
+          required: true
+        - label: I'm using Spotify Premium (playback needs it).
+          required: false

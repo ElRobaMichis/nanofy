@@ -75,6 +75,7 @@ Jam. It runs on Windows, Linux and macOS. **Playback requires Spotify Premium.**
 
 - Playlists: create, edit, change the cover, make them collaborative, organize them in folders and add songs to several at once.
 - Liked songs, albums, artists, podcasts and history; song lists have multi-select and their own search box.
+- Filter your liked songs by artist or genre and save the filter as a dynamic playlist that keeps itself up to date.
 - Tabs with their own history, a customizable Home and search with nine filters.
 - Paste an `open.spotify.com` link or a `spotify:` URI into the search box to open it directly.
 
@@ -174,7 +175,7 @@ machines. It only talks to these services:
 | Spotify | Session, audio, library, search, cover art, Spotify Connect, Jam, DJ | The same as from any Spotify Connect device, including what's playing |
 | [BiniLyrics](https://lrc.red), Lyrics+ (Musixmatch) and [LRCLIB](https://lrclib.net) | Lyrics, only while the lyrics panel or a song page is open | Title, artist, album and duration of the song (and of the next one, to have it ready) |
 | [Genius](https://genius.com) | Annotations on the song page, only when you turn them on | Title and artist |
-| Deezer, iTunes, MusicBrainz and Wikidata | Genres of albums, artists and songs | Only the artist, album or song names |
+| Deezer, iTunes, MusicBrainz and Wikidata | Genres of albums, artists and songs | Only the artist, album or song names (and, for the genre filter of your liked songs, Deezer gets their ISRC codes) |
 | GitHub | Checking for and downloading updates (can be turned off) | The installed version, without any account or token |
 
 Like any server, all of these services see your IP address. Audio and cover art are fetched from the

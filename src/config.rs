@@ -213,8 +213,11 @@ pub struct Settings {
     /// Orden de «Canciones que te gustan»: 0 recientes, 1 antiguas, 2 título, 3 artista,
     /// 4 álbum, 5 duración.
     pub liked_sort: u8,
-    /// Filtro de «Canciones que te gustan»: 0 todo, 1 descargadas.
+    /// Filtro de «Canciones que te gustan»: 0 todo, 1 un artista, 2 un género (de Deezer).
     pub liked_filter: u8,
+    /// Su valor (id del artista o número del género) y su nombre para el botón.
+    pub liked_filter_value: String,
+    pub liked_filter_label: String,
     /// Biblioteca de lo más antiguo a lo más reciente (el botón «Recientes»).
     pub library_oldest: bool,
     /// Biblioteca agrupada por tipo (playlists, carpetas, álbumes, artistas…).
@@ -278,6 +281,8 @@ impl Default for Settings {
             liked_grid: false,
             liked_sort: 0,
             liked_filter: 0,
+            liked_filter_value: String::new(),
+            liked_filter_label: String::new(),
             library_oldest: false,
             library_grouped: false,
             library_kind: 0,

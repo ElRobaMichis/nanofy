@@ -251,6 +251,9 @@ pub enum Req {
     /// Solo etiqueta los géneros que manda el carril de enriquecimiento (Resp::Genres); enviada
     /// a la API devuelve los ya conocidos, sin red.
     Genres { key: String },
+    /// Géneros de Deezer de «Canciones que te gustan» (id, título, primer artista y duración de
+    /// cada una): van en su propio hilo, ver `genres_deezer`. La respuesta llega por partes.
+    LikedGenres { songs: Vec<crate::genres_deezer::LikedSong> },
     ArtistTop(String),
     /// Pista completa (álbum, portada) por los metadatos internos.
     TrackInfo(String),
@@ -445,6 +448,9 @@ pub enum Resp {
     ArtistThumbs(Vec<Artist>),
     /// Géneros encontrados después de responder (`key` = "album:<id>" o "artist:<id>").
     Genres { key: String, genres: Vec<String> },
+    /// Lo encontrado de `Req::LikedGenres`: géneros (números de Deezer) de canciones, nombres de
+    /// géneros nuevos y cuántas canciones faltan (0 al acabar).
+    LikedGenres { tracks: Vec<(String, Vec<u32>)>, names: Vec<(u32, String)>, pending: usize },
     ArtistTop(Vec<Track>),
     TrackInfo(Track),
     TrackPage(Box<TrackPage>),
@@ -524,6 +530,12 @@ pub struct Api {
     web_personal: Arc<WebAuth>,
     /// Para las autorizaciones de la biblioteca, que esperan en su propio hilo (`begin_web_chain`).
     ui: UiTx,
+    /// Para los géneros de «Canciones que te gustan», que se buscan en su propio hilo (minutos la
+    /// primera vez: no deben ocupar un carril común).
+    client: Arc<Client>,
+    liked_genres_busy: Arc<std::sync::atomic::AtomicBool>,
+    liked_genres: Arc<Mutex<crate::genres_deezer::Store>>,
+    liked_genres_file: PathBuf,
 }
 
 impl Drop for Api {
@@ -848,7 +860,23 @@ impl Api {
                 })
                 .expect("no se pudo crear el hilo de la API");
         }
-        Self { tx, prio_tx, search_tx, bg_tx, internal_tx, enrich, web, web_personal, ui }
+        let liked_genres_file = web.state_dir().join("liked_genres.json");
+        let liked_genres = Arc::new(Mutex::new(crate::genres_deezer::Store::load(&liked_genres_file)));
+        Self {
+            tx,
+            prio_tx,
+            search_tx,
+            bg_tx,
+            internal_tx,
+            enrich,
+            web,
+            web_personal,
+            ui,
+            client,
+            liked_genres_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            liked_genres,
+            liked_genres_file,
+        }
     }
 
     /// Prepara la autorización de la biblioteca (identidad de primera parte) y la deja esperando
@@ -896,6 +924,28 @@ impl Api {
     }
 
     pub fn send(&self, req: Req) {
+        // Géneros de «Canciones que te gustan»: su propio hilo, uno a la vez (si ya hay uno, la
+        // interfaz vuelve a pedir al acabar si quedó algo nuevo).
+        if let Req::LikedGenres { songs } = req {
+            use std::sync::atomic::Ordering;
+            if self.liked_genres_busy.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let (client, ui, store, path, busy) = (self.client.clone(), self.ui.clone(), self.liked_genres.clone(), self.liked_genres_file.clone(), self.liked_genres_busy.clone());
+            let spawned = std::thread::Builder::new().name("nanofy-generos".into()).stack_size(512 * 1024).spawn(move || {
+                crate::genres_deezer::run(&store, &path, songs, |ids| client.isrcs(ids), |f| {
+                    ui.send(Msg::Api(ApiResult {
+                        req: Req::LikedGenres { songs: Vec::new() },
+                        result: Ok(Resp::LikedGenres { tracks: f.tracks, names: f.names, pending: f.pending }),
+                    }));
+                });
+                busy.store(false, Ordering::SeqCst);
+            });
+            if spawned.is_err() {
+                self.liked_genres_busy.store(false, Ordering::SeqCst);
+            }
+            return;
+        }
         // Solo la búsqueda va a su carril «gana la última». Req::User se queda en el común
         // aunque la búsqueda de perfiles lo envíe junto a ella: descartarlo dejaría «user:x»
         // pedido para siempre y el perfil o el avatar no llegarían nunca.
@@ -1882,6 +1932,33 @@ impl Client {
     /// Como tracks_by_ids, pero una entrada por id pedido y en su orden (`None` si Spotify no la
     /// tiene): una pista puede volver con otro id (Spotify sustituye ediciones) y hay que saber
     /// de cuál de las pedidas es.
+    /// ISRC (código de la grabación) de las pistas `ids`, de los metadatos internos por lotes (no
+    /// gastan cuota de la Web API). Las que no lo traen, o si un lote falla, no salen.
+    pub(crate) fn isrcs(&self, ids: &[String]) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        let kind = librespot_protocol::extension_kind::ExtensionKind::TRACK_V4;
+        for (i, chunk) in ids.chunks(BATCH_MAX).enumerate() {
+            if i > 0 {
+                yield_to_playback_blocking();
+            }
+            let uris: Vec<SpotifyUri> = chunk.iter().filter_map(|id| SpotifyUri::from_uri(&format!("spotify:track:{id}")).ok()).collect();
+            match self.metadata_batch::<librespot_metadata::Track>(&uris, kind, 0) {
+                Ok(metas) => {
+                    for (uri, m) in uris.iter().zip(metas) {
+                        let Some(m) = m else { continue };
+                        let Some(isrc) = m.external_ids.iter().find(|e| e.external_type.eq_ignore_ascii_case("isrc")) else { continue };
+                        if let Ok(u) = uri.to_uri() {
+                            out.insert(u.trim_start_matches("spotify:track:").to_string(), isrc.id.clone());
+                        }
+                    }
+                }
+                Err(e) => log::warn!("[generos-deezer] ISRC del lote {i}: {e}"),
+            }
+        }
+        log::info!("[generos-deezer] ISRC de {} de {} canciones", out.len(), ids.len());
+        out
+    }
+
     fn tracks_aligned(&self, ids: &[String]) -> Result<Vec<Option<Track>>, String> {
         let kind = librespot_protocol::extension_kind::ExtensionKind::TRACK_V4;
         let uris: Vec<Option<SpotifyUri>> = ids.iter().map(|id| SpotifyUri::from_uri(&format!("spotify:track:{id}")).ok()).collect();
@@ -3571,6 +3648,8 @@ impl Client {
                 self.warm_metadata(uris)?;
                 Ok(Resp::Done)
             }
+            // Se atiende en su propio hilo (`Api::send`); aquí no llega.
+            Req::LikedGenres { .. } => Err("los géneros de Me gusta van por su hilo".into()),
             Req::Genres { key } => Ok(Resp::Genres {
                 key: key.clone(),
                 genres: self.cached_genres(key).unwrap_or_default(),

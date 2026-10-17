@@ -65,6 +65,7 @@ una. Funciona en Windows, Linux y macOS, y la interfaz está en español. Para r
 
 - Playlists: crear, editar, cambiar la portada, hacerlas colaborativas, organizarlas en carpetas y añadir canciones a varias a la vez.
 - Me gusta, álbumes, artistas, podcasts e historial; las listas de canciones tienen selección múltiple y buscador propio.
+- Filtra tus canciones que te gustan por artista o género y guarda el filtro como una playlist dinámica que se pone al día sola.
 - Pestañas con historial propio, Inicio personalizable y búsqueda con nueve filtros.
 - Pegar en la búsqueda un enlace de `open.spotify.com` o una URI `spotify:` lo abre directamente.
 
@@ -169,7 +170,7 @@ conecta a estos servicios:
 | Spotify | Sesión, audio, biblioteca, búsqueda, portadas, Spotify Connect, Jam y DJ | Lo mismo que recibe de cualquier dispositivo Spotify Connect, incluido lo que suena |
 | [BiniLyrics](https://lrc.red), Lyrics+ (Musixmatch) y [LRCLIB](https://lrclib.net) | Letras, solo con el panel de la letra o una página de canción abiertos | Título, artista, álbum y duración de la canción (y de la siguiente, para tenerla lista) |
 | [Genius](https://genius.com) | Explicaciones de la página de canción, solo si las activas | Título y artista |
-| Deezer, iTunes, MusicBrainz y Wikidata | Géneros de álbumes, artistas y canciones | Solo los nombres del artista, del álbum o de la canción |
+| Deezer, iTunes, MusicBrainz y Wikidata | Géneros de álbumes, artistas y canciones | Solo los nombres del artista, del álbum o de la canción (y, para el filtro por género de tus canciones que te gustan, Deezer recibe sus códigos ISRC) |
 | GitHub | Buscar y descargar actualizaciones (desactivable) | La versión instalada, sin cuenta ni token |
 
 Como cualquier servidor, todos estos servicios ven tu dirección IP. El audio y las portadas se

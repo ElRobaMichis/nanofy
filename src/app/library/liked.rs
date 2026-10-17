@@ -4,6 +4,8 @@
 //! Las medidas son las de la referencia en una ventana con cliente de 1772 × 1029 (la misma
 //! escala que la biblioteca): la barra cae donde la de la biblioteca, así que se comparten.
 
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use egui::{pos2, vec2, Color32, CornerRadius, Rect, Sense};
@@ -11,8 +13,9 @@ use egui::{pos2, vec2, Color32, CornerRadius, Rect, Sense};
 use super::super::icons::Icon;
 use super::super::theme;
 use super::super::widgets::{galley_truncated, text_on_baseline, RowOpts};
-use super::super::{Action, App, PlayTarget, CONTENT_PAD_LEFT, CONTENT_PAD_RIGHT, LIKED};
-use super::{glass_choice_menu, ink_left, ink_right, lm, paint_mask, px, style, FolderDialog, GM_LEFT, GM_TOP};
+use super::super::{Action, App, Page, PlayTarget, CONTENT_PAD_LEFT, CONTENT_PAD_RIGHT, LIKED};
+use super::liked_masks as km;
+use super::{ink_left, ink_right, lm, paint_mask, px, style, FolderDialog};
 use super::{BAR_BASE, BAR_FONT, CARD, COVER_W, GAP_GROUP_SEARCH, GAP_GROUP_TEXT, GAP_SORT_GROUP, GRID_C, GRID_LEFT, GRID_RIGHT, LIST_C};
 use super::{PITCH_X, PITCH_Y, SORT_TEXT_X, SUB_FONT, SUB_GAP, SUB_LINE, TITLE_FONT, VIEW_BG_DY, VIEW_BG_H, VIEW_BG_W};
 use crate::api::Req;
@@ -40,11 +43,131 @@ const SORT_ICON_X: f32 = 159.0;
 
 /// Órdenes del botón «Recientes» (`Settings::liked_sort`).
 const SORTS: [&str; 6] = ["Recientes", "Antiguas", "Título", "Artista", "Álbum", "Duración"];
-/// Filtros (`Settings::liked_filter`); el botón dice «Filtro: <nombre>».
-const FILTERS: [&str; 2] = ["Todo", "Descargadas"];
+/// Filas del menú de filtro (`Settings::liked_filter`: 0 todo, 1 un artista, 2 un género).
+const FILTERS: [&str; 3] = ["Todo", "Artistas", "Géneros"];
 
-/// Lo que define la vista ordenada y filtrada que se guarda entre fotogramas.
-pub(in crate::app) type LikedViewKey = (u64, usize, String, u8, u8, usize);
+/// Menú de filtro (2.png, misma escala que la página, medido por el antialias de sus bordes):
+/// 18,84 px a la izquierda de la tinta de su icono y 57,1 bajo el borde del panel; 191,5 de ancho
+/// y 28,8 de margen arriba y abajo; filas cada 50,5 con la primera centrada a 29,38 del borde (así caen las bases de todas sus filas),
+/// texto Semilight 17 a 25,3. Sus submenús (artistas, géneros) a 198,29 de su borde izquierdo y
+/// 3,97 por encima de la fila que los abre. El cristal, gris 31 sobre el negro del panel (38 con
+/// la misma transparencia del de «Agrupar»).
+const FM_DX: f32 = -18.84;
+const FM_DY: f32 = 57.1;
+const FM_W: f32 = 191.5;
+const FM_EDGE: f32 = 28.8;
+const FM_PAD: f32 = 29.38;
+const FM_ROW: f32 = 50.5;
+const FM_TEXT_X: f32 = 25.3;
+const FM_FONT: f32 = 17.0;
+const FM_SUB_DX: f32 = 198.29;
+const FM_SUB_DY: f32 = -3.97;
+/// En el submenú el texto va medio píxel más abajo respecto de su borde (sus dos filas de la
+/// referencia, a 34,87 y 84,87 del borde; las del menú, a 33,9).
+const FM_SUB_TEXT_DY: f32 = 0.5;
+const FM_FILL: u8 = 38;
+const FM_TEXT: u8 = 211;
+const FM_CHEVRON: u8 = 142;
+/// El submenú no baja de aquí (desde el borde de abajo del panel); con más filas, se desplaza.
+const FM_SUB_BOTTOM: f32 = 16.0;
+
+/// «Playlist dinámica» (3.png): el texto acaba 52 px antes de la tinta del «+» (107 antes de su
+/// ancla) y el rayo va 28 antes del texto; texto verde apagado y rayo verde.
+const DYN_TEXT_RIGHT: f32 = -107.0;
+const DYN_TEXT: Color32 = Color32::from_rgb(131, 164, 148);
+const DYN_TEXT_HOVER: Color32 = Color32::from_rgb(170, 214, 188);
+const DYN_BOLT: Color32 = Color32::from_rgb(65, 210, 124);
+
+/// Lo que define la vista ordenada y filtrada que se guarda entre fotogramas: versión y largo de
+/// la lista, búsqueda, orden, tipo y valor del filtro y versión de los géneros.
+pub(in crate::app) type LikedViewKey = (u64, usize, String, u8, u8, String, u64);
+
+/// Una playlist dinámica: la playlist `id` lleva las canciones que te gustan del artista o del
+/// género del filtro (`kind` 1 o 2, `value` su id) y se pone al día sola cuando cambian
+/// (`sync_dynamic_playlists`). `synced`: lo que Nanofy añadió, para quitar solo eso (lo que añadas
+/// tú a mano no se toca). Se guardan aparte de los ajustes (`dynamic_playlists.json`), para que
+/// guardar la página de ajustes no las pise.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(in crate::app) struct DynamicPlaylist {
+    pub id: String,
+    pub name: String,
+    pub kind: u8,
+    pub value: String,
+    pub label: String,
+    #[serde(default)]
+    pub synced: Vec<String>,
+}
+
+pub(in crate::app) fn load_dynamic(path: &PathBuf) -> Vec<DynamicPlaylist> {
+    std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Una fila de los menús de la página.
+struct FmItem {
+    text: String,
+    chevron: bool,
+    green: bool,
+    dim: bool,
+}
+
+impl FmItem {
+    fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into(), chevron: false, green: false, dim: false }
+    }
+}
+
+/// Rectángulo de un menú de `n` filas con la esquina en `min` (sin redondear: sus bordes caen
+/// entre píxeles como en la referencia).
+fn fm_rect(min: egui::Pos2, n: usize) -> Rect {
+    Rect::from_min_size(min, vec2(FM_W, 2.0 * FM_EDGE + FM_ROW * n.saturating_sub(1) as f32))
+}
+
+/// El cristal de los menús: lo de detrás desenfocado (como el de «Agrupar») y el velo.
+fn fm_glass(painter: &egui::Painter, rect: Rect, dark: bool) {
+    if dark {
+        painter.add(egui::Shape::Callback(egui::epaint::PaintCallback {
+            rect,
+            callback: std::sync::Arc::new(crate::raster::BackdropBlur { sigma: 56.0, corner: 7.0 }),
+        }));
+    }
+    let glass = if dark { Color32::from_rgba_unmultiplied(FM_FILL, FM_FILL, FM_FILL, 191) } else { Color32::from_rgba_unmultiplied(250, 250, 250, 232) };
+    painter.rect_filled(rect, CornerRadius::same(7), glass);
+}
+
+/// Una fila de menú centrada en `cy` dentro de `rect` (su menú): fondo al pasar el ratón, texto y,
+/// si abre un submenú, su «›». `chevron_row`: qué fila es, para bajar el «›» las que hagan falta.
+/// Devuelve la respuesta de la fila.
+fn fm_row(ui: &mut egui::Ui, id: egui::Id, rect: Rect, cy: f32, item: &FmItem, chevron_row: usize) -> egui::Response {
+    let p = theme::palette(ui.ctx());
+    let painter = ui.painter().clone();
+    let row = Rect::from_min_max(pos2(rect.min.x + 8.0, cy - FM_ROW / 2.0 + 1.0), pos2(rect.max.x - 8.0, cy + FM_ROW / 2.0 - 1.0));
+    let r = ui.interact(row, id, if item.dim { Sense::hover() } else { Sense::click() });
+    // Las que abren un submenú no se resaltan (2.png: el ratón sobre «Genres», sin fondo).
+    if r.hovered() && !item.dim && !item.chevron {
+        painter.rect_filled(row, CornerRadius::same(4), if p.dark { Color32::from_white_alpha(10) } else { p.hover });
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if item.dim {
+        if p.dark { Color32::from_gray(110) } else { p.faint }
+    } else if item.green {
+        theme::GREEN
+    } else if p.dark {
+        Color32::from_gray(FM_TEXT)
+    } else {
+        p.text
+    };
+    let max_w = FM_W - FM_TEXT_X - if item.chevron { 48.0 } else { 16.0 };
+    let g = galley_truncated(&painter, &item.text, theme::semilight(FM_FONT), color, max_w);
+    let lead = ink_left(&g);
+    text_on_baseline(&painter, pos2((rect.min.x + FM_TEXT_X).round() - lead, cy + 6.0), g, color);
+    if item.chevron {
+        let c = if p.dark { Color32::from_gray(FM_CHEVRON) } else { p.weak };
+        // Los «›» de la referencia van cada 50 px justos (las filas, cada 50,5).
+        let anchor = px(&painter, pos2(rect.min.x, rect.min.y + (FM_ROW * (chevron_row as f32 - 1.0)).floor()));
+        paint_mask(&painter, "fm_chevron", &km::CHEVRON, anchor, c);
+    }
+    r
+}
 
 impl App {
     /// La página entera en el panel `panel` (como `library_panel`): la barra fija y la tabla (o
@@ -56,20 +179,21 @@ impl App {
             self.album_search.clear();
             self.album_search_open = false;
         }
+        self.liked_genres_tick();
         let list = self.lists.remove(LIKED).unwrap_or_default();
         let origin = pos2(panel.min.x.round(), panel.min.y.round());
         let grid = self.settings.liked_grid;
 
         let view = self.liked_view(&list.tracks, list.gen);
         let shown: &[Track] = view.as_deref().unwrap_or(&list.tracks);
+        let filtered = self.liked_filter_on().is_some();
 
-        if self.sel_list == LIKED && !self.sel.is_empty() {
+        let selecting = self.sel_list == LIKED && !self.sel.is_empty();
+        if selecting {
             // Con canciones elegidas, su barra en el sitio de la de herramientas.
             let bar = Rect::from_min_max(pos2(panel.min.x + CONTENT_PAD_LEFT, origin.y + 8.0), pos2(panel.max.x - CONTENT_PAD_RIGHT, origin.y + 52.0));
             let mut c = ui.new_child(egui::UiBuilder::new().max_rect(bar));
             self.selection_bar(&mut c, LIKED, shown);
-        } else {
-            self.liked_toolbar(ui, origin, panel);
         }
 
         let top = origin.y + if grid { GRID_TOP } else { TABLE_TOP };
@@ -86,8 +210,8 @@ impl App {
                 let st = style(ui.ctx());
                 let text = if !self.album_search.trim().is_empty() {
                     "Nada coincide con tu búsqueda"
-                } else if self.settings.liked_filter != 0 {
-                    "Ninguna canción que te gusta está descargada"
+                } else if filtered {
+                    "Ninguna canción que te gusta tiene este filtro"
                 } else {
                     "Las canciones que te gusten aparecerán aquí"
                 };
@@ -106,12 +230,17 @@ impl App {
                 let mut row = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(left, ui.cursor().min.y), vec2(w, f32::INFINITY))));
                 row.spacing_mut().item_spacing = vec2(0.0, 0.0);
                 row.set_width(w);
-                self.track_rows(&mut row, LIKED, shown, RowOpts { header: true, select: true, cols_w: Some(cols_w.min(w)), ..RowOpts::tracks(true, true) });
+                // Filtrada, cada canción con su número en la lista entera (3.png: 1, 2, 5, 7).
+                self.track_rows(&mut row, LIKED, shown, RowOpts { header: true, select: true, numbered: filtered, cols_w: Some(cols_w.min(w)), ..RowOpts::tracks(true, true) });
                 let used = row.min_rect().height();
                 ui.allocate_exact_size(vec2(panel.width() - 2.0, used + 24.0), Sense::hover());
             }
         });
         self.lists.insert(LIKED.to_string(), list);
+        // La barra, con la lista ya en su sitio: los submenús del filtro sacan de ella sus opciones.
+        if !selecting {
+            self.liked_toolbar(ui, origin, panel);
+        }
     }
 
     /// Las canciones ordenadas y filtradas según la barra, más la búsqueda de la lupa. `None` si
@@ -119,13 +248,14 @@ impl App {
     /// Con miles de canciones se guarda y solo se rehace si cambia algo de lo que la define.
     fn liked_view(&mut self, tracks: &[Track], gen: u64) -> Option<Rc<[Track]>> {
         let sort = self.settings.liked_sort.min(SORTS.len() as u8 - 1);
-        let filter = self.settings.liked_filter.min(FILTERS.len() as u8 - 1);
+        let filter = self.liked_filter_on();
         let q = self.list_query(LIKED);
-        if sort == 0 && filter == 0 && q.is_empty() {
+        if sort == 0 && filter.is_none() && q.is_empty() {
             self.liked_view = None;
             return None;
         }
-        let key: LikedViewKey = (gen, tracks.len(), q.clone(), sort, filter, self.downloaded.len());
+        let (kind, value) = filter.clone().unwrap_or((0, String::new()));
+        let key: LikedViewKey = (gen, tracks.len(), q.clone(), sort, kind, value.clone(), self.liked_genres_ver);
         if let Some((k, v)) = &self.liked_view {
             if *k == key {
                 return Some(v.clone());
@@ -133,14 +263,22 @@ impl App {
         }
         let mut v: Vec<Track> = tracks
             .iter()
-            .filter(|t| {
+            .enumerate()
+            .filter(|(_, t)| {
                 q.is_empty()
                     || t.name.to_lowercase().contains(&q)
                     || t.artists.iter().any(|a| a.name.to_lowercase().contains(&q))
                     || t.album.as_ref().is_some_and(|a| a.name.to_lowercase().contains(&q))
             })
-            .filter(|t| filter == 0 || t.id.as_ref().is_some_and(|i| self.downloaded.contains(i)))
-            .cloned()
+            .filter(|(_, t)| kind == 0 || self.liked_match(t, kind, &value) == Some(true))
+            .map(|(i, t)| {
+                let mut t = t.clone();
+                // Con filtro se ve su número en la lista entera (ver `numbered` en la tabla).
+                if kind != 0 {
+                    t.track_number = Some(i as u32 + 1);
+                }
+                t
+            })
             .collect();
         // Por texto, sin distinguir mayúsculas y con lo que no tiene nombre (canciones retiradas)
         // al final.
@@ -210,21 +348,18 @@ impl App {
         }
         if self.liked_sort_open {
             let ctx = ui.ctx().clone();
-            let (pick, close) = glass_choice_menu(&ctx, "liked_sort_menu", at(SORT_ICON_X + GM_LEFT, GM_TOP), sort_hit, &SORTS, sort);
-            if let Some(k) = pick {
-                self.settings.liked_sort = k as u8;
-                self.settings.save(&self.paths);
-            }
-            if close {
-                self.liked_sort_open = false;
-            }
+            self.liked_sort_menu(&ctx, at(SORT_ICON_X + FM_DX, FM_DY), sort_hit, sort);
         }
 
         // Filtro: su icono (el de «Agrupar» de la biblioteca) a 46 px del texto de orden.
-        let filter = (self.settings.liked_filter as usize).min(FILTERS.len() - 1);
+        let filter = self.liked_filter_on();
         let filter_x = SORT_TEXT_X + text_w + GAP_SORT_GROUP;
         let dx = filter_x - (lm::GROUP.ox as f32 + 2.0);
-        let label = format!("Filtro: {}", FILTERS[filter]);
+        let label = match &filter {
+            Some((1, _)) => format!("Filtro: Artista ({})", self.settings.liked_filter_label),
+            Some(_) => format!("Filtro: Género ({})", self.settings.liked_filter_label),
+            None => "Filtro: Todo".to_string(),
+        };
         let fa = painter.layout_no_wrap(label, theme::semibold(BAR_FONT), st.bar_text);
         let fa_ink = ink_left(&fa);
         let fa_w = fa.size().x - fa_ink - ink_right(&fa);
@@ -234,25 +369,19 @@ impl App {
         hand(ui, &filter_r);
         let hov = filter_r.hovered();
         // En blanco con un filtro puesto, como «Agrupar» con uno elegido.
-        let active = filter != 0 || self.liked_filter_open;
+        let active = filter.is_some() || self.liked_filter_open;
         let c = if active { st.icon_on } else if hov { st.hover } else { st.icon };
         paint_mask(&painter, "group", &lm::GROUP, px(&painter, at(dx, 0.0)), c);
         let tc = if active { st.icon_on } else if hov { st.hover } else { st.bar_text };
         text_on_baseline(&painter, at(ftext_x - fa_ink, BAR_BASE), fa, tc);
         if filter_r.clicked() {
             self.liked_filter_open = !self.liked_filter_open;
+            self.liked_filter_sub = None;
             self.liked_sort_open = false;
         }
         if self.liked_filter_open {
             let ctx = ui.ctx().clone();
-            let (pick, close) = glass_choice_menu(&ctx, "liked_filter_menu", at(filter_x + GM_LEFT, GM_TOP), filter_hit, &FILTERS, filter);
-            if let Some(k) = pick {
-                self.settings.liked_filter = k as u8;
-                self.settings.save(&self.paths);
-            }
-            if close {
-                self.liked_filter_open = false;
-            }
+            self.liked_filter_menu(&ctx, at(filter_x + FM_DX, FM_DY), filter_hit, panel);
         }
 
         // Lupa: la búsqueda de la lista (la misma de las demás listas de canciones).
@@ -299,8 +428,28 @@ impl App {
             }
         }
 
-        // «+»: crear playlist o carpeta, como en la biblioteca.
         let po = pos2(panel.max.x.round() + PLUS_DX, o.y);
+        if filter.is_some() {
+            let g = painter.layout_no_wrap("Playlist dinámica".into(), theme::semibold(BAR_FONT), DYN_TEXT);
+            let lead = ink_left(&g);
+            let w = g.size().x - lead - ink_right(&g);
+            let right = po.x + DYN_TEXT_RIGHT;
+            let left = right - w;
+            let hit = Rect::from_min_max(pos2(left - 40.0, o.y + 9.0), pos2(right + 8.0, o.y + 50.0));
+            let r = ui.interact(hit, ui.id().with("liked_dynamic"), Sense::click());
+            hand(ui, &r);
+            let hov = r.hovered();
+            let bolt = if hov { Color32::from_rgb(110, 235, 160) } else { DYN_BOLT };
+            paint_mask(&painter, "bolt", &km::BOLT, px(&painter, pos2(left, o.y)), bolt);
+            text_on_baseline(&painter, pos2(left - lead, o.y + BAR_BASE), g, if hov { DYN_TEXT_HOVER } else { DYN_TEXT });
+            let exists = self.liked_dynamic_rule().is_some();
+            let tip = if exists { "Abrir su playlist dinámica" } else { "Guardar como playlist dinámica: se pone al día sola cuando cambian tus canciones que te gustan" };
+            if r.on_hover_text(tip).clicked() {
+                self.liked_dynamic_click();
+            }
+        }
+
+        // «+»: crear playlist o carpeta, como en la biblioteca.
         let plus_hit = Rect::from_center_size(pos2(po.x + lm::PLUS.ox as f32 + 2.0 + 8.5, o.y + 29.0), vec2(40.0, 40.0));
         let plus_r = ui.interact(plus_hit, ui.id().with("liked_plus"), Sense::click());
         hand(ui, &plus_r);
@@ -317,6 +466,282 @@ impl App {
                 ui.close();
             }
         });
+    }
+
+    /// El filtro en uso (tipo y valor), o `None` si se ven todas (de unos ajustes viejos, un
+    /// tipo sin valor cuenta como «Todo»).
+    pub(in crate::app) fn liked_filter_on(&self) -> Option<(u8, String)> {
+        let kind = self.settings.liked_filter;
+        let value = &self.settings.liked_filter_value;
+        (matches!(kind, 1 | 2) && !value.is_empty()).then(|| (kind, value.clone()))
+    }
+
+    /// ¿Entra la canción en el filtro? Por artista, si es uno de los suyos; por género, si su
+    /// álbum lo tiene en Deezer (`None` si aún no se conocen sus géneros).
+    fn liked_match(&self, t: &Track, kind: u8, value: &str) -> Option<bool> {
+        match kind {
+            1 => Some(t.artists.iter().any(|a| a.id.as_deref() == Some(value))),
+            2 => {
+                let g: u32 = value.parse().ok()?;
+                t.id.as_ref().and_then(|i| self.liked_genres.get(i)).map(|gs| gs.contains(&g))
+            }
+            _ => Some(true),
+        }
+    }
+
+    /// Opciones del submenú `kind` (1 artistas, 2 géneros): (valor, nombre), de los que más
+    /// canciones tienen a los que menos; y, si aún se buscan géneros, una nota para el final.
+    pub(in crate::app) fn liked_filter_options(&self, kind: u8) -> (Vec<(String, String)>, Option<String>) {
+        let mut count: HashMap<String, (String, usize)> = HashMap::new();
+        if let Some(list) = self.lists.get(LIKED) {
+            for t in &list.tracks {
+                if kind == 1 {
+                    for a in &t.artists {
+                        if let Some(id) = &a.id {
+                            count.entry(id.clone()).or_insert_with(|| (a.name.clone(), 0)).1 += 1;
+                        }
+                    }
+                } else if let Some(gs) = t.id.as_ref().and_then(|i| self.liked_genres.get(i)) {
+                    for g in gs {
+                        let name = self.genre_names.get(g).cloned().unwrap_or_else(|| g.to_string());
+                        count.entry(g.to_string()).or_insert_with(|| (name, 0)).1 += 1;
+                    }
+                }
+            }
+        }
+        let mut v: Vec<(String, String, usize)> = count.into_iter().map(|(k, (name, n))| (k, name, n)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+        let note = match (kind, self.liked_genres_pending) {
+            (2, Some(n)) if n > 0 && n != usize::MAX => Some(format!("Buscando géneros… ({n})")),
+            (2, Some(n)) if n > 0 => Some("Buscando géneros…".to_string()),
+            (2, None) => Some("Buscando géneros…".to_string()),
+            _ => None,
+        };
+        (v.into_iter().map(|(k, name, _)| (k, name)).collect(), note)
+    }
+
+    /// El menú de orden, con el cristal y el sitio del de filtro (respecto de su icono).
+    fn liked_sort_menu(&mut self, ctx: &egui::Context, min: egui::Pos2, button: Rect, sort: usize) {
+        let dark = theme::palette(ctx).dark;
+        let rect = fm_rect(min, SORTS.len());
+        let mut pick = None;
+        egui::Area::new(egui::Id::new("liked_sort_menu")).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+            ui.allocate_rect(rect, Sense::click());
+            fm_glass(ui.painter(), rect, dark);
+            for (k, name) in SORTS.iter().enumerate() {
+                let item = FmItem { green: k == sort, ..FmItem::new(*name) };
+                if fm_row(ui, egui::Id::new(("liked_sort_row", k)), rect, rect.min.y + FM_PAD + FM_ROW * k as f32, &item, 0).clicked() {
+                    pick = Some(k);
+                }
+            }
+        });
+        if let Some(k) = pick {
+            self.settings.liked_sort = k as u8;
+            self.settings.save(&self.paths);
+        }
+        let outside = ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p) && !button.contains(p)));
+        if pick.is_some() || outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.liked_sort_open = false;
+        }
+    }
+
+    /// El menú de filtro (2.png): «Todo», «Artistas ›» y «Géneros ›»; al pasar por estas dos, su
+    /// submenú a la derecha con las opciones de tus canciones (con muchas, se desplaza).
+    fn liked_filter_menu(&mut self, ctx: &egui::Context, min: egui::Pos2, button: Rect, panel: Rect) {
+        let dark = theme::palette(ctx).dark;
+        let rect = fm_rect(min, FILTERS.len());
+        let mut pick: Option<(u8, String, String)> = None;
+        let mut sub = self.liked_filter_sub;
+        egui::Area::new(egui::Id::new("liked_filter_menu")).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+            ui.allocate_rect(rect, Sense::click());
+            fm_glass(ui.painter(), rect, dark);
+            for (k, name) in FILTERS.iter().enumerate() {
+                let item = FmItem { chevron: k > 0, ..FmItem::new(*name) };
+                let r = fm_row(ui, egui::Id::new(("liked_filter_row", k)), rect, rect.min.y + FM_PAD + FM_ROW * k as f32, &item, k);
+                if k > 0 && (r.hovered() || r.clicked()) {
+                    sub = Some(k as u8);
+                }
+                if k == 0 && r.clicked() {
+                    pick = Some((0, String::new(), String::new()));
+                }
+                if k == 0 && r.hovered() {
+                    sub = None;
+                }
+            }
+        });
+        let mut sub_rect = Rect::NOTHING;
+        if let Some(kind) = sub {
+            let (options, note) = self.liked_filter_options(kind);
+            let mut items: Vec<(Option<(String, String)>, FmItem)> = options.into_iter().map(|(v, name)| (Some((v, name.clone())), FmItem::new(name))).collect();
+            if let Some(n) = note {
+                items.push((None, FmItem { dim: true, ..FmItem::new(n) }));
+            }
+            if items.is_empty() {
+                items.push((None, FmItem { dim: true, ..FmItem::new("Nada aún") }));
+            }
+            let smin = pos2(rect.min.x + FM_SUB_DX, rect.min.y + FM_ROW * kind as f32 + FM_SUB_DY);
+            let room = ((panel.max.y - FM_SUB_BOTTOM - smin.y - 2.0 * FM_EDGE) / FM_ROW).floor().max(0.0) as usize + 1;
+            let shown = items.len().min(room.max(1));
+            sub_rect = fm_rect(smin, shown);
+            let scroll = items.len() > shown;
+            let r = sub_rect;
+            egui::Area::new(egui::Id::new("liked_filter_sub")).order(egui::Order::Foreground).fixed_pos(r.min).show(ctx, |ui| {
+                ui.allocate_rect(r, Sense::hover());
+                fm_glass(ui.painter(), r, dark);
+                let mut draw = |ui: &mut egui::Ui, k: usize, cy: f32, frame: Rect| {
+                    let (value, item) = &items[k];
+                    if fm_row(ui, egui::Id::new(("liked_filter_opt", kind, k)), frame, cy, item, 0).clicked() {
+                        if let Some((v, name)) = value {
+                            pick = Some((kind, v.clone(), name.clone()));
+                        }
+                    }
+                };
+                if scroll {
+                    let inner = r.shrink2(vec2(0.0, 4.0));
+                    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+                    c.set_clip_rect(inner);
+                    egui::ScrollArea::vertical().id_salt(("liked_filter_scroll", kind)).max_height(inner.height()).auto_shrink([false, false]).show(&mut c, |ui| {
+                        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                        // Las filas a mano, cada 50,5 exactos (con `allocate` se redondearían).
+                        let h = 2.0 * FM_EDGE - 8.0 + FM_ROW * (items.len() - 1) as f32;
+                        let (all, _) = ui.allocate_exact_size(vec2(FM_W, h), Sense::hover());
+                        let frame = Rect::from_min_size(pos2(r.min.x, all.min.y - 4.0), vec2(FM_W, h + 8.0));
+                        for k in 0..items.len() {
+                            draw(ui, k, frame.min.y + FM_PAD + FM_SUB_TEXT_DY + FM_ROW * k as f32, frame);
+                        }
+                    });
+                } else {
+                    for k in 0..items.len() {
+                        draw(ui, k, r.min.y + FM_PAD + FM_SUB_TEXT_DY + FM_ROW * k as f32, r);
+                    }
+                }
+            });
+        }
+        self.liked_filter_sub = sub;
+        if let Some((kind, value, label)) = pick.clone() {
+            self.settings.liked_filter = kind;
+            self.settings.liked_filter_value = value;
+            self.settings.liked_filter_label = label;
+            self.settings.save(&self.paths);
+        }
+        let outside = ctx.input(|i| {
+            i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p) && !sub_rect.contains(p) && !button.contains(p))
+        });
+        if pick.is_some() || outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.liked_filter_open = false;
+            self.liked_filter_sub = None;
+        }
+    }
+
+    /// La playlist dinámica del filtro en uso, si ya existe.
+    fn liked_dynamic_rule(&self) -> Option<&DynamicPlaylist> {
+        let (kind, value) = self.liked_filter_on()?;
+        self.dynamic_playlists.iter().find(|r| r.kind == kind && r.value == value)
+    }
+
+    /// «Playlist dinámica»: abre la del filtro si ya existe; si no, crea una playlist privada con
+    /// su nombre y, cuando llega (`Resp::PlaylistCreated`), se rellena y queda al día.
+    fn liked_dynamic_click(&mut self) {
+        if let Some(r) = self.liked_dynamic_rule() {
+            self.actions.push(Action::Go(Page::Playlist(r.id.clone())));
+            return;
+        }
+        let Some((kind, value)) = self.liked_filter_on() else { return };
+        if self.pending_dynamic.is_some() {
+            return;
+        }
+        let Some(user_id) = self.my_id().map(str::to_string) else {
+            self.status_err("Inicia sesión para crear playlists");
+            return;
+        };
+        let label = self.settings.liked_filter_label.clone();
+        let name = format!("{label} · Canciones que te gustan");
+        let what = if kind == 1 { "de" } else { "del género" };
+        let description = format!("Playlist dinámica de Nanofy: tus canciones que te gustan {what} {label}. Se pone al día sola cuando añades o quitas canciones.");
+        self.pending_dynamic = Some(DynamicPlaylist { id: String::new(), name: name.clone(), kind, value, label, synced: Vec::new() });
+        self.api.send(Req::CreatePlaylist { user_id, name, description, public: false, collaborative: false });
+        self.status("Creando la playlist dinámica…");
+    }
+
+    pub(in crate::app) fn save_dynamic(&self) {
+        if let Ok(t) = serde_json::to_string(&self.dynamic_playlists) {
+            crate::cache::write_atomic(&self.dynamic_path, &t);
+        }
+    }
+
+    /// Pide los géneros de Deezer de las canciones que te gustan que falten (en su propio hilo,
+    /// ver `genres_deezer`), una vez por versión de la lista y sin pisar una búsqueda en curso.
+    pub(in crate::app) fn liked_genres_tick(&mut self) {
+        let Some(list) = self.lists.get(LIKED) else { return };
+        if list.loading || list.tracks.is_empty() {
+            return;
+        }
+        let mark = (list.gen, list.tracks.len());
+        if self.liked_genres_asked == Some(mark) || self.liked_genres_pending.is_some_and(|p| p > 0) {
+            return;
+        }
+        let songs: Vec<crate::genres_deezer::LikedSong> = list
+            .tracks
+            .iter()
+            .filter_map(|t| Some((t.id.clone()?, t.name.clone(), t.artists.first().map(|a| a.name.clone()).unwrap_or_default(), t.duration_ms)))
+            .collect();
+        self.liked_genres_asked = Some(mark);
+        self.liked_genres_pending = Some(usize::MAX);
+        self.api.send(Req::LikedGenres { songs });
+    }
+
+    /// Pone al día las playlists dinámicas con las canciones que te gustan: añade las que entran
+    /// en su filtro y quita las que añadió y ya no entran (dejaron de gustarte o, por género, ya se
+    /// sabe que no lo tienen). Solo cuando cambia la lista, sus géneros o las reglas.
+    pub(in crate::app) fn sync_dynamic_playlists(&mut self) {
+        if self.dynamic_playlists.is_empty() {
+            return;
+        }
+        let Some(list) = self.lists.get(LIKED) else { return };
+        if list.loading || list.tracks.is_empty() {
+            return;
+        }
+        let key = (list.gen, list.tracks.len(), self.liked_genres_ver, self.dynamic_playlists.len());
+        if self.dynamic_sync_key == Some(key) {
+            return;
+        }
+        self.dynamic_sync_key = Some(key);
+        let by_uri: HashMap<&str, &Track> = list.tracks.iter().map(|t| (t.uri.as_str(), t)).collect();
+        let mut rules = std::mem::take(&mut self.dynamic_playlists);
+        let mut changed = false;
+        for r in rules.iter_mut().filter(|r| !r.id.is_empty()) {
+            let have: HashSet<&str> = r.synced.iter().map(String::as_str).collect();
+            let mut seen = HashSet::new();
+            let add: Vec<String> = list
+                .tracks
+                .iter()
+                .filter(|t| !have.contains(t.uri.as_str()) && self.liked_match(t, r.kind, &r.value) == Some(true) && seen.insert(t.uri.clone()))
+                .map(|t| t.uri.clone())
+                .collect();
+            let remove: Vec<String> = r
+                .synced
+                .iter()
+                .filter(|u| by_uri.get(u.as_str()).is_none_or(|t| self.liked_match(t, r.kind, &r.value) == Some(false)))
+                .cloned()
+                .collect();
+            if !add.is_empty() {
+                log::info!("[dinamica] «{}»: se añaden {}", r.name, add.len());
+                self.api.send(Req::AddToPlaylist { id: r.id.clone(), uris: add.clone() });
+                r.synced.extend(add);
+                changed = true;
+            }
+            if !remove.is_empty() {
+                log::info!("[dinamica] «{}»: se quitan {}", r.name, remove.len());
+                self.api.send(Req::RemoveFromPlaylist { id: r.id.clone(), uris: remove.clone() });
+                let gone: HashSet<String> = remove.into_iter().collect();
+                r.synced.retain(|u| !gone.contains(u));
+                changed = true;
+            }
+        }
+        self.dynamic_playlists = rules;
+        if changed {
+            self.save_dynamic();
+        }
     }
 
     fn set_liked_grid(&mut self, on: bool) {

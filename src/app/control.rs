@@ -996,10 +996,53 @@ impl App {
                 Some("filter") => {
                     self.liked_filter_open = b(cmd, "on", !self.liked_filter_open);
                     self.liked_sort_open = false;
+                    // `sub`: 1 abre el submenú de artistas, 2 el de géneros.
+                    self.liked_filter_sub = n(cmd, "sub").filter(|k| matches!(k, 1 | 2)).map(|k| k as u8);
                     ok()
                 }
                 _ => err("which debe ser sort o filter"),
             },
+            // Filtro de «Canciones que te gustan»: `kind` 0 todo, 1 artista, 2 género; sin
+            // `value`, el primero del submenú (el que más canciones tiene).
+            "liked_filter" => {
+                let kind = n(cmd, "kind").unwrap_or(0).clamp(0, 2) as u8;
+                let (options, _) = self.liked_filter_options(kind);
+                let pick = match s(cmd, "value") {
+                    Some(v) => options.iter().find(|(k, _)| k == v).cloned(),
+                    None => options.first().cloned(),
+                };
+                match (kind, pick) {
+                    (0, _) => {
+                        self.settings.liked_filter = 0;
+                        self.settings.liked_filter_value.clear();
+                        self.settings.liked_filter_label.clear();
+                        ok()
+                    }
+                    (_, Some((value, label))) => {
+                        self.settings.liked_filter = kind;
+                        self.settings.liked_filter_value = value.clone();
+                        self.settings.liked_filter_label = label.clone();
+                        json!({"ok": true, "value": value, "label": label})
+                    }
+                    _ => err("no hay esa opción"),
+                }
+            }
+            // Estado de los géneros de Deezer y las playlists dinámicas.
+            "liked_genres" => {
+                let (genres, note) = self.liked_filter_options(2);
+                let top: Vec<Value> = genres.iter().take(n(cmd, "top").unwrap_or(12) as usize).map(|(k, v)| json!([k, v])).collect();
+                let dynamic: Vec<Value> = self.dynamic_playlists.iter().map(|d| json!({"id": d.id, "name": d.name, "kind": d.kind, "value": d.value, "synced": d.synced.len()})).collect();
+                json!({
+                    "ok": true,
+                    "known": self.liked_genres.len(),
+                    "with_genre": self.liked_genres.values().filter(|g| !g.is_empty()).count(),
+                    "pending": self.liked_genres_pending.map(|p| if p == usize::MAX { -1 } else { p as i64 }),
+                    "genres": genres.len(),
+                    "top": top,
+                    "note": note,
+                    "dynamic": dynamic,
+                })
+            }
             "library_filter" => {
                 self.library_filter = s(cmd, "q").unwrap_or("").to_string();
                 self.library_search_open = b(cmd, "open", !self.library_filter.is_empty());

@@ -1104,6 +1104,23 @@ pub struct App {
     /// Menús de cristal de «Canciones que te gustan»: orden y filtro.
     liked_sort_open: bool,
     liked_filter_open: bool,
+    /// Submenú abierto del de filtro: 1 artistas, 2 géneros.
+    liked_filter_sub: Option<u8>,
+    /// Géneros de Deezer de las canciones que te gustan (por id) y sus nombres.
+    liked_genres: HashMap<String, Vec<u32>>,
+    genre_names: HashMap<u32, String>,
+    /// Sube con cada lote de géneros que llega (para rehacer la vista filtrada).
+    liked_genres_ver: u64,
+    /// Canciones que aún se buscan (`usize::MAX` mientras llega la primera respuesta); `None`:
+    /// nunca se han pedido.
+    liked_genres_pending: Option<usize>,
+    /// Versión y largo de la lista para la que se pidieron.
+    liked_genres_asked: Option<(u64, usize)>,
+    /// Playlists dinámicas (library/liked.rs) y la que se está creando.
+    dynamic_playlists: Vec<library::DynamicPlaylist>,
+    dynamic_path: PathBuf,
+    pending_dynamic: Option<library::DynamicPlaylist>,
+    dynamic_sync_key: Option<(u64, usize, u64, usize)>,
     /// El panel de los tres puntos del reproductor, abierto, y la fila cuyo submenú se ve.
     pub player_more_open: bool,
     pub player_more_sub: Option<usize>,
@@ -1243,6 +1260,7 @@ impl App {
         crate::fonts::install_system_fonts(ctx);
         crate::tmark("fuentes");
 
+        let dynamic_path = paths.state_dir.join("dynamic_playlists.json");
         let mut app = Self {
             draft: settings.clone(),
             paths,
@@ -1512,6 +1530,16 @@ impl App {
             library_group_open: false,
             liked_sort_open: false,
             liked_filter_open: false,
+            liked_filter_sub: None,
+            liked_genres: HashMap::new(),
+            genre_names: HashMap::new(),
+            liked_genres_ver: 0,
+            liked_genres_pending: None,
+            liked_genres_asked: None,
+            dynamic_playlists: library::load_dynamic(&dynamic_path),
+            dynamic_path,
+            pending_dynamic: None,
+            dynamic_sync_key: None,
             player_more_open: false,
             player_more_sub: None,
             player_more_at: None,
@@ -4676,6 +4704,7 @@ impl App {
                     Req::CreatePlaylist { .. }
                     | Req::UpdatePlaylist { .. }
                     | Req::SetPlaylistImage { .. } => {
+                        self.pending_dynamic = None;
                         if let Some(ed) = self.editor.as_mut() {
                             ed.busy = false;
                         }
@@ -5380,8 +5409,20 @@ impl App {
                     self.status("Descarga completada");
                 }
             }
+            Resp::LikedGenres { tracks, names, pending } => {
+                for (id, g) in tracks {
+                    self.liked_genres.insert(id, g);
+                }
+                for (id, name) in names {
+                    self.genre_names.insert(id, name);
+                }
+                self.liked_genres_ver += 1;
+                self.liked_genres_pending = Some(pending);
+            }
             Resp::PlaylistCreated(p) => {
                 let id = p.id.clone();
+                // La de «Playlist dinámica»: queda registrada y se rellena sola (sin abrirla).
+                let dynamic = self.pending_dynamic.as_ref().is_some_and(|d| d.name == p.name);
                 if let Some(d) = self.add_dialog.as_mut() {
                     if d.pending_new.as_deref() == Some(p.name.as_str()) {
                         d.pending_new = None;
@@ -5404,8 +5445,19 @@ impl App {
                         });
                     }
                 }
-                self.status("Playlist creada");
-                self.go(Page::Playlist(id));
+                if dynamic {
+                    if let Some(mut d) = self.pending_dynamic.take() {
+                        d.id = id;
+                        log::info!("[dinamica] creada «{}» ({})", d.name, d.id);
+                        self.dynamic_playlists.push(d);
+                        self.save_dynamic();
+                        self.dynamic_sync_key = None;
+                    }
+                    self.status("Playlist dinámica creada: se pondrá al día sola");
+                } else {
+                    self.status("Playlist creada");
+                    self.go(Page::Playlist(id));
+                }
             }
             Resp::PlaylistChanged(id) => {
                 // La edición le da otro snapshot_id. Hasta que llegue el listado nuevo (se pide
@@ -5912,6 +5964,11 @@ impl App {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        // Playlists dinámicas: al día con la lista (y sus géneros, si alguna es de género).
+        if self.dynamic_playlists.iter().any(|r| r.kind == 2) {
+            self.liked_genres_tick();
+        }
+        self.sync_dynamic_playlists();
         self.diag_tick(ctx);
         // Comprobación de versiones programada (la interfaz solo repinta cuando hace falta, así
         // que se pide un repintado para el instante previsto).

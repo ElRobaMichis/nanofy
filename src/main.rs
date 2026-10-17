@@ -11,6 +11,7 @@ mod config;
 mod control;
 mod fonts;
 mod genius;
+mod genres_deezer;
 mod images;
 mod lyrics_sources;
 mod media;

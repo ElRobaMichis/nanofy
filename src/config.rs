@@ -208,6 +208,13 @@ pub struct Settings {
     pub liked_unpinned: bool,
     /// Biblioteca en cuadrícula (true) o lista.
     pub library_grid: bool,
+    /// «Canciones que te gustan» en cuadrícula (true) o lista (de fábrica, como en la referencia).
+    pub liked_grid: bool,
+    /// Orden de «Canciones que te gustan»: 0 recientes, 1 antiguas, 2 título, 3 artista,
+    /// 4 álbum, 5 duración.
+    pub liked_sort: u8,
+    /// Filtro de «Canciones que te gustan»: 0 todo, 1 descargadas.
+    pub liked_filter: u8,
     /// Biblioteca de lo más antiguo a lo más reciente (el botón «Recientes»).
     pub library_oldest: bool,
     /// Biblioteca agrupada por tipo (playlists, carpetas, álbumes, artistas…).
@@ -268,6 +275,9 @@ impl Default for Settings {
             pinned: Vec::new(),
             liked_unpinned: false,
             library_grid: true,
+            liked_grid: false,
+            liked_sort: 0,
+            liked_filter: 0,
             library_oldest: false,
             library_grouped: false,
             library_kind: 0,

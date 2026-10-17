@@ -7,7 +7,7 @@ use egui::{pos2, vec2, Align, Button, Color32, CornerRadius, Label, Layout, Rect
 use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
 use super::widgets::{child_in, galley_truncated, text_on_baseline, uri_to_link, CardInfo, CardKind, RowOpts, Source, HEADER_H, TABLE_HEAD_H, TABLE_ROW_H};
-use super::{fmt_thousands, strip_html, Action, App, Auth, FolderDialog, Page, PlayTarget, ERROR_RED, LIKED};
+use super::{fmt_thousands, strip_html, Action, App, Auth, FolderDialog, Page, PlayTarget, ERROR_RED};
 use super::panels::{about_view, Tone};
 use crate::api::Req;
 use crate::config::{Loudness, Quality, Theme};
@@ -15,8 +15,8 @@ use crate::model::*;
 
 /// Columna derecha de información en playlists y álbumes y su separación de la izquierda (de
 /// la referencia de diseño: portada de 320 px a 46 px de la tabla).
-const INFO_W: f32 = 320.0;
-const INFO_GAP: f32 = 46.0;
+pub(super) const INFO_W: f32 = 320.0;
+pub(super) const INFO_GAP: f32 = 46.0;
 /// Título de las páginas y su línea de metadatos.
 const TITLE_FONT: f32 = 35.5;
 const META_FONT: f32 = 14.5;
@@ -1733,62 +1733,12 @@ impl App {
 
     // ---------------------------------------------------------------- me gusta
 
+    /// Sin sesión, la bienvenida; con ella, la página va en su propio panel (`liked_panel`, en
+    /// library/liked.rs), como la biblioteca.
     fn liked_page(&mut self, ui: &mut egui::Ui) {
         if !self.signed_in() {
             self.welcome(ui);
-            return;
         }
-        self.request_once(LIKED, Req::Liked);
-        let list = self.lists.remove(LIKED).unwrap_or_default();
-        let summary = self.list_summary(LIKED, &list);
-        let total_ms = summary.total_ms;
-        let tracks = list.tracks;
-        let loading = list.loading;
-        let total = list.total;
-        let gen = list.gen;
-        // Con la lista completa (o la copia entera a la vista mientras se refresca), los artistas
-        // más presentes ya no cambian: es cuando se piden sus imágenes. Un total 0 en carga aún
-        // no se conoce (no es una lista vacía): con él, cada lote pediría otro artista suelto.
-        let thumbs_ready = !loading || (total > 0 && tracks.len() >= total as usize);
-
-        let me = self.display_name();
-        let by: Vec<(String, Option<Page>)> = if me.is_empty() { Vec::new() } else { vec![(me, self.my_id().map(|id| Page::User(id.to_string())))] };
-        let mut parts = vec![format!("{total} canciones")];
-        if !tracks.is_empty() {
-            parts.push(fmt_total(total_ms));
-        }
-
-        self.two_columns(
-            ui,
-            |app, ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                app.collection_header(ui, "Canciones que te gustan", None, &by, &parts);
-                if !tracks.is_empty() {
-                    app.collection_bar(ui, LIKED, &tracks, None, None, |_, _, _| false, None);
-                }
-                if loading && tracks.is_empty() {
-                    // Primer arranque sin copia: el hueco de las filas mientras llegan.
-                    ui.add_space(TABLE_HEAD_H);
-                    Self::skeleton_rows(ui, 8, TABLE_ROW_H, 50.0, 43.0);
-                } else if loading {
-                    ui.add_space(8.0);
-                    Self::loading(ui, &format!("Cargando {} de {}", tracks.len(), total));
-                }
-                let shown = app.filter_tracks(LIKED, Some(gen), &tracks);
-                app.track_rows(ui, LIKED, &shown, RowOpts { header: true, select: true, ..RowOpts::tracks(true, true) });
-            },
-            |app, ui| {
-                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                let side = ui.available_width().min(INFO_W);
-                let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
-                ui.painter().rect_filled(rect, CornerRadius::same(6), theme::GREEN_DARK);
-                icons::paint(ui.painter(), rect.shrink(side * 0.28), GREEN, Icon::HeartFilled);
-                let chips = [format!("{total} canciones"), fmt_total(total_ms)];
-                app.info_chips_and_artists(ui, &chips, &summary.top, thumbs_ready);
-            },
-        );
-        // Con su versión: si no, el resumen y la búsqueda guardados no valdrían al fotograma siguiente.
-        self.lists.insert(LIKED.to_string(), crate::app::TrackList { tracks, total, loading, gen });
     }
 
     // ----------------------------------------------------------------- álbumes
@@ -2246,6 +2196,7 @@ impl App {
                         editable_playlist: editable.then_some(id.as_str()),
                         selectable: true,
                         select: true,
+                        cols_w: None,
                     },
                 );
                 app.rows_added_by = false;
@@ -2381,6 +2332,7 @@ impl App {
                         editable_playlist: None,
                         selectable: true,
                         select: true,
+                        cols_w: None,
                     },
                 );
                 if filtered.is_empty() && !all.is_empty() {

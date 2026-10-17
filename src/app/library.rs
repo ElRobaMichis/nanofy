@@ -20,6 +20,9 @@ use super::widgets::{galley_truncated, keyed_child, text_on_baseline, CardKind};
 use super::{strip_html, Action, App, FolderDialog, Page, PlayTarget, LIKED};
 use crate::api::Req;
 
+mod liked;
+pub(super) use liked::LikedViewKey;
+
 // --- Barra de herramientas (desde la esquina del panel) ----------------------------------------
 
 /// Fondo del modo de vista elegido: 40,8 × 40,1, radio 6, centrado 0,16 px por encima del icono.

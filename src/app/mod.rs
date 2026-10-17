@@ -730,6 +730,8 @@ pub struct App {
     /// Último resultado de la búsqueda interna en una lista (clave, consulta, versión, pistas,
     /// coincidencias): mientras no cambien no se vuelve a filtrar ni a copiar en cada fotograma.
     filter_cache: Option<(String, String, u64, usize, std::rc::Rc<[Track]>)>,
+    /// «Canciones que te gustan» ordenada y filtrada (ver `liked_view` en library/liked.rs).
+    liked_view: Option<(library::LikedViewKey, std::rc::Rc<[Track]>)>,
     pub saved_albums: Vec<Album>,
     pub followed_artists: Vec<Artist>,
     pub artists_loaded: bool,
@@ -1294,6 +1296,7 @@ impl App {
             list_gen: 0,
             page_cache: HashMap::new(),
             filter_cache: None,
+            liked_view: None,
             saved_albums: Vec::new(),
             followed_artists: Vec::new(),
             artists_loaded: false,
@@ -8809,7 +8812,8 @@ impl crate::shell::UiApp for App {
                 // el panel entero).
                 let page_now = self.page().clone();
                 let library = page_now == Page::Library && self.signed_in();
-                let black = library || matches!(page_now, Page::Artist(_) | Page::Home | Page::Search);
+                let liked = page_now == Page::Liked && self.signed_in();
+                let black = library || liked || matches!(page_now, Page::Artist(_) | Page::Home | Page::Search);
                 if matches!(page_now, Page::Track(_)) {
                     // La de una canción, sobre su portada desenfocada (fija: no se desplaza).
                     self.track_panel = Some(panel);
@@ -8831,6 +8835,13 @@ impl crate::shell::UiApp for App {
                     let mut c = ui.new_child(egui::UiBuilder::new().max_rect(panel));
                     c.set_clip_rect(panel.shrink(1.0));
                     self.library_panel(&mut c, panel);
+                    return;
+                }
+                if liked {
+                    // «Canciones que te gustan», igual: su barra fija y la tabla debajo.
+                    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(panel));
+                    c.set_clip_rect(panel.shrink(1.0));
+                    self.liked_panel(&mut c, panel);
                     return;
                 }
                 let inner = egui::Rect::from_min_max(

@@ -1155,6 +1155,7 @@ impl App {
                 editable_playlist: None,
                 selectable: true,
                 select: false,
+                cols_w: None,
             },
         );
         top + c.min_rect().height() + 24.0

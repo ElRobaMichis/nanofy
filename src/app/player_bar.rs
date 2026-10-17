@@ -518,9 +518,15 @@ impl App {
     fn side_row(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool, open: bool, st: &TopStyle) -> egui::Response {
         let w = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(vec2(w, SIDE_ROW_H), Sense::click());
-        let color = st.color(selected, resp.hovered());
-        let (color, icon_color) = if open && color == st.text { (st.open, st.icon) } else { (color, st.icon_of(color)) };
         let c = rect.center().y;
+        // La página abierta: un recuadro detrás de su fila, con el texto como el de las demás
+        // (referencia 1.png de «Canciones que te gustan»: de x 16 a 265, 40 de alto).
+        if selected {
+            let bg = Rect::from_min_max(pos2(rect.min.x + SIDE_SEL_X0, c - SIDE_SEL_H / 2.0 + SIDE_SEL_DY), pos2(rect.min.x + SIDE_SEL_X1, c + SIDE_SEL_H / 2.0 + SIDE_SEL_DY));
+            ui.painter().rect_filled(bg, CornerRadius::same(6), st.sel_bg);
+        }
+        let color = st.color(false, resp.hovered());
+        let (color, icon_color) = if open && color == st.text { (st.open, st.icon) } else { (color, st.icon_of(color)) };
         icons::paint_side(ui.painter(), pos2(rect.min.x + 37.0, c), SIDE_ICON, icon_color, icon);
         let g = galley_truncated(ui.painter(), text, theme::regular(SIDE_FONT), color, (w - 67.0 - 44.0).max(20.0));
         text_on_baseline(ui.painter(), pos2(rect.min.x + 67.0, c + 7.0), g, color);
@@ -1604,6 +1610,12 @@ const TAB_PITCH: f32 = 210.0;
 /// lado de sus iconos y tamaño de su texto.
 const SIDE_FIRST_CENTER: f32 = 30.0;
 const SIDE_ROW_H: f32 = 51.5;
+/// Recuadro de la fila de la página abierta: de x a x y alto.
+const SIDE_SEL_X0: f32 = 16.0;
+const SIDE_SEL_X1: f32 = 265.0;
+const SIDE_SEL_H: f32 = 40.0;
+/// Su centro, respecto del de la fila (el icono queda a 18,8 de su borde de arriba).
+const SIDE_SEL_DY: f32 = 1.0;
 const SIDE_ICON: f32 = 28.0;
 const SIDE_FONT: f32 = 14.5;
 /// Filas de las playlists desplegadas (2.png): alto, dónde empieza el texto y el hueco antes de
@@ -1628,6 +1640,8 @@ struct TopStyle {
     tab_bg: Color32,
     tab_hover: Color32,
     close_hover: Color32,
+    /// Recuadro de la fila de la barra lateral de la página abierta.
+    sel_bg: Color32,
 }
 
 impl TopStyle {
@@ -1643,6 +1657,7 @@ impl TopStyle {
                 tab_bg: Color32::from_gray(17),
                 tab_hover: Color32::from_gray(12),
                 close_hover: Color32::from_gray(44),
+                sel_bg: Color32::from_gray(31),
             }
         } else {
             Self {
@@ -1655,6 +1670,7 @@ impl TopStyle {
                 tab_bg: p.hover,
                 tab_hover: p.card2,
                 close_hover: p.border,
+                sel_bg: p.hover,
             }
         }
     }

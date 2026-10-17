@@ -773,7 +773,7 @@ impl App {
                             ui,
                             &format!("exp:{aid}"),
                             &tracks,
-                            RowOpts { show_cover: false, show_album: false, numbered: true, header: false, source: Source::Context(&uri2), editable_playlist: None, selectable: true, select: false, },
+                            RowOpts { show_cover: false, show_album: false, numbered: true, header: false, source: Source::Context(&uri2), editable_playlist: None, selectable: true, select: false, cols_w: None, },
                         );
                         self.albums.insert(aid.clone(), album);
                     }

@@ -60,6 +60,9 @@ pub struct RowOpts<'a> {
     pub selectable: bool,
     /// Círculo de selección múltiple (solo en páginas con barra de selección).
     pub select: bool,
+    /// Ancho con el que se reparten las columnas de la tabla, si no es el de la tabla (la de
+    /// «Canciones que te gustan» va a todo lo ancho con las columnas de las demás listas).
+    pub cols_w: Option<f32>,
 }
 
 impl<'a> RowOpts<'a> {
@@ -73,6 +76,7 @@ impl<'a> RowOpts<'a> {
             editable_playlist: None,
             selectable: true,
             select: false,
+            cols_w: None,
         }
     }
 
@@ -1213,7 +1217,7 @@ impl App {
         let ink = theme::ink(&p);
         let w = ui.available_width();
         let left = ui.cursor().min.x;
-        let cols = table_cols(w, opts.show_cover, opts.show_album, self.rows_added_by);
+        let cols = table_cols(opts.cols_w.unwrap_or(w), opts.show_cover, opts.show_album, self.rows_added_by);
         let small = theme::regular(TABLE_SMALL_FONT);
 
         // Cabecera: textos con la línea base a 44 px y el separador a 59.

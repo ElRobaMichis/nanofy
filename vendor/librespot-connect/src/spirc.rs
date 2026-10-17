@@ -575,16 +575,16 @@ impl Spirc {
         Ok(self.commands.send(SpircCommand::Disconnect { pause })?)
     }
 
-    /// Nanofy: comprueba que el bucle de Spirc sigue atendiendo órdenes. La respuesta llega
-    /// cuando le toca el turno a esta, así que si tarda es que una orden anterior está atascada
-    /// (una petición colgada tras suspender el equipo, por ejemplo) y lo que haya detrás no se
-    /// atenderá: entonces conviene reconectar en vez de repetir la carga.
     /// Nanofy: ¿salió ya el primer registro del dispositivo en Spotify Connect? Hasta entonces
     /// Spirc contesta al ping pero las órdenes esperan (ver `hold_until_registered`).
     pub fn registered(&self) -> bool {
         self.registered.load(Ordering::Relaxed)
     }
 
+    /// Nanofy: comprueba que el bucle de Spirc sigue atendiendo órdenes. La respuesta llega
+    /// cuando le toca el turno a esta, así que si tarda es que una orden anterior está atascada
+    /// (una petición colgada tras suspender el equipo, por ejemplo) y lo que haya detrás no se
+    /// atenderá: entonces conviene reconectar en vez de repetir la carga.
     pub fn ping(&self) -> Result<oneshot::Receiver<()>, Error> {
         let (tx, rx) = oneshot::channel();
         self.commands.send(SpircCommand::Ping(tx))?;

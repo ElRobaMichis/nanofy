@@ -156,6 +156,13 @@ struct Shell<A: UiApp> {
     sb_context: Option<softbuffer::Context<Arc<Window>>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     surface_size: (u32, u32),
+    /// Escala con la que se anotó el tamaño de la ventana en el registro (para diagnosticar
+    /// diseños que dependen del ancho: la escala de Windows cambia el ancho útil).
+    logged_scale: f32,
+    /// Tamaño anotado y cuándo anotar el nuevo (tras dos segundos sin cambiar: no a cada paso
+    /// mientras se arrastra el borde).
+    logged_size: (u32, u32),
+    size_log_at: Option<std::time::Instant>,
     raster: Raster,
     info: ViewportInfo,
     start: Instant,
@@ -195,6 +202,9 @@ pub fn run<A: UiApp + 'static>(
         sb_context: None,
         surface: None,
         surface_size: (0, 0),
+        logged_scale: 0.0,
+        logged_size: (0, 0),
+        size_log_at: None,
         raster: Raster::default(),
         info: ViewportInfo::default(),
         start: Instant::now(),
@@ -388,6 +398,24 @@ impl<A: UiApp> Shell<A> {
         let mut t_raster = t_tess;
 
         let size = window.inner_size();
+        let now = std::time::Instant::now();
+        if (size.width, size.height) != self.logged_size && self.size_log_at.is_none() {
+            self.size_log_at = Some(now + std::time::Duration::from_secs(2));
+        }
+        let settled = self.size_log_at.is_some_and(|at| now >= at);
+        if size.width > 0 && size.height > 0 && (ppp != self.logged_scale || settled) {
+            self.logged_scale = ppp;
+            self.logged_size = (size.width, size.height);
+            self.size_log_at = None;
+            log::info!(
+                "[ventana] {}×{} px con escala {:.0} % = {:.0}×{:.0} de diseño",
+                size.width,
+                size.height,
+                ppp * 100.0,
+                size.width as f32 / ppp,
+                size.height as f32 / ppp
+            );
+        }
         if size.width > 0 && size.height > 0 {
             if self.surface_size != (size.width, size.height) {
                 if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))

@@ -1682,6 +1682,7 @@ impl App {
             "artist_views": artist_views,
             "users": users,
             "user_playlists": self.user_playlists.iter().map(|(k, v)| (k.clone(), json!(v.len()))).collect::<serde_json::Map<_, _>>(),
+            "user_playlist_ids": self.user_playlists.iter().map(|(k, v)| (k.clone(), json!(v.iter().map(|p| [p.id.as_str(), p.owner.id.as_deref().unwrap_or("")]).collect::<Vec<_>>()))).collect::<serde_json::Map<_, _>>(),
             "search": {"query": self.search_query, "loading": self.search_loading, "pending": self.search_pending, "filter": self.search_filter, "result": search, "result_query": self.search_result_for},
             "focus_search": self.focus_search,
             "folders": self.folders.iter().map(|f| json!({"id": f.id, "name": f.name, "playlists": f.playlists})).collect::<Vec<_>>(),

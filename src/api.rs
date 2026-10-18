@@ -1898,7 +1898,13 @@ impl Client {
                 }),
                 _ => None,
             })
-            .collect();
+            .collect::<Vec<(String, Option<String>, Option<String>)>>();
+        // Para diagnosticar «Añadida por»: cuántas filas traen autor y cuántos autores distintos.
+        let mut authors: Vec<&str> = items.iter().filter_map(|(_, by, _)| by.as_deref()).collect();
+        let with_author = authors.len();
+        authors.sort_unstable();
+        authors.dedup();
+        log::info!("[playlist] {id}: {} filas, {with_author} con autor ({} distintos), propietario {:?}", items.len(), authors.len(), meta.owner.id);
         Ok((items, meta))
     }
 

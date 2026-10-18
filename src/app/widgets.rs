@@ -850,7 +850,8 @@ impl App {
             50.0 + 28.0 * 3.0 + 8.0
         };
         // Playlists con varios autores: columnas «Añadida por» y «Fecha» entre álbum y duración.
-        // Si no hay sitio para el título, se ocultan por orden: fecha, «Añadida por» y álbum.
+        // Si no hay sitio para el título, se ocultan por orden: fecha, álbum y «Añadida por» (lo
+        // que distingue las filas de una playlist de varios autores es quién las añadió).
         let contrib_all = self.rows_added_by && show_album && opts.selectable;
         let mut show_date = contrib_all;
         let mut show_by = contrib_all;
@@ -888,10 +889,10 @@ impl App {
             }
             if show_date {
                 show_date = false;
-            } else if show_by {
-                show_by = false;
-            } else {
+            } else if show_album {
                 show_album = false;
+            } else {
+                show_by = false;
             }
         };
         let contrib = show_by;
@@ -1532,19 +1533,23 @@ struct TableCols {
 
 /// Columnas para un ancho `w`: las de la referencia (1039 px: álbum en 360, duración en 670 y
 /// el corazón en 771), proporcionales al ancho. En playlists de varios autores (`contrib`),
-/// «Añadida por» y «Fecha» entre el álbum y la duración si hay sitio.
+/// «Añadida por» y «Fecha» entre el álbum y la duración si hay sitio; si no (una laptop de
+/// 1366 px deja la tabla en ~640 y una de 1280, en ~550), «Añadida por» en vez del álbum: es lo que
+/// distingue sus filas.
 fn table_cols(w: f32, cover: bool, album: bool, contrib: bool) -> TableCols {
     let title_x = if cover { 111.0 } else { TABLE_COVER_X };
     let dur_x = (w * 0.645).round().min(w - 150.0).max(title_x + 100.0);
     let gap = 16.0;
     let (album_x, by_x, date_x) = if album && contrib && w >= 900.0 {
         (Some((w * 0.28).round()), Some((w * 0.43).round()), Some((w * 0.55).round()))
+    } else if album && contrib && w >= 545.0 {
+        (None, Some((w * 0.45).round().max(title_x + 130.0)), None)
     } else if album && w >= 620.0 {
         (Some((w * 0.3465).round()), None, None)
     } else {
         (None, None, None)
     };
-    let title_end = album_x.unwrap_or(dur_x);
+    let title_end = album_x.or(by_x).or(date_x).unwrap_or(dur_x);
     let album_end = by_x.unwrap_or(dur_x);
     let by_end = date_x.unwrap_or(dur_x);
     TableCols {
@@ -1631,10 +1636,34 @@ mod tests {
                 xs.extend(c.date_x);
                 xs.push(c.dur_x);
                 assert!(xs.windows(2).all(|p| p[1] - p[0] >= 56.0), "{w} {xs:?}");
+                // Ni el título ni ninguna columna invaden la siguiente.
+                assert!(c.title_x + c.title_w + 16.0 <= xs[1] + 0.5, "{w} {c:?}");
+                for (x, cw) in [(c.album_x, c.album_w), (c.by_x, c.by_w), (c.date_x, c.date_w)] {
+                    if let Some(x) = x {
+                        let next = xs.iter().copied().find(|n| *n > x).unwrap();
+                        assert!(x + cw + 16.0 <= next + 0.5, "{w} {c:?}");
+                    }
+                }
                 assert!(c.title_w >= 40.0 && c.heart_c + 16.0 <= w, "{w} {c:?}");
-                assert_eq!(c.album_x.is_some(), album && w >= 620.0, "{w}");
-                assert_eq!(c.by_x.is_some(), album && contrib && w >= 900.0, "{w}");
+                assert_eq!(c.album_x.is_some(), album && w >= 620.0 && (!contrib || w >= 900.0), "{w}");
+                assert_eq!(c.by_x.is_some(), album && contrib && w >= 545.0, "{w}");
+                assert_eq!(c.date_x.is_some(), album && contrib && w >= 900.0, "{w}");
+                if c.by_x.is_some() {
+                    assert!(c.by_w >= 90.0, "{w} {c:?}");
+                }
             }
+        }
+    }
+
+    /// Playlist de varios autores en laptops de 1366 y 1280 px (tablas de ~640 y ~552):
+    /// «Añadida por» se ve, en vez del álbum, con sitio para el título y el nombre.
+    #[test]
+    fn autores_en_pantalla_pequena() {
+        for w in [640.0, 552.0] {
+            let c = table_cols(w, true, true, true);
+            assert_eq!((c.album_x, c.date_x), (None, None));
+            let by = c.by_x.expect("«Añadida por»");
+            assert!(c.title_w >= 115.0 && c.by_w >= 90.0, "{w} {by} {c:?}");
         }
     }
 }

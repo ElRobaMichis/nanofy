@@ -6,9 +6,11 @@
 //! mismo nombre. Mezclar fuentes (como los chips de géneros de álbumes y canciones) da etiquetas que
 //! no casan entre sí; aquí no se mezcla nada.
 //!
-//! Los géneros son los del álbum en Deezer (a veces varios: «Alternativo» e «Indie Pop»). Sin ISRC
-//! o sin coincidencia, se busca en el propio Deezer por título, artista y duración. Lo encontrado se
-//! guarda en disco; sin resultado, se vuelve a probar pasados 30 días.
+//! Los géneros son los del álbum en Deezer (a veces varios: «Alternativo» e «Indie Pop»). Se busca
+//! una vez por álbum de Spotify: el de Deezer por su UPC (una consulta con los géneros dentro) y, si
+//! no, por el ISRC de sus canciones; sin ninguno, en el propio Deezer por título, artista y
+//! duración. Varias consultas a la vez, al ritmo de su límite. Lo encontrado se guarda en disco;
+//! sin resultado, se vuelve a probar pasados 30 días.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,12 +24,26 @@ use serde_json::Value;
 /// duración en ms.
 pub type LikedSong = (String, String, String, u32);
 
-/// Pausa entre consultas a Deezer: su límite es de 50 cada 5 s.
-const PACE: Duration = Duration::from_millis(125);
+/// Ritmo común de todas las consultas a Deezer: su límite es de 50 cada 5 s (medido el 17 oct
+/// 2026: a 9,5 por segundo ninguna rechazada, a 12 una de cada seis). Si alguna otra consulta de
+/// la app lo hace saltar, todos frenan (`Deezer::get`).
+const PACE: Duration = Duration::from_millis(105);
+/// Consultas a la vez: cada una tarda unos 350 ms, así que con una sola no se pasa de 3 por
+/// segundo; con 5 se llega al ritmo de arriba.
+const WORKERS: usize = 5;
 /// Sin resultado, se vuelve a buscar pasado este tiempo.
 const MISS_TTL: u64 = 30 * 24 * 3600;
 /// Cada cuántas canciones se manda lo encontrado a la interfaz.
 const BATCH: usize = 20;
+
+/// Lo que dan los metadatos de Spotify de una canción para encontrarla en Deezer: el ISRC de la
+/// grabación, su álbum de Spotify y el UPC (código de barras) de ese álbum.
+#[derive(Clone, Debug, Default)]
+pub struct Codes {
+    pub isrc: Option<String>,
+    pub album: Option<String>,
+    pub upc: Option<String>,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Store {
@@ -37,6 +53,9 @@ pub struct Store {
     /// Géneros de cada álbum de Deezer ya consultado (muchas canciones comparten álbum).
     #[serde(default)]
     pub albums: HashMap<u64, Vec<u32>>,
+    /// Géneros por álbum de Spotify: las canciones nuevas de un álbum ya visto no consultan nada.
+    #[serde(default)]
+    pub spotify_albums: HashMap<String, Vec<u32>>,
     /// Nombre (en español) de cada género.
     #[serde(default)]
     pub names: HashMap<u32, String>,
@@ -94,9 +113,33 @@ pub fn same_song(name: &str, artist: &str, dur_ms: u32, hit: &Value) -> bool {
     !title.is_empty() && norm(title) == norm(name) && norm(by) == norm(artist) && dur_ok
 }
 
+/// Géneros (número y nombre) de un álbum de Deezer en su respuesta.
+fn parse_genres(v: &Value) -> Vec<(u32, String)> {
+    v["genres"]["data"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|g| Some((g["id"].as_u64()? as u32, g["name"].as_str()?.to_string()))).collect())
+        .unwrap_or_default()
+}
+
+/// Formas de un UPC para pedirlo a Deezer. Spotify los da de 13 cifras y Deezer guarda muchos sin
+/// los ceros de delante: con 948 canciones, de los que empiezan por cero 110 salieron sin ellos y
+/// 41 tal cual, así que se prueba primero sin ceros.
+pub fn upc_forms(upc: &str) -> Vec<String> {
+    let short = upc.trim_start_matches('0');
+    if short != upc && short.len() >= 11 {
+        vec![short.to_string(), upc.to_string()]
+    } else {
+        vec![upc.to_string()]
+    }
+}
+
+/// Cliente de Deezer que comparten los hilos: un solo ritmo para todos.
 struct Deezer {
     agent: ureq::Agent,
-    last: Instant,
+    next: Mutex<Instant>,
+    /// Para el registro: consultas hechas y álbumes hallados por la primera forma del UPC, por la
+    /// segunda, por ISRC y buscando.
+    stats: [std::sync::atomic::AtomicUsize; 5],
 }
 
 impl Deezer {
@@ -111,18 +154,33 @@ impl Deezer {
             .http_status_as_error(false)
             .tls_config(tls)
             .build();
-        Self { agent: ureq::Agent::new_with_config(config), last: Instant::now() - PACE }
+        Self { agent: ureq::Agent::new_with_config(config), next: Mutex::new(Instant::now()), stats: Default::default() }
     }
 
-    /// GET con el ritmo de su límite; los nombres de géneros, en español. Si Deezer avisa de su
-    /// límite (código 4), espera y repite. `None` si no hay respuesta válida.
-    fn get(&mut self, url: &str) -> Option<Value> {
-        for _ in 0..3 {
-            let wait = PACE.saturating_sub(self.last.elapsed());
-            if !wait.is_zero() {
-                std::thread::sleep(wait);
-            }
-            self.last = Instant::now();
+    fn count(&self, k: usize) {
+        self.stats[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Espera su turno en el ritmo común.
+    fn slot(&self) {
+        let wait = {
+            let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            let at = (*next).max(now);
+            *next = at + PACE;
+            at - now
+        };
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+    }
+
+    /// GET a su ritmo; los nombres de géneros, en español. Si Deezer avisa de su límite (código
+    /// 4), frena a todos los hilos un par de segundos y repite. `None` si no hay respuesta válida.
+    fn get(&self, url: &str) -> Option<Value> {
+        for _ in 0..4 {
+            self.slot();
+            self.count(0);
             let resp = self
                 .agent
                 .get(url)
@@ -142,43 +200,88 @@ impl Deezer {
                 }
             };
             let v: Value = serde_json::from_str(&resp.body_mut().read_to_string().ok()?).ok()?;
-            match v["error"]["code"].as_i64() {
-                Some(4) => std::thread::sleep(Duration::from_secs(5)),
-                Some(_) => return Some(v),
-                None => return Some(v),
+            if v["error"]["code"].as_i64() == Some(4) {
+                log::info!("[generos-deezer] límite de Deezer: se frena");
+                let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+                *next = (*next).max(Instant::now() + Duration::from_secs(2));
+                continue;
+            }
+            return Some(v);
+        }
+        None
+    }
+
+    /// El álbum de Deezer por el UPC del de Spotify, con sus géneros (una sola consulta).
+    fn album_by_upc(&self, upc: &str) -> Option<(u64, Vec<(u32, String)>)> {
+        for (k, form) in upc_forms(upc).into_iter().enumerate() {
+            if let Some(v) = self.get(&format!("https://api.deezer.com/album/upc:{form}")) {
+                if let (None, Some(id)) = (v.get("error"), v["id"].as_u64()) {
+                    self.count(1 + k);
+                    return Some((id, parse_genres(&v)));
+                }
             }
         }
         None
     }
 
-    /// El álbum de Deezer de una canción: por su ISRC y, si no, buscándola.
-    fn album_of(&mut self, song: &LikedSong, isrc: Option<&str>) -> Option<u64> {
+    /// El álbum de Deezer de una canción: por su ISRC o, sin él, buscándola.
+    fn album_of(&self, song: &LikedSong, isrc: Option<&str>) -> Option<u64> {
         if let Some(isrc) = isrc {
-            if let Some(v) = self.get(&format!("https://api.deezer.com/track/isrc:{isrc}")) {
-                if let Some(id) = v["album"]["id"].as_u64() {
-                    return Some(id);
-                }
+            if let Some(id) = self.get(&format!("https://api.deezer.com/track/isrc:{isrc}")).and_then(|v| v["album"]["id"].as_u64()) {
+                self.count(3);
+                return Some(id);
             }
         }
         let (_, name, artist, dur) = song;
         let q = crate::api::urlencode(&format!("{artist} {}", norm(name)));
         let v = self.get(&format!("https://api.deezer.com/search?q={q}&limit=10"))?;
-        v["data"].as_array()?.iter().find(|hit| same_song(name, artist, *dur, hit)).and_then(|hit| hit["album"]["id"].as_u64())
+        let id = v["data"].as_array()?.iter().find(|hit| same_song(name, artist, *dur, hit)).and_then(|hit| hit["album"]["id"].as_u64());
+        if id.is_some() {
+            self.count(4);
+        }
+        id
     }
 
-    /// Géneros (número y nombre) de un álbum de Deezer.
-    fn album_genres(&mut self, album: u64) -> Option<Vec<(u32, String)>> {
+    /// Géneros de un álbum de Deezer.
+    fn album_genres(&self, album: u64) -> Option<Vec<(u32, String)>> {
         let v = self.get(&format!("https://api.deezer.com/album/{album}"))?;
         if v.get("error").is_some() {
             return None;
         }
-        Some(
-            v["genres"]["data"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|g| Some((g["id"].as_u64()? as u32, g["name"].as_str()?.to_string()))).collect())
-                .unwrap_or_default(),
-        )
+        Some(parse_genres(&v))
     }
+}
+
+/// Canciones de un mismo álbum de Spotify (o una sola, si no se sabe su álbum): se buscan juntas.
+struct Group {
+    album: Option<String>,
+    upc: Option<String>,
+    songs: Vec<(LikedSong, Option<String>)>,
+}
+
+/// Géneros de un grupo: el álbum por su UPC y, si no, por el ISRC de hasta tres de sus canciones
+/// (o buscando la primera). Devuelve los géneros con su nombre y el álbum de Deezer, si se halló.
+fn lookup(dz: &Deezer, store: &Mutex<Store>, g: &Group) -> Option<(Vec<(u32, String)>, Option<u64>)> {
+    if let Some((id, genres)) = g.upc.as_deref().and_then(|u| dz.album_by_upc(u)) {
+        if !genres.is_empty() {
+            return Some((genres, Some(id)));
+        }
+    }
+    let with_isrc: Vec<&(LikedSong, Option<String>)> = g.songs.iter().filter(|(_, i)| i.is_some()).take(3).collect();
+    let tries: Vec<&(LikedSong, Option<String>)> = if with_isrc.is_empty() { g.songs.iter().take(1).collect() } else { with_isrc };
+    for (song, isrc) in tries {
+        let Some(album) = dz.album_of(song, isrc.as_deref()) else { continue };
+        let known = {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            s.albums.get(&album).map(|ids| ids.iter().map(|id| (*id, s.names.get(id).cloned().unwrap_or_default())).collect::<Vec<_>>())
+        };
+        if let Some(genres) = known.or_else(|| dz.album_genres(album)) {
+            if !genres.is_empty() {
+                return Some((genres, Some(album)));
+            }
+        }
+    }
+    None
 }
 
 /// Lo que se manda a la interfaz: géneros de canciones, nombres de géneros y cuántas quedan.
@@ -189,9 +292,9 @@ pub struct Found {
 }
 
 /// Busca los géneros de `songs` y va llamando a `emit` con lo encontrado (primero lo que ya se
-/// conocía, luego cada `BATCH` canciones y al final, con `pending` 0). `isrcs` da el ISRC de un
-/// lote de ids (de los metadatos de Spotify).
-pub fn run(store: &Mutex<Store>, path: &PathBuf, songs: Vec<LikedSong>, isrcs: impl Fn(&[String]) -> HashMap<String, String>, mut emit: impl FnMut(Found)) {
+/// conocía, luego cada `BATCH` canciones y al final, con `pending` 0). `codes` da los códigos de
+/// un lote de ids (de los metadatos de Spotify). Las consultas van en `WORKERS` hilos a la vez.
+pub fn run(store: &Mutex<Store>, path: &PathBuf, songs: Vec<LikedSong>, codes: impl Fn(&[String]) -> Option<HashMap<String, Codes>>, mut emit: impl FnMut(Found)) {
     let now = crate::cache::now_secs();
     // Lo ya conocido, de una vez.
     let (known, todo): (Vec<(String, Vec<u32>)>, Vec<LikedSong>) = {
@@ -207,58 +310,126 @@ pub fn run(store: &Mutex<Store>, path: &PathBuf, songs: Vec<LikedSong>, isrcs: i
     }
     log::info!("[generos-deezer] {} canciones por buscar", todo.len());
     let t0 = Instant::now();
+    let total = todo.len();
     let ids: Vec<String> = todo.iter().map(|t| t.0.clone()).collect();
-    let isrc = isrcs(&ids);
-    let mut dz = Deezer::new();
+    let Some(codes) = codes(&ids) else {
+        // Sin los códigos (sin sesión), nada se apunta como no encontrado: se reintenta luego.
+        emit(Found { tracks: Vec::new(), names: Vec::new(), pending: 0 });
+        return;
+    };
+    let mut pending = total;
     let mut batch: Vec<(String, Vec<u32>)> = Vec::new();
     let mut new_names: Vec<(u32, String)> = Vec::new();
     let mut found = 0usize;
-    for (k, song) in todo.iter().enumerate() {
-        let album = dz.album_of(song, isrc.get(&song.0).map(String::as_str));
-        let genres = match album {
-            Some(a) => {
-                let cached = store.lock().unwrap_or_else(|e| e.into_inner()).albums.get(&a).cloned();
-                match cached {
-                    Some(g) => Some(g),
-                    None => dz.album_genres(a).map(|gs| {
-                        let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-                        for (id, name) in &gs {
+
+    // Por álbum de Spotify, en el orden de la lista (lo reciente primero). Las de un álbum ya
+    // conocido salen sin consultar nada.
+    let mut groups: Vec<Group> = Vec::new();
+    let mut by_album: HashMap<String, usize> = HashMap::new();
+    {
+        let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+        for song in todo {
+            let c = codes.get(&song.0).cloned().unwrap_or_default();
+            if let Some(g) = c.album.as_ref().and_then(|a| s.spotify_albums.get(a).cloned()) {
+                s.tracks.insert(song.0.clone(), g.clone());
+                s.miss.remove(&song.0);
+                batch.push((song.0, g));
+                found += 1;
+                pending -= 1;
+                continue;
+            }
+            match c.album.as_ref().and_then(|a| by_album.get(a).copied()) {
+                Some(k) => groups[k].songs.push((song, c.isrc)),
+                None => {
+                    if let Some(a) = &c.album {
+                        by_album.insert(a.clone(), groups.len());
+                    }
+                    groups.push(Group { album: c.album, upc: c.upc, songs: vec![(song, c.isrc)] });
+                }
+            }
+        }
+    }
+    if !batch.is_empty() {
+        emit(Found { tracks: std::mem::take(&mut batch), names: Vec::new(), pending });
+    }
+
+    let dz = Deezer::new();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for w in 0..WORKERS.min(groups.len()) {
+            let (tx, dz, next, groups) = (tx.clone(), &dz, &next, &groups);
+            let spawned = std::thread::Builder::new().name(format!("nanofy-generos-{w}")).stack_size(256 * 1024).spawn_scoped(scope, move || loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(g) = groups.get(k) else { break };
+                if tx.send((k, lookup(dz, store, g))).is_err() {
+                    break;
+                }
+            });
+            if let Err(e) = spawned {
+                log::warn!("[generos-deezer] hilo {w}: {e}");
+            }
+        }
+        drop(tx);
+        let mut since = 0usize;
+        for (k, result) in rx {
+            let g = &groups[k];
+            {
+                let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+                match &result {
+                    Some((genres, dz_album)) => {
+                        for (id, name) in genres {
                             if s.names.insert(*id, name.clone()).is_none() {
                                 new_names.push((*id, name.clone()));
                             }
                         }
-                        let ids: Vec<u32> = gs.into_iter().map(|(id, _)| id).collect();
-                        s.albums.insert(a, ids.clone());
-                        ids
-                    }),
+                        let ids: Vec<u32> = genres.iter().map(|(id, _)| *id).collect();
+                        if let Some(a) = dz_album {
+                            s.albums.insert(*a, ids.clone());
+                        }
+                        if let Some(a) = &g.album {
+                            s.spotify_albums.insert(a.clone(), ids.clone());
+                        }
+                        for (song, _) in &g.songs {
+                            s.tracks.insert(song.0.clone(), ids.clone());
+                            s.miss.remove(&song.0);
+                            batch.push((song.0.clone(), ids.clone()));
+                        }
+                        found += g.songs.len();
+                    }
+                    // Sin álbum o sin géneros en Deezer: se apunta para no repetir hasta dentro de un mes.
+                    None => {
+                        for (song, _) in &g.songs {
+                            s.miss.insert(song.0.clone(), now);
+                        }
+                    }
                 }
             }
-            None => None,
-        };
-        {
-            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            match &genres {
-                Some(g) if !g.is_empty() => {
-                    s.tracks.insert(song.0.clone(), g.clone());
-                    s.miss.remove(&song.0);
-                }
-                // Sin álbum o sin géneros en Deezer: se apunta para no repetir hasta dentro de un mes.
-                _ => {
-                    s.miss.insert(song.0.clone(), now);
-                }
+            pending -= g.songs.len();
+            since += g.songs.len();
+            if pending == 0 || since >= BATCH {
+                since = 0;
+                store.lock().unwrap_or_else(|e| e.into_inner()).save(path);
+                emit(Found { tracks: std::mem::take(&mut batch), names: std::mem::take(&mut new_names), pending });
             }
         }
-        if let Some(g) = genres.filter(|g| !g.is_empty()) {
-            found += 1;
-            batch.push((song.0.clone(), g));
-        }
-        let last = k + 1 == todo.len();
-        if last || (k + 1) % BATCH == 0 {
-            store.lock().unwrap_or_else(|e| e.into_inner()).save(path);
-            emit(Found { tracks: std::mem::take(&mut batch), names: std::mem::take(&mut new_names), pending: todo.len() - k - 1 });
-        }
+    });
+    if pending > 0 {
+        // Algún hilo no arrancó: lo que queda se reintenta la próxima vez.
+        store.lock().unwrap_or_else(|e| e.into_inner()).save(path);
+        emit(Found { tracks: batch, names: new_names, pending: 0 });
     }
-    log::info!("[generos-deezer] {found} de {} con géneros en {} s", todo.len(), t0.elapsed().as_secs());
+    let st: Vec<usize> = dz.stats.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
+    log::info!(
+        "[generos-deezer] {found} de {total} con géneros en {} s: {} álbumes, {} consultas (álbum por UPC {} + {} con su otra forma, por ISRC {}, buscando {})",
+        t0.elapsed().as_secs(),
+        groups.len(),
+        st[0],
+        st[1],
+        st[2],
+        st[3],
+        st[4]
+    );
 }
 
 #[cfg(test)]
@@ -282,6 +453,13 @@ mod tests {
         assert!(!same_song("Get Lucky", "Daft Punk", 369_000, &hit));
         assert!(!same_song("Lose Yourself to Dance", "Daft Punk", 248_000, &hit));
         assert!(!same_song("Get Lucky", "Pharrell Williams", 248_000, &hit));
+    }
+
+    #[test]
+    fn upc_con_y_sin_ceros() {
+        assert_eq!(upc_forms("0602445790098"), vec!["602445790098", "0602445790098"]);
+        assert_eq!(upc_forms("196871234567"), vec!["196871234567"]);
+        assert_eq!(upc_forms("00000"), vec!["00000"]);
     }
 
     #[test]

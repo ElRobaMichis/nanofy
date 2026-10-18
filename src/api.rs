@@ -933,7 +933,7 @@ impl Api {
             }
             let (client, ui, store, path, busy) = (self.client.clone(), self.ui.clone(), self.liked_genres.clone(), self.liked_genres_file.clone(), self.liked_genres_busy.clone());
             let spawned = std::thread::Builder::new().name("nanofy-generos".into()).stack_size(512 * 1024).spawn(move || {
-                crate::genres_deezer::run(&store, &path, songs, |ids| client.isrcs(ids), |f| {
+                crate::genres_deezer::run(&store, &path, songs, |ids| client.liked_codes(ids), |f| {
                     ui.send(Msg::Api(ApiResult {
                         req: Req::LikedGenres { songs: Vec::new() },
                         result: Ok(Resp::LikedGenres { tracks: f.tracks, names: f.names, pending: f.pending }),
@@ -1929,36 +1929,77 @@ impl Client {
         Ok(out)
     }
 
-    /// Como tracks_by_ids, pero una entrada por id pedido y en su orden (`None` si Spotify no la
-    /// tiene): una pista puede volver con otro id (Spotify sustituye ediciones) y hay que saber
-    /// de cuál de las pedidas es.
-    /// ISRC (código de la grabación) de las pistas `ids`, de los metadatos internos por lotes (no
-    /// gastan cuota de la Web API). Las que no lo traen, o si un lote falla, no salen.
-    pub(crate) fn isrcs(&self, ids: &[String]) -> std::collections::HashMap<String, String> {
-        let mut out = std::collections::HashMap::new();
-        let kind = librespot_protocol::extension_kind::ExtensionKind::TRACK_V4;
+    /// Códigos de las pistas `ids` para buscarlas en Deezer: su ISRC (el de la grabación), su
+    /// álbum de Spotify y el UPC de ese álbum (su código de barras), de los metadatos internos por
+    /// lotes (no gastan cuota de la Web API). Las que no traen nada, o si un lote falla, no salen.
+    /// La lista de Me gusta llega del disco antes que la sesión: se espera a esta hasta un minuto
+    /// (`None` si no llega).
+    pub(crate) fn liked_codes(&self, ids: &[String]) -> Option<std::collections::HashMap<String, crate::genres_deezer::Codes>> {
+        use librespot_protocol::extension_kind::ExtensionKind;
+        let t0 = Instant::now();
+        while self.session().is_err() {
+            if t0.elapsed() > Duration::from_secs(60) {
+                log::info!("[generos-deezer] sin sesión: se deja para luego");
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let mut out: std::collections::HashMap<String, crate::genres_deezer::Codes> = std::collections::HashMap::new();
+        let mut albums: Vec<SpotifyUri> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for (i, chunk) in ids.chunks(BATCH_MAX).enumerate() {
             if i > 0 {
                 yield_to_playback_blocking();
             }
             let uris: Vec<SpotifyUri> = chunk.iter().filter_map(|id| SpotifyUri::from_uri(&format!("spotify:track:{id}")).ok()).collect();
-            match self.metadata_batch::<librespot_metadata::Track>(&uris, kind, 0) {
+            match self.metadata_batch::<librespot_metadata::Track>(&uris, ExtensionKind::TRACK_V4, 0) {
                 Ok(metas) => {
                     for (uri, m) in uris.iter().zip(metas) {
-                        let Some(m) = m else { continue };
-                        let Some(isrc) = m.external_ids.iter().find(|e| e.external_type.eq_ignore_ascii_case("isrc")) else { continue };
-                        if let Ok(u) = uri.to_uri() {
-                            out.insert(u.trim_start_matches("spotify:track:").to_string(), isrc.id.clone());
+                        let (Some(m), Ok(u)) = (m, uri.to_uri()) else { continue };
+                        let isrc = m.external_ids.iter().find(|e| e.external_type.eq_ignore_ascii_case("isrc")).map(|e| e.id.clone());
+                        let album = m.album.id.to_uri().ok().filter(|a| a.starts_with("spotify:album:"));
+                        if album.as_ref().is_some_and(|a| seen.insert(a.clone())) {
+                            albums.push(m.album.id.clone());
+                        }
+                        let album = album.map(|a| a.trim_start_matches("spotify:album:").to_string());
+                        out.insert(u.trim_start_matches("spotify:track:").to_string(), crate::genres_deezer::Codes { isrc, album, upc: None });
+                    }
+                }
+                Err(e) => log::warn!("[generos-deezer] metadatos del lote {i}: {e}"),
+            }
+        }
+        // El UPC de cada álbum, de sus propios metadatos (en los de la pista no viene).
+        let mut upcs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (i, chunk) in albums.chunks(BATCH_MAX).enumerate() {
+            yield_to_playback_blocking();
+            match self.metadata_batch::<librespot_metadata::Album>(chunk, ExtensionKind::ALBUM_V4, 0) {
+                Ok(metas) => {
+                    for (uri, m) in chunk.iter().zip(metas) {
+                        let (Some(m), Ok(u)) = (m, uri.to_uri()) else { continue };
+                        if let Some(upc) = m.external_ids.iter().find(|e| e.external_type.eq_ignore_ascii_case("upc")) {
+                            upcs.insert(u.trim_start_matches("spotify:album:").to_string(), upc.id.clone());
                         }
                     }
                 }
-                Err(e) => log::warn!("[generos-deezer] ISRC del lote {i}: {e}"),
+                Err(e) => log::warn!("[generos-deezer] álbumes del lote {i}: {e}"),
             }
         }
-        log::info!("[generos-deezer] ISRC de {} de {} canciones", out.len(), ids.len());
-        out
+        for c in out.values_mut() {
+            c.upc = c.album.as_ref().and_then(|a| upcs.get(a)).cloned();
+        }
+        log::info!(
+            "[generos-deezer] de {} canciones: {} con ISRC, {} álbumes ({} con UPC)",
+            ids.len(),
+            out.values().filter(|c| c.isrc.is_some()).count(),
+            albums.len(),
+            upcs.len()
+        );
+        Some(out)
     }
 
+    /// Como tracks_by_ids, pero una entrada por id pedido y en su orden (`None` si Spotify no la
+    /// tiene): una pista puede volver con otro id (Spotify sustituye ediciones) y hay que saber
+    /// de cuál de las pedidas es.
     fn tracks_aligned(&self, ids: &[String]) -> Result<Vec<Option<Track>>, String> {
         let kind = librespot_protocol::extension_kind::ExtensionKind::TRACK_V4;
         let uris: Vec<Option<SpotifyUri>> = ids.iter().map(|id| SpotifyUri::from_uri(&format!("spotify:track:{id}")).ok()).collect();

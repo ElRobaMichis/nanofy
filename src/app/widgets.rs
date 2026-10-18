@@ -1577,6 +1577,15 @@ pub fn text_on_baseline(painter: &egui::Painter, at: egui::Pos2, galley: std::sy
 }
 
 /// Texto en una línea recortado con puntos suspensivos para caber en `max_w`.
+/// Rayo de las playlists dinámicas, de `h` px de alto centrado en `c` (dos triángulos que se
+/// cruzan: el zigzag no es convexo).
+pub fn paint_bolt(painter: &egui::Painter, c: egui::Pos2, h: f32, color: Color32) {
+    let p = |x: f32, y: f32| pos2(c.x + (x - 0.5) * h * 0.62, c.y + (y - 0.5) * h);
+    let stroke = egui::epaint::PathStroke::NONE;
+    painter.add(egui::Shape::convex_polygon(vec![p(0.72, 0.0), p(0.08, 0.6), p(0.56, 0.6)], color, stroke.clone()));
+    painter.add(egui::Shape::convex_polygon(vec![p(0.44, 0.4), p(0.92, 0.4), p(0.28, 1.0)], color, stroke));
+}
+
 pub fn galley_truncated(painter: &egui::Painter, text: &str, font: egui::FontId, color: Color32, max_w: f32) -> std::sync::Arc<egui::Galley> {
     let mut label = text.to_string();
     let mut galley = painter.layout_no_wrap(label.clone(), font.clone(), color);

@@ -633,6 +633,24 @@ impl App {
         }
     }
 
+    /// ¿Es `id` una playlist dinámica de Nanofy?
+    pub(in crate::app) fn is_dynamic(&self, id: &str) -> bool {
+        self.dynamic_playlists.iter().any(|d| d.id == id)
+    }
+
+    /// Marca de la cabecera de una playlist dinámica: texto y explicación.
+    pub(in crate::app) fn dynamic_badge(&self, id: &str) -> Option<(String, String)> {
+        let d = self.dynamic_playlists.iter().find(|d| d.id == id)?;
+        let what = if d.kind == 1 { format!("de {}", d.label) } else { format!("del género {}", d.label) };
+        Some((
+            format!("Dinámica · {}", d.label),
+            format!(
+                "Playlist dinámica: Nanofy le añade y le quita tus canciones que te gustan {what} en cuanto cambian, también si les das «Me gusta» desde el móvil u otra app (mientras Nanofy está abierta; si no, al abrirla). Lo que añadas tú a mano no se toca.\n\nAñadidas por Nanofy: {}.",
+                d.synced.len()
+            ),
+        ))
+    }
+
     /// La playlist dinámica del filtro en uso, si ya existe.
     fn liked_dynamic_rule(&self) -> Option<&DynamicPlaylist> {
         let (kind, value) = self.liked_filter_on()?;

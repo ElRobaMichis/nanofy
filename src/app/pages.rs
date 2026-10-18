@@ -284,7 +284,9 @@ impl App {
     /// en negrita y debajo «De <autores> • <partes>», con los autores en blanco y en negrita
     /// (enlaces a su página). Ocupa `HEADER_H`: la fila de botones va justo debajo. `tip`: globo
     /// del título (la descripción de la playlist).
-    fn collection_header(&mut self, ui: &mut egui::Ui, title: &str, tip: Option<&str>, by: &[(String, Option<Page>)], parts: &[String]) {
+    /// `badge`: texto y explicación de una marca verde con rayo al final de la línea de datos (las
+    /// playlists dinámicas).
+    fn collection_header(&mut self, ui: &mut egui::Ui, title: &str, tip: Option<&str>, by: &[(String, Option<Page>)], parts: &[String], badge: Option<(&str, &str)>) {
         let p = theme::palette(ui.ctx());
         let ink = theme::ink(&p);
         let w = ui.available_width();
@@ -331,6 +333,15 @@ impl App {
             }
             let g = painter.layout_no_wrap(part.clone(), font.clone(), ink.dim);
             cx = text_on_baseline(&painter, pos2(cx, base), g, ink.dim).max.x;
+        }
+        if let Some((text, explain)) = badge {
+            let dot = pos2(cx + 10.5, base - 5.5);
+            painter.circle_filled(dot, 3.0, ink.dim);
+            let x0 = dot.x + 9.5;
+            super::widgets::paint_bolt(&painter, pos2(x0 + 5.0, base - 6.0), 15.0, theme::GREEN);
+            let g = painter.layout_no_wrap(text.to_string(), theme::bold(META_FONT), theme::GREEN);
+            let r = text_on_baseline(&painter, pos2(x0 + 14.0, base), g, theme::GREEN);
+            ui.interact(r.union(Rect::from_min_max(pos2(x0, r.min.y), r.min)), ui.id().with("header_badge"), Sense::hover()).on_hover_text(explain);
         }
     }
 
@@ -2022,6 +2033,11 @@ impl App {
             parts.push(fmt_total(total_ms));
         }
         let mut chips = vec![if mine { "Tu playlist".to_string() } else { "Playlist".to_string() }];
+        // Playlist dinámica de Nanofy: su marca en la cabecera y su chip.
+        let dynamic = self.dynamic_badge(&id);
+        if dynamic.is_some() {
+            chips.push("Dinámica".into());
+        }
         if let Some(pl) = &full_meta {
             match (pl.collaborative, pl.public) {
                 (Some(true), _) => chips.push("Colaborativa".into()),
@@ -2067,7 +2083,8 @@ impl App {
             |app, ui| {
                 let p = theme::palette(ui.ctx());
                 ui.spacing_mut().item_spacing.y = 0.0;
-                app.collection_header(ui, &name, description.as_deref(), &by, &parts);
+                let badge = dynamic.as_ref().map(|(t, e)| (t.as_str(), e.as_str()));
+                app.collection_header(ui, &name, description.as_deref(), &by, &parts, badge);
                 let link = uri_to_link(&uri2);
                 let id_m = id2.clone();
                 let meta_m = full_meta2.clone();
@@ -2276,7 +2293,7 @@ impl App {
             |app, ui| {
                 let p = theme::palette(ui.ctx());
                 ui.spacing_mut().item_spacing.y = 0.0;
-                app.collection_header(ui, &name, None, &by, &parts);
+                app.collection_header(ui, &name, None, &by, &parts, None);
                 let link = uri_to_link(&uri);
                 let id_m = id.clone();
                 let uri_m = uri.clone();

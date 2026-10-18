@@ -287,6 +287,10 @@ pub enum Event {
     /// Estado del clúster de Spotify Connect (llega por el dealer al conectar y con cada cambio):
     /// la sesión de la cuenta aunque ningún dispositivo esté activo.
     Cluster(ClusterInfo),
+    /// Spotify avisa de que cambió la biblioteca (desde cualquier dispositivo): canciones que se
+    /// dejaron de guardar (ids) y si hay algo más (guardadas nuevas o un aviso que no se entiende),
+    /// que pide releer lo reciente de Me gusta.
+    CollectionChanged { removed: Vec<String>, more: bool },
     /// Cola compartida de una Jam (pista actual, contexto y siguientes, por uri) cuando somos
     /// participante, para mostrarla en la interfaz en lugar de la cola local de la cuenta.
     JamQueue {
@@ -1729,6 +1733,27 @@ async fn start(
             }
         });
     }
+    // Cambios de la biblioteca hechos en cualquier dispositivo (el móvil, la app oficial): así Me
+    // gusta y sus playlists dinámicas se ponen al día al momento y no al abrir Nanofy otra vez.
+    {
+        use futures_util::StreamExt;
+        match session.dealer().add_listen_for("hm://collection/") {
+            Ok(mut changes) => {
+                let ui_c = ui.clone();
+                tokio::spawn(async move {
+                    while let Some(m) = changes.next().await {
+                        let (removed, more) = match &m.payload {
+                            librespot_core::dealer::protocol::PayloadValue::Raw(b) => parse_collection_change(b),
+                            _ => (Vec::new(), true),
+                        };
+                        log::info!("[biblioteca] aviso: {} quitadas, más: {more}", removed.len());
+                        ui_c.send(Msg::Backend(Event::CollectionChanged { removed, more }));
+                    }
+                });
+            }
+            Err(e) => log::warn!("[biblioteca] sin avisos de cambios: {e}"),
+        }
+    }
     // Spirc::new (parche propio) pide el token de cliente y el de acceso mientras conecta al
     // punto de acceso; esperar aquí antes a esos mismos datos solo retrasaba la conexión.
     let (spirc, task) = match tokio::time::timeout(
@@ -2179,10 +2204,99 @@ fn audio_info(
     }
 }
 
+/// Lo que dice un aviso de cambio de la biblioteca (`hm://collection/collection/<usuario>`): ids
+/// de canciones quitadas y si hay algo más que releer (canciones nuevas, que llegan sin sus datos,
+/// o un aviso que no se entiende). Llega en protobuf (visto el 18 oct 2026 dando y quitando un
+/// «Me gusta»): campo 1 repetido, cada uno con el tipo (1, 0 = canción), el id de 16 bytes (2), la
+/// fecha (5) y si se quitó (6).
+pub fn parse_collection_change(bytes: &[u8]) -> (Vec<String>, bool) {
+    fn varint(b: &[u8], i: &mut usize) -> Option<u64> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *b.get(*i)?;
+            *i += 1;
+            v |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(v);
+            }
+        }
+        None
+    }
+    /// Campos de un mensaje: (número, valor si es varint, bytes si va con longitud).
+    fn fields(b: &[u8]) -> Option<Vec<(u64, u64, &[u8])>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let tag = varint(b, &mut i)?;
+            match tag & 7 {
+                0 => out.push((tag >> 3, varint(b, &mut i)?, &b[0..0])),
+                2 => {
+                    let len = varint(b, &mut i)? as usize;
+                    let end = i.checked_add(len).filter(|e| *e <= b.len())?;
+                    out.push((tag >> 3, 0, &b[i..end]));
+                    i = end;
+                }
+                1 => i += 8,
+                5 => i += 4,
+                _ => return None,
+            }
+        }
+        (i == b.len()).then_some(out)
+    }
+    let Some(top) = fields(bytes) else { return (Vec::new(), true) };
+    let mut removed = Vec::new();
+    let mut more = false;
+    let mut items = 0;
+    for (_, _, item) in top.into_iter().filter(|(n, _, _)| *n == 1) {
+        items += 1;
+        let Some(f) = fields(item) else {
+            more = true;
+            continue;
+        };
+        let kind = f.iter().find(|(n, _, _)| *n == 1).map_or(0, |x| x.1);
+        if kind != 0 {
+            continue;
+        }
+        let gone = f.iter().find(|(n, _, _)| *n == 6).is_some_and(|x| x.1 != 0);
+        let id = f
+            .iter()
+            .find(|(n, _, b)| *n == 2 && b.len() == 16)
+            .and_then(|x| librespot_core::SpotifyId::from_raw(x.2).ok())
+            .and_then(|id| id.to_base62().ok());
+        match (gone, id) {
+            (true, Some(id)) => removed.push(id),
+            _ => more = true,
+        }
+    }
+    (removed, more || items == 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Quality;
+
+    #[test]
+    fn avisos_de_la_biblioteca() {
+        // Los dos avisos reales de dar y quitar «Me gusta» a Get Lucky (18 oct 2026).
+        let puesto = [
+            0x0a, 0x1c, 0x08, 0x00, 0x12, 0x10, 0xca, 0x16, 0xac, 0x68, 0x75, 0x93, 0x46, 0x2f, 0x8a, 0x7b, 0xb7, 0xdc, 0xd6, 0xe9, 0x31,
+            0x54, 0x28, 0x9a, 0x8c, 0xd1, 0xd6, 0x06, 0x30, 0x00,
+        ];
+        let quitado = [
+            0x0a, 0x18, 0x08, 0x00, 0x12, 0x10, 0xca, 0x16, 0xac, 0x68, 0x75, 0x93, 0x46, 0x2f, 0x8a, 0x7b, 0xb7, 0xdc, 0xd6, 0xe9, 0x31,
+            0x54, 0x28, 0x00, 0x30, 0x01,
+        ];
+        assert_eq!(parse_collection_change(&puesto), (Vec::new(), true));
+        assert_eq!(parse_collection_change(&quitado), (vec!["69kOkLUCkxIZYexIgSG8rq".to_string()], false));
+        // Otro tipo (un álbum): no toca Me gusta.
+        let mut album = quitado;
+        album[3] = 0x01;
+        assert_eq!(parse_collection_change(&album), (Vec::new(), false));
+        // Lo que no se entiende pide releer.
+        assert_eq!(parse_collection_change(b"no es protobuf"), (Vec::new(), true));
+        assert_eq!(parse_collection_change(&[]), (Vec::new(), true));
+    }
     use librespot_playback::config::Bitrate;
     use librespot_playback::player::NormalisationData;
 

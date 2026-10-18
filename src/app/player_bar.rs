@@ -415,7 +415,7 @@ impl App {
                 // Copia solo de las fijadas (pocas): el menú contextual necesita `&mut self`.
                 let pl = self.playlists[i].clone();
                 let sel = matches!(&page, Page::Playlist(id) if *id == pl.id);
-                let r = Self::side_child(ui, &pl.name, sel, &st);
+                let r = Self::side_child(ui, &pl.name, sel, self.is_dynamic(&pl.id), &st);
                 if r.clicked() {
                     self.go_main(Page::Playlist(pl.id.clone()));
                 }
@@ -463,7 +463,8 @@ impl App {
                         // Id de la fila por playlist: con ids automáticos el hover y el menú
                         // abierto saltarían de fila al desplazarse.
                         let key = ui.id().with(("sb_pl", i, &pl.id));
-                        let r = ui.scope_builder(UiBuilder::new().id(key), |ui| Self::side_child(ui, &pl.name, sel, &st)).inner;
+                        let dynamic = self.is_dynamic(&pl.id);
+                        let r = ui.scope_builder(UiBuilder::new().id(key), |ui| Self::side_child(ui, &pl.name, sel, dynamic, &st)).inner;
                         if r.clicked() {
                             self.go_main(Page::Playlist(pl.id.clone()));
                         }
@@ -537,15 +538,23 @@ impl App {
     }
 
     /// Playlist dentro de Fijados o Playlists desplegados (como en la referencia): fila de 34 px,
-    /// icono de 16 px a 38,5 del borde y el texto, algo más apagado, a 59.
-    fn side_child(ui: &mut egui::Ui, text: &str, selected: bool, st: &TopStyle) -> egui::Response {
+    /// icono de 16 px a 38,5 del borde y el texto, algo más apagado, a 59. Las dinámicas llevan
+    /// un rayo verde en vez del icono.
+    fn side_child(ui: &mut egui::Ui, text: &str, selected: bool, dynamic: bool, st: &TopStyle) -> egui::Response {
         let w = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(vec2(w, SIDE_CHILD_H), Sense::click());
         let color = if selected || resp.hovered() { st.color(selected, resp.hovered()) } else { st.child };
         let icon_color = if color == st.child { st.icon } else { color };
         let c = rect.center().y;
-        icons::paint_side(ui.painter(), pos2(rect.min.x + 38.5, c - 1.0), 16.0, icon_color, Icon::PlaylistItem);
+        if dynamic {
+            super::widgets::paint_bolt(ui.painter(), pos2(rect.min.x + 38.5, c - 1.0), 15.0, GREEN);
+        } else {
+            icons::paint_side(ui.painter(), pos2(rect.min.x + 38.5, c - 1.0), 16.0, icon_color, Icon::PlaylistItem);
+        }
         let g = galley_truncated(ui.painter(), text, theme::regular(SIDE_FONT), color, (w - SIDE_CHILD_TEXT_X - 24.0).max(20.0));
+        if dynamic {
+            resp.clone().on_hover_text("Playlist dinámica: se pone al día sola con tus canciones que te gustan");
+        }
         text_on_baseline(ui.painter(), pos2(rect.min.x + SIDE_CHILD_TEXT_X, c + 5.0), g, color);
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

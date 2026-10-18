@@ -1106,6 +1106,8 @@ pub struct App {
     liked_filter_open: bool,
     /// Submenú abierto del de filtro: 1 artistas, 2 géneros.
     liked_filter_sub: Option<u8>,
+    /// Cuándo releer lo reciente de Me gusta tras un aviso de cambio de la biblioteca.
+    liked_push_at: Option<Instant>,
     /// Géneros de Deezer de las canciones que te gustan (por id) y sus nombres.
     liked_genres: HashMap<String, Vec<u32>>,
     genre_names: HashMap<u32, String>,
@@ -1531,6 +1533,7 @@ impl App {
             liked_sort_open: false,
             liked_filter_open: false,
             liked_filter_sub: None,
+            liked_push_at: None,
             liked_genres: HashMap::new(),
             genre_names: HashMap::new(),
             liked_genres_ver: 0,
@@ -4083,6 +4086,16 @@ impl App {
                 }
             }
             Event::ShutdownDone => self.shutdown_done = true,
+            Event::CollectionChanged { removed, more } => {
+                // Lo quitado fuera se quita ya (set_liked ajusta la cuenta: sin recarga completa);
+                // lo nuevo llega sin sus datos y se relee lo reciente, juntando avisos seguidos.
+                for id in &removed {
+                    self.set_liked(id, false);
+                }
+                if more && self.logged_in() {
+                    self.liked_push_at.get_or_insert_with(|| Instant::now() + Duration::from_millis(1500));
+                }
+            }
             Event::Cluster(info) => {
                 if self.server_cluster.is_none() {
                     crate::tmark("sesión: estado del clúster recibido");
@@ -5964,6 +5977,16 @@ impl App {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        if let Some(at) = self.liked_push_at {
+            let now = Instant::now();
+            if now >= at {
+                self.liked_push_at = None;
+                log::info!("Me gusta: cambió en otro dispositivo; se relee lo reciente");
+                self.api.send(Req::LikedRecent);
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
         // Playlists dinámicas: al día con la lista (y sus géneros, si alguna es de género).
         if self.dynamic_playlists.iter().any(|r| r.kind == 2) {
             self.liked_genres_tick();

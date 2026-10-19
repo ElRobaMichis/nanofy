@@ -252,7 +252,97 @@ fn arrow(painter: &egui::Painter, c: egui::Pos2, right: bool, color: Color32) {
     painter.line_segment([pos2(tip, c.y), pos2(tip + back, c.y + ARROW_HEAD)], s);
 }
 
+/// Copias en disco de las páginas de categoría: se muestran al instante y se renuevan si tienen
+/// más de este tiempo.
+const PAGE_FRESH_SECS: u64 = 6 * 3600;
+
 impl App {
+    /// Pide una página (clave y petición) una vez. Si falló, la vuelve a pedir sola a los 1,5 y
+    /// 5 s; si sigue fallando, devuelve el error para enseñar «Reintentar» (antes se quedaba
+    /// cargando para siempre).
+    pub(super) fn request_page(&mut self, ctx: &egui::Context, key: &str, req: Req) -> Option<String> {
+        if let Some((err, at, tries)) = self.page_errors.get(key).cloned() {
+            if tries >= 3 {
+                return Some(err);
+            }
+            let wait = if tries == 1 { 1.5 } else { 5.0 };
+            let left = wait - at.elapsed().as_secs_f32();
+            if left <= 0.0 {
+                self.requested.remove(key);
+                // El intento sigue contando: si vuelve a fallar, sube.
+                self.request_once(key, req);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f32(left + 0.05));
+            }
+            return None;
+        }
+        self.request_once(key, req);
+        None
+    }
+
+    /// «No se pudo cargar…» con «Reintentar» (centrado arriba de `area`). Devuelve si se pulsó.
+    pub(super) fn page_error(&mut self, ui: &mut egui::Ui, area: Rect, key: &str, err: &str) {
+        let p = theme::palette(ui.ctx());
+        let painter = ui.painter().clone();
+        let top = area.min.y + 60.0;
+        let g = painter.layout_no_wrap("No se pudo cargar".into(), theme::bold(20.0), p.text);
+        let w = g.size().x;
+        text_on_baseline(&painter, pos2(area.center().x - w / 2.0, top + 20.0), g, p.text);
+        let g = galley_truncated(&painter, err, theme::regular(13.0), p.weak, area.width() - 80.0);
+        let w = g.size().x;
+        text_on_baseline(&painter, pos2(area.center().x - w / 2.0, top + 46.0), g, p.weak);
+        let b = Rect::from_center_size(pos2(area.center().x, top + 84.0), vec2(130.0, 38.0));
+        let r = ui.interact(b, ui.id().with(("retry", key)), Sense::click());
+        painter.rect_filled(b, CornerRadius::same(19), if r.hovered() { Color32::WHITE } else { Color32::from_gray(235) });
+        let g = painter.layout_no_wrap("Reintentar".into(), theme::bold(14.0), Color32::BLACK);
+        let w = g.size().x;
+        text_on_baseline(&painter, pos2(b.center().x - w / 2.0, b.center().y + 5.0), g, Color32::BLACK);
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if r.clicked() {
+            self.page_errors.remove(key);
+            self.requested.remove(key);
+        }
+    }
+
+    fn browse_page_path(&self, uri: &str) -> std::path::PathBuf {
+        self.browse_path.with_file_name("browse_pages").join(format!("{}.json", uri.rsplit(':').next().unwrap_or(uri)))
+    }
+
+    /// Guarda la página de una categoría (con la fecha, para saber si renovarla).
+    pub(super) fn save_browse_page(&self, page: &crate::model::BrowsePage) {
+        let path = self.browse_page_path(&page.uri);
+        if let Ok(t) = serde_json::to_string(&(crate::cache::now_secs(), page)) {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            crate::cache::write_atomic(&path, &t);
+        }
+    }
+
+    /// La copia en disco de una categoría, si la hay, y si sigue al día.
+    fn load_browse_page(&self, uri: &str) -> Option<(crate::model::BrowsePage, bool)> {
+        let t = std::fs::read_to_string(self.browse_page_path(uri)).ok()?;
+        let (at, page): (u64, crate::model::BrowsePage) = serde_json::from_str(&t).ok()?;
+        Some((page, crate::cache::now_secs().saturating_sub(at) < PAGE_FRESH_SECS))
+    }
+
+    /// Precarga la página de una categoría (al pasar el ratón por su tarjeta): al pulsarla ya
+    /// está, o casi.
+    fn prefetch_browse(&mut self, uri: &str) {
+        if self.browse_pages.contains_key(uri) {
+            return;
+        }
+        if let Some((page, fresh)) = self.load_browse_page(uri) {
+            self.browse_pages.insert(uri.to_string(), page);
+            if fresh {
+                return;
+            }
+        }
+        self.request_once(&format!("browse:{uri}"), Req::BrowsePage(uri.to_string()));
+    }
+
     /// Pide lo que falte: las categorías (una vez por sesión, o si su copia tiene más de 12 h) y
     /// las búsquedas recientes (una vez por sesión y tras cada cambio).
     pub(super) fn browse_tick(&mut self) {
@@ -479,6 +569,19 @@ impl App {
             }
             let rect = Rect::from_min_size(pos2(x.round(), row.min.y.round()), vec2(CARD, CARD));
             let r = self.browse_card(ui, rect, clip, card, ("browse", g, k));
+            // Precarga tras un cuarto de segundo encima (no al cruzar la fila con el ratón).
+            if r.hovered() && card.feature.is_none() {
+                match &self.browse_hover {
+                    Some((u, at)) if *u == card.uri => {
+                        if at.elapsed() >= std::time::Duration::from_millis(250) {
+                            self.prefetch_browse(&card.uri);
+                        } else {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(260));
+                        }
+                    }
+                    _ => self.browse_hover = Some((card.uri.clone(), std::time::Instant::now())),
+                }
+            }
             if r.clicked() {
                 open = Some(card.clone());
             }
@@ -541,8 +644,25 @@ impl App {
 
     /// La página de una categoría: su título sobre su color y sus secciones.
     pub(super) fn browse_page(&mut self, ui: &mut egui::Ui, uri: String) {
+        let key = format!("browse:{uri}");
         if !self.browse_pages.contains_key(&uri) {
-            self.request_once(&format!("browse:{uri}"), Req::BrowsePage(uri.clone()));
+            // La copia en disco al instante; si no está al día, se renueva detrás.
+            match self.load_browse_page(&uri) {
+                Some((page, fresh)) => {
+                    self.browse_pages.insert(uri.clone(), page);
+                    if !fresh {
+                        self.request_once(&key, Req::BrowsePage(uri.clone()));
+                    }
+                }
+                None => {
+                    let ctx = ui.ctx().clone();
+                    if let Some(err) = self.request_page(&ctx, &key, Req::BrowsePage(uri.clone())) {
+                        let area = ui.max_rect();
+                        self.page_error(ui, area, &key, &err);
+                        return;
+                    }
+                }
+            }
         }
         let Some(page) = self.browse_pages.get(&uri).cloned() else {
             Self::loading(ui, "Cargando");

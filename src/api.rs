@@ -24,6 +24,9 @@ const WORKERS: usize = 2;
 /// Hilos del carril interno (`Api::send`): lo que se ve al abrir una página y sale del protocolo
 /// interno de Spotify, no de la Web API.
 const INTERNAL_WORKERS: usize = 3;
+/// Hilos del carril de páginas (consultas de pathfinder de Buscar, categorías, podcasts y
+/// episodios): aparte del común, que se queda esperando cuando la Web API va lenta o da 503.
+const PAGE_WORKERS: usize = 3;
 /// Elementos que se piden uno a uno como mucho por llamada (los que un lote de metadatos no
 /// trajo, o un lote pequeño que falló), y cuántos a la vez. Sin tope, un lote fallido de
 /// cientos agotaba el cupo de librespot (300 cada 30 s) y la canción que suena no cargaba.
@@ -204,6 +207,22 @@ struct ListCopy {
 /// ¿Va por el carril interno? Lo que abre una página y sale del protocolo interno de Spotify (sin
 /// la Web API, o el álbum, que la prueba sin esperar). Nada que escriba; solo la lista de playlists
 /// cae a la Web API, y únicamente si el rootlist no sirve.
+/// Peticiones de las páginas que se abren al pulsar algo (por pathfinder, sin cuota de la Web
+/// API): van a su carril para no quedarse detrás de las del común.
+fn de_pagina(req: &Req) -> bool {
+    matches!(
+        req,
+        Req::BrowseAll
+            | Req::BrowsePage(_)
+            | Req::RecentSearches
+            | Req::SaveRecentSearches(_)
+            | Req::RemoveRecentSearches(_)
+            | Req::Show(_)
+            | Req::Episode(_)
+            | Req::VideoManifest(_)
+    )
+}
+
 fn interno(req: &Req) -> bool {
     matches!(
         req,
@@ -544,6 +563,7 @@ pub struct Api {
     search_tx: mpsc::Sender<Req>,
     bg_tx: mpsc::Sender<Req>,
     internal_tx: mpsc::Sender<Req>,
+    page_tx: mpsc::Sender<Req>,
     enrich: Enrich,
     web: Arc<WebAuth>,
     web_personal: Arc<WebAuth>,
@@ -593,6 +613,8 @@ impl Api {
         // cada una): con la cuota compartida limitando, abrir una playlist, un álbum o una radio
         // en frío tardaba 5-20 s en una petición de 0,3 s.
         let (internal_tx, internal_rx) = mpsc::channel::<Req>();
+        let (page_tx, page_rx) = mpsc::channel::<Req>();
+        let page_rx = Arc::new(Mutex::new(page_rx));
         let internal_rx = Arc::new(Mutex::new(internal_rx));
         // Carril de enriquecimiento: letras y géneros de fuentes externas (LRCLIB, iTunes, Deezer,
         // MusicBrainz), segundos de consultas en serie que antes ocupaban los dos hilos comunes
@@ -787,6 +809,25 @@ impl Api {
                 })
                 .expect("no se pudo crear el hilo de la API");
         }
+        for i in 0..PAGE_WORKERS {
+            let rx = page_rx.clone();
+            let client = client.clone();
+            let ui = ui.clone();
+            std::thread::Builder::new()
+                .name(format!("nanofy-api-page-{i}"))
+                .stack_size(512 * 1024)
+                .spawn(move || loop {
+                    let req = {
+                        let guard = rx.lock().unwrap();
+                        guard.recv()
+                    };
+                    match req {
+                        Ok(req) => run(req, &client, &ui),
+                        Err(_) => break,
+                    }
+                })
+                .expect("no se pudo crear el hilo de la API");
+        }
         for i in 0..INTERNAL_WORKERS {
             let rx = internal_rx.clone();
             let client = client.clone();
@@ -887,6 +928,7 @@ impl Api {
             search_tx,
             bg_tx,
             internal_tx,
+            page_tx,
             enrich,
             web,
             web_personal,
@@ -986,6 +1028,10 @@ impl Api {
         }
         if interno(&req) {
             let _ = self.internal_tx.send(req);
+            return;
+        }
+        if de_pagina(&req) {
+            let _ = self.page_tx.send(req);
             return;
         }
         let player = matches!(
@@ -3719,12 +3765,8 @@ impl Client {
             }
             Req::BrowseAll => {
                 use crate::pathfinder as pf;
-                let all = self.pf.query(pf::BROWSE_ALL, pf::browse_vars(None))?;
-                let cards = pf::map_browse_all(&all);
-                if cards.is_empty() {
-                    return Err("Spotify no devolvió categorías".into());
-                }
-                // Las categorías de dentro de Pódcasts y Audiolibros (si fallan, sin ellas).
+                // Las categorías de dentro de Pódcasts y Audiolibros (si fallan, sin ellas), a la vez
+                // que las de «Explorar todo»: tres consultas en paralelo en vez de seguidas.
                 let inner = |hub: &str| -> Vec<BrowseCard> {
                     match self.pf.query(pf::BROWSE_PAGE, pf::browse_vars(Some(hub))) {
                         Ok(v) => pf::map_browse_page(&v, hub).sections.into_iter().flat_map(|(_, items)| items).filter_map(|e| e.card()).collect(),
@@ -3734,8 +3776,16 @@ impl Client {
                         }
                     }
                 };
-                let podcasts = inner(pf::PODCASTS_HUB);
-                let audiobooks = inner(pf::AUDIOBOOKS_HUB);
+                let (all, podcasts, audiobooks) = std::thread::scope(|s| {
+                    let p = s.spawn(|| inner(pf::PODCASTS_HUB));
+                    let a = s.spawn(|| inner(pf::AUDIOBOOKS_HUB));
+                    let all = self.pf.query(pf::BROWSE_ALL, pf::browse_vars(None));
+                    (all, p.join().unwrap_or_default(), a.join().unwrap_or_default())
+                });
+                let cards = pf::map_browse_all(&all?);
+                if cards.is_empty() {
+                    return Err("Spotify no devolvió categorías".into());
+                }
                 log::info!("[explorar] {} categorías, {} de pódcasts y {} de audiolibros", cards.len(), podcasts.len(), audiobooks.len());
                 Ok(Resp::Browse(BrowseData { cards, podcasts, audiobooks, fetched_at: crate::cache::now_secs() }))
             }
@@ -4689,10 +4739,15 @@ audio {:?}",
                 use crate::pathfinder as pf;
                 let uri = format!("spotify:show:{id}");
                 let got: Result<(Show, Vec<Episode>), String> = (|| {
-                    let meta = self.pf.query(pf::SHOW_META, serde_json::json!({"uri": uri, "includeContentCapabilityTrait": true, "includeEpisodeContentRatingsV2": false}))?;
-                    let show = pf::map_show_meta(&meta).ok_or("podcast sin datos")?;
                     let page = |offset: u64| self.pf.query(pf::SHOW_EPISODES, serde_json::json!({"uri": uri, "offset": offset, "limit": 50, "includeEpisodeContentRatingsV2": false}));
-                    let (mut episodes, mut next, _) = pf::map_show_episodes(&page(0)?);
+                    // Datos del podcast y primera página de episodios, a la vez.
+                    let (meta, first) = std::thread::scope(|s| {
+                        let f = s.spawn(|| page(0));
+                        let meta = self.pf.query(pf::SHOW_META, serde_json::json!({"uri": uri, "includeContentCapabilityTrait": true, "includeEpisodeContentRatingsV2": false}));
+                        (meta, f.join().unwrap_or_else(|_| Err("el hilo falló".into())))
+                    });
+                    let show = pf::map_show_meta(&meta?).ok_or("podcast sin datos")?;
+                    let (mut episodes, mut next, _) = pf::map_show_episodes(&first?);
                     ui.send(Msg::Api(ApiResult { req: req.clone(), result: Ok(Resp::Show { show: show.clone(), episodes: episodes.clone() }) }));
                     for _ in 0..3 {
                         let Some(off) = next else { break };

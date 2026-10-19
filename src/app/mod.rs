@@ -1128,6 +1128,11 @@ pub struct App {
     video: Option<crate::video::VideoPlayer>,
     video_tex: Option<egui::TextureHandle>,
     video_manifests: HashMap<String, crate::video::VideoManifest>,
+    /// Tarjeta de categoría bajo el ratón y desde cuándo (para precargar su página).
+    browse_hover: Option<(String, Instant)>,
+    /// Fallos de las páginas que se abren al pulsar algo (clave de `request_page`): mensaje,
+    /// cuándo y cuántos intentos van.
+    page_errors: HashMap<String, (String, Instant, u8)>,
     /// Desplazamiento vertical pedido para Buscar sin consulta (QA).
     search_start_scroll: Option<f32>,
     /// Ya se pulsó Intro con lo escrito: se ven los resultados. Mientras no, aunque haya texto,
@@ -1570,6 +1575,8 @@ impl App {
             browse_pages: HashMap::new(),
             browse_offset: HashMap::new(),
             search_start_scroll: None,
+            page_errors: HashMap::new(),
+            browse_hover: None,
             episodes: HashMap::new(),
             video: None,
             video_tex: None,
@@ -4689,6 +4696,18 @@ impl App {
                     }
                     // Completar el listado del rootlist era opcional: se queda como estaba y se
                     // vuelve a intentar con el próximo listado.
+                    // Páginas de Buscar, categorías, podcasts y episodios: se apunta el fallo para
+                    // reintentarlo (ver `request_page`) en vez de quedarse cargando.
+                    Req::BrowsePage(ref k) | Req::Show(ref k) | Req::Episode(ref k) => {
+                        let key = match &r.req {
+                            Req::BrowsePage(_) => format!("browse:{k}"),
+                            Req::Show(_) => format!("show:{k}"),
+                            _ => format!("episode:{k}"),
+                        };
+                        let tries = self.page_errors.get(&key).map_or(0, |p| p.2) + 1;
+                        log::info!("[página] {key}: {e} (intento {tries})");
+                        self.page_errors.insert(key, (e.to_string(), Instant::now(), tries));
+                    }
                     Req::PlaylistsWeb => {
                         self.playlists_web_pending = false;
                         log::info!("[biblioteca] la Web API no completó el listado: {e}");
@@ -5476,6 +5495,7 @@ impl App {
                 self.video_manifests.insert(episode, manifest);
             }
             Resp::Episode(e) => {
+                self.page_errors.remove(&format!("episode:{}", e.id));
                 // Lo que ya se sabía de la lista del podcast (nombre del podcast) se conserva si la
                 // respuesta no lo trae.
                 let prev = self.episodes.remove(&e.id);
@@ -5489,6 +5509,8 @@ impl App {
                 self.episodes.insert(e.id.clone(), e);
             }
             Resp::BrowsePage(p) => {
+                self.page_errors.remove(&format!("browse:{}", p.uri));
+                self.save_browse_page(&p);
                 self.browse_pages.insert(p.uri.clone(), p);
             }
             Resp::RecentSearches(v) => {
@@ -5712,6 +5734,7 @@ impl App {
                 self.artist_views.insert(id, view);
             }
             Resp::Show { show, episodes } => {
+                self.page_errors.remove(&format!("show:{}", show.id));
                 self.shows.insert(show.id.clone(), (show, episodes));
             }
             Resp::WebConnected => {

@@ -34,9 +34,11 @@ const DOWN: Duration = Duration::from_secs(600);
 /// reproductor web).
 const DISCOVERY_EVERY: u64 = 86_400;
 /// Limitador propio (token bucket): ráfaga y fichas por segundo. No toca el de la Web API: una
-/// búsqueda por aquí no le quita ritmo a la biblioteca ni al revés.
-const BURST: f64 = 5.0;
-const REFILL: f64 = 1.0;
+/// búsqueda por aquí no le quita ritmo a la biblioteca ni al revés. Desde la 1.30 también carga
+/// páginas (Buscar, categorías, podcasts, episodios): con 5 y 1/s, abrir Buscar gastaba la ráfaga
+/// y la categoría pulsada esperaba su ficha; el reproductor web hace muchas más por página.
+const BURST: f64 = 10.0;
+const REFILL: f64 = 3.0;
 /// Bytes de la primera respuesta que se copian al registro (la entera son cientos de KB).
 const LOG_FIRST: usize = 2 * 1024;
 const WEB_PLAYER: &str = "https://open.spotify.com/";

@@ -352,7 +352,8 @@ impl App {
     /// la izquierda sus episodios con orden, filtro y búsqueda; a la derecha portada, «Acerca de» y
     /// temas.
     pub(super) fn podcast_panel(&mut self, ui: &mut egui::Ui, panel: Rect, id: String) {
-        self.request_once(&format!("show:{id}"), Req::Show(id.clone()));
+        let ctx = ui.ctx().clone();
+        let failed = self.request_page(&ctx, &format!("show:{id}"), Req::Show(id.clone()));
         self.request_once("saved_shows", Req::SavedShows);
         self.request_once("saved_episodes", Req::SavedEpisodes);
         let data = self.shows.get(&id).cloned();
@@ -360,6 +361,10 @@ impl App {
         let accent = data.as_ref().and_then(|(s, _)| s.accent);
         self.podcast_backdrop(ui.painter(), panel, accent, cover.as_deref());
         let Some((show, episodes)) = data else {
+            if let Some(err) = failed {
+                self.page_error(ui, panel, &format!("show:{id}"), &err);
+                return;
+            }
             let g = ui.painter().layout_no_wrap("Cargando…".into(), theme::regular(15.0), WEAK);
             text_on_baseline(ui.painter(), pos2(panel.min.x + LEFT, panel.min.y + 60.0), g, WEAK);
             return;
@@ -626,15 +631,22 @@ impl App {
     /// vídeo (su imagen 16:9 con un botón de reproducir: el audio suena en Nanofy) y, a la
     /// derecha, portada y «Acerca del episodio».
     pub(super) fn episode_panel(&mut self, ui: &mut egui::Ui, panel: Rect, id: String) {
-        if self.episodes.get(&id).is_none_or(|e| e.html_description.is_empty() && e.wide_image.is_none()) {
-            self.request_once(&format!("episode:{id}"), Req::Episode(id.clone()));
-        }
+        let ctx = ui.ctx().clone();
+        let failed = if self.episodes.get(&id).is_none_or(|e| e.html_description.is_empty() && e.wide_image.is_none()) {
+            self.request_page(&ctx, &format!("episode:{id}"), Req::Episode(id.clone()))
+        } else {
+            None
+        };
         self.request_once("saved_episodes", Req::SavedEpisodes);
         let e = self.episodes.get(&id).cloned();
         let cover = e.as_ref().and_then(|e| e.cover(640).map(str::to_string));
         let accent = e.as_ref().and_then(|e| e.accent);
         self.podcast_backdrop(ui.painter(), panel, accent, cover.as_deref());
         let Some(e) = e else {
+            if let Some(err) = failed {
+                self.page_error(ui, panel, &format!("episode:{id}"), &err);
+                return;
+            }
             let g = ui.painter().layout_no_wrap("Cargando…".into(), theme::regular(15.0), WEAK);
             text_on_baseline(ui.painter(), pos2(panel.min.x + LEFT, panel.min.y + 60.0), g, WEAK);
             return;

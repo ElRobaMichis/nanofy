@@ -1057,12 +1057,27 @@ impl App {
                     .map(|(i, g)| json!({"title": super::browse::SECTIONS[i], "cards": g.iter().map(|c| c.title.clone()).collect::<Vec<_>>()}))
                     .collect();
                 let recent: Vec<Value> = self.recent_searches.iter().flatten().map(|e| json!([e.kind, e.title, e.uri])).collect();
-                json!({"ok": true, "loaded": self.browse.is_some(), "sections": sections, "recent": recent, "results_shown": self.search_shown})
+                json!({"ok": true, "loaded": self.browse.is_some(), "sections": sections, "recent": recent, "results_shown": self.search_shown,
+                    "pages": self.browse_pages.keys().cloned().collect::<Vec<_>>(),
+                    "uris": self.browse.as_ref().map(super::browse::grouped).unwrap_or_default().iter().flatten().map(|c| c.uri.clone()).collect::<Vec<_>>()})
             }
             "search_start_scroll" => {
                 self.search_start_scroll = Some(n(cmd, "y").unwrap_or(0).max(0) as f32);
                 ok()
             }
+            // Simula que una página falló `tries` veces (clave de request_page, p. ej.
+            // «browse:spotify:page:…»), para ver el reintento y la pantalla de error.
+            "page_error" => match s(cmd, "key") {
+                Some(key) => {
+                    let tries = n(cmd, "tries").unwrap_or(3).clamp(1, 3) as u8;
+                    if let Some(uri) = key.strip_prefix("browse:") {
+                        self.browse_pages.remove(uri);
+                    }
+                    self.page_errors.insert(key.to_string(), ("prueba: sin respuesta".into(), std::time::Instant::now(), tries));
+                    ok()
+                }
+                None => err("falta key"),
+            },
             "browse_scroll" => {
                 let k = n(cmd, "section").unwrap_or(0).clamp(0, 5) as u8;
                 self.browse_offset.insert(k, n(cmd, "first").unwrap_or(0).max(0) as f32);

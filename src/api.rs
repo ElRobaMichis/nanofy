@@ -256,6 +256,8 @@ pub enum Req {
     LikedGenres { songs: Vec<crate::genres_deezer::LikedSong> },
     /// Un episodio para su página (con su imagen 16:9 y su descripción en HTML).
     Episode(String),
+    /// El manifiesto del vídeo de un episodio (sus segmentos H.264, ver video.rs).
+    VideoManifest(String),
     /// Categorías de «Explorar todo» (con las de dentro de Pódcasts y Audiolibros).
     BrowseAll,
     /// La página de una categoría (`spotify:page:…`).
@@ -465,6 +467,7 @@ pub enum Resp {
     LikedGenres { tracks: Vec<(String, Vec<u32>)>, names: Vec<(u32, String)>, pending: usize },
     Browse(BrowseData),
     Episode(Episode),
+    VideoManifest { episode: String, manifest: crate::video::VideoManifest },
     BrowsePage(BrowsePage),
     RecentSearches(Vec<BrowseEntry>),
     ArtistTop(Vec<Track>),
@@ -4711,6 +4714,19 @@ audio {:?}",
                         self.exec(&Req::ShowPlain(id.clone()), ui)
                     }
                 }
+            }
+            Req::VideoManifest(id) => {
+                let session = self.session()?;
+                let uri = SpotifyUri::from_uri(&format!("spotify:episode:{id}")).map_err(|e| e.to_string())?;
+                let ep = self.block(TIMEOUT_ITEM, librespot_metadata::Episode::get(&session, &uri)).map_err(|e| format!("episodio: {e}"))?;
+                let file = ep.videos.first().ok_or("el episodio no tiene vídeo")?;
+                // El id del vídeo son los 16 primeros bytes del archivo (el resto, relleno).
+                let hex = file.to_base16().map_err(|e| e.to_string())?;
+                let source = hex.get(..32).unwrap_or(&hex);
+                let text = self.spclient(http::Method::GET, &format!("/manifests/v9/json/sources/{source}/options/supports_drm"))?;
+                let v: Value = serde_json::from_str(&text).map_err(|e| format!("manifiesto: {e}"))?;
+                let manifest = crate::video::parse_manifest(&v)?;
+                Ok(Resp::VideoManifest { episode: id.clone(), manifest })
             }
             Req::Episode(id) => {
                 let v = self.pf.query(crate::pathfinder::EPISODE, serde_json::json!({"uri": format!("spotify:episode:{id}"), "includeEpisodeContentRatingsV2": false}))?;

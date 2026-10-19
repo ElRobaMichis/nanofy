@@ -685,16 +685,55 @@ impl App {
             let video = Rect::from_min_size(pos2(o.x + LEFT, o.y + VIDEO_Y), vec2(vw, vw * 9.0 / 16.0));
             let mut video_clicked = false;
             if has_video {
-                let img = e.wide_image.clone().or_else(|| cover.clone());
-                self.cover_in(ui, img.as_deref(), video, 8);
+                // Con este episodio sonando, su vídeo (video.rs) sincronizado con el audio; si no,
+                // o mientras llega, su imagen 16:9.
+                let current = self.player.now.as_ref().is_some_and(|n| n.uri == e.uri);
+                let mut drew = false;
+                if e.video && current {
+                    self.request_once(&format!("videomanifest:{id}"), Req::VideoManifest(id.clone()));
+                    if self.video.as_ref().is_none_or(|v| v.episode != e.uri) {
+                        if let Some(m) = self.video_manifests.get(&id).cloned() {
+                            self.video = Some(crate::video::VideoPlayer::start(e.uri.clone(), m, self.player.position() as u64));
+                            self.video_tex = None;
+                        }
+                    }
+                    if let Some(v) = &self.video {
+                        if let Some(f) = v.frame_at(self.player.position() as u64) {
+                            let img = egui::ColorImage::from_rgba_unmultiplied(f.size, &f.rgba);
+                            match &mut self.video_tex {
+                                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                                None => self.video_tex = Some(ui.ctx().load_texture("video-podcast", img, egui::TextureOptions::LINEAR)),
+                            }
+                        }
+                        if let Some(t) = &self.video_tex {
+                            egui::Image::from_texture(egui::load::SizedTexture::from_handle(t)).corner_radius(8).maintain_aspect_ratio(false).paint_at(ui, video);
+                            drew = true;
+                        }
+                        if playing {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                        }
+                    }
+                }
+                if !drew {
+                    let img = e.wide_image.clone().or_else(|| cover.clone());
+                    self.cover_in(ui, img.as_deref(), video, 8);
+                }
                 let vr = ui.interact(video, ui.id().with("epi_video"), Sense::click());
-                let pc = video.center();
-                painter.circle_filled(pc, VIDEO_PLAY_D / 2.0, if vr.hovered() { Color32::WHITE } else { Color32::from_gray(238) });
-                icons::paint_side(&painter, pc + vec2(2.0, 0.0), VIDEO_PLAY_D * 0.36, Color32::BLACK, if playing { Icon::Pause } else { Icon::Play });
+                // El botón de en medio, con el vídeo parado (sonando, solo al pasar el ratón).
+                if !(drew && playing) || vr.hovered() {
+                    let pc = video.center();
+                    painter.circle_filled(pc, VIDEO_PLAY_D / 2.0, if vr.hovered() { Color32::WHITE } else { Color32::from_gray(238) });
+                    icons::paint_side(&painter, pc + vec2(if playing { 0.0 } else { 2.0 }, 0.0), VIDEO_PLAY_D * 0.36, Color32::BLACK, if playing { Icon::Pause } else { Icon::Play });
+                }
                 if vr.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                video_clicked = vr.on_hover_text("Reproducir (en Nanofy suena el audio del vídeo)").clicked();
+                let err = self.video.as_ref().and_then(|v| v.error());
+                let tip = match err {
+                    Some(e) => format!("El vídeo no se pudo cargar ({e}); suena el audio"),
+                    None => if playing { "Pausar".to_string() } else { "Reproducir".to_string() },
+                };
+                video_clicked = vr.on_hover_text(tip).clicked();
             }
             if play_r.clicked() || video_clicked {
                 if self.player.now.as_ref().is_some_and(|n| n.uri == e.uri) {

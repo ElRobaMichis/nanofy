@@ -1123,6 +1123,11 @@ pub struct App {
     browse_offset: HashMap<u8, f32>,
     /// Episodios abiertos en su página (con su imagen 16:9 y su descripción en HTML).
     episodes: HashMap<String, crate::model::Episode>,
+    /// Vídeo del episodio que suena con su página abierta (video.rs), su textura y los
+    /// manifiestos ya pedidos.
+    video: Option<crate::video::VideoPlayer>,
+    video_tex: Option<egui::TextureHandle>,
+    video_manifests: HashMap<String, crate::video::VideoManifest>,
     /// Desplazamiento vertical pedido para Buscar sin consulta (QA).
     search_start_scroll: Option<f32>,
     /// Ya se pulsó Intro con lo escrito: se ven los resultados. Mientras no, aunque haya texto,
@@ -1566,6 +1571,9 @@ impl App {
             browse_offset: HashMap::new(),
             search_start_scroll: None,
             episodes: HashMap::new(),
+            video: None,
+            video_tex: None,
+            video_manifests: HashMap::new(),
             search_shown: false,
             liked_push_at: None,
             liked_genres: HashMap::new(),
@@ -5464,6 +5472,9 @@ impl App {
                 }
                 self.browse = Some(d);
             }
+            Resp::VideoManifest { episode, manifest } => {
+                self.video_manifests.insert(episode, manifest);
+            }
             Resp::Episode(e) => {
                 // Lo que ya se sabía de la lista del podcast (nombre del podcast) se conserva si la
                 // respuesta no lo trae.
@@ -6038,6 +6049,15 @@ impl App {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        // El vídeo de un podcast solo mientras suena su episodio con su página abierta.
+        if let Some(v) = &self.video {
+            let on_page = matches!(self.page(), Page::Episode(id) if v.episode.ends_with(id.as_str()));
+            let current = self.player.now.as_ref().is_some_and(|n| n.uri == v.episode);
+            if !on_page || !current {
+                self.video = None;
+                self.video_tex = None;
+            }
+        }
         if let Some(at) = self.liked_push_at {
             let now = Instant::now();
             if now >= at {

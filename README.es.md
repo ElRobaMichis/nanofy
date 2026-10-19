@@ -67,7 +67,7 @@ una. Funciona en Windows, Linux y macOS, y la interfaz está en español. Para r
 - Me gusta, álbumes, artistas, podcasts e historial; las listas de canciones tienen selección múltiple y buscador propio.
 - Filtra tus canciones que te gustan por artista o género y guarda el filtro como una playlist dinámica que se pone al día sola.
 - Pestañas con historial propio, Inicio personalizable y búsqueda con nueve filtros.
-- Páginas de podcast con valoración, temas y todos sus episodios (los de vídeo, marcados), orden, filtro y búsqueda; páginas de episodio con la imagen del vídeo y su descripción.
+- Páginas de podcast con valoración, temas y todos sus episodios (los de vídeo, marcados), orden, filtro y búsqueda; páginas de episodio que reproducen su vídeo sincronizado con el audio, y su descripción.
 - Buscar se abre con tus búsquedas recientes (las mismas que en la app oficial) y las categorías de Spotify agrupadas en Descubrir, Géneros, Estado de ánimo y actividad, Entretenimiento, Pódcasts y Audiolibros.
 - Pegar en la búsqueda un enlace de `open.spotify.com` o una URI `spotify:` lo abre directamente.
 
@@ -220,7 +220,8 @@ Nanofy se apoya en [librespot](https://github.com/librespot-org/librespot) (con 
 [softbuffer](https://github.com/rust-windowing/softbuffer), [rodio](https://github.com/RustAudio/rodio),
 [Symphonia](https://github.com/pdeljanov/Symphonia) y [souvlaki](https://github.com/Sinono3/souvlaki).
 Letras de BiniLyrics, Musixmatch (por Lyrics+) y [LRCLIB](https://lrclib.net); explicaciones de
-[Genius](https://genius.com); géneros de Deezer, iTunes, MusicBrainz y Wikidata.
+[Genius](https://genius.com); géneros de Deezer, iTunes, MusicBrainz y Wikidata. El vídeo de los podcasts se
+decodifica con [OpenH264](https://www.openh264.org) (Cisco, licencia BSD).
 
 Licencia [MIT](LICENSE). Nanofy es un proyecto independiente y no está afiliado a Spotify.
 Spotify es una marca de Spotify AB.

@@ -1120,6 +1120,10 @@ pub struct App {
     browse_offset: HashMap<u8, f32>,
     /// Desplazamiento vertical pedido para Buscar sin consulta (QA).
     search_start_scroll: Option<f32>,
+    /// Ya se pulsó Intro con lo escrito: se ven los resultados. Mientras no, aunque haya texto,
+    /// sigue a la vista Buscar sin consulta (recientes y «Explorar todo»); al vaciar la caja se
+    /// vuelve a ella.
+    search_shown: bool,
     /// Cuándo releer lo reciente de Me gusta tras un aviso de cambio de la biblioteca.
     liked_push_at: Option<Instant>,
     /// Géneros de Deezer de las canciones que te gustan (por id) y sus nombres.
@@ -1556,6 +1560,7 @@ impl App {
             browse_pages: HashMap::new(),
             browse_offset: HashMap::new(),
             search_start_scroll: None,
+            search_shown: false,
             liked_push_at: None,
             liked_genres: HashMap::new(),
             genre_names: HashMap::new(),
@@ -6470,7 +6475,7 @@ impl App {
                 Action::Go(p) => {
                     // Lo que se abre desde los resultados de una búsqueda entra en las búsquedas
                     // recientes de la cuenta (como en la app oficial).
-                    if *self.page() == Page::Search && !self.search_query.trim().is_empty() {
+                    if *self.page() == Page::Search && self.search_shown {
                         if let Some(uri) = browse::page_uri(&p) {
                             self.remember_uri(uri);
                         }
@@ -6484,7 +6489,7 @@ impl App {
                 }
                 Action::Play(t) => {
                     // Una canción que se pone desde los resultados, también.
-                    if *self.page() == Page::Search && !self.search_query.trim().is_empty() {
+                    if *self.page() == Page::Search && self.search_shown {
                         let track = match &t {
                             PlayTarget::Tracks { uris, index, .. } => uris.get(index.unwrap_or(0) as usize).cloned(),
                             PlayTarget::Context { track_uri, .. } => track_uri.clone(),
@@ -8506,6 +8511,7 @@ impl App {
 
     pub fn run_search(&mut self) {
         let q = self.search_query.trim().to_string();
+        self.search_shown = !q.is_empty();
         self.search_for(q);
     }
 
@@ -8978,8 +8984,12 @@ impl crate::shell::UiApp for App {
                     self.library_panel(&mut c, panel);
                     return;
                 }
-                if page_now == Page::Search && self.signed_in() && self.search_query.trim().is_empty() {
-                    // Buscar sin consulta: búsquedas recientes y «Explorar todo» (browse.rs).
+                if self.search_query.trim().is_empty() {
+                    self.search_shown = false;
+                }
+                if page_now == Page::Search && self.signed_in() && !self.search_shown {
+                    // Buscar sin consulta (o escribiendo, hasta pulsar Intro): búsquedas recientes
+                    // y «Explorar todo» (browse.rs).
                     self.search_start(ui, panel);
                     return;
                 }

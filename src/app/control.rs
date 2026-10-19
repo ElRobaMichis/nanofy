@@ -578,6 +578,11 @@ impl App {
                 }
                 None => err("falta q"),
             },
+            // Texto en la caja de Buscar sin pulsar Intro (como teclearlo).
+            "search_text" => {
+                self.search_query = s(cmd, "q").unwrap_or("").to_string();
+                ok()
+            }
             "search_filter" => match n(cmd, "n") {
                 Some(f) => {
                     // Como el clic en la píldora: Perfiles pide el perfil y, al salir de ahí, se
@@ -1050,7 +1055,7 @@ impl App {
                     .map(|(i, g)| json!({"title": super::browse::SECTIONS[i], "cards": g.iter().map(|c| c.title.clone()).collect::<Vec<_>>()}))
                     .collect();
                 let recent: Vec<Value> = self.recent_searches.iter().flatten().map(|e| json!([e.kind, e.title, e.uri])).collect();
-                json!({"ok": true, "loaded": self.browse.is_some(), "sections": sections, "recent": recent})
+                json!({"ok": true, "loaded": self.browse.is_some(), "sections": sections, "recent": recent, "results_shown": self.search_shown})
             }
             "search_start_scroll" => {
                 self.search_start_scroll = Some(n(cmd, "y").unwrap_or(0).max(0) as f32);

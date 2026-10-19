@@ -5,6 +5,7 @@
 //! (y más a menudo si el panel de letras está abierto, para resaltar la línea actual).
 
 mod artist;
+mod browse;
 pub mod control;
 mod icon_masks;
 mod icons;
@@ -120,6 +121,8 @@ pub enum Page {
     Artist(String),
     /// Página de una canción (la abre la portada del reproductor).
     Track(String),
+    /// Página de una categoría de «Explorar todo» (`spotify:page:…`).
+    Browse(String),
     User(String),
     Settings,
 }
@@ -1106,6 +1109,17 @@ pub struct App {
     liked_filter_open: bool,
     /// Submenú abierto del de filtro: 1 artistas, 2 géneros.
     liked_filter_sub: Option<u8>,
+    /// Buscar sin consulta (browse.rs): categorías (y su copia en disco), búsquedas recientes de
+    /// la cuenta, páginas de categoría y la primera tarjeta a la vista de cada sección.
+    browse: Option<crate::model::BrowseData>,
+    browse_path: PathBuf,
+    browse_asked: bool,
+    recent_searches: Option<Vec<crate::model::BrowseEntry>>,
+    recent_asked: bool,
+    browse_pages: HashMap<String, crate::model::BrowsePage>,
+    browse_offset: HashMap<u8, f32>,
+    /// Desplazamiento vertical pedido para Buscar sin consulta (QA).
+    search_start_scroll: Option<f32>,
     /// Cuándo releer lo reciente de Me gusta tras un aviso de cambio de la biblioteca.
     liked_push_at: Option<Instant>,
     /// Géneros de Deezer de las canciones que te gustan (por id) y sus nombres.
@@ -1263,6 +1277,7 @@ impl App {
         crate::tmark("fuentes");
 
         let dynamic_path = paths.state_dir.join("dynamic_playlists.json");
+        let browse_path = paths.state_dir.join("browse.json");
         let mut app = Self {
             draft: settings.clone(),
             paths,
@@ -1533,6 +1548,14 @@ impl App {
             liked_sort_open: false,
             liked_filter_open: false,
             liked_filter_sub: None,
+            browse: std::fs::read_to_string(&browse_path).ok().and_then(|t| serde_json::from_str(&t).ok()),
+            browse_path,
+            browse_asked: false,
+            recent_searches: None,
+            recent_asked: false,
+            browse_pages: HashMap::new(),
+            browse_offset: HashMap::new(),
+            search_start_scroll: None,
             liked_push_at: None,
             liked_genres: HashMap::new(),
             genre_names: HashMap::new(),
@@ -5422,6 +5445,18 @@ impl App {
                     self.status("Descarga completada");
                 }
             }
+            Resp::Browse(d) => {
+                if let Ok(t) = serde_json::to_string(&d) {
+                    crate::cache::write_atomic(&self.browse_path, &t);
+                }
+                self.browse = Some(d);
+            }
+            Resp::BrowsePage(p) => {
+                self.browse_pages.insert(p.uri.clone(), p);
+            }
+            Resp::RecentSearches(v) => {
+                self.recent_searches = Some(v);
+            }
             Resp::LikedGenres { tracks, names, pending } => {
                 for (id, g) in tracks {
                     self.liked_genres.insert(id, g);
@@ -6432,13 +6467,34 @@ impl App {
         let actions = std::mem::take(&mut self.actions);
         for a in actions {
             match a {
-                Action::Go(p) => self.go(p),
+                Action::Go(p) => {
+                    // Lo que se abre desde los resultados de una búsqueda entra en las búsquedas
+                    // recientes de la cuenta (como en la app oficial).
+                    if *self.page() == Page::Search && !self.search_query.trim().is_empty() {
+                        if let Some(uri) = browse::page_uri(&p) {
+                            self.remember_uri(uri);
+                        }
+                    }
+                    self.go(p)
+                }
                 Action::OpenPlaylist(p) => {
                     let id = p.id.clone();
                     self.playlist_meta.insert(id.clone(), p);
                     self.go(Page::Playlist(id));
                 }
-                Action::Play(t) => self.play(t),
+                Action::Play(t) => {
+                    // Una canción que se pone desde los resultados, también.
+                    if *self.page() == Page::Search && !self.search_query.trim().is_empty() {
+                        let track = match &t {
+                            PlayTarget::Tracks { uris, index, .. } => uris.get(index.unwrap_or(0) as usize).cloned(),
+                            PlayTarget::Context { track_uri, .. } => track_uri.clone(),
+                        };
+                        if let Some(uri) = track.filter(|u| u.starts_with("spotify:track:")) {
+                            self.remember_uri(uri);
+                        }
+                    }
+                    self.play(t)
+                }
                 Action::Like(id, on) => self.like(id, on),
                 Action::SaveAlbum(id, on) => {
                     if self.logged_in() {
@@ -8920,6 +8976,11 @@ impl crate::shell::UiApp for App {
                     let mut c = ui.new_child(egui::UiBuilder::new().max_rect(panel));
                     c.set_clip_rect(panel.shrink(1.0));
                     self.library_panel(&mut c, panel);
+                    return;
+                }
+                if page_now == Page::Search && self.signed_in() && self.search_query.trim().is_empty() {
+                    // Buscar sin consulta: búsquedas recientes y «Explorar todo» (browse.rs).
+                    self.search_start(ui, panel);
                     return;
                 }
                 if liked {

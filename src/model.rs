@@ -1480,6 +1480,84 @@ pub struct EpisodeWithShow {
     pub show: Option<Show>,
 }
 
+/// Una tarjeta de categoría de «Explorar todo» (o de una página de categoría): color de fondo y
+/// portada girada, como en la app oficial. `uri`: `spotify:page:…` (o `spotify:xlink:…` para las
+/// especiales, con su destino en `feature`, p. ej. `spotify:podcastcharts`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BrowseCard {
+    pub uri: String,
+    pub title: String,
+    pub color: [u8; 3],
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub feature: Option<String>,
+}
+
+impl BrowseCard {
+    /// Id de la página (lo que va tras `spotify:page:` o `spotify:xlink:`).
+    pub fn id(&self) -> &str {
+        self.uri.rsplit(':').next().unwrap_or(&self.uri)
+    }
+}
+
+/// Las categorías de la búsqueda: las de «Explorar todo» y las de dentro de Pódcasts y
+/// Audiolibros (ahí están «Éxitos en pódcasts», «Video Podcasts» o los géneros de libros).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BrowseData {
+    pub cards: Vec<BrowseCard>,
+    #[serde(default)]
+    pub podcasts: Vec<BrowseCard>,
+    #[serde(default)]
+    pub audiobooks: Vec<BrowseCard>,
+    /// Cuándo se pidieron (segundos Unix).
+    #[serde(default)]
+    pub fetched_at: u64,
+}
+
+/// Un elemento de una sección de una página de categoría o de las búsquedas recientes.
+/// `kind`: artist, album, track, playlist, show, episode, audiobook, user o category.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BrowseEntry {
+    pub uri: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: String,
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Color de la tarjeta (categorías) o el oscuro de la portada (álbumes).
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+}
+
+impl BrowseEntry {
+    pub fn id(&self) -> &str {
+        self.uri.rsplit(':').next().unwrap_or(&self.uri)
+    }
+
+    /// La tarjeta de categoría que es (si lo es).
+    pub fn card(&self) -> Option<BrowseCard> {
+        (self.kind == "category").then(|| BrowseCard {
+            uri: self.uri.clone(),
+            title: self.title.clone(),
+            color: self.color.unwrap_or([40, 40, 40]),
+            image: self.image.clone(),
+            feature: (!self.subtitle.is_empty()).then(|| self.subtitle.clone()),
+        })
+    }
+}
+
+/// Una página de categoría: cabecera y secciones.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BrowsePage {
+    pub uri: String,
+    pub title: String,
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+    pub sections: Vec<(String, Vec<BrowseEntry>)>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

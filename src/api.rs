@@ -254,6 +254,14 @@ pub enum Req {
     /// Géneros de Deezer de «Canciones que te gustan» (id, título, primer artista y duración de
     /// cada una): van en su propio hilo, ver `genres_deezer`. La respuesta llega por partes.
     LikedGenres { songs: Vec<crate::genres_deezer::LikedSong> },
+    /// Categorías de «Explorar todo» (con las de dentro de Pódcasts y Audiolibros).
+    BrowseAll,
+    /// La página de una categoría (`spotify:page:…`).
+    BrowsePage(String),
+    /// Búsquedas recientes de la cuenta (las de la app oficial) y su guardado y borrado.
+    RecentSearches,
+    SaveRecentSearches(Vec<String>),
+    RemoveRecentSearches(Vec<String>),
     ArtistTop(String),
     /// Pista completa (álbum, portada) por los metadatos internos.
     TrackInfo(String),
@@ -451,6 +459,9 @@ pub enum Resp {
     /// Lo encontrado de `Req::LikedGenres`: géneros (números de Deezer) de canciones, nombres de
     /// géneros nuevos y cuántas canciones faltan (0 al acabar).
     LikedGenres { tracks: Vec<(String, Vec<u32>)>, names: Vec<(u32, String)>, pending: usize },
+    Browse(BrowseData),
+    BrowsePage(BrowsePage),
+    RecentSearches(Vec<BrowseEntry>),
     ArtistTop(Vec<Track>),
     TrackInfo(Track),
     TrackPage(Box<TrackPage>),
@@ -3695,6 +3706,48 @@ impl Client {
                 self.warm_metadata(uris)?;
                 Ok(Resp::Done)
             }
+            Req::BrowseAll => {
+                use crate::pathfinder as pf;
+                let all = self.pf.query(pf::BROWSE_ALL, pf::browse_vars(None))?;
+                let cards = pf::map_browse_all(&all);
+                if cards.is_empty() {
+                    return Err("Spotify no devolvió categorías".into());
+                }
+                // Las categorías de dentro de Pódcasts y Audiolibros (si fallan, sin ellas).
+                let inner = |hub: &str| -> Vec<BrowseCard> {
+                    match self.pf.query(pf::BROWSE_PAGE, pf::browse_vars(Some(hub))) {
+                        Ok(v) => pf::map_browse_page(&v, hub).sections.into_iter().flat_map(|(_, items)| items).filter_map(|e| e.card()).collect(),
+                        Err(e) => {
+                            log::info!("[explorar] {hub}: {e}");
+                            Vec::new()
+                        }
+                    }
+                };
+                let podcasts = inner(pf::PODCASTS_HUB);
+                let audiobooks = inner(pf::AUDIOBOOKS_HUB);
+                log::info!("[explorar] {} categorías, {} de pódcasts y {} de audiolibros", cards.len(), podcasts.len(), audiobooks.len());
+                Ok(Resp::Browse(BrowseData { cards, podcasts, audiobooks, fetched_at: crate::cache::now_secs() }))
+            }
+            Req::BrowsePage(uri) => {
+                use crate::pathfinder as pf;
+                let v = self.pf.query(pf::BROWSE_PAGE, pf::browse_vars(Some(uri)))?;
+                Ok(Resp::BrowsePage(pf::map_browse_page(&v, uri)))
+            }
+            Req::RecentSearches => {
+                let v = self.pf.query(
+                    crate::pathfinder::RECENT_SEARCHES,
+                    serde_json::json!({"limit": 50, "includeAuthors": true, "includeEpisodeContentRatingsV2": false}),
+                )?;
+                Ok(Resp::RecentSearches(crate::pathfinder::map_recent(&v)))
+            }
+            Req::SaveRecentSearches(uris) => {
+                self.pf.query(crate::pathfinder::SAVE_RECENT_SEARCHES, serde_json::json!({ "uris": uris }))?;
+                Ok(Resp::Done)
+            }
+            Req::RemoveRecentSearches(uris) => {
+                self.pf.query(crate::pathfinder::REMOVE_RECENT_SEARCHES, serde_json::json!({ "uris": uris }))?;
+                Ok(Resp::Done)
+            }
             // Se atiende en su propio hilo (`Api::send`); aquí no llega.
             Req::LikedGenres { .. } => Err("los géneros de Me gusta van por su hilo".into()),
             Req::Genres { key } => Ok(Resp::Genres {
@@ -4170,8 +4223,37 @@ impl Client {
             Req::Probe(endpoint) => {
                 // «pf:getTrack:<id>» o «pf:internalLinkRecommenderTrack:<id>»: una consulta de la
                 // página de canción.
-                let text = match endpoint.strip_prefix("pf:").and_then(|r| r.split_once(':')) {
-                    Some((op, id)) => {
+                let browse = |extra: serde_json::Value| {
+                    let mut v = serde_json::json!({
+                        "pagePagination": {"offset": 0, "limit": 10},
+                        "sectionPagination": {"offset": 0, "limit": 99},
+                        "browseEndUserIntegration": "INTEGRATION_WEB_PLAYER",
+                    });
+                    if let (Some(v), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+                        v.extend(e.clone());
+                    }
+                    v
+                };
+                let text = match endpoint.as_str() {
+                    "pf:browseAll" => Some(self.pf.query(crate::pathfinder::BROWSE_ALL, browse(serde_json::json!({})))?.to_string()),
+                    "pf:recentSearches" => Some(
+                        self.pf
+                            .query(crate::pathfinder::RECENT_SEARCHES, serde_json::json!({"limit": 50, "includeAuthors": true, "includeEpisodeContentRatingsV2": false}))?
+                            .to_string(),
+                    ),
+                    e if e.starts_with("pf:browsePage:") => Some(
+                        self.pf
+                            .query(
+                                crate::pathfinder::BROWSE_PAGE,
+                                browse(serde_json::json!({"uri": &e[14..], "sectionPagination": {"offset": 0, "limit": 10}, "includeEpisodeContentRatingsV2": false})),
+                            )?
+                            .to_string(),
+                    ),
+                    _ => None,
+                };
+                let text = match (text, endpoint.strip_prefix("pf:").and_then(|r| r.split_once(':'))) {
+                    (Some(t), _) => t,
+                    (None, Some((op, id))) => {
                         let uri = format!("spotify:track:{id}");
                         let (op, vars) = match op {
                             "getTrack" => (crate::pathfinder::GET_TRACK, serde_json::json!({"uri": uri})),
@@ -4179,7 +4261,7 @@ impl Client {
                         };
                         self.pf.query(op, vars)?.to_string()
                     }
-                    None => self.spclient(http::Method::GET, endpoint)?,
+                    (None, None) => self.spclient(http::Method::GET, endpoint)?,
                 };
                 let name = endpoint.trim_start_matches('/').replace(['/', '?', '&', '=', ':'], "_");
                 let _ = std::fs::write(std::env::temp_dir().join(format!("nanofy_probe_{name}.json")), &text);

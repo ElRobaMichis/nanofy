@@ -352,6 +352,14 @@ impl App {
             Page::Folders => (Icon::Folder, "Carpetas".into()),
             Page::Artists => (Icon::Artist, "Artistas".into()),
             Page::Settings => (Icon::Settings, "Ajustes".into()),
+            Page::Browse(uri) => (
+                Icon::Search,
+                self.browse_pages
+                    .get(uri)
+                    .map(|p| p.title.clone())
+                    .or_else(|| self.browse.iter().flat_map(|b| b.cards.iter().chain(&b.podcasts).chain(&b.audiobooks)).find(|c| &c.uri == uri).map(|c| c.title.clone()))
+                    .unwrap_or_else(|| "Explorar".into()),
+            ),
             Page::Show(id) => (Icon::Podcast, self.shows.get(id).map(|s| s.0.name.clone()).unwrap_or_else(|| "Podcast".into())),
             Page::Playlist(id) => (
                 Icon::Playlist,

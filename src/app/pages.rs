@@ -61,6 +61,7 @@ impl App {
             Page::Track(id) => self.track_page(ui, id),
             Page::Show(id) => self.show_page(ui, id),
             Page::User(id) => self.user_page(ui, id),
+            Page::Browse(uri) => self.browse_page(ui, uri),
             Page::Settings => self.settings_page(ui),
         }
     }
@@ -248,7 +249,7 @@ impl App {
             });
     }
 
-    fn section_header(ui: &mut egui::Ui, title: &str, link: Option<&str>) -> bool {
+    pub(super) fn section_header(ui: &mut egui::Ui, title: &str, link: Option<&str>) -> bool {
         let p = theme::palette(ui.ctx());
         let mut clicked = false;
         ui.add_space(14.0);

@@ -59,6 +59,7 @@ pub fn parse_page(spec: &str) -> Option<Page> {
         s if s.starts_with("track:") => Page::Track(s[6..].to_string()),
         s if s.starts_with("user:") => Page::User(s[5..].to_string()),
         s if s.starts_with("show:") => Page::Show(s[5..].to_string()),
+        s if s.starts_with("browse:") => Page::Browse(s[7..].to_string()),
         _ => return None,
     })
 }
@@ -83,6 +84,7 @@ pub(super) fn page_spec(p: &Page) -> String {
         Page::Track(id) => format!("track:{id}"),
         Page::User(id) => format!("user:{id}"),
         Page::Show(id) => format!("show:{id}"),
+        Page::Browse(uri) => format!("browse:{uri}"),
     }
 }
 
@@ -1026,6 +1028,38 @@ impl App {
                     }
                     _ => err("no hay esa opción"),
                 }
+            }
+            // Buscar sin consulta: guardar búsquedas recientes (`uris`, cada una pasa al frente en
+            // el orden dado), su estado y la primera tarjeta a la vista de una sección.
+            "recent_save" => {
+                let uris: Vec<String> = cmd["uris"].as_array().into_iter().flatten().filter_map(|u| u.as_str().map(str::to_string)).collect();
+                if uris.is_empty() {
+                    return err("faltan uris");
+                }
+                for u in uris {
+                    self.api.send(crate::api::Req::SaveRecentSearches(vec![u]));
+                }
+                self.recent_asked = false;
+                ok()
+            }
+            "browse_state" => {
+                let groups = self.browse.as_ref().map(super::browse::grouped).unwrap_or_default();
+                let sections: Vec<Value> = groups
+                    .iter()
+                    .enumerate()
+                    .map(|(i, g)| json!({"title": super::browse::SECTIONS[i], "cards": g.iter().map(|c| c.title.clone()).collect::<Vec<_>>()}))
+                    .collect();
+                let recent: Vec<Value> = self.recent_searches.iter().flatten().map(|e| json!([e.kind, e.title, e.uri])).collect();
+                json!({"ok": true, "loaded": self.browse.is_some(), "sections": sections, "recent": recent})
+            }
+            "search_start_scroll" => {
+                self.search_start_scroll = Some(n(cmd, "y").unwrap_or(0).max(0) as f32);
+                ok()
+            }
+            "browse_scroll" => {
+                let k = n(cmd, "section").unwrap_or(0).clamp(0, 5) as u8;
+                self.browse_offset.insert(k, n(cmd, "first").unwrap_or(0).max(0) as f32);
+                ok()
             }
             // Estado de los géneros de Deezer y las playlists dinámicas.
             "liked_genres" => {

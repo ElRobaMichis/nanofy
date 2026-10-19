@@ -67,6 +67,7 @@ una. Funciona en Windows, Linux y macOS, y la interfaz está en español. Para r
 - Me gusta, álbumes, artistas, podcasts e historial; las listas de canciones tienen selección múltiple y buscador propio.
 - Filtra tus canciones que te gustan por artista o género y guarda el filtro como una playlist dinámica que se pone al día sola.
 - Pestañas con historial propio, Inicio personalizable y búsqueda con nueve filtros.
+- Buscar se abre con tus búsquedas recientes (las mismas que en la app oficial) y las categorías de Spotify agrupadas en Descubrir, Géneros, Estado de ánimo y actividad, Entretenimiento, Pódcasts y Audiolibros.
 - Pegar en la búsqueda un enlace de `open.spotify.com` o una URI `spotify:` lo abre directamente.
 
 ### Control y social

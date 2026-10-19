@@ -1,6 +1,6 @@
 [package]
 name = "nanofy"
-version = "1.29.1"
+version = "1.30.0"
 edition = "2021"
 description = "Cliente nativo y ligero de Spotify (Rust + egui + librespot)"
 license = "MIT"
@@ -23,7 +23,7 @@ serde = { version = "1", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 directories = "6"
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }

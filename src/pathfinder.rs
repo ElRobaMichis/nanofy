@@ -61,6 +61,21 @@ pub const TRACK_RECOMMEND: Op = Op {
     route: "xpui-routes-track-v2",
 };
 
+/// «Explorar todo» de la búsqueda: secciones de categorías (tarjetas de color con portada).
+pub const BROWSE_ALL: Op =
+    Op { name: "browseAll", hash: "dbd8b55e09a58afc52eab438bc228ba28fd72ac2f2148c6c26354980e4579001", route: "xpui-routes-search" };
+/// La página de una categoría (`spotify:page:…`): cabecera y secciones de playlists.
+pub const BROWSE_PAGE: Op =
+    Op { name: "browsePage", hash: "f5c4e6d668f5716464a231c1cc8b22c1cbf6ad68b09929fd7de813a30581298b", route: "browse-v2" };
+/// Búsquedas recientes de la cuenta (las mismas que en la app oficial) y su guardado y borrado
+/// (las tres en un mismo documento).
+pub const RECENT_SEARCHES: Op =
+    Op { name: "recentSearches", hash: "ece96d7b82c820fb9938dd1df50dee3e53737d808c3883e3d01c467c423601b0", route: "xpui-routes-recent-searches" };
+pub const SAVE_RECENT_SEARCHES: Op =
+    Op { name: "saveRecentSearches", hash: "ece96d7b82c820fb9938dd1df50dee3e53737d808c3883e3d01c467c423601b0", route: "xpui-routes-recent-searches" };
+pub const REMOVE_RECENT_SEARCHES: Op =
+    Op { name: "removeRecentSearches", hash: "ece96d7b82c820fb9938dd1df50dee3e53737d808c3883e3d01c467c423601b0", route: "xpui-routes-recent-searches" };
+
 pub enum PfErr {
     /// El hash ya no vale (PersistedQueryNotFound).
     UnknownHash,
@@ -1011,9 +1026,180 @@ fn audiobook(d: &Value) -> Option<Audiobook> {
     })
 }
 
+// ------------------------------------------------------------------ explorar y recientes
+
+/// Página de Pódcasts y de Audiolibros: sus categorías (las de dentro) completan «Explorar todo».
+pub const PODCASTS_HUB: &str = "spotify:page:0JQ5DArNBzkmxXHCqFLx2J";
+pub const AUDIOBOOKS_HUB: &str = "spotify:page:0JQ5DAqbMKFETqK4t8f1n3";
+
+/// Variables de browseAll y browsePage (las del reproductor web): `pagePagination` cuenta
+/// secciones y `sectionPagination` elementos de cada una (browseAll pide 99 y trae las 77
+/// categorías; una página, 10 por sección, salvo las de Pódcasts y Audiolibros, que se piden
+/// enteras para tener todas sus categorías).
+pub fn browse_vars(uri: Option<&str>) -> Value {
+    let items = match uri {
+        Some(u) if u != PODCASTS_HUB && u != AUDIOBOOKS_HUB => 10,
+        _ => 99,
+    };
+    let mut v = serde_json::json!({
+        "pagePagination": {"offset": 0, "limit": 10},
+        "sectionPagination": {"offset": 0, "limit": items},
+        "browseEndUserIntegration": "INTEGRATION_WEB_PLAYER",
+    });
+    if let Some(u) = uri {
+        v["uri"] = Value::String(u.to_string());
+        v["includeEpisodeContentRatingsV2"] = Value::Bool(false);
+    }
+    v
+}
+
+/// «#dc148c» -> [220, 20, 140].
+fn hex_color(v: &Value) -> Option<[u8; 3]> {
+    let h = v.as_str()?.trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let p = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some([p(0)?, p(2)?, p(4)?])
+}
+
+fn first_image(v: &Value) -> Option<String> {
+    let imgs = images(v);
+    // La más grande: en las tarjetas se ve a ~100 px y en recientes a 170.
+    imgs.iter().max_by_key(|i| i.width.unwrap_or(0)).map(|i| i.url.clone())
+}
+
+/// Una tarjeta de categoría de un elemento de sección (`{uri, content: {data: …}}`).
+fn browse_card(item: &Value) -> Option<BrowseCard> {
+    let d = &item["content"]["data"];
+    let uri = item["uri"].as_str()?.to_string();
+    let (c, feature) = match d["__typename"].as_str()? {
+        "BrowseSectionContainer" => (&d["data"]["cardRepresentation"], None),
+        "BrowseClientFeature" => (d, opt_text(&d["featureUri"])),
+        _ => return None,
+    };
+    let title = opt_text(&c["title"]["transformedLabel"])?;
+    Some(BrowseCard { uri, title, color: hex_color(&c["backgroundColor"]["hex"]).unwrap_or([40, 40, 40]), image: first_image(&c["artwork"]), feature })
+}
+
+/// browseAll -> tarjetas de «Explorar todo», en su orden.
+pub fn map_browse_all(v: &Value) -> Vec<BrowseCard> {
+    v["browseStart"]["sections"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|s| s["sectionItems"]["items"].as_array().into_iter().flatten())
+        .filter_map(browse_card)
+        .collect()
+}
+
+/// Un elemento cualquiera de una sección (playlist, álbum, audiolibro, podcast, categoría…).
+fn browse_entry(item: &Value) -> Option<BrowseEntry> {
+    if let Some(c) = browse_card(item) {
+        return Some(BrowseEntry { uri: c.uri, kind: "category".into(), title: c.title, subtitle: c.feature.unwrap_or_default(), image: c.image, color: Some(c.color) });
+    }
+    let d = &item["content"]["data"];
+    let d = if d.is_object() { d } else { &item["data"] };
+    entry_of(d)
+}
+
+/// Entidad de pathfinder (Track, Album, Artist, Playlist, Podcast, Episode, Audiobook, User)
+/// -> BrowseEntry.
+fn entry_of(d: &Value) -> Option<BrowseEntry> {
+    let uri = d["uri"].as_str()?.to_string();
+    let e = |kind: &str, title: String, subtitle: String, image: Option<String>| BrowseEntry { uri: uri.clone(), kind: kind.into(), title, subtitle, image, color: None };
+    Some(match d["__typename"].as_str()? {
+        "Track" => {
+            let artists = artist_refs(&d["artists"]).into_iter().map(|a| a.name).collect::<Vec<_>>().join(", ");
+            e("track", text(&d["name"]), artists, first_image(&d["albumOfTrack"]["coverArt"]))
+        }
+        "Album" => {
+            let artists = artist_refs(&d["artists"]).into_iter().map(|a| a.name).collect::<Vec<_>>().join(", ");
+            BrowseEntry { color: hex_color(&d["coverArt"]["extractedColors"]["colorDark"]["hex"]), ..e("album", text(&d["name"]), artists, first_image(&d["coverArt"])) }
+        }
+        "Artist" => {
+            let img = first_image(&d["visuals"]["avatarImage"]);
+            e("artist", text(&d["profile"]["name"]), "Artista".into(), img)
+        }
+        "Playlist" => {
+            let p = playlist(d)?;
+            let owner = p.owner.display_name.clone().unwrap_or_default();
+            e("playlist", p.name, owner, p.images.and_then(|i| i.into_iter().next()).map(|i| i.url))
+        }
+        "Podcast" => {
+            let s = show(d)?;
+            e("show", s.name, s.publisher, s.images.into_iter().max_by_key(|i| i.width.unwrap_or(0)).map(|i| i.url))
+        }
+        "Episode" => {
+            let ep = episode(d)?;
+            e("episode", ep.name, text(&d["podcastV2"]["data"]["name"]), ep.images.into_iter().max_by_key(|i| i.width.unwrap_or(0)).map(|i| i.url))
+        }
+        "Audiobook" => {
+            let b = audiobook(d)?;
+            let authors = b.authors.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ");
+            e("audiobook", b.name, authors, b.images.into_iter().max_by_key(|i| i.width.unwrap_or(0)).map(|i| i.url))
+        }
+        "User" => e("user", text(&d["name"]), "Perfil".into(), first_image(&d["avatar"])),
+        _ => return None,
+    })
+}
+
+/// browsePage -> cabecera y secciones. Las secciones «relacionadas» («Explorar todos los
+/// géneros») no se incluyen: llevan a la lista entera, que ya es la búsqueda.
+pub fn map_browse_page(v: &Value, uri: &str) -> BrowsePage {
+    let b = &v["browse"];
+    let sections = b["sections"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s["data"]["__typename"].as_str() != Some("BrowseRelatedSectionData"))
+        .filter_map(|s| {
+            let title = text(&s["data"]["title"]["transformedLabel"]);
+            let items: Vec<BrowseEntry> = s["sectionItems"]["items"].as_array().into_iter().flatten().filter_map(browse_entry).collect();
+            (!items.is_empty()).then_some((title, items))
+        })
+        .collect();
+    BrowsePage { uri: uri.to_string(), title: text(&b["header"]["title"]["transformedLabel"]), color: hex_color(&b["header"]["color"]["hex"]), sections }
+}
+
+/// recentSearches -> búsquedas recientes, de la más nueva a la más antigua.
+pub fn map_recent(v: &Value) -> Vec<BrowseEntry> {
+    v["recentSearches"]["recentSearchesItems"]["items"].as_array().into_iter().flatten().filter_map(|it| entry_of(&it["data"])).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recortes de las respuestas reales de browseAll, recentSearches y browsePage (Audiolibros)
+    /// de una cuenta de México (18 oct 2026).
+    #[test]
+    fn explorar_y_recientes() {
+        let ba: Value = serde_json::from_str(r##"{"browseStart":{"sections":{"items":[{"data":{"__typename":"BrowseGridSectionData","title":{"transformedLabel":"Explorar todo"}},"sectionItems":{"items":[{"content":{"__typename":"BrowseSectionContainerWrapper","data":{"__typename":"BrowseSectionContainer","data":{"cardRepresentation":{"artwork":{"sources":[{"height":300,"url":"https://i.scdn.co/image/ab67fb8200005caf474a477debc822a3a45c5acb","width":300}]},"backgroundColor":{"hex":"#dc148c"},"title":{"transformedLabel":"Música"}}}}},"uri":"spotify:page:0JQ5DAqbMKFSi39LMRT0Cy"},{"content":{"__typename":"BrowseXlinkResponseWrapper","data":{"__typename":"BrowseClientFeature","artwork":{"sources":[{"height":300,"url":"https://podcast-charts-assets.spotifycdn.com/images/charts/top-mx-es_MX.png","width":300}]},"backgroundColor":{"hex":"#1e3264"},"featureUri":"spotify:podcastcharts","iconOverlay":{"sources":[{"height":274,"url":"https://t.scdn.co/images/cd59d6084c4a4c5191aeaad187246f24.jpeg","width":274}]},"title":{"transformedLabel":"Éxitos en pódcasts"}}},"uri":"spotify:xlink:0JQ5DAozXW0GUBAKjHsifF"}]},"uri":"spotify:section:0JQ5DAwD41j2mAgQ1AtEZl"}]}}}"##).unwrap();
+        let cards = map_browse_all(&ba);
+        assert_eq!(cards.len(), 2);
+        assert_eq!((cards[0].title.as_str(), cards[0].color, cards[0].id()), ("Música", [0xdc, 0x14, 0x8c], "0JQ5DAqbMKFSi39LMRT0Cy"));
+        assert!(cards[0].image.as_deref().is_some_and(|u| u.starts_with("https://i.scdn.co/image/")));
+        assert_eq!(cards[1].feature.as_deref(), Some("spotify:podcastcharts"));
+
+        let rs: Value = serde_json::from_str(r##"{"recentSearches":{"recentSearchesItems":{"items":[{"__typename":"ArtistResponseWrapper","data":{"__typename":"Artist","profile":{"name":"Rita Payés"},"uri":"spotify:artist:1XSmez9xyCCPpOZp0uImwM","visuals":{"avatarImage":{"extractedColors":{"colorDark":{"hex":"#827659","isFallback":false}},"sources":[{"height":640,"url":"https://i.scdn.co/image/ab6761610000e5eb6dd16a5425ef1e854f2d7752","width":640},{"height":160,"url":"https://i.scdn.co/image/ab6761610000f1786dd16a5425ef1e854f2d7752","width":160},{"height":320,"url":"https://i.scdn.co/image/ab676161000051746dd16a5425ef1e854f2d7752","width":320}]}}}},{"__typename":"AlbumResponseWrapper","data":{"__typename":"Album","artists":{"items":[{"onPlatformReputationTrait":{"verification":{"aiPersona":null}},"profile":{"name":"AKRIILA"},"uri":"spotify:artist:39hfuTf4PHfnHgIl0QBDGL"}]},"coverArt":{"extractedColors":{"colorDark":{"hex":"#A02028","isFallback":false}},"sources":[{"height":300,"url":"https://i.scdn.co/image/ab67616d00001e0210c1f926d85d2fa2625e908e","width":300},{"height":64,"url":"https://i.scdn.co/image/ab67616d0000485110c1f926d85d2fa2625e908e","width":64},{"height":640,"url":"https://i.scdn.co/image/ab67616d0000b27310c1f926d85d2fa2625e908e","width":640}]},"name":"partedemipartedeti","uri":"spotify:album:2qm8KUb1VIkBXwgwHn7y4z"}}]}}}"##).unwrap();
+        let recent = map_recent(&rs);
+        assert_eq!(recent.len(), 2);
+        assert_eq!((recent[0].kind.as_str(), recent[0].title.as_str()), ("artist", "Rita Payés"));
+        assert!(recent[0].image.is_some());
+        assert_eq!((recent[1].kind.as_str(), recent[1].subtitle.as_str()), ("album", "AKRIILA"));
+        assert!(recent[1].color.is_some());
+
+        let bp: Value = serde_json::from_str(r##"{"browse":{"header":{"backgroundImage":{"sources":[{"height":422,"url":"https://i.scdn.co/image/ab6728880000dcf391fd24b2b90b0f4a3778b9d1","width":750},{"height":840,"url":"https://i.scdn.co/image/ab6728880000e31e91fd24b2b90b0f4a3778b9d1","width":1494},{"height":1496,"url":"https://i.scdn.co/image/ab6728880000f94d91fd24b2b90b0f4a3778b9d1","width":2660}]},"color":{"hex":"#3505B7"},"subtitle":null,"title":{"transformedLabel":"Audiolibros"}},"sections":{"items":[{"__typename":"BrowseSection","data":{"__typename":"BrowseGridSectionData","subtitle":null,"title":{"transformedLabel":"Explora sin límites"}},"sectionItems":{"items":[{"content":{"__typename":"BrowseSectionContainerWrapper","data":{"__typename":"BrowseSectionContainer","data":{"cardRepresentation":{"artwork":{"sources":[{"height":300,"url":"https://i.scdn.co/image/ab676663000022a883fe98642012a88696634a19","width":300}]},"backgroundColor":{"hex":"#006450"},"title":{"transformedLabel":"Biografías y memorias"}}}}},"uri":"spotify:page:0JQ5DAqbMKFGmztXKJ44L2"},{"content":{"__typename":"BrowseSectionContainerWrapper","data":{"__typename":"BrowseSectionContainer","data":{"cardRepresentation":{"artwork":{"sources":[{"height":300,"url":"https://i.scdn.co/image/ab676663000022a80e20d96c7afba0ee91880366","width":300}]},"backgroundColor":{"hex":"#477d95"},"title":{"transformedLabel":"Ficción y literatura"}}}}},"uri":"spotify:page:0JQ5DAqbMKFN0lmhry1LfG"}]},"targetLocation":"","uri":"spotify:section:0JQ5DAwD41j4G9eJIr2JyP"},{"__typename":"BrowseSection","data":{"__typename":"BrowseRelatedSectionData","subtitle":null,"title":null},"sectionItems":{"items":[{"content":{"__typename":"BrowseSectionContainerWrapper","data":{"__typename":"BrowseSectionContainer","data":{"cardRepresentation":{"artwork":null,"backgroundColor":{"hex":"#1e3264"},"title":{"transformedLabel":"Explorar todos los géneros"}}}}},"uri":"spotify:page:0JQ5DArNBzkmxXHCqFLx3b"}],"totalCount":1},"targetLocation":"","uri":"spotify:section:0JQ5DAwD41iWA7sZPm59Dw"}]}}}"##).unwrap();
+        let page = map_browse_page(&bp, AUDIOBOOKS_HUB);
+        assert_eq!(page.title, "Audiolibros");
+        // La sección «relacionada» (Explorar todos los géneros) no entra.
+        assert_eq!(page.sections.len(), 1);
+        let (title, items) = &page.sections[0];
+        assert_eq!(title, "Explora sin límites");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|e| e.kind == "category" && e.card().is_some()));
+    }
 
     /// Recorte de las respuestas reales de getTrack e internalLinkRecommenderTrack (Get Lucky,
     /// oct 2026).

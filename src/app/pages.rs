@@ -62,6 +62,8 @@ impl App {
             Page::Show(id) => self.show_page(ui, id),
             Page::User(id) => self.user_page(ui, id),
             Page::Browse(uri) => self.browse_page(ui, uri),
+            // Va en su propio panel (podcast.rs); sin sesión, la bienvenida.
+            Page::Episode(_) => self.welcome(ui),
             Page::Settings => self.settings_page(ui),
         }
     }

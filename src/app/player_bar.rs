@@ -352,6 +352,7 @@ impl App {
             Page::Folders => (Icon::Folder, "Carpetas".into()),
             Page::Artists => (Icon::Artist, "Artistas".into()),
             Page::Settings => (Icon::Settings, "Ajustes".into()),
+            Page::Episode(id) => (Icon::Podcast, self.episodes.get(id).map(|e| e.name.clone()).unwrap_or_else(|| "Episodio".into())),
             Page::Browse(uri) => (
                 Icon::Search,
                 self.browse_pages

@@ -254,6 +254,8 @@ pub enum Req {
     /// Géneros de Deezer de «Canciones que te gustan» (id, título, primer artista y duración de
     /// cada una): van en su propio hilo, ver `genres_deezer`. La respuesta llega por partes.
     LikedGenres { songs: Vec<crate::genres_deezer::LikedSong> },
+    /// Un episodio para su página (con su imagen 16:9 y su descripción en HTML).
+    Episode(String),
     /// Categorías de «Explorar todo» (con las de dentro de Pódcasts y Audiolibros).
     BrowseAll,
     /// La página de una categoría (`spotify:page:…`).
@@ -412,6 +414,8 @@ pub enum Req {
     ArtistView(String),
     /// Podcast / audiolibro con sus episodios.
     Show(String),
+    /// Un podcast por la Web API o los metadatos internos (sin pathfinder).
+    ShowPlain(String),
     /// Conecta la biblioteca (Web API) con la identidad de primera parte: abre el navegador y
     /// espera en un hilo de la API. La interfaz usa `Api::begin_web_chain`, que no ocupa ninguno y
     /// se puede cancelar; sus resultados llegan con esta misma petición.
@@ -460,6 +464,7 @@ pub enum Resp {
     /// géneros nuevos y cuántas canciones faltan (0 al acabar).
     LikedGenres { tracks: Vec<(String, Vec<u32>)>, names: Vec<(u32, String)>, pending: usize },
     Browse(BrowseData),
+    Episode(Episode),
     BrowsePage(BrowsePage),
     RecentSearches(Vec<BrowseEntry>),
     ArtistTop(Vec<Track>),
@@ -2628,6 +2633,7 @@ impl Client {
                 release_date: Some(format!("{:04}-{:02}-{:02}", e.publish_time.as_utc().year(), e.publish_time.as_utc().month() as u8, e.publish_time.as_utc().day())),
                 description: e.description.clone(),
                 explicit: e.is_explicit,
+                ..Default::default()
             })
             .collect();
         let show = Show {
@@ -2640,6 +2646,8 @@ impl Client {
             total_episodes: Some(s.episodes.len() as u32),
             media_type: None,
             keywords: s.keywords.clone(),
+            rating: None,
+            accent: None,
         };
         Ok((show, episodes))
     }
@@ -4241,6 +4249,19 @@ impl Client {
                             .query(crate::pathfinder::RECENT_SEARCHES, serde_json::json!({"limit": 50, "includeAuthors": true, "includeEpisodeContentRatingsV2": false}))?
                             .to_string(),
                     ),
+                    e if e.starts_with("pf:showMeta:") => Some(
+                        self.pf
+                            .query(crate::pathfinder::SHOW_META, serde_json::json!({"uri": &e[12..], "includeContentCapabilityTrait": true, "includeEpisodeContentRatingsV2": false}))?
+                            .to_string(),
+                    ),
+                    e if e.starts_with("pf:episodes:") => Some(
+                        self.pf
+                            .query(crate::pathfinder::SHOW_EPISODES, serde_json::json!({"uri": &e[12..], "offset": 0, "limit": 5, "includeEpisodeContentRatingsV2": false}))?
+                            .to_string(),
+                    ),
+                    e if e.starts_with("pf:episode:") => Some(
+                        self.pf.query(crate::pathfinder::EPISODE, serde_json::json!({"uri": &e[11..], "includeEpisodeContentRatingsV2": false}))?.to_string(),
+                    ),
                     e if e.starts_with("pf:browsePage:") => Some(
                         self.pf
                             .query(
@@ -4645,7 +4666,44 @@ impl Client {
                 id: id.clone(),
                 view: self.artist_view_via_librespot(id, ui)?,
             }),
-            Req::Show(id) => {
+            Req::Show(id) if self.pf.usable(false).is_ok() => {
+                // Por pathfinder (como el reproductor web): trae la valoración, los temas y qué
+                // episodios tienen vídeo. Los primeros 50 se muestran ya; hasta 150 más después.
+                // Si falla, la Web API o los metadatos internos (la rama de abajo, por `Req::ShowPlain`).
+                use crate::pathfinder as pf;
+                let uri = format!("spotify:show:{id}");
+                let got: Result<(Show, Vec<Episode>), String> = (|| {
+                    let meta = self.pf.query(pf::SHOW_META, serde_json::json!({"uri": uri, "includeContentCapabilityTrait": true, "includeEpisodeContentRatingsV2": false}))?;
+                    let show = pf::map_show_meta(&meta).ok_or("podcast sin datos")?;
+                    let page = |offset: u64| self.pf.query(pf::SHOW_EPISODES, serde_json::json!({"uri": uri, "offset": offset, "limit": 50, "includeEpisodeContentRatingsV2": false}));
+                    let (mut episodes, mut next, _) = pf::map_show_episodes(&page(0)?);
+                    ui.send(Msg::Api(ApiResult { req: req.clone(), result: Ok(Resp::Show { show: show.clone(), episodes: episodes.clone() }) }));
+                    for _ in 0..3 {
+                        let Some(off) = next else { break };
+                        match page(off) {
+                            Ok(v) => {
+                                let (more, n, _) = pf::map_show_episodes(&v);
+                                episodes.extend(more);
+                                next = n;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Ok((show, episodes))
+                })();
+                match got {
+                    Ok((show, episodes)) => Ok(Resp::Show { show, episodes }),
+                    Err(e) => {
+                        log::info!("[podcast] {id} por pathfinder: {e}; por la Web API");
+                        self.exec(&Req::ShowPlain(id.clone()), ui)
+                    }
+                }
+            }
+            Req::Episode(id) => {
+                let v = self.pf.query(crate::pathfinder::EPISODE, serde_json::json!({"uri": format!("spotify:episode:{id}"), "includeEpisodeContentRatingsV2": false}))?;
+                Ok(Resp::Episode(crate::pathfinder::map_episode(&v).ok_or("episodio sin datos")?))
+            }
+            Req::Show(id) | Req::ShowPlain(id) => {
                 // Web API si está disponible; si no, metadatos internos.
                 let web: Result<(Show, Vec<Episode>), String> = (|| {
                     let show: Show = self.get_json(&format!("{BASE}/shows/{id}?market=from_token"))?;

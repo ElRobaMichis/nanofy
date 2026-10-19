@@ -320,6 +320,12 @@ impl Images {
     }
 
     pub fn tint(&self, url: &str) -> Option<egui::Color32> {
+        self.tint_with(url, 40.6, 0.65)
+    }
+
+    /// Como `tint`, con la luminancia y la saturación máxima dadas (los podcasts van más vivos:
+    /// 52,6 y 0,73 en su referencia).
+    pub fn tint_with(&self, url: &str, target: f32, max_sat: f32) -> Option<egui::Color32> {
         let c = self.colors.get(url).copied()?;
         let (r, g, b) = (c.r() as f32, c.g() as f32, c.b() as f32);
         let lum = |r: f32, g: f32, b: f32| 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -328,9 +334,8 @@ impl Images {
         let max = r.max(g).max(b);
         let min = r.min(g).min(b);
         let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
-        let k = if sat > 0.65 { 0.65 / sat } else { 1.0 };
+        let k = if sat > max_sat { max_sat / sat } else { 1.0 };
         let (r, g, b) = (l + (r - l) * k, l + (g - l) * k, l + (b - l) * k);
-        let target = 40.6;
         let l2 = lum(r, g, b).max(1.0);
         let f = (target / l2).min(255.0 / r.max(g).max(b).max(1.0));
         Some(egui::Color32::from_rgb((r * f).clamp(0.0, 255.0) as u8, (g * f).clamp(0.0, 255.0) as u8, (b * f).clamp(0.0, 255.0) as u8))

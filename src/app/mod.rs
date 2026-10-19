@@ -6,6 +6,7 @@
 
 mod artist;
 mod browse;
+mod podcast;
 pub mod control;
 mod icon_masks;
 mod icons;
@@ -123,6 +124,8 @@ pub enum Page {
     Track(String),
     /// Página de una categoría de «Explorar todo» (`spotify:page:…`).
     Browse(String),
+    /// Página de un episodio de podcast.
+    Episode(String),
     User(String),
     Settings,
 }
@@ -1118,6 +1121,8 @@ pub struct App {
     recent_asked: bool,
     browse_pages: HashMap<String, crate::model::BrowsePage>,
     browse_offset: HashMap<u8, f32>,
+    /// Episodios abiertos en su página (con su imagen 16:9 y su descripción en HTML).
+    episodes: HashMap<String, crate::model::Episode>,
     /// Desplazamiento vertical pedido para Buscar sin consulta (QA).
     search_start_scroll: Option<f32>,
     /// Ya se pulsó Intro con lo escrito: se ven los resultados. Mientras no, aunque haya texto,
@@ -1560,6 +1565,7 @@ impl App {
             browse_pages: HashMap::new(),
             browse_offset: HashMap::new(),
             search_start_scroll: None,
+            episodes: HashMap::new(),
             search_shown: false,
             liked_push_at: None,
             liked_genres: HashMap::new(),
@@ -5456,6 +5462,19 @@ impl App {
                 }
                 self.browse = Some(d);
             }
+            Resp::Episode(e) => {
+                // Lo que ya se sabía de la lista del podcast (nombre del podcast) se conserva si la
+                // respuesta no lo trae.
+                let prev = self.episodes.remove(&e.id);
+                let mut e = e;
+                if let Some(p) = prev {
+                    if e.show_name.is_empty() {
+                        e.show_name = p.show_name;
+                        e.show_id = p.show_id;
+                    }
+                }
+                self.episodes.insert(e.id.clone(), e);
+            }
             Resp::BrowsePage(p) => {
                 self.browse_pages.insert(p.uri.clone(), p);
             }
@@ -8986,6 +9005,16 @@ impl crate::shell::UiApp for App {
                 }
                 if self.search_query.trim().is_empty() {
                     self.search_shown = false;
+                }
+                if let (Page::Show(id) | Page::Episode(id), true) = (&page_now, self.signed_in() && p.dark) {
+                    // Podcast y episodio: su degradado y su maquetación (podcast.rs).
+                    let id = id.clone();
+                    if matches!(page_now, Page::Show(_)) {
+                        self.podcast_panel(ui, panel, id);
+                    } else {
+                        self.episode_panel(ui, panel, id);
+                    }
+                    return;
                 }
                 if page_now == Page::Search && self.signed_in() && !self.search_shown {
                     // Buscar sin consulta (o escribiendo, hasta pulsar Intro): búsquedas recientes

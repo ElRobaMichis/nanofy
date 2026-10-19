@@ -450,6 +450,13 @@ pub struct Show {
     /// Temas del podcast (solo por los metadatos internos).
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// Valoración media y número de valoraciones (pathfinder).
+    #[serde(default)]
+    pub rating: Option<(f32, u32)>,
+    /// Color de la paleta de Spotify de su portada (`encoreBaseSetTextColor`): de su tono sale el
+    /// del fondo de la página.
+    #[serde(default)]
+    pub accent: Option<[u8; 3]>,
 }
 
 impl Show {
@@ -476,6 +483,25 @@ pub struct Episode {
     pub description: String,
     #[serde(default)]
     pub explicit: bool,
+    /// Tiene vídeo (pathfinder: `mediaTypes` con VIDEO).
+    #[serde(default)]
+    pub video: bool,
+    /// Cómo va su escucha: NOT_STARTED, IN_PROGRESS o COMPLETED (pathfinder).
+    #[serde(default)]
+    pub played: Option<String>,
+    /// Imagen 16:9 (la del vídeo) y descripción en HTML, para su página.
+    #[serde(default)]
+    pub wide_image: Option<String>,
+    #[serde(default)]
+    pub html_description: String,
+    /// Su podcast (id y nombre), para su página.
+    #[serde(default)]
+    pub show_id: String,
+    #[serde(default)]
+    pub show_name: String,
+    /// Como el de `Show`, de su propia portada.
+    #[serde(default)]
+    pub accent: Option<[u8; 3]>,
 }
 
 impl Episode {

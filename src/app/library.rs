@@ -314,6 +314,14 @@ pub(super) fn paint_mask(painter: &egui::Painter, name: &'static str, m: &LibMas
     painter.image(tex, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), color);
 }
 
+/// Una máscara de la biblioteca con su centro en `c` (en otras barras con los mismos iconos, como
+/// la de los episodios de un podcast). `name` distingue su textura.
+pub(super) fn paint_lib_mask(painter: &egui::Painter, name: &'static str, m: &LibMask, c: egui::Pos2, color: Color32) {
+    let ppp = painter.pixels_per_point();
+    let anchor = (((c.x - m.w as f32 / 2.0) * ppp).round() - (m.ox as f32 * ppp).round(), ((c.y - m.h as f32 / 2.0) * ppp).round() - (m.oy as f32 * ppp).round());
+    paint_mask(painter, name, m, anchor, color);
+}
+
 /// Un punto en píxeles de pantalla redondeados (el ancla de una máscara).
 pub(super) fn px(painter: &egui::Painter, p: egui::Pos2) -> (f32, f32) {
     let ppp = painter.pixels_per_point();

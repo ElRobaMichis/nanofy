@@ -77,6 +77,7 @@ Jam. It runs on Windows, Linux and macOS. **Playback requires Spotify Premium.**
 - Liked songs, albums, artists, podcasts and history; song lists have multi-select and their own search box.
 - Filter your liked songs by artist or genre and save the filter as a dynamic playlist that keeps itself up to date.
 - Tabs with their own history, a customizable Home and search with nine filters.
+- Podcast pages with rating, topics and every episode (video ones marked), sort, filter and search; episode pages with the video's image and their description.
 - Search opens with your recent searches (the same as in the official app) and Spotify's categories grouped into Discover, Genres, Mood & activity, Entertainment, Podcasts and Audiobooks.
 - Paste an `open.spotify.com` link or a `spotify:` URI into the search box to open it directly.
 

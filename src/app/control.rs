@@ -60,6 +60,7 @@ pub fn parse_page(spec: &str) -> Option<Page> {
         s if s.starts_with("user:") => Page::User(s[5..].to_string()),
         s if s.starts_with("show:") => Page::Show(s[5..].to_string()),
         s if s.starts_with("browse:") => Page::Browse(s[7..].to_string()),
+        s if s.starts_with("episode:") => Page::Episode(s[8..].to_string()),
         _ => return None,
     })
 }
@@ -85,6 +86,7 @@ pub(super) fn page_spec(p: &Page) -> String {
         Page::User(id) => format!("user:{id}"),
         Page::Show(id) => format!("show:{id}"),
         Page::Browse(uri) => format!("browse:{uri}"),
+        Page::Episode(id) => format!("episode:{id}"),
     }
 }
 

@@ -76,6 +76,17 @@ pub const SAVE_RECENT_SEARCHES: Op =
 pub const REMOVE_RECENT_SEARCHES: Op =
     Op { name: "removeRecentSearches", hash: "ece96d7b82c820fb9938dd1df50dee3e53737d808c3883e3d01c467c423601b0", route: "xpui-routes-recent-searches" };
 
+/// Un podcast: nombre, editorial, portada y sus colores, descripción, temas, valoración y si se
+/// sigue.
+pub const SHOW_META: Op =
+    Op { name: "queryShowMetadataV2", hash: "b475447846f37cc426add800b995a7859c169c53c72b62de6338c0c40a5dacea", route: "xpui-routes-show" };
+/// Episodios de un podcast, por páginas (con si son de vídeo, fecha, duración y descripción).
+pub const SHOW_EPISODES: Op =
+    Op { name: "queryPodcastEpisodes", hash: "3539d746cf882f3909660de40b4ef472b3f5893a0761d617c282541de5d412c5", route: "xpui-routes-show" };
+/// Un episodio (su página).
+pub const EPISODE: Op =
+    Op { name: "getEpisodeOrChapter", hash: "5f77db47e5a2ce6680330bb61317aa09e17ddd1d189513cb218e7cd3e43288be", route: "xpui-routes-episode" };
+
 pub enum PfErr {
     /// El hash ya no vale (PersistedQueryNotFound).
     UnknownHash,
@@ -986,7 +997,12 @@ fn show(d: &Value) -> Option<Show> {
         description: text(&d["description"]),
         total_episodes: None,
         media_type: d["mediaType"].as_str().map(|m| m.to_ascii_lowercase()),
-        keywords: Vec::new(),
+        keywords: d["topics"]["items"].as_array().into_iter().flatten().filter_map(|t| opt_text(&t["title"])).collect(),
+        accent: accent(d),
+        rating: d["rating"]["averageRating"]
+            .as_object()
+            .filter(|r| r.get("showAverage").and_then(Value::as_bool).unwrap_or(true))
+            .and_then(|r| Some((r.get("average")?.as_f64()? as f32, r.get("totalRatings")?.as_u64()? as u32))),
     })
 }
 
@@ -1001,7 +1017,41 @@ fn episode(d: &Value) -> Option<Episode> {
         release_date: iso_day(&d["releaseDate"]),
         description: text(&d["description"]),
         explicit: explicit(d),
+        video: d["mediaTypes"].as_array().is_some_and(|m| m.iter().any(|t| t.as_str() == Some("VIDEO"))),
+        played: opt_text(&d["playedState"]["state"]),
+        wide_image: d["visualIdentity"]["sixteenByNineCoverImage"]["image"]["data"]["sources"]
+            .as_array()
+            .and_then(|a| a.iter().max_by_key(|s| s["maxWidth"].as_u64().unwrap_or(0)))
+            .and_then(|s| opt_text(&s["url"])),
+        html_description: text(&d["htmlDescription"]),
+        show_id: d["podcastV2"]["data"]["uri"].as_str().map(last_seg).unwrap_or_default(),
+        show_name: text(&d["podcastV2"]["data"]["name"]),
+        accent: accent(d),
     })
+}
+
+/// El color de texto de la paleta que Spotify saca de la portada (de él sale el tono del fondo de
+/// las páginas de podcast y episodio).
+fn accent(d: &Value) -> Option<[u8; 3]> {
+    let c = &d["visualIdentity"]["squareCoverImage"]["extractedColorSet"]["encoreBaseSetTextColor"];
+    Some([c["red"].as_u64()? as u8, c["green"].as_u64()? as u8, c["blue"].as_u64()? as u8])
+}
+
+/// queryShowMetadataV2 -> el podcast (con temas y valoración).
+pub fn map_show_meta(v: &Value) -> Option<Show> {
+    show(&v["podcastUnionV2"])
+}
+
+/// queryPodcastEpisodes -> episodios de la página, el siguiente desplazamiento y el total.
+pub fn map_show_episodes(v: &Value) -> (Vec<Episode>, Option<u64>, u64) {
+    let e = &v["podcastUnionV2"]["episodesV2"];
+    let items = e["items"].as_array().into_iter().flatten().filter_map(|it| episode(&it["entity"]["data"])).collect();
+    (items, e["pagingInfo"]["nextOffset"].as_u64(), e["totalCount"].as_u64().unwrap_or(0))
+}
+
+/// getEpisodeOrChapter -> el episodio (con su imagen 16:9, su HTML y su podcast).
+pub fn map_episode(v: &Value) -> Option<Episode> {
+    episode(&v["episodeUnionV2"])
 }
 
 fn audiobook(d: &Value) -> Option<Audiobook> {
@@ -1170,6 +1220,29 @@ pub fn map_recent(v: &Value) -> Vec<BrowseEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recortes de queryShowMetadataV2, queryPodcastEpisodes y getEpisodeOrChapter (The Joe Rogan
+    /// Experience, 18 oct 2026).
+    #[test]
+    fn podcast_y_episodio() {
+        let m: Value = serde_json::from_str(r##"{"podcastUnionV2":{"__typename":"Podcast","uri":"spotify:show:4rOoJ6Egrf8K2IrywzwOMk","name":"The Joe Rogan Experience","publisher":{"name":"Joe Rogan"},"description":"The official podcast of comedian Joe Rogan.","coverArt":{"sources":[{"height":64,"url":"https://i.scdn.co/image/ab6765630000f68d8007f4df0a76e787cb94308a","width":64}]},"rating":{"averageRating":{"average":4.651721611721652,"showAverage":true,"totalRatings":955500},"canRate":true,"rating":{"rating":0}},"topics":{"items":[{"__typename":"PodcastTopic","title":"Humor","uri":"spotify:genre:0JQ5DAqbMKFNr6gDrHHVKL"}]},"mediaType":"MIXED","visualIdentity":{"squareCoverImage":{"extractedColorSet":{"encoreBaseSetTextColor":{"alpha":255,"blue":100,"green":165,"red":255}}}}}}"##).unwrap();
+        let show = map_show_meta(&m).unwrap();
+        assert_eq!(show.name, "The Joe Rogan Experience");
+        assert_eq!(show.keywords, vec!["Humor".to_string()]);
+        let (avg, n) = show.rating.unwrap();
+        assert!((avg - 4.65).abs() < 0.01 && n == 955_500);
+        assert_eq!(show.accent, Some([255, 165, 100]));
+        let e: Value = serde_json::from_str(r##"{"podcastUnionV2":{"episodesV2":{"items":[{"entity":{"data":{"__typename":"Episode","uri":"spotify:episode:24C6qd4r0IKDGkytUzYUnM","name":"#2567 - Mariana van Zeller","duration":{"totalMilliseconds":8657854},"releaseDate":{"isoString":"2026-10-16T17:00:00Z","precision":"MINUTE"},"mediaTypes":["AUDIO","VIDEO"],"playedState":{"playPositionMilliseconds":0,"state":"NOT_STARTED"},"description":"Mariana van Zeller is a journalist."}}}],"pagingInfo":{"nextOffset":5},"totalCount":2766}}}"##).unwrap();
+        let (eps, next, total) = map_show_episodes(&e);
+        assert_eq!((eps.len(), next, total), (1, Some(5), 2766));
+        assert!(eps[0].video);
+        assert_eq!(eps[0].played.as_deref(), Some("NOT_STARTED"));
+        assert_eq!(eps[0].release_date.as_deref(), Some("2026-10-16"));
+        let o: Value = serde_json::from_str(r##"{"episodeUnionV2":{"__typename":"Episode","uri":"spotify:episode:24C6qd4r0IKDGkytUzYUnM","name":"#2567 - Mariana van Zeller","duration":{"totalMilliseconds":8657854},"mediaTypes":["AUDIO","VIDEO"],"htmlDescription":"<p>Primero.</p><p>www.example.com</p>","visualIdentity":{"sixteenByNineCoverImage":{"image":{"data":{"__typename":"ImageV2","sources":[{"maxHeight":720,"maxWidth":1280,"url":"https://image-cdn-fa.spotifycdn.com/image/ab6772ab000030ae5ee477acba1cc06e8dbec44d"},{"maxHeight":360,"maxWidth":640,"url":"https://image-cdn-fa.spotifycdn.com/image/ab6772ab0000e0e75ee477acba1cc06e8dbec44d"}]}}}},"podcastV2":{"data":{"uri":"spotify:show:4rOoJ6Egrf8K2IrywzwOMk","name":"The Joe Rogan Experience"}}}}"##).unwrap();
+        let ep = map_episode(&o).unwrap();
+        assert!(ep.wide_image.as_deref().is_some_and(|u| u.contains("ab6772ab000030ae")));
+        assert_eq!((ep.show_id.as_str(), ep.show_name.as_str()), ("4rOoJ6Egrf8K2IrywzwOMk", "The Joe Rogan Experience"));
+    }
 
     /// Recortes de las respuestas reales de browseAll, recentSearches y browsePage (Audiolibros)
     /// de una cuenta de México (18 oct 2026).

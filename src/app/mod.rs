@@ -4323,7 +4323,9 @@ impl App {
         }
         let played = track_from_now(&np);
         // Sin id de álbum (librespot no lo da): se pide para «Ver álbum» y el menú de la portada.
-        if np.album_id.is_none() {
+        // Solo para canciones: con un episodio, pedir su ficha de canción daba «pista no
+        // encontrada» al darle a reproducir.
+        if np.album_id.is_none() && np.uri.starts_with("spotify:track:") {
             if let Some(id) = np.id.clone() {
                 self.request_once(&format!("trackinfo:{id}"), Req::TrackInfo(id));
             }

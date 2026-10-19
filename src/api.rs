@@ -4249,6 +4249,19 @@ impl Client {
                             .query(crate::pathfinder::RECENT_SEARCHES, serde_json::json!({"limit": 50, "includeAuthors": true, "includeEpisodeContentRatingsV2": false}))?
                             .to_string(),
                     ),
+                    e if e.starts_with("videoids:") => {
+                        let session = self.session()?;
+                        let uri = SpotifyUri::from_uri(&format!("spotify:episode:{}", &e[9..])).map_err(|e| e.to_string())?;
+                        let ep = self.block(TIMEOUT_ITEM, librespot_metadata::Episode::get(&session, &uri)).map_err(|e| e.to_string())?;
+                        Some(format!(
+                            "videos {:?}
+previews {:?}
+audio {:?}",
+                            ep.videos.iter().map(|f| f.to_base16().unwrap_or_default()).collect::<Vec<_>>(),
+                            ep.video_previews.iter().map(|f| f.to_base16().unwrap_or_default()).collect::<Vec<_>>(),
+                            ep.audio.keys().collect::<Vec<_>>()
+                        ))
+                    }
                     e if e.starts_with("pf:showMeta:") => Some(
                         self.pf
                             .query(crate::pathfinder::SHOW_META, serde_json::json!({"uri": &e[12..], "includeContentCapabilityTrait": true, "includeEpisodeContentRatingsV2": false}))?

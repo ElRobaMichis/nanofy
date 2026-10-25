@@ -1,0 +1,903 @@
+es,en
+@name,English
+@thousands,","
+@decimal,.
+no se pudo crear el hilo de la autorización: {},couldn't start the authorization thread: {}
+token: {},token: {}
+red: {},network: {}
+artista: {},artist: {}
+álbum: {},album: {}
+pistas: {},tracks: {}
+invitación: {},invite: {}
+Spotify no devolvió un enlace de invitación,Spotify didn't return an invite link
+el hilo falló,the thread failed
+pista no encontrada,track not found
+Spotify no devolvió categorías,Spotify didn't return any categories
+los géneros de Me gusta van por su hilo,Liked Songs genres have their own thread
+Spotify no devolvió una radio para esta canción,Spotify didn't return a radio for this song
+pathfinder no encontró nada,pathfinder found nothing
+hash de searchDesktop rechazado,searchDesktop hash rejected
+pathfinder limita {} s,pathfinder rate-limited for {} s
+La búsqueda no respondió ({}). {},The search didn't respond ({}). {}
+inicio: {},home: {}
+carpeta no encontrada,folder not found
+la playlist no está en tu biblioteca,the playlist isn't in your library
+miembros: {},members: {}
+la caché de audio está desactivada (Ajustes → Caché de audio),the audio cache is turned off (Settings → Audio cache)
+respuesta inesperada: {},unexpected response: {}
+perfil: {},profile: {}
+perfil: respuesta inesperada: {},profile: unexpected response: {}
+las letras van por su carril,lyrics have their own lane
+Jam: no se pudo salir ({}),Jam: couldn't leave ({})
+podcast sin datos,podcast without data
+episodio: {},episode: {}
+el episodio no tiene vídeo,the episode has no video
+manifiesto: {},manifest: {}
+episodio sin datos,episode without data
+Conecta tu biblioteca con Spotify (no hace falta crear ninguna app).,Connect your library with Spotify (no need to create any app).
+rootlist: {} metadatos para {} entradas ({} de carpetas),rootlist: {} metadata for {} entries ({} folders)
+rootlist: {} playlists sin atributos,rootlist: {} playlists without attributes
+Spotify no respondió en {} s,Spotify didn't respond in {} s
+metadatos por lotes: {},batch metadata: {}
+no se pudo abrir la imagen: {},couldn't open the image: {}
+no se pudo codificar la imagen: {},couldn't encode the image: {}
+la imagen es demasiado grande incluso reducida,the image is too large even when downscaled
+Spotify rechazó la sesión (401). Cierra sesión y vuelve a entrar.,Spotify rejected the session (401). Log out and log back in.
+Spotify no lo permite (403): {},Spotify doesn't allow it (403): {}
+No encontrado (404): {},Not found (404): {}
+pista: {},track: {}
+sin archivo de audio disponible,no audio file available
+sin formato de audio compatible,no compatible audio format
+descarga: {},download: {}
+Escuchado recientemente,Recently played
+Spotify no permite modificar «Me gusta» desde apps de terceros en modo desarrollo.          Alternativa: añade la canción a una playlist (eso sí funciona).,Spotify doesn't let third-party apps in development mode change Liked Songs. Alternative: add the song to a playlist (that does work).
+Añadir a una playlist,Add to playlist
+Buscar una playlist o carpeta,Find a playlist or folder
+Nueva playlist,New playlist
+Nombre de la playlist,Playlist name
+Todavía no tienes playlists propias.,You don't have any playlists of your own yet.
+Nada coincide con tu búsqueda.,Nothing matches your search.
+Esta carpeta está vacía,This folder is empty
+Cancelar,Cancel
+Listo ({}),Done ({})
+Listo,Done
+Todavía no se ha cargado tu perfil; inténtalo en un momento,Your profile hasn't loaded yet; try again in a moment
+Añadido a la playlist,Added to playlist
+Añadido a {} playlists,Added to {} playlists
+Inicio,Home
+Álbumes,Albums
+Sencillos y EPs,Singles and EPs
+Recopilatorios,Compilations
+Aparece en,Appears On
+Playlists,Playlists
+Acerca de,About
+Artista,Artist
+Cargando…,Loading…
+Nada por aquí.,Nothing here.
+{} seguidores,{} followers
+Reproducir,Play
+Añadir populares a una playlist,Add popular tracks to a playlist
+Añadir populares a la cola,Add popular tracks to queue
+Más,More
+Copiar enlace,Copy link
+Enlace,Link
+Abrir en una nueva pestaña,Open in a new tab
+Siguiendo,Following
+Seguir,Follow
+Dejar de seguir,Unfollow
+Buscar dentro del artista,Search within artist
+Buscar en {},Search in {}
+Lista,List
+Cuadrícula,Grid
+Tus más escuchadas,Your top tracks
+Todavía no has escuchado nada de {} en Nanofy.,You haven't listened to anything by {} on Nanofy yet.
+Populares,Popular
+Cargando,Loading
+Los fans también escuchan,Fans also like
+Selección del artista,Artist pick
+Último lanzamiento,Latest release
+Sin novedades.,No new releases.
+Leer más,Read more
+Buscando playlists del artista,Looking for the artist's playlists
+{} no tiene playlists públicas propias.,{} has no public playlists of their own.
+Spotify no tiene biografía para este artista.,Spotify has no biography for this artist.
+Seguidores,Followers
+Géneros,Genres
+{} canciones,{} songs
+Añadir el álbum a una playlist,Add album to a playlist
+Despliega el álbum para cargar sus canciones,Expand the album to load its songs
+Añadir a la cola,Add to queue
+Abrir el álbum,Open album
+Cargando canciones,Loading songs
+Descubrir,Discover
+Estado de ánimo y actividad,Mood & Activity
+Entretenimiento,Entertainment
+Pódcasts,Podcasts
+Audiolibros,Audiobooks
+No se pudo cargar,Couldn't load
+Reintentar,Retry
+Búsquedas recientes,Recent searches
+Explorar todo,Browse all
+Cargando categorías…,Loading categories…
+Sin categorías,No categories
+Borrar búsquedas recientes,Clear recent searches
+Quitar de las búsquedas recientes,Remove from recent searches
+«{}» aún no está en Nanofy,“{}” isn't on Nanofy yet
+Recientes,Recent
+Antiguas,Oldest
+Título,Title
+Álbum,Album
+Duración,Duration
+Todo,All
+Artistas,Artists
+Nada coincide con tu búsqueda,Nothing matches your search
+Ninguna canción que te gusta tiene este filtro,None of your liked songs match this filter
+Las canciones que te gusten aparecerán aquí,Songs you like will appear here
+Filtro: Artista ({}),Filter: Artist ({})
+Filtro: Género ({}),Filter: Genre ({})
+Filtro: Todo,Filter: All
+Buscar en Canciones que te gustan,Search in Liked Songs
+Playlist dinámica,Dynamic playlist
+Abrir su playlist dinámica,Open its dynamic playlist
+Guardar como playlist dinámica: se pone al día sola cuando cambian tus canciones que te gustan,Save as a dynamic playlist: it updates itself when your liked songs change
+Crear,Create
+Playlist,Playlist
+Carpeta,Folder
+Buscando géneros… ({}),Looking up genres… ({})
+Buscando géneros…,Looking up genres…
+Nada aún,Nothing yet
+de {},by {}
+del género {},in the {} genre
+Dinámica · {},Dynamic · {}
+"Playlist dinámica: Nanofy le añade y le quita tus canciones que te gustan {} en cuanto cambian, también si les das «Me gusta» desde el móvil u otra app (mientras Nanofy está abierta; si no, al abrirla). Lo que añadas tú a mano no se toca.
+
+Añadidas por Nanofy: {}.","Dynamic playlist: Nanofy adds and removes your liked songs {} as soon as they change, even if you like them from your phone or another app (while Nanofy is open; otherwise, when you open it). Anything you add by hand is left alone.\n\nAdded by Nanofy: {}."
+Inicia sesión para crear playlists,Log in to create playlists
+{} · Canciones que te gustan,{} · Liked Songs
+Playlist dinámica de Nanofy: tus canciones que te gustan {}. Se pone al día sola cuando añades o quitas canciones.,Nanofy dynamic playlist: your liked songs {}. It updates itself when you add or remove songs.
+Creando la playlist dinámica…,Creating the dynamic playlist…
+Carpetas,Folders
+Podcasts,Podcasts
+Canciones,Songs
+Canciones que te gustan,Liked Songs
+{} y más,{} and more
+De {},By {}
+Antiguos,Oldest
+De lo más antiguo a lo más reciente,Oldest to newest
+De lo más reciente a lo más antiguo,Newest to oldest
+Agrupar,Group
+Buscar en Tu biblioteca,Search in Your Library
+Esta carpeta está vacía. Añade playlists desde su menú («Añadir a carpeta»).,This folder is empty. Add playlists from their menu (“Add to folder”).
+Aquí aparecerá lo que guardes,What you save will appear here
+Volver a Tu biblioteca,Back to Your Library
+Desfijar,Unpin
+Fijar,Pin
+Renombrar…,Rename…
+Eliminar carpeta,Delete folder
+Podcast,Podcast
+Audiolibro,Audiobook
+Letra,Lyrics
+La letra sigue a la canción (pulsa para moverte libremente),Lyrics follow the song (click to scroll freely)
+Seguir la canción,Follow the song
+Compartir este fragmento,Share this snippet
+Fragmento de la letra,Lyrics snippet
+Inicia sesión para ver la letra.,Log in to see lyrics.
+Nada en reproducción.,Nothing playing.
+Buscando la letra…,Looking for lyrics…
+Esta canción no tiene letra disponible.,This song has no lyrics available.
+Canción oculta: se atenúa en las listas y se salta al reproducir,Song hidden: dimmed in lists and skipped when playing
+Canción visible de nuevo,Song visible again
+Radio de la canción,Song radio
+Contexto,Context
+Carpeta: {},Folder: {}
+Añadir a carpeta,Add to folder
+Quitar de la carpeta,Remove from folder
+Nueva carpeta…,New folder…
+Invitar colaboradores,Invite collaborators
+Enlace de invitación,Invite link
+Activa la caché de audio en Ajustes para descargar,Turn on the audio cache in Settings to download
+Ya estaban descargadas,They were already downloaded
+Descargando 1 canción…,Downloading 1 song…
+Descargando {} canciones…,Downloading {} songs…
+Hay una versión nueva: {},There's a new version: {}
+Nanofy {} está lista,Nanofy {} is ready
+Estás al día ({}),You're up to date ({})
+"Hay una versión nueva ({}), pero aún se está publicando; vuelve a mirar en unos minutos","There's a new version ({}), but it's still being published; check again in a few minutes"
+En este sistema la actualización se instala a mano: descarga el zip,On this system the update is installed by hand: download the zip
+Estado de prueba: no hay ninguna versión preparada,Test status: no version is prepared
+No se encuentra el ejecutable actual,Can't find the current executable
+No se pudo instalar la versión nueva ({}),Couldn't install the new version ({})
+Se han abierto las novedades en el navegador,The release notes opened in your browser
+Se ha abierto el navegador para descargar la versión nueva,Your browser opened to download the new version
+Inicio de sesión cancelado,Login cancelled
+Se ha abierto el navegador: permite que Nanofy lea tu biblioteca…,Your browser opened: let Nanofy read your library…
+No se pudo abrir la autorización de la biblioteca: {},Couldn't open the library authorization: {}
+Un último paso en el navegador: permite que Nanofy lea tu biblioteca (no tienes que crear nada).,One last step in your browser: let Nanofy read your library (you don't have to create anything).
+Un último paso en otra pestaña del navegador: permite que Nanofy lea tu biblioteca (no tienes que crear nada).,One last step in another browser tab: let Nanofy read your library (you don't have to create anything).
+Conectado a Spotify,Connected to Spotify
+Sesión cerrada,Logged out
+Temporizador: reproducción pausada al terminar la canción,Sleep timer: playback paused at the end of the song
+Sesión restaurada desde Spotify,Session restored from Spotify
+No se pudo encontrar el álbum de esta canción,Couldn't find this song's album
+No se pudo cargar la playlist ({}); se reintentará sola,Couldn't load the playlist ({}); it will retry on its own
+Spotify limita; reintentando en {} s,Spotify is rate-limiting; retrying in {} s
+Descarga: {},Download: {}
+No se pudo conectar la biblioteca: {},Couldn't connect the library: {}
+No se encontró el álbum de esta canción,This song's album wasn't found
+Guardada en Canciones que te gustan,Saved to Liked Songs
+Quitada de Canciones que te gustan,Removed from Liked Songs
+Álbum guardado en tu biblioteca,Album saved to your library
+Álbum quitado de tu biblioteca,Album removed from your library
+Carpeta creada,Folder created
+Carpeta eliminada,Folder deleted
+Carpeta renombrada,Folder renamed
+Siguiendo el podcast,Following the podcast
+Has dejado de seguir el podcast,You unfollowed the podcast
+Episodio guardado,Episode saved
+Episodio quitado de guardados,Episode removed from saves
+Descarga completada,Download complete
+Playlist dinámica creada: se pondrá al día sola,Dynamic playlist created: it will update itself
+Playlist creada,Playlist created
+Playlist actualizada,Playlist updated
+Imagen de la playlist actualizada,Playlist image updated
+Añadida a la playlist,Added to playlist
+Quitada de la playlist,Removed from playlist
+Playlist añadida a tu biblioteca,Playlist added to your library
+Playlist quitada de tu biblioteca,Playlist removed from your library
+Ahora sigues este perfil,You're now following this profile
+Has dejado de seguir este perfil,You unfollowed this profile
+Te has unido al Jam,You joined the Jam
+Has salido del Jam,You left the Jam
+Jam finalizado,Jam ended
+Tu app propia está conectada. Recargando la biblioteca…,Your own app is connected. Reloading the library…
+Biblioteca conectada con Spotify. Cargándola…,Library connected with Spotify. Loading it…
+Tu app propia está desconectada,Your own app is disconnected
+Biblioteca desconectada de Spotify,Library disconnected from Spotify
+Añadida a la cola,Added to queue
+Cola actualizada,Queue updated
+Temporizador: reproducción pausada,Sleep timer: playback paused
+Subiendo la imagen de la playlist…,Uploading the playlist image…
+Solo puedes cambiar la imagen de tus propias playlists,You can only change the image of your own playlists
+Abriendo la radio…,Opening the radio…
+{} copiado,{} copied
+Tipo de enlace no soportado: {},Unsupported link type: {}
+Inicia sesión para unirte a un Jam,Log in to join a Jam
+La cola solo se puede editar cuando la música suena en Nanofy,The queue can only be edited while music is playing in Nanofy
+No se puede reconstruir la cola: la reproducción no empezó desde Nanofy,Can't rebuild the queue: playback didn't start from Nanofy
+Solo se pueden quitar las canciones añadidas a la cola desde Nanofy,Only songs added to the queue from Nanofy can be removed
+Buscando el álbum…,Looking for the album…
+Inicia sesión para reproducir música,Log in to play music
+"Para reordenar la cola, la música tiene que sonar en Nanofy","To reorder the queue, music has to be playing in Nanofy"
+Trayendo la reproducción a este equipo…,Bringing playback to this device…
+Reproduciendo en {},Playing on {}
+Inicia sesión para buscar,Log in to search
+Ajustes guardados,Settings saved
+"Calidad aplicada desde la próxima canción que se cargue; el volumen, al instante","Quality applies from the next song that loads; volume, right away"
+Calidad aplicada desde la próxima canción que se cargue,Quality applies from the next song that loads
+Volumen aplicado al instante,Volume applied right away
+Imagen de la playlist,Playlist image
+Imágenes,Images
+"Spotify nativo, en unos pocos MB.","Native Spotify, in just a few MB."
+Iniciar sesión con Spotify,Log in with Spotify
+Completa el inicio de sesión en el navegador,Finish logging in in your browser
+Cancelando…,Cancelling…
+El inicio de sesión se hace en la web de Spotify (OAuth con PKCE); Nanofy nunca ve tu contraseña. Spotify te pedirá permiso dos veces seguidas: para reproducir y para leer tu biblioteca (no hace falta crear ninguna app). Para reproducir música hace falta Premium.,You log in on Spotify's website (OAuth with PKCE); Nanofy never sees your password. Spotify will ask for permission twice in a row: to play and to read your library (no need to create any app). Playing music requires Premium.
+El inicio de sesión se hace en la web de Spotify (OAuth con PKCE); Nanofy nunca ve tu contraseña. Para reproducir música hace falta Premium.,You log in on Spotify's website (OAuth with PKCE); Nanofy never sees your password. Playing music requires Premium.
+Editar…,Edit…
+De ,By 
+Música,Music
+Personalizar el inicio,Customize home
+Preparando tu inicio,Getting your home ready
+Spotify todavía no te recomienda podcasts; escucha alguno y aparecerán aquí.,Spotify isn't recommending you podcasts yet; listen to a few and they'll show up here.
+Spotify todavía no te recomienda audiolibros; escucha alguno y aparecerán aquí.,Spotify isn't recommending you audiobooks yet; listen to a few and they'll show up here.
+"No hay secciones que mostrar. Actívalas desde el botón de personalizar, arriba a la derecha.","There are no sections to show. Turn them on with the customize button, top right."
+Personalizar inicio,Customize home
+Seleccionar de la biblioteca,Select from library
+Todas tus playlists ya están en el inicio.,All your playlists are already on home.
+Fijar arriba,Pin to top
+Quitar del inicio,Remove from home
+Mostrar,Show
+Ocultar,Hide
+Permitir filas recomendadas,Allow recommended rows
+Opciones de la sección,Section options
+Desfijar del inicio,Unpin from home
+Fijar arriba del inicio,Pin to top of home
+Ocultar esta sección,Hide this section
+"Hola, {}","Hi, {}"
+Reproducidos recientemente,Recently played
+Ver historial,See history
+Tus playlists,Your playlists
+Ver biblioteca,See library
+Álbumes guardados,Saved albums
+Ver todos,Show all
+Artistas que sigues,Artists you follow
+Filtro activo: solo se muestra una categoría.,Filter on: only one category is shown.
+Historial,History
+"Lo último que has escuchado, del más reciente al más antiguo","What you've listened to lately, newest first"
+Lo escuchado en Nanofy se guarda en este equipo; de otros dispositivos Spotify solo entrega las últimas 50 reproducciones.,What you play in Nanofy is stored on this computer; from other devices Spotify only provides the last 50 plays.
+Episodios,Episodes
+Perfiles,Profiles
+Escribe el nombre de usuario exacto (el que aparece en su enlace open.spotify.com/user/…).,Type the exact username (the one in their open.spotify.com/user/… link).
+Perfil · {},Profile · {}
+"Buscando ese usuario… Spotify no permite buscar perfiles por nombre, solo por nombre de usuario exacto.","Looking for that user… Spotify doesn't let you search profiles by name, only by exact username."
+Buscando,Searching
+"Escribe arriba y pulsa Intro. También puedes pegar un enlace de Spotify (canción, álbum, artista, playlist, podcast, perfil o Jam).","Type above and press Enter. You can also paste a Spotify link (song, album, artist, playlist, podcast, profile or Jam)."
+Episodio,Episode
+Todos los episodios,All episodes
+Buscar episodio,Search episode
+Descargados,Downloaded
+Guardados,Saves
+Filtrar,Filter
+Nuevos,New
+Cambiar el orden,Change order
+Cargando episodios…,Loading episodes…
+Ningún episodio coincide.,No episodes match.
+Quitar de tus episodios,Remove from your episodes
+Guardar en tus episodios,Save to your episodes
+Añadir a playlist,Add to playlist
+Descargado (en la caché de audio),Downloaded (in the audio cache)
+Descargando…,Downloading…
+Descargar,Download
+{} álbumes,{} albums
+{} artistas,{} artists
+Todavía no sigues a ningún artista.,You don't follow any artists yet.
+{} episodios guardados,{} saved episodes
+Guarda episodios con el marcador de cualquier podcast y aparecerán aquí.,Save episodes with the bookmark on any podcast and they'll show up here.
+{} podcasts que sigues,{} podcasts you follow
+Todavía no sigues ningún podcast. Búscalos y pulsa «Seguir».,You don't follow any podcasts yet. Search for them and click “Follow”.
+{} audiolibros guardados,{} saved audiobooks
+No tienes audiolibros guardados.,You have no saved audiobooks.
+{} carpetas,{} folders
+Nueva carpeta,New folder
+No tienes carpetas. Crea una aquí o desde el menú de cualquier playlist («Añadir a carpeta»).,You have no folders. Create one here or from any playlist's menu (“Add to folder”).
+{} playlists,{} playlists
+Opciones de la carpeta,Folder options
+Sus playlists no están en tu biblioteca cargada.,Its playlists aren't in your loaded library.
+Tu playlist,Your playlist
+Dinámica,Dynamic
+Colaborativa,Collaborative
+Privada,Private
+Pública,Public
+Desfijar de la biblioteca,Unpin from library
+Fijar en la biblioteca,Pin to library
+Editar playlist…,Edit playlist…
+Cambiar imagen…,Change image…
+Quitar de tu biblioteca,Remove from your library
+Guardar en tu biblioteca,Save to your library
+Añadir todas a una playlist,Add all to a playlist
+Cargando {} de {},Loading {} of {}
+No se pudo cargar la playlist,Couldn't load the playlist
+Mostrando {} de {},Showing {} of {}
+reintentando,retrying
+Esta playlist está vacía. Añade canciones con el botón + de cualquier fila.,This playlist is empty. Add songs with the + button on any row.
+Sencillo,Single
+Recopilatorio,Compilation
+Ir a {},Go to {}
+Ninguna canción coincide con la búsqueda.,No songs match the search.
+TU PERFIL,YOUR PROFILE
+PERFIL,PROFILE
+{} playlists públicas,{} public playlists
+Playlists públicas,Public playlists
+Un último paso en el navegador,One last step in your browser
+"Permite que Nanofy lea tu biblioteca (no tienes que crear nada). En cuanto aceptes, aparece aquí.","Let Nanofy read your library (you don't have to create anything). As soon as you accept, it shows up here."
+Abrir de nuevo en el navegador,Open again in browser
+Esperando,Waiting
+Conecta tu biblioteca,Connect your library
+Solo tienes que autorizar tu cuenta en la web de Spotify; no hace falta crear ninguna app.,You just need to authorize your account on Spotify's website; no need to create any app.
+Conectar con Spotify,Connect with Spotify
+Conectada con Spotify,Connected with Spotify
+Sin conectar,Not connected
+Desconectar,Disconnect
+Reconectar,Reconnect
+¿No se abrió o la cerraste?,"Didn't it open, or did you close it?"
+Abrir de nuevo,Open again
+"Autoriza tu cuenta en el navegador (una sola vez). Habilita la biblioteca, la búsqueda, las playlists, el corazón y seguir artistas. No necesitas crear ninguna app.","Authorize your account in the browser (just once). It enables the library, search, playlists, the heart and following artists. You don't need to create any app."
+"Avanzado (opcional, no hace falta)","Advanced (optional, not needed)"
+Tu propia app de desarrollador,Your own developer app
+Quitar,Remove
+Reconectar app,Reconnect app
+Conectar mi app,Connect my app
+Se ha abierto el navegador para autorizar tu app…,Your browser opened to authorize your app…
+"No hace falta: Nanofy funciona entero sin ella. Solo si ya tienes una app en developer.spotify.com y quieres que las lecturas usen su cuota, añádele esta Redirect URI y pega aquí su Client ID:","Not needed: Nanofy works fully without it. Only if you already have an app on developer.spotify.com and want reads to use its quota, add this Redirect URI to it and paste its Client ID here:"
+Copiar la URI,Copy URI
+CLIENT ID DE TU APP,YOUR APP'S CLIENT ID
+32 caracteres,32 characters
+Fundido entre canciones,Crossfade songs
+Fundido activado,Crossfade on
+Fundido desactivado,Crossfade off
+Duración del fundido,Crossfade duration
+"La siguiente canción entra mientras la anterior se apaga. No se aplica al cambiar de canción a mano, al repetir una canción ni en podcasts.","The next song comes in while the previous one fades out. Not applied when you change songs by hand, repeat a song or in podcasts."
+Fundir también canciones seguidas de un mismo álbum,Also crossfade consecutive songs from the same album
+Spotify no funde temas consecutivos de un álbum para respetar las transiciones del artista.,"Spotify doesn't crossfade consecutive tracks of an album, to respect the artist's transitions."
+Fundido suspendido mientras el temporizador «al terminar la canción» está puesto.,Crossfade paused while the “end of song” sleep timer is set.
+Ajustes,Settings
+"El fundido entre canciones se aplica al instante; los demás cambios de reproducción, al guardar; el resto, al instante.","Crossfade applies right away; other playback changes, when you save; everything else, right away."
+Reproducción,Playback
+Nombre en Spotify Connect,Spotify Connect name
+Así aparece Nanofy en la lista de dispositivos.,This is how Nanofy appears in the device list.
+Calidad de audio,Audio quality
+"Ogg Vorbis, el mismo formato que la app de escritorio de Spotify. «Muy alta» es la máxima calidad que Spotify entrega a apps que no son las suyas.","Ogg Vorbis, the same format as Spotify's desktop app. “Very high” is the highest quality Spotify delivers to apps other than its own."
+Sin pérdida (FLAC): Spotify solo la entrega a sus apps y dispositivos certificados.,Lossless (FLAC): Spotify only delivers it to its own apps and certified devices.
+"El dispositivo ya está a 44,1 kHz: el audio llega sin convertir.",The device is already at 44.1 kHz: audio arrives unconverted.
+"Para evitar el remuestreo, pon el dispositivo en 44100 Hz: Configuración → Sistema → Sonido → (dispositivo) → Formato.","To avoid resampling, set the device to 44100 Hz: Settings → System → Sound → (device) → Format."
+"Para evitar el remuestreo, pon el dispositivo de salida en 44100 Hz.","To avoid resampling, set the output device to 44100 Hz."
+Salida de audio,Audio output
+Se sabrá al reproducir la primera canción,Known once the first song plays
+Normalizar volumen,Normalize volume
+Como en Spotify: todas las canciones suenan a un volumen parecido.,Like Spotify: all songs play at a similar volume.
+Nivel de volumen,Volume level
+Reproducción sin pausas (gapless),Gapless playback
+Autoplay al terminar una lista,Autoplay when a list ends
+Precarga inteligente,Smart preload
+Prepara la canción sobre la que pasas el ratón para que suene al instante.,Prepares the song under your mouse so it plays instantly.
+Teclas multimedia del sistema,System media keys
+Caché de audio en disco,Audio cache on disk
+Las canciones descargadas y ya escuchadas se guardan aquí.,Downloaded and already played songs are stored here.
+Apariencia y rendimiento,Appearance and performance
+Idioma,Language
+Lo que falte en un idioma se ve en español.,Anything missing in a language is shown in Spanish.
+Automático,Automatic
+Tema,Theme
+Sistema,System
+Oscuro,Dark
+Claro,Light
+Escala de la interfaz,Interface scale
+Límite de fotogramas,Frame limit
+Solo durante animaciones; en reposo no se repinta.,Only during animations; nothing is redrawn when idle.
+Guardar,Save
+Descartar,Discard
+Al guardar se reinicia el reproductor.,Saving restarts the player.
+"Biblioteca · playlists, búsqueda, Me gusta y perfiles","Library · playlists, search, Liked Songs and profiles"
+Cuenta,Account
+Cerrar sesión,Log out
+Ver mi perfil,View my profile
+Con una cuenta gratuita Spotify no permite reproducir música en clientes externos.,With a free account Spotify doesn't allow playing music in external clients.
+Conectando con Spotify,Connecting to Spotify
+Acerca de Nanofy,About Nanofy
+Versión {},Version {}
+Buscar actualizaciones,Check for updates
+Buscar versiones nuevas automáticamente,Check for new versions automatically
+Actualizar automáticamente,Update automatically
+Descarga las versiones nuevas en segundo plano; solo tendrás que pulsar Reiniciar.,Downloads new versions in the background; you'll only have to click Restart.
+En esta copia (de desarrollo o de pruebas) no se aplica: las versiones nuevas se avisan con «Instalar».,Not applied in this copy (development or testing): new versions are offered with “Install”.
+Memoria en uso {} MB · {} portadas en memoria ({} MB) · último fotograma {} ms,Memory in use {} MB · {} covers in memory ({} MB) · last frame {} ms
+Teclas multimedia: {},Media keys: {}
+activas,active
+no disponibles,unavailable
+Ajustes: {},Settings: {}
+Caché: {},Cache: {}
+Borrar caché de imágenes,Clear image cache
+Caché de imágenes borrada,Image cache cleared
+Atajos de teclado,Keyboard shortcuts
+"Nanofy es un proyecto independiente y no está afiliado a Spotify. Usa librespot para la reproducción y egui para la interfaz, dibujada por CPU.","Nanofy is an independent project and isn't affiliated with Spotify. It uses librespot for playback and egui for the interface, drawn by the CPU."
+Recordar más tarde,Remind me later
+Omitir esta versión,Skip this version
+No volver a avisar de esta versión,Don't notify me about this version again
+No se pudo actualizar,Couldn't update
+Cerrar,Close
+Nanofy se actualizó a la {},Nanofy was updated to {}
+Ver novedades,See what's new
+Novedades de Nanofy {},What's new in Nanofy {}
+Ver en GitHub,View on GitHub
+Renombrar carpeta,Rename folder
+NOMBRE,NAME
+Mi carpeta,My folder
+La playlist se moverá dentro de la carpeta nueva.,The playlist will be moved into the new folder.
+Espacio,Space
+Reproducir o pausar,Play or pause
+Anterior / siguiente,Previous / next
+Retroceder / avanzar 10 s,Rewind / forward 10 s
+Volumen,Volume
+Silenciar,Mute
+Aleatorio / repetir,Shuffle / repeat
+Cola / letra,Queue / lyrics
+Jam (escuchar en grupo),Jam (listen together)
+Ctrl+F o /,Ctrl+F or /
+Buscar (o pegar un enlace),Search (or paste a link)
+Mostrar u ocultar la barra lateral,Show or hide the sidebar
+Atrás / adelante,Back / forward
+Inicio / Canciones que te gustan,Home / Liked Songs
+Ctrl+/ o ?,Ctrl+/ or ?
+Esta ventana,This window
+Salir,Quit
+"En macOS, Cmd sustituye a Ctrl. Las teclas multimedia del teclado también funcionan.","On macOS, Cmd replaces Ctrl. The keyboard's media keys work too."
+Cerrar (Esc),Close (Esc)
+Jam · escuchar en grupo,Jam · listen together
+Inicia sesión para usar Jam.,Log in to use Jam.
+Estás en un Jam que has creado tú,You're in a Jam you created
+Estás en un Jam,You're in a Jam
+ENLACE PARA INVITAR,INVITE LINK
+Copiar,Copy
+Enlace del Jam,Jam link
+PARTICIPANTES ({} DE {}),PARTICIPANTS ({} OF {})
+PARTICIPANTES ({}),PARTICIPANTS ({})
+Anfitrión,Host
+Salir del Jam,Leave Jam
+Finalizar para todos,End for everyone
+Actualizar,Refresh
+Varias personas escuchan y controlan la misma música desde sus propios dispositivos.,Several people listen to and control the same music from their own devices.
+Crear un Jam,Start a Jam
+O ÚNETE CON UN ENLACE O CÓDIGO,OR JOIN WITH A LINK OR CODE
+Unirme,Join
+Enlace no válido,Invalid link
+Jam usa una API interna de Spotify a través de librespot; requiere Premium y puede dejar de funcionar si Spotify la cambia.,Jam uses an internal Spotify API through librespot; it requires Premium and may stop working if Spotify changes it.
+Editar playlist,Edit playlist
+Mi playlist,My playlist
+DESCRIPCIÓN,DESCRIPTION
+Opcional,Optional
+Playlist pública,Public playlist
+COLABORADORES,COLLABORATORS
+Todavía nadie más colabora en esta playlist.,Nobody else collaborates on this playlist yet.
+Copiar enlace de invitación,Copy invite link
+Quien abra el enlace en Spotify podrá añadir y quitar canciones.,Anyone who opens the link in Spotify can add and remove songs.
+Podrás invitar colaboradores en cuanto la crees.,You can invite collaborators as soon as you create it.
+Colaborativa (otras personas pueden añadir y quitar canciones),Collaborative (other people can add and remove songs)
+IMAGEN,IMAGE
+Elegir…,Choose…
+imagen,image
+o arrastra un JPG/PNG aquí,or drag a JPG/PNG here
+Nanofy {} disponible,Nanofy {} available
+Instalando la versión nueva…,Installing the new version…
+Tienes la {}. Descarga el zip nuevo y sustituye el ejecutable.,You have {}. Download the new zip and replace the executable.
+Descargando Nanofy {},Downloading Nanofy {}
+Puedes seguir escuchando mientras tanto.,You can keep listening in the meantime.
+Preparando la actualización…,Preparing the update…
+Estás en una Jam: al reiniciar saldrás de ella.,You're in a Jam: restarting will make you leave it.
+Reiniciar igualmente,Restart anyway
+Reinicia para usar la versión nueva. La música seguirá donde estaba.,Restart to use the new version. The music will pick up where it was.
+Reiniciar,Restart
+Más tarde,Later
+"Si no, se instalará sola la próxima vez que abras Nanofy.","Otherwise, it will install itself the next time you open Nanofy."
+Descargar a mano,Download manually
+Tienes la {}. {},You have {}. {}
+Tienes la {}. Se descarga en segundos y solo tendrás que reiniciar.,You have {}. It downloads in seconds and you'll only have to restart.
+Instalar,Install
+Instalando la versión nueva,Installing the new version
+Nanofy {} lista,Nanofy {} ready
+Tu biblioteca,Your Library
+"Ajustes (Ctrl+,)","Settings (Ctrl+,)"
+Buscar,Search
+Cerrar pestaña,Close tab
+Tu perfil,Your profile
+Iniciar sesión,Log in
+Buscar…,Search…
+Nanofy {} está lista. La música seguirá donde estaba.,Nanofy {} is ready. The music will pick up where it was.
+Explorar,Browse
+Canción,Song
+Perfil,Profile
+Fijados,Pinned
+Fija playlists con el clic derecho,Pin playlists with right-click
+Nueva playlist (Ctrl+N),New playlist (Ctrl+N)
+Playlist dinámica: se pone al día sola con tus canciones que te gustan,Dynamic playlist: it keeps itself up to date with your liked songs
+Eliminar,Delete
+Quitar de la biblioteca,Remove from library
+Anterior (Ctrl+←),Previous (Ctrl+←)
+Siguiente (Ctrl+→),Next (Ctrl+→)
+Retroceder 15 s,Rewind 15 s
+Avanzar 15 s,Forward 15 s
+Aleatorio (S),Shuffle (S)
+Repetir (R),Repeat (R)
+Reproducir / pausar (Espacio),Play / pause (Space)
+Volumen · clic para silenciar (M),Volume · click to mute (M)
+{} %  ({} dB),{} %  ({} dB)
+Silencio,Muted
+Nada en reproducción,Nothing playing
+A continuación,Next up
+Quitar de Me gusta,Remove from Liked Songs
+Guardar en Me gusta,Save to Liked Songs
+Letra (L),Lyrics (L)
+Sonando en {},Playing on {}
+Dispositivos,Devices
+Cola (Q),Queue (Q)
+DJ: cambiar de estilo,DJ: change style
+Reproducir en,Play on
+Inicia sesión para ver tus dispositivos.,Log in to see your devices.
+Buscando dispositivos,Looking for devices
+{} (este equipo),{} (this computer)
+{} · sonando,{} · playing
+Actualizar lista,Refresh list
+Saltar,Skip
+Pasar a la siguiente canción,Skip to the next song
+la canción,the song
+Se cortó la conexión al cargar {}; reintentando…,The connection dropped while loading {}; retrying…
+Spotify está frenando las peticiones de reproducción; reintentando {}…,Spotify is throttling playback requests; retrying {}…
+No se pudo reproducir {}.,Couldn't play {}.
+{} no está disponible en tu país o se retiró. Pasamos a la siguiente.,{} isn't available in your country or was removed. Moving on to the next one.
+No se pudo reproducir {}. Pasamos a la siguiente.,Couldn't play {}. Moving on to the next one.
+Varias canciones seguidas no se pudieron reproducir; se detuvo la reproducción.,Several songs in a row couldn't be played; playback stopped.
+Se cortó la conexión. Seguirá desde {} en cuanto vuelva.,The connection dropped. It will resume from {} as soon as it's back.
+Spotify no responde y {} no termina de cargar.,Spotify isn't responding and {} won't finish loading.
+No hay ninguna salida de audio. Conecta unos auriculares o altavoces.,There's no audio output. Plug in headphones or speakers.
+"Spotify solo permite reproducir en apps externas con Premium. Puedes seguir explorando tu biblioteca, buscar y gestionar playlists.","Spotify only allows playback in external apps with Premium. You can keep browsing your library, searching and managing playlists."
+Cargando… la conexión va lenta,Loading… the connection is slow
+Reiniciar para actualizar,Restart to update
+Descargada,Downloaded
+Descargar episodio,Download episode
+Descargar canción,Download song
+Temporizador ({} min),Sleep timer ({} min)
+Temporizador (al terminar),Sleep timer (end of song)
+Temporizador de apagado,Sleep timer
+Mostrar canción,Show song
+Ocultar canción,Hide song
+Compartir canción,Share song
+Agregar a la biblioteca,Add to library
+Agregar a la cola,Add to queue
+Quitar de la cola,Remove from queue
+Quitar de esta playlist,Remove from this playlist
+Ir a la radio de la canción,Go to song radio
+Ver álbum,Go to album
+Ver artista,Go to artist
+Salir del miniplayer,Exit miniplayer
+Miniplayer,Miniplayer
+Salir de pantalla completa,Exit full screen
+Pantalla completa,Full screen
+Iniciar una Jam,Start a Jam
+{} minutos,{} minutes
+Al terminar la canción,End of song
+Cancelar temporizador,Cancel sleep timer
+Quitar de Canciones que te gustan,Remove from Liked Songs
+Añadir a una playlist…,Add to playlist…
+Al final de la cola,At the end of the queue
+Abrir la cola,Open queue
+Se pausará en {} minutos,Will pause in {} minutes
+Se pausará al terminar la canción,Will pause at the end of the song
+ene,Jan
+feb,Feb
+mar,Mar
+abr,Apr
+may,May
+jun,Jun
+jul,Jul
+ago,Aug
+sept,Sep
+oct,Oct
+nov,Nov
+dic,Dec
+{} h {} min,{} hr {} min
+{} min,{} min
+Pausar,Pause
+Quitar de Guardados,Remove from Saves
+Guardar en Guardados,Save to Saves
+Descargado,Downloaded
+{} valoraciones,{} ratings
+Sin escuchar,Unplayed
+Empezados,In progress
+El vídeo no se pudo cargar ({}); suena el audio,The video couldn't load ({}); the audio plays
+Acerca del episodio,About the episode
+Cola,Queue
+Inicia sesión para ver la cola.,Log in to see the queue.
+Cargando la cola…,Loading the queue…
+Siguiente en la cola,Next in queue
+Siguientes canciones,Next songs
+La cola está vacía.,The queue is empty.
+A continuación:,Next up:
+Aleatorio,Shuffle
+Repetir,Repeat
+Quitar lo que queda de {},Remove what's left of {}
+Vaciar la cola,Clear queue
+Reproducir canciones similares,Play similar songs
+"Al acabarse lo que suena, sigue con canciones parecidas","When what's playing runs out, keep going with similar songs"
+Conexión con Spotify restablecida,Connection to Spotify restored
+Sin conexión con Spotify; reintentando en {} s…,No connection to Spotify; retrying in {} s…
+Créditos,Credits
+Más como esta,More like this
+No se pudo cargar la canción. Pulsa para reintentar.,Couldn't load the song. Click to retry.
+Copiar el enlace de la canción,Copy song link
+Más opciones,More options
+Traducir (pronto),Translate (coming soon)
+Tamaño del texto (pronto),Text size (coming soon)
+Ir a lo que suena,Go to what's playing
+Ocultar las explicaciones de Genius,Hide Genius annotations
+Explicaciones de Genius,Genius annotations
+Buscando en Genius…,Searching Genius…
+No se pudo consultar Genius.,Couldn't reach Genius.
+Genius no tiene explicaciones de esta canción.,Genius has no annotations for this song.
+Genius no tiene explicaciones de los versos de esta letra.,Genius has no annotations for the lines of these lyrics.
+Abrir en Genius,Open in Genius
+Spotify no tiene créditos de esta canción.,Spotify has no credits for this song.
+Spotify no tiene recomendaciones para esta canción.,Spotify has no recommendations for this song.
+Puede que no esté disponible en tu país o que se haya retirado de Spotify,It may not be available in your country or may have been removed from Spotify
+Buscar en esta lista,Search in this list
+Añadir a Me gusta,Add to Liked Songs
+Copiar enlaces,Copy links
+Enlaces,Links
+Reproducir la selección,Play selection
+Seleccionar todo,Select all
+Deseleccionar todo,Deselect all
+{} seleccionadas,{} selected
+Añadida por,Added by
+Fecha,Date
+Descargada (en la caché de audio),Downloaded (in the audio cache)
+Me gusta,Like
+Conectando con Spotify…,Connecting to Spotify…
+Reconectando con Spotify…,Reconnecting to Spotify…
+Spotify no acepta este dispositivo ahora mismo (fallo de sus servidores); se sigue intentando…,Spotify isn't accepting this device right now (a server failure on their side); still trying…
+la cuenta no es Premium,the account isn't Premium
+No se pudo conectar con Spotify,Couldn't connect to Spotify
+Se ha abierto el navegador para iniciar sesión en Spotify…,Your browser opened to log in to Spotify…
+No se pudo iniciar sesión: {},Couldn't log in: {}
+Ajustes de reproducción aplicados,Playback settings applied
+No se pudo reiniciar la reproducción,Couldn't restart playback
+Error de reproducción: {},Playback error: {}
+{}: pasaron {} minutos sin completarlo en el navegador,{}: {} minutes passed without finishing it in the browser
+no hay mezclador de volumen disponible,no volume mixer available
+no hay salida de audio disponible,no audio output available
+Spotify no respondió al conectar (25 s),Spotify didn't respond when connecting (25 s)
+Desconocido,Unknown
+Archivo local,Local file
+Normal · 96 kbps,Normal · 96 kbps
+Alta · 160 kbps,High · 160 kbps
+Muy alta · 320 kbps,Very high · 320 kbps
+Alto,Loud
+Normal,Normal
+Bajo,Quiet
+"−11 LUFS, con limitador · para ambientes ruidosos","−11 LUFS, with limiter · for noisy environments"
+−14 LUFS · el predeterminado de Spotify,−14 LUFS · Spotify's default
+−19 LUFS · para ambientes tranquilos,−19 LUFS · for quiet environments
+no has iniciado sesión,you're not logged in
+Spotify está limitando las peticiones; inténtalo de nuevo en unos segundos.,Spotify is rate-limiting requests; try again in a few seconds.
+Spotify está limitando las peticiones; espera unos segundos,Spotify is rate-limiting requests; wait a few seconds
+Spotify está limitando las peticiones (reintenta en {} s),Spotify is rate-limiting requests (retry in {} s)
+Spotify ha agotado la cuota de la biblioteca; vuelve en {}. La reproducción sigue funcionando.,Spotify has used up the library quota; come back in {}. Playback keeps working.
+Normalización desactivada,Normalization off
+Normalización: {} · sin datos de volumen (0 dB),Normalization: {} · no volume data (0 dB)
+Normalización: {} · {} ({}),Normalization: {} · {} ({})
+por álbum,per album
+por canción,per track
+Salida: {},Output: {}
+Suena la copia ya guardada a {} kbps (de antes de cambiar la calidad).,Playing the copy already saved at {} kbps (from before the quality changed).
+Esta canción no está disponible en {} kbps; suena a {} kbps.,This song isn't available at {} kbps; playing at {} kbps.
+La calidad nueva ({} kbps) se aplica desde la próxima canción.,The new quality ({} kbps) applies from the next song.
+sin remuestreo,no resampling
+remuestreo de alta calidad,high-quality resampling
+remuestreo básico de rodio,basic rodio resampling
+Artista principal,Main artist
+Artista invitado,Featured artist
+Compositor,Composer
+Letrista,Lyricist
+Autor,Writer
+Productor,Producer
+Coproductor,Co-producer
+Productor ejecutivo,Executive producer
+Producción adicional,Additional production
+Remezclador,Remixer
+Arreglista,Arranger
+Ingeniero,Engineer
+Ingeniero de mezcla,Mixing engineer
+Ingeniero de masterización,Mastering engineer
+Ingeniero de grabación,Recording engineer
+Programación,Programming
+Voz,Vocals
+Coros,Background vocals
+Guitarra,Guitar
+Batería,Drums
+Teclados,Keyboards
+Piano,Piano
+Sintetizador,Synthesizer
+Percusión,Percussion
+Intérprete,Performer
+Interpretada por,Performed by
+Escrita por,Written by
+Producida por,Produced by
+buscando el hash nuevo de searchDesktop,looking for the new searchDesktop hash
+pathfinder apartado {} s más,pathfinder set aside for {} more s
+respuesta que no es JSON,response that isn't JSON
+errores: {},errors: {}
+respuesta sin data.searchV2,response without data.searchV2
+{} resultados en un formato desconocido,{} results in an unknown format
+sin respuesta,no response
+Spotify ya no conoce el hash de {},Spotify no longer knows the {} hash
+el reproductor web usa el mismo hash de {},the web player uses the same {} hash
+sin hash nuevo de {}: {},no new {} hash: {}
+{} sin data,{} without data
+token: sin respuesta,token: no response
+client-token: sin respuesta,client-token: no response
+la página del reproductor web no enlaza su paquete,the web player page doesn't link its bundle
+{} no aparece en el paquete,{} doesn't appear in the bundle
+HTTP {} en {},HTTP {} on {}
+no responde en {} s,not responding in {} s
+Esta versión aún no tiene descarga para tu sistema.,This version doesn't have a download for your system yet.
+No hay espacio suficiente en el disco para la actualización.,There isn't enough disk space for the update.
+No se pudo descargar la actualización. Revisa tu conexión.,Couldn't download the update. Check your connection.
+La descarga llegó dañada y se descartó.,The download arrived damaged and was discarded.
+No hay espacio suficiente en el disco.,There isn't enough disk space.
+No se pudo guardar la actualización en el disco.,Couldn't save the update to disk.
+Windows o tu antivirus bloqueó la versión nueva. Sigues usando la {}.,Windows or your antivirus blocked the new version. You're still using {}.
+El sistema no dejó arrancar la versión nueva. Sigues usando la {}.,The system didn't let the new version start. You're still using {}.
+No se pudo sustituir el ejecutable.,Couldn't replace the executable.
+"Nanofy está en una carpeta donde no puede actualizarse solo ({}). Muévelo, por ejemplo a {}, y a partir de ahí se actualizará solo.","Nanofy is in a folder where it can't update itself ({}). Move it, for example to {}, and from there it will update itself."
+Estás abriendo Nanofy desde dentro del zip. Descomprímelo en una carpeta y ábrelo desde ahí.,You're opening Nanofy from inside the zip. Extract it to a folder and open it from there.
+Descargando… {} %,Downloading… {} %
+Descargando… {} MB,Downloading… {} MB
+No se pudo empezar la descarga ({}),Couldn't start the download ({})
+No se pudo crear la carpeta de la descarga,Couldn't create the download folder
+Windows o tu antivirus bloqueó la versión nueva ({}). Sigues usando la {}.,Windows or your antivirus blocked the new version ({}). You're still using {}.
+El sistema no dejó arrancar la versión nueva ({}). Sigues usando la {}.,The system didn't let the new version start ({}). You're still using {}.
+Sin conexión con GitHub ({}),No connection to GitHub ({})
+GitHub respondió HTTP {},GitHub responded HTTP {}
+No se pudo crear la descarga,Couldn't create the download
+Descarga interrumpida: {},Download interrupted: {}
+No se pudo guardar la descarga,Couldn't save the download
+La descarga no coincide con la release (más de {} bytes),The download doesn't match the release (more than {} bytes)
+Descarga incompleta ({} de {} bytes),Incomplete download ({} of {} bytes)
+La descarga llegó dañada (su SHA-256 no es el que publica la release) y se descartó.,The download arrived damaged (its SHA-256 isn't the one the release publishes) and was discarded.
+No se pudo abrir la descarga,Couldn't open the download
+Zip no válido: {},Invalid zip: {}
+El zip no contiene {},The zip doesn't contain {}
+No se pudo extraer el ejecutable,Couldn't extract the executable
+No se pudo extraer el ejecutable: {},Couldn't extract the executable: {}
+El ejecutable descargado no parece válido,The downloaded executable doesn't look valid
+No se pudo dejar la versión nueva en {},Couldn't place the new version in {}
+{}: la copia quedó incompleta ({} de {} bytes),{}: the copy was incomplete ({} of {} bytes)
+No se pudo guardar {},Couldn't save {}
+el archivo nuevo desapareció,the new file disappeared
+no se pudo esperar a la autoprueba: {},couldn't wait for the self-test: {}
+la autoprueba no respondió en {} s,the self-test didn't respond in {} s
+la autoprueba terminó con error ({}),the self-test ended with an error ({})
+la autoprueba respondió «{}» en vez de «{}»,the self-test answered “{}” instead of “{}”
+"el antivirus la tomó por una amenaza, código 225","the antivirus flagged it as a threat, code 225"
+"una directiva del sistema impide abrirla, código 1260","a system policy prevents opening it, code 1260"
+"Control inteligente de aplicaciones no deja abrirla, código 4551","Smart App Control won't let it open, code 4551"
+"no arrancó, código {}","didn't start, code {}"
+no arrancó: {},didn't start: {}
+otra ventana de Nanofy está instalando la actualización,another Nanofy window is installing the update
+no se pudo crear {}: {},couldn't create {}: {}
+Nanofy se está cerrando,Nanofy is closing
+no se pudo apartar el ejecutable actual: {},couldn't move the current executable aside: {}
+no se pudo colocar el ejecutable nuevo: {},couldn't put the new executable in place: {}
+no se pudo devolver el ejecutable actual a su sitio ({}); está en {},couldn't put the current executable back ({}); it's at {}
+{} está en uso,{} is in use
+la versión preparada es para {},the prepared version is for {}
+la versión preparada ({}) no es más nueva que la {},the prepared version ({}) isn't newer than {}
+la versión preparada ya no está; quizá la retiró el antivirus,the prepared version is gone; maybe the antivirus removed it
+no se pudo leer la versión preparada: {},couldn't read the prepared version: {}
+la versión preparada está incompleta ({} de {} bytes),the prepared version is incomplete ({} of {} bytes)
+la versión preparada cambió después de probarla,the prepared version changed after it was tested
+no hay ninguna versión preparada,there is no prepared version
+No se pudo sustituir {} ({}). Se intentará de nuevo al abrir Nanofy.,Couldn't replace {} ({}). It will try again when you open Nanofy.
+No se pudo instalar la versión nueva ({}).,Couldn't install the new version ({}).
+La versión {} no arrancaba; se volvió a la {},Version {} wouldn't start; went back to {}
+La versión {} no arrancaba; sigues con la {},Version {} wouldn't start; you're still on {}
+Respuesta de GitHub no válida ({}),Invalid response from GitHub ({})
+La release no tiene etiqueta,The release has no tag
+Versión no reconocida: {},Unrecognized version: {}
+manifiesto sin contenido,manifest without content
+el vídeo va cifrado,the video is encrypted
+sin vídeo MP4 en el manifiesto,no MP4 video in the manifest
+manifiesto sin servidor,manifest without server
+sin plantilla de inicio,no init template
+sin plantilla de segmentos,no segment template
+inicio sin moov,init without moov
+inicio sin trak,init without trak
+inicio sin mdia,init without mdia
+inicio sin mdhd,init without mdhd
+mdhd corto,mdhd too short
+sin minf,no minf
+sin stbl,no stbl
+sin stsd,no stsd
+stsd corto,stsd too short
+sin avc1,no avc1
+avc1 corto,avc1 too short
+sin avcC,no avcC
+avcC corto,avcC too short
+sps corto,sps too short
+pps corto,pps too short
+moof sin traf,moof without traf
+traf sin tfhd,traf without tfhd
+tfhd corto,tfhd too short
+tfdt corto,tfdt too short
+muestra fuera del segmento,sample outside the segment
+Listo. Ya puedes cerrar esta pestaña y volver a Nanofy.,Done. You can close this tab and go back to Nanofy.
+Inicio de sesión cancelado. Ya puedes cerrar esta pestaña.,Login cancelled. You can close this tab.
+No se ha conectado tu biblioteca. Puedes hacerlo cuando quieras desde Nanofy con «Conectar con Spotify».,Your library hasn't been connected. You can do it anytime from Nanofy with “Connect with Spotify”.
+Este enlace ya no vale. Vuelve a Nanofy y pulsa «Conectar con Spotify».,This link is no longer valid. Go back to Nanofy and click “Connect with Spotify”.
+Un momento…,One moment…
+Continuar: permite que Nanofy lea tu biblioteca,Continue: let Nanofy read your library
+la cancelaste en el navegador,you cancelled it in the browser
+Spotify respondió «{}»,Spotify responded “{}”
+Client ID no válido,Invalid Client ID
+solo para la identidad de primera parte,only for first-party identity
+redirección sin dirección: {},redirect without address: {}
+no se pudo escuchar en {}: {},couldn't listen on {}: {}
+Spotify no aceptó la autorización ({}),Spotify didn't accept the authorization ({})
+no se pudo renovar el token de la Web API: {},couldn't refresh the Web API token: {}

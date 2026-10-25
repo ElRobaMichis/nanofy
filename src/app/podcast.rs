@@ -14,6 +14,7 @@ use super::theme::{self, GREEN};
 use super::widgets::{galley_truncated, text_on_baseline};
 use super::{Action, App, Page, PlayTarget};
 use crate::api::Req;
+use crate::i18n::t;
 use crate::model::{Episode, Show};
 
 // --- colores (blanco translúcido sobre el degradado)
@@ -100,11 +101,11 @@ fn ink_left(g: &egui::Galley) -> f32 {
 
 /// Fecha corta como en Spotify: «10 may» (con el año si no es el actual).
 fn short_date(iso: &str) -> String {
-    const M: [&str; 12] = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic"];
+    const M: [&str; 12] = [tk!("ene"), tk!("feb"), tk!("mar"), tk!("abr"), tk!("may"), tk!("jun"), tk!("jul"), tk!("ago"), tk!("sept"), tk!("oct"), tk!("nov"), tk!("dic")];
     let mut it = iso.get(..10).unwrap_or(iso).split('-');
     let (Some(y), Some(m), Some(d)) = (it.next(), it.next(), it.next()) else { return iso.to_string() };
     let (Ok(m), Ok(d)) = (m.parse::<usize>(), d.parse::<u32>()) else { return iso.to_string() };
-    let name = M.get(m.wrapping_sub(1)).copied().unwrap_or("");
+    let name = M.get(m.wrapping_sub(1)).map(|s| t(*s)).unwrap_or("");
     let this_year = crate::cache::now_secs() / 31_556_952 + 1970;
     if y.parse::<u64>().ok() == Some(this_year) {
         format!("{d} {name}")
@@ -117,16 +118,16 @@ fn short_date(iso: &str) -> String {
 fn duration(ms: u32) -> String {
     let m = ms as u64 / 60_000;
     if m >= 60 {
-        format!("{} h {} min", m / 60, m % 60)
+        tr!("{} h {} min", m / 60, m % 60)
     } else {
-        format!("{m} min")
+        tr!("{} min", m)
     }
 }
 
 /// «956 K» -> «956K»; «1,2 M».
 fn compact(n: u32) -> String {
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f32 / 1e6).replace('.', ",")
+        crate::i18n::decimal(format!("{:.1}M", n as f32 / 1e6))
     } else if n >= 1000 {
         format!("{}K", (n + 500) / 1000)
     } else {
@@ -243,7 +244,7 @@ impl App {
 
     /// Botón verde de reproducir de `d` de diámetro.
     fn pod_play(&mut self, ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, c: egui::Pos2, d: f32, playing: bool) -> egui::Response {
-        let r = ui.interact(Rect::from_center_size(c, vec2(d, d)), ui.id().with(id), Sense::click()).on_hover_text(if playing { "Pausar" } else { "Reproducir" });
+        let r = ui.interact(Rect::from_center_size(c, vec2(d, d)), ui.id().with(id), Sense::click()).on_hover_text(if playing { t("Pausar") } else { t("Reproducir") });
         let fill = if r.hovered() { GREEN.lerp_to_gamma(Color32::WHITE, 0.12) } else { GREEN };
         ui.painter().circle_filled(c, d / 2.0, fill);
         icons::paint_side(ui.painter(), c, d * 0.42, Color32::BLACK, if playing { Icon::Pause } else { Icon::Play });
@@ -258,16 +259,16 @@ impl App {
         let link = super::widgets::uri_to_link(&e.uri);
         egui::Popup::menu(r).show(|ui| {
             ui.set_min_width(200.0);
-            if Self::menu_item(ui, Some(Icon::AddToQueue), "Añadir a la cola", false).clicked() {
+            if Self::menu_item(ui, Some(Icon::AddToQueue), t("Añadir a la cola"), false).clicked() {
                 self.actions.push(Action::AddToQueue(e.uri.clone()));
                 ui.close();
             }
-            if Self::menu_item(ui, Some(Icon::NewTab), "Abrir en una nueva pestaña", false).clicked() {
+            if Self::menu_item(ui, Some(Icon::NewTab), t("Abrir en una nueva pestaña"), false).clicked() {
                 self.actions.push(Action::OpenInTab(Page::Episode(e.id.clone())));
                 ui.close();
             }
-            if Self::menu_item(ui, Some(Icon::Share), "Copiar enlace", false).clicked() {
-                self.actions.push(Action::CopyText(link.clone(), "Enlace"));
+            if Self::menu_item(ui, Some(Icon::Share), t("Copiar enlace"), false).clicked() {
+                self.actions.push(Action::CopyText(link.clone(), t("Enlace")));
                 ui.close();
             }
         });
@@ -278,23 +279,23 @@ impl App {
     fn episode_actions(&mut self, ui: &mut egui::Ui, e: &Episode, o: egui::Pos2, xs: &[f32; 6], y: f32, add_circle: bool) {
         let saved = self.saved_episodes.contains(&e.id);
         let k = &e.id;
-        if self.pod_icon(ui, ("ep_save", k), pos2(o.x + xs[1], y), 29.3, if saved { Icon::BookmarkFilled } else { Icon::Bookmark }, saved, if saved { "Quitar de Guardados" } else { "Guardar en Guardados" }).clicked() {
+        if self.pod_icon(ui, ("ep_save", k), pos2(o.x + xs[1], y), 29.3, if saved { Icon::BookmarkFilled } else { Icon::Bookmark }, saved, if saved { t("Quitar de Guardados") } else { t("Guardar en Guardados") }).clicked() {
             self.actions.push(Action::SaveEpisode(e.id.clone(), !saved));
         }
         let (add_icon, add_side) = if add_circle { (Icon::PlusCircle, 23.4) } else { (Icon::PlusSquare, 27.2) };
-        if self.pod_icon(ui, ("ep_add", k), pos2(o.x + xs[2], y), add_side, add_icon, false, "Añadir a una playlist").clicked() {
+        if self.pod_icon(ui, ("ep_add", k), pos2(o.x + xs[2], y), add_side, add_icon, false, t("Añadir a una playlist")).clicked() {
             self.open_add_dialog(vec![e.uri.clone()]);
         }
         let dl = self.downloaded.contains(&e.id);
         let busy = self.downloading.contains(&e.id);
-        let tip = if dl { "Descargado" } else if busy { "Descargando…" } else { "Descargar" };
+        let tip = if dl { t("Descargado") } else if busy { t("Descargando…") } else { t("Descargar") };
         if self.pod_icon(ui, ("ep_dl", k), pos2(o.x + xs[3], y), 24.5, if busy { Icon::Hourglass } else { Icon::Download }, dl, tip).clicked() && !dl && !busy {
             self.actions.push(Action::DownloadEpisodes(vec![e.id.clone()]));
         }
-        if self.pod_icon(ui, ("ep_share", k), pos2(o.x + xs[4], y), 27.2, Icon::Share, false, "Copiar enlace").clicked() {
-            self.actions.push(Action::CopyText(super::widgets::uri_to_link(&e.uri), "Enlace"));
+        if self.pod_icon(ui, ("ep_share", k), pos2(o.x + xs[4], y), 27.2, Icon::Share, false, t("Copiar enlace")).clicked() {
+            self.actions.push(Action::CopyText(super::widgets::uri_to_link(&e.uri), t("Enlace")));
         }
-        let more = self.pod_icon(ui, ("ep_more", k), pos2(o.x + xs[5], y), 30.2, Icon::More, false, "Más");
+        let more = self.pod_icon(ui, ("ep_more", k), pos2(o.x + xs[5], y), 30.2, Icon::More, false, t("Más"));
         self.episode_menu(&more, e);
     }
 
@@ -365,7 +366,7 @@ impl App {
                 self.page_error(ui, panel, &format!("show:{id}"), &err);
                 return;
             }
-            let g = ui.painter().layout_no_wrap("Cargando…".into(), theme::regular(15.0), WEAK);
+            let g = ui.painter().layout_no_wrap(t("Cargando…").into(), theme::regular(15.0), WEAK);
             text_on_baseline(ui.painter(), pos2(panel.min.x + LEFT, panel.min.y + 60.0), g, WEAK);
             return;
         };
@@ -406,7 +407,7 @@ impl App {
             self.episodes_toolbar(ui, o, col_right);
             let uris: Vec<String> = eps.iter().map(|e| e.uri.clone()).collect();
             if eps.is_empty() {
-                let msg = if episodes.is_empty() { "Cargando episodios…" } else { "Ningún episodio coincide." };
+                let msg = if episodes.is_empty() { t("Cargando episodios…") } else { t("Ningún episodio coincide.") };
                 let g = ui.painter().layout_no_wrap(msg.into(), theme::regular(META_FONT), WEAK);
                 text_on_baseline(ui.painter(), pos2(o.x + LEFT, o.y + ROW0 + 20.0), g, WEAK);
             }
@@ -418,7 +419,7 @@ impl App {
                 self.podcast_row(ui, o, col_right, top, &show, e, i, &uris);
             }
             let about = strip(&show.description);
-            self.podcast_right(ui, o, right, cover.as_deref(), "Acerca de", &about, &show.keywords, None);
+            self.podcast_right(ui, o, right, cover.as_deref(), t("Acerca de"), &about, &show.keywords, None);
         });
     }
 
@@ -431,7 +432,7 @@ impl App {
         text_on_baseline(&painter, pos2(o.x + LEFT - ink_left(&g), o.y + SUB_BASE), g, STRONG);
         // Seguir / Siguiendo.
         let followed = self.followed_shows.contains(&show.id);
-        let label = if followed { "Siguiendo" } else { "Seguir" };
+        let label = if followed { t("Siguiendo") } else { t("Seguir") };
         let g = painter.layout_no_wrap(label.into(), theme::regular(PILL_FONT), STRONG);
         let w = FOLLOW_W.max(g.size().x + 2.0 * 23.4);
         let pill = Rect::from_min_size(pos2(o.x + FOLLOW_X, o.y + FOLLOW_Y), vec2(w, FOLLOW_H));
@@ -448,7 +449,7 @@ impl App {
         let mut x = pill.max.x + (RATING_X - FOLLOW_X - FOLLOW_W);
         // Valoración: «4,7 ★ 956K» en una píldora con filo.
         if let Some((avg, n)) = show.rating {
-            let g1 = painter.layout_no_wrap(format!("{avg:.1}").replace('.', ","), theme::regular(PILL_FONT), STRONG);
+            let g1 = painter.layout_no_wrap(crate::i18n::decimal(format!("{avg:.1}")), theme::regular(PILL_FONT), STRONG);
             let g2 = painter.layout_no_wrap(compact(n), theme::regular(PILL_FONT * 0.93), WEAK);
             let w1 = g1.size().x - ink_left(&g1);
             let w2 = g2.size().x - ink_left(&g2);
@@ -463,7 +464,7 @@ impl App {
             tx += STAR + RATING_GAP2;
             let l2 = ink_left(&g2);
             text_on_baseline(&painter, pos2(tx - l2, o.y + PILL_BASE), g2, WEAK);
-            ui.interact(pill, ui.id().with("show_rating"), Sense::hover()).on_hover_text(format!("{} valoraciones", n));
+            ui.interact(pill, ui.id().with("show_rating"), Sense::hover()).on_hover_text(tr!("{} valoraciones", n));
             x = pill.max.x;
         }
         // «…»
@@ -476,12 +477,12 @@ impl App {
         let sid = show.id.clone();
         egui::Popup::menu(&more).show(|ui| {
             ui.set_min_width(200.0);
-            if Self::menu_item(ui, Some(Icon::NewTab), "Abrir en una nueva pestaña", false).clicked() {
+            if Self::menu_item(ui, Some(Icon::NewTab), t("Abrir en una nueva pestaña"), false).clicked() {
                 self.actions.push(Action::OpenInTab(Page::Show(sid.clone())));
                 ui.close();
             }
-            if Self::menu_item(ui, Some(Icon::Share), "Copiar enlace", false).clicked() {
-                self.actions.push(Action::CopyText(link.clone(), "Enlace"));
+            if Self::menu_item(ui, Some(Icon::Share), t("Copiar enlace"), false).clicked() {
+                self.actions.push(Action::CopyText(link.clone(), t("Enlace")));
                 ui.close();
             }
         });
@@ -490,13 +491,13 @@ impl App {
     /// «Todos los episodios» y, a la derecha, orden, filtro y búsqueda.
     fn episodes_toolbar(&mut self, ui: &mut egui::Ui, o: egui::Pos2, col_right: f32) {
         let painter = ui.painter().clone();
-        let g = painter.layout_no_wrap("Todos los episodios".into(), theme::bold(SEC_FONT), STRONG);
+        let g = painter.layout_no_wrap(t("Todos los episodios").into(), theme::bold(SEC_FONT), STRONG);
         text_on_baseline(&painter, pos2(o.x + LEFT - ink_left(&g), o.y + SEC_BASE), g, STRONG);
         let y = o.y + TOOL_Y;
         // Lupa (máscara de la biblioteca), con el campo de búsqueda a su izquierda al abrirla.
         let lupa_right = col_right - 9.7;
         let lupa_c = pos2(lupa_right - 11.2, y - 1.0);
-        let lr = ui.interact(Rect::from_center_size(lupa_c, vec2(34.0, 34.0)), ui.id().with("ep_search"), Sense::click()).on_hover_text("Buscar episodio");
+        let lr = ui.interact(Rect::from_center_size(lupa_c, vec2(34.0, 34.0)), ui.id().with("ep_search"), Sense::click()).on_hover_text(t("Buscar episodio"));
         let lcol = if self.album_search_open { GREEN } else if lr.hovered() { Color32::WHITE } else { WEAK };
         super::library::paint_lib_mask(&painter, "pod-search", &lm::SEARCH, lupa_c, lcol);
         if lr.clicked() {
@@ -510,7 +511,7 @@ impl App {
         if self.album_search_open {
             let field = Rect::from_min_max(pos2(right - 200.0, y - 13.0), pos2(right, y + 13.0));
             let mut f = ui.new_child(egui::UiBuilder::new().max_rect(field));
-            let r = f.add(egui::TextEdit::singleline(&mut self.album_search).hint_text("Buscar episodio").desired_width(field.width()));
+            let r = f.add(egui::TextEdit::singleline(&mut self.album_search).hint_text(t("Buscar episodio")).desired_width(field.width()));
             if self.album_search_focus {
                 self.album_search_focus = false;
                 r.request_focus();
@@ -522,8 +523,8 @@ impl App {
             right = field.min.x - 20.2;
         }
         // Filtro.
-        const FILTERS: [&str; 5] = ["Todos los episodios", "Sin escuchar", "Empezados", "Guardados", "Descargados"];
-        let fg = painter.layout_no_wrap(FILTERS[self.show_filter as usize % FILTERS.len()].into(), theme::regular(TOOL_FONT), WEAK);
+        const FILTERS: [&str; 5] = [tk!("Todos los episodios"), tk!("Sin escuchar"), tk!("Empezados"), tk!("Guardados"), tk!("Descargados")];
+        let fg = painter.layout_no_wrap(t(FILTERS[self.show_filter as usize % FILTERS.len()]).into(), theme::regular(TOOL_FONT), WEAK);
         let fw = fg.size().x - ink_left(&fg);
         let fl = fg.clone();
         let label_x = right - fw;
@@ -539,7 +540,7 @@ impl App {
         egui::Popup::menu(&fr).show(|ui| {
             ui.set_min_width(200.0);
             for (i, f) in FILTERS.iter().enumerate() {
-                if Self::menu_item(ui, None, f, self.show_filter as usize == i).clicked() {
+                if Self::menu_item(ui, None, t(*f), self.show_filter as usize == i).clicked() {
                     self.show_filter = i as u8;
                     ui.close();
                 }
@@ -547,12 +548,12 @@ impl App {
         });
         // Orden: «Nuevos» / «Antiguos».
         let right = icon_c.x - 10.15 - 21.4;
-        let sg = painter.layout_no_wrap(if self.show_sort_newest { "Nuevos" } else { "Antiguos" }.into(), theme::regular(TOOL_FONT), WEAK);
+        let sg = painter.layout_no_wrap(if self.show_sort_newest { t("Nuevos") } else { t("Antiguos") }.into(), theme::regular(TOOL_FONT), WEAK);
         let sw = sg.size().x - ink_left(&sg);
         let sx = right - sw;
         let sort_c = pos2(sx - 14.9 - 12.25, y);
         let hit = Rect::from_min_max(pos2(sort_c.x - 15.0, y - 16.0), pos2(right + 4.0, y + 16.0));
-        let sr = ui.interact(hit, ui.id().with("ep_sort"), Sense::click()).on_hover_text("Cambiar el orden");
+        let sr = ui.interact(hit, ui.id().with("ep_sort"), Sense::click()).on_hover_text(t("Cambiar el orden"));
         let scol = if sr.hovered() { Color32::WHITE } else { WEAK };
         super::library::paint_lib_mask(&painter, "pod-sort", &lm::SORT, sort_c, scol);
         let sl = ink_left(&sg);
@@ -647,7 +648,7 @@ impl App {
                 self.page_error(ui, panel, &format!("episode:{id}"), &err);
                 return;
             }
-            let g = ui.painter().layout_no_wrap("Cargando…".into(), theme::regular(15.0), WEAK);
+            let g = ui.painter().layout_no_wrap(t("Cargando…").into(), theme::regular(15.0), WEAK);
             text_on_baseline(ui.painter(), pos2(panel.min.x + LEFT, panel.min.y + 60.0), g, WEAK);
             return;
         };
@@ -742,8 +743,8 @@ impl App {
                 }
                 let err = self.video.as_ref().and_then(|v| v.error());
                 let tip = match err {
-                    Some(e) => format!("El vídeo no se pudo cargar ({e}); suena el audio"),
-                    None => if playing { "Pausar".to_string() } else { "Reproducir".to_string() },
+                    Some(e) => tr!("El vídeo no se pudo cargar ({}); suena el audio", e),
+                    None => if playing { t("Pausar").to_string() } else { t("Reproducir").to_string() },
                 };
                 video_clicked = vr.on_hover_text(tip).clicked();
             }
@@ -757,7 +758,7 @@ impl App {
             // Columna derecha.
             let text = if e.html_description.is_empty() { e.description.clone() } else { html_text(&e.html_description) };
             // El primer enlace suelto del final va aparte, como en la referencia.
-            self.podcast_right(ui, o, right, cover.as_deref(), "Acerca del episodio", &text, &[], None);
+            self.podcast_right(ui, o, right, cover.as_deref(), t("Acerca del episodio"), &text, &[], None);
         });
     }
 }

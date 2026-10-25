@@ -1,6 +1,8 @@
 #![recursion_limit = "512"]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[macro_use]
+mod i18n;
 mod ap_keeper;
 mod api;
 mod app;
@@ -190,6 +192,8 @@ fn main() {
     #[cfg(windows)]
     set_app_user_model_id();
     let settings = config::Settings::load(&paths);
+    i18n::init();
+    i18n::set(&settings.language);
     tmark("ajustes cargados");
     // `--diag`: prueba automática de letras, dispositivos, cola y reproducción (10 s), y sale.
     let diag = std::env::args().any(|a| a == "--diag");

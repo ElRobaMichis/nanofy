@@ -16,6 +16,7 @@ use super::menu_masks as mm;
 use super::theme;
 use super::widgets::{galley_truncated, text_on_baseline};
 use super::{Action, App, Page, SideTab};
+use crate::i18n::t;
 use crate::model::Track;
 
 /// Ancho del panel y de una fila.
@@ -273,32 +274,32 @@ impl App {
         let hidden = s.id.as_ref().is_some_and(|i| self.hidden_tracks.contains(i));
         match w {
             What::Download => (
-                if downloaded { "Descargada" } else if s.is_episode { "Descargar episodio" } else { "Descargar canción" }.to_string(),
+                if downloaded { t("Descargada") } else if s.is_episode { t("Descargar episodio") } else { t("Descargar canción") }.to_string(),
                 s.id.is_some() && !downloaded,
             ),
             What::Timer => (
                 match (self.sleep_at, self.sleep_end_of_track) {
-                    (Some(at), _) => format!("Temporizador ({} min)", (at.saturating_duration_since(std::time::Instant::now()).as_secs() + 59) / 60),
-                    (None, true) => "Temporizador (al terminar)".to_string(),
-                    _ => "Temporizador de apagado".to_string(),
+                    (Some(at), _) => tr!("Temporizador ({} min)", (at.saturating_duration_since(std::time::Instant::now()).as_secs() + 59) / 60),
+                    (None, true) => t("Temporizador (al terminar)").to_string(),
+                    _ => t("Temporizador de apagado").to_string(),
                 },
                 true,
             ),
-            What::Hide => ((if hidden { "Mostrar canción" } else { "Ocultar canción" }).to_string(), s.id.is_some()),
-            What::Share => ("Compartir canción".to_string(), s.track.as_ref().is_some_and(|t| !t.uri.is_empty())),
-            What::Library => ("Agregar a la biblioteca".to_string(), s.track.is_some()),
-            What::Queue => ("Agregar a la cola".to_string(), s.track.is_some()),
+            What::Hide => ((if hidden { t("Mostrar canción") } else { t("Ocultar canción") }).to_string(), s.id.is_some()),
+            What::Share => (t("Compartir canción").to_string(), s.track.as_ref().is_some_and(|t| !t.uri.is_empty())),
+            What::Library => (t("Agregar a la biblioteca").to_string(), s.track.is_some()),
+            What::Queue => (t("Agregar a la cola").to_string(), s.track.is_some()),
             What::Remove => (
-                (if s.remove_from.as_deref() == Some("queue") { "Quitar de la cola" } else { "Quitar de esta playlist" }).to_string(),
+                (if s.remove_from.as_deref() == Some("queue") { t("Quitar de la cola") } else { t("Quitar de esta playlist") }).to_string(),
                 s.track.is_some() && s.remove_from.is_some(),
             ),
-            What::Radio => ("Ir a la radio de la canción".to_string(), s.id.is_some() && !s.is_episode),
+            What::Radio => (t("Ir a la radio de la canción").to_string(), s.id.is_some() && !s.is_episode),
             // Sin el álbum a mano (canciones del historial guardadas sin él) se busca al elegirlo.
-            What::Album => ("Ver álbum".to_string(), s.album_id.is_some() || (s.id.is_some() && !s.is_episode)),
-            What::Artist => ("Ver artista".to_string(), !s.artists.is_empty()),
-            What::Miniplayer => ((if self.miniplayer { "Salir del miniplayer" } else { "Miniplayer" }).to_string(), true),
-            What::Fullscreen => ((if self.fullscreen { "Salir de pantalla completa" } else { "Pantalla completa" }).to_string(), true),
-            What::Jam => ((if self.jam.is_some() { "Jam" } else { "Iniciar una Jam" }).to_string(), true),
+            What::Album => (t("Ver álbum").to_string(), s.album_id.is_some() || (s.id.is_some() && !s.is_episode)),
+            What::Artist => (t("Ver artista").to_string(), !s.artists.is_empty()),
+            What::Miniplayer => ((if self.miniplayer { t("Salir del miniplayer") } else { t("Miniplayer") }).to_string(), true),
+            What::Fullscreen => ((if self.fullscreen { t("Salir de pantalla completa") } else { t("Pantalla completa") }).to_string(), true),
+            What::Jam => ((if self.jam.is_some() { "Jam" } else { t("Iniciar una Jam") }).to_string(), true),
         }
     }
 
@@ -306,10 +307,10 @@ impl App {
     fn more_sub_items(&self, w: What, s: &Song) -> Vec<(Pick, String)> {
         match w {
             What::Timer => {
-                let mut v: Vec<(Pick, String)> = [15u64, 30, 45, 60].iter().map(|&m| (Pick::Timer(m), format!("{m} minutos"))).collect();
-                v.push((Pick::TimerEnd, "Al terminar la canción".into()));
+                let mut v: Vec<(Pick, String)> = [15u64, 30, 45, 60].iter().map(|&m| (Pick::Timer(m), tr!("{} minutos", m))).collect();
+                v.push((Pick::TimerEnd, t("Al terminar la canción").into()));
                 if self.sleep_at.is_some() || self.sleep_end_of_track {
-                    v.push((Pick::TimerCancel, "Cancelar temporizador".into()));
+                    v.push((Pick::TimerCancel, t("Cancelar temporizador").into()));
                 }
                 v
             }
@@ -317,12 +318,12 @@ impl App {
                 let liked = s.id.as_ref().is_some_and(|i| self.liked_set.contains(i));
                 let mut v = Vec::new();
                 if s.id.is_some() {
-                    v.push((Pick::Like(!liked), if liked { "Quitar de Canciones que te gustan" } else { "Canciones que te gustan" }.to_string()));
+                    v.push((Pick::Like(!liked), if liked { t("Quitar de Canciones que te gustan") } else { t("Canciones que te gustan") }.to_string()));
                 }
-                v.push((Pick::AddToPlaylist, "Añadir a una playlist…".into()));
+                v.push((Pick::AddToPlaylist, t("Añadir a una playlist…").into()));
                 v
             }
-            What::Queue => vec![(Pick::QueueEnd, "Al final de la cola".into()), (Pick::OpenQueue, "Abrir la cola".into())],
+            What::Queue => vec![(Pick::QueueEnd, t("Al final de la cola").into()), (Pick::OpenQueue, t("Abrir la cola").into())],
             What::Artist => s.artists.iter().map(|(name, aid)| (Pick::Artist(aid.clone()), name.clone())).collect(),
             _ => Vec::new(),
         }
@@ -456,7 +457,7 @@ impl App {
                 }
                 What::Share => {
                     if let Some(t) = &s.track {
-                        self.actions.push(Action::CopyText(super::widgets::uri_to_link(&t.uri), "Enlace"));
+                        self.actions.push(Action::CopyText(super::widgets::uri_to_link(&t.uri), crate::i18n::t("Enlace")));
                     }
                 }
                 What::Remove => {
@@ -485,13 +486,13 @@ impl App {
                 Pick::Timer(m) => {
                     self.sleep_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(m * 60));
                     self.set_sleep_end_of_track(false);
-                    self.status(format!("Se pausará en {m} minutos"));
+                    self.status(tr!("Se pausará en {} minutos", m));
                 }
                 Pick::TimerEnd => {
                     // Suspende el fundido hasta que se cumpla (ver `set_sleep_end_of_track`).
                     self.set_sleep_end_of_track(true);
                     self.sleep_at = None;
-                    self.status("Se pausará al terminar la canción");
+                    self.status(t("Se pausará al terminar la canción"));
                 }
                 Pick::TimerCancel => {
                     self.sleep_at = None;

@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::backend::Shared;
 use crate::bus::{Msg, UiTx};
+use crate::i18n::t;
 use crate::model::*;
 use crate::pathfinder::{PfErr, Pathfinder};
 use crate::webauth::{WebAuth, WebChain};
@@ -963,7 +964,7 @@ impl Api {
                     result: result.map(|()| Resp::WebConnected),
                 }));
             })
-            .map_err(|e| format!("no se pudo crear el hilo de la autorización: {e}"))?;
+            .map_err(|e| tr!("no se pudo crear el hilo de la autorización: {}", e))?;
         if open {
             crate::webauth::open_in_browser(&chain.url);
         }
@@ -1164,7 +1165,7 @@ impl Client {
         let session = self.session()?;
         let token = self
             .block(TIMEOUT_ITEM, session.login5().auth_token())
-            .map_err(|e| format!("token: {e}"))?;
+            .map_err(|e| tr!("token: {}", e))?;
         Ok((token.access_token, false))
     }
 
@@ -1292,7 +1293,7 @@ impl Client {
                 let session = self.session()?;
                 let token = self
                     .block(TIMEOUT_ITEM, session.login5().auth_token())
-                    .map_err(|e| format!("token: {e}"))?;
+                    .map_err(|e| tr!("token: {}", e))?;
                 v.push((token.access_token, false, false));
             }
             v
@@ -1380,7 +1381,7 @@ impl Client {
                         }
                     }
                 };
-                let mut resp = resp.map_err(|e| format!("red: {e}"))?;
+                let mut resp = resp.map_err(|e| tr!("red: {}", e))?;
                 let status = resp.status().as_u16();
                 if status != 429 {
                     // Respondió sin limitar: el token vuelve a estar libre para las lecturas. Solo
@@ -1434,7 +1435,7 @@ impl Client {
                     // o la caché). Un token que no es de app propia (login5) sin cuota -> avisar.
                     if !write {
                         if !own_app {
-                            return Err(NO_APP_HINT.to_string());
+                            return Err(t(NO_APP_HINT).to_string());
                         }
                         // Las demás lecturas saltan este token hasta que pase el Retry-After, en
                         // vez de gastar otra llamada cada una para descubrir el mismo 429.
@@ -2196,7 +2197,7 @@ impl Client {
         let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}")).map_err(|e| e.to_string())?;
         let a = self
             .block(TIMEOUT_ITEM, librespot_metadata::Artist::get(&session, &uri))
-            .map_err(|e| format!("artista: {e}"))?;
+            .map_err(|e| tr!("artista: {}", e))?;
         Ok(self.artist_from_meta(id, &a))
     }
 
@@ -2497,13 +2498,16 @@ impl Client {
         if ids.is_empty() {
             return Vec::new();
         }
-        let Some(l) = get(&format!("{API}?action=wbgetentities&ids={}&props=labels&languages=es|en&format=json", ids.join("|"))) else {
+        // Etiqueta en el idioma de la interfaz o, si no hay, en inglés.
+        let lang = crate::i18n::current();
+        let languages = if lang == "en" { "en".to_string() } else { format!("{lang}|en") };
+        let Some(l) = get(&format!("{API}?action=wbgetentities&ids={}&props=labels&languages={languages}&format=json", ids.join("|"))) else {
             return Vec::new();
         };
         ids.iter()
             .filter_map(|id| {
                 let labels = &l["entities"][id]["labels"];
-                labels["es"]["value"].as_str().or_else(|| labels["en"]["value"].as_str()).map(str::to_string)
+                labels[lang]["value"].as_str().or_else(|| labels["en"]["value"].as_str()).map(str::to_string)
             })
             .collect()
     }
@@ -2514,7 +2518,7 @@ impl Client {
         let uri = SpotifyUri::from_uri(&format!("spotify:album:{id}")).map_err(|e| e.to_string())?;
         let a = self
             .block(TIMEOUT_ITEM, librespot_metadata::Album::get(&session, &uri))
-            .map_err(|e| format!("álbum: {e}"))?;
+            .map_err(|e| tr!("álbum: {}", e))?;
         let ids: Vec<String> = a.discs.iter().flat_map(|d| d.tracks.iter()).filter_map(|u| u.to_id().ok()).collect();
         let tracks = self.tracks_by_ids(&ids)?;
         let total = tracks.len() as u32;
@@ -2617,7 +2621,7 @@ impl Client {
         let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}")).map_err(|e| e.to_string())?;
         let a = self
             .block(TIMEOUT_ITEM, librespot_metadata::Artist::get(&session, &uri))
-            .map_err(|e| format!("artista: {e}"))?;
+            .map_err(|e| tr!("artista: {}", e))?;
         // Un fallo de las populares llega como el de Req::ArtistTop y no impide la vista.
         let top = self.tracks_by_ids(&top_track_ids(&a, &session.country()));
         ui.send(Msg::Api(ApiResult { req: Req::ArtistTop(id.to_string()), result: top.map(Resp::ArtistTop) }));
@@ -2707,7 +2711,7 @@ impl Client {
         let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}")).map_err(|e| e.to_string())?;
         let artist = self
             .block(TIMEOUT_ITEM, librespot_metadata::Artist::get(&session, &uri))
-            .map_err(|e| format!("artista: {e}"))?;
+            .map_err(|e| tr!("artista: {}", e))?;
         // Cada grupo agrupa versiones del mismo álbum: nos quedamos con la primera.
         let mut uris: Vec<SpotifyUri> = Vec::new();
         for group in artist.albums.iter().chain(artist.singles.iter()) {
@@ -2870,7 +2874,7 @@ impl Client {
         // Que no llegue ninguna es un fallo (sin red, el limitador), no una lista vacía: así
         // quien pidió conserva lo que tenía en vez de quedarse sin pistas.
         match first_err {
-            Some(e) if out.is_empty() => Err(format!("pistas: {e}")),
+            Some(e) if out.is_empty() => Err(tr!("pistas: {}", e)),
             _ => Ok(out),
         }
     }
@@ -3072,10 +3076,10 @@ impl Client {
         let body = opts.write_to_bytes().map_err(|e| e.to_string())?;
         // Ruta observada en el reproductor web: POST …/permission-grant (con guion).
         let out = self.spclient_pb(http::Method::POST, &format!("/playlist-permission/v1/playlist/{playlist}/permission-grant"), Some(&body))?;
-        let grant = PermissionGrant::parse_from_bytes(&out).map_err(|e| format!("invitación: {e}"))?;
+        let grant = PermissionGrant::parse_from_bytes(&out).map_err(|e| tr!("invitación: {}", e))?;
         let token = grant.token().to_string();
         if token.is_empty() {
-            return Err("Spotify no devolvió un enlace de invitación".into());
+            return Err(t("Spotify no devolvió un enlace de invitación").into());
         }
         Ok(format!("https://open.spotify.com/playlist/{playlist}?pi={token}"))
     }
@@ -3093,15 +3097,15 @@ impl Client {
             let info = s.spawn(|| self.pf.query(crate::pathfinder::GET_TRACK, serde_json::json!({ "uri": uri })));
             let credits = s.spawn(|| self.spclient(http::Method::GET, &format!("/track-credits-view/v0/experimental/{id}/credits")));
             let related = s.spawn(|| self.pf.query(crate::pathfinder::TRACK_RECOMMEND, serde_json::json!({ "uri": uri, "limit": 20 })));
-            let join = |h: std::thread::ScopedJoinHandle<'_, Result<String, String>>| h.join().unwrap_or_else(|_| Err("el hilo falló".into()));
-            let joinv = |h: std::thread::ScopedJoinHandle<'_, Result<Value, String>>| h.join().unwrap_or_else(|_| Err("el hilo falló".into()));
+            let join = |h: std::thread::ScopedJoinHandle<'_, Result<String, String>>| h.join().unwrap_or_else(|_| Err(t("el hilo falló").into()));
+            let joinv = |h: std::thread::ScopedJoinHandle<'_, Result<Value, String>>| h.join().unwrap_or_else(|_| Err(t("el hilo falló").into()));
             (joinv(info), join(credits), joinv(related))
         });
         let mut page = match info.as_ref().ok().and_then(crate::pathfinder::map_track_page) {
             Some(p) => p,
             None => {
                 log::info!("[canción] {id}: sin getTrack ({}); de los metadatos internos", info.as_ref().err().map_or("respuesta sin pista", |e| e.as_str()));
-                let t = self.tracks_by_ids(std::slice::from_ref(&id.to_string()))?.pop().ok_or_else(|| "pista no encontrada".to_string())?;
+                let t = self.tracks_by_ids(std::slice::from_ref(&id.to_string()))?.pop().ok_or_else(|| t("pista no encontrada").to_string())?;
                 TrackPage {
                     id: id.to_string(),
                     uri: t.uri.clone(),
@@ -3133,7 +3137,7 @@ impl Client {
         let first = page.artists.first().map(|a| (a.id.clone(), a.name.clone()));
         if let Some((aid, artist)) = &first {
             let album = page.album.as_ref().map(|a| a.name.as_str());
-            page.genres = self.genres_or_queue_song(&format!("song:{id}"), artist, album, Some(&page.name));
+            page.genres = self.genres_or_queue_song(&song_genres_key(&id), artist, album, Some(&page.name));
             if page.genres.is_empty() {
                 page.genres = page
                     .album
@@ -3503,7 +3507,7 @@ impl Client {
                     // ya envía esos mismos metadatos y solo ocuparía un hilo.
                     Err(e)
                         if retry_secs(&e).is_some()
-                            || e == NO_APP_HINT
+                            || e == t(NO_APP_HINT)
                             || e.starts_with("Spotify ha agotado la cuota")
                             || e.starts_with("Spotify está limitando") =>
                     {
@@ -3784,7 +3788,7 @@ impl Client {
                 });
                 let cards = pf::map_browse_all(&all?);
                 if cards.is_empty() {
-                    return Err("Spotify no devolvió categorías".into());
+                    return Err(t("Spotify no devolvió categorías").into());
                 }
                 log::info!("[explorar] {} categorías, {} de pódcasts y {} de audiolibros", cards.len(), podcasts.len(), audiobooks.len());
                 Ok(Resp::Browse(BrowseData { cards, podcasts, audiobooks, fetched_at: crate::cache::now_secs() }))
@@ -3810,7 +3814,7 @@ impl Client {
                 Ok(Resp::Done)
             }
             // Se atiende en su propio hilo (`Api::send`); aquí no llega.
-            Req::LikedGenres { .. } => Err("los géneros de Me gusta van por su hilo".into()),
+            Req::LikedGenres { .. } => Err(t("los géneros de Me gusta van por su hilo").into()),
             Req::Genres { key } => Ok(Resp::Genres {
                 key: key.clone(),
                 genres: self.cached_genres(key).unwrap_or_default(),
@@ -3836,12 +3840,12 @@ impl Client {
                 let uri = v["mediaItems"][0]["uri"].as_str().unwrap_or("");
                 match uri.strip_prefix("spotify:playlist:") {
                     Some(pid) => Ok(Resp::RadioPlaylist { playlist_id: pid.to_string() }),
-                    None => Err("Spotify no devolvió una radio para esta canción".into()),
+                    None => Err(t("Spotify no devolvió una radio para esta canción").into()),
                 }
             }
             Req::TrackInfo(id) => {
                 let mut v = self.tracks_by_ids(std::slice::from_ref(id))?;
-                v.pop().map(Resp::TrackInfo).ok_or_else(|| "pista no encontrada".to_string())
+                v.pop().map(Resp::TrackInfo).ok_or_else(|| t("pista no encontrada").to_string())
             }
             Req::TrackPage(id) => self.track_page(id).map(|p| Resp::TrackPage(Box::new(p))),
             Req::Genius { id, name, artist } => self.genius(name, artist).map(|song| Resp::Genius { id: id.clone(), song }),
@@ -3854,7 +3858,7 @@ impl Client {
                     .map_err(|e| e.to_string())?;
                 let artist = self
                     .block(TIMEOUT_ITEM, librespot_metadata::Artist::get(&session, &uri))
-                    .map_err(|e| format!("artista: {e}"))?;
+                    .map_err(|e| tr!("artista: {}", e))?;
                 Ok(Resp::ArtistTop(self.tracks_by_ids(&top_track_ids(&artist, &session.country()))?))
             }
             Req::ArtistAlbums(id) => {
@@ -3897,11 +3901,11 @@ impl Client {
                         Err(PfErr::Empty(r)) => {
                             self.pf.ok(&hash);
                             empty = Some(r);
-                            "pathfinder no encontró nada".to_string()
+                            t("pathfinder no encontró nada").to_string()
                         }
                         Err(PfErr::UnknownHash) => {
                             self.pf.reject(&hash, q);
-                            "hash de searchDesktop rechazado".to_string()
+                            t("hash de searchDesktop rechazado").to_string()
                         }
                         Err(PfErr::Down(e)) => {
                             self.pf.down(&e);
@@ -3910,7 +3914,7 @@ impl Client {
                         Err(PfErr::Limited(secs)) => {
                             self.pf.limited(secs);
                             retry = Some(secs);
-                            format!("pathfinder limita {secs} s")
+                            tr!("pathfinder limita {} s", secs)
                         }
                         Err(PfErr::Failed(e)) => e,
                     },
@@ -3923,7 +3927,7 @@ impl Client {
                     }
                     return Err(match retry {
                         Some(secs) => throttle_message(secs),
-                        None => format!("La búsqueda no respondió ({why}). {}", cooldown_message(left)),
+                        None => tr!("La búsqueda no respondió ({}). {}", why, cooldown_message(left)),
                     });
                 }
                 match self.search_web(q) {
@@ -4107,8 +4111,8 @@ impl Client {
                 Ok(Resp::AlbumSaved { id: id.clone(), saved: false })
             }
             Req::HomeFeed => {
-                let text = self.spclient(http::Method::GET, "/homeview/v1/home?platform=web&locale=es")?;
-                let v: Value = serde_json::from_str(&text).map_err(|e| format!("inicio: {e}"))?;
+                let text = self.spclient(http::Method::GET, &format!("/homeview/v1/home?platform=web&locale={}", crate::i18n::current()))?;
+                let v: Value = serde_json::from_str(&text).map_err(|e| tr!("inicio: {}", e))?;
                 Ok(Resp::HomeFeed(parse_home(&v)))
             }
             Req::FolderCreate { name, playlists } => {
@@ -4182,7 +4186,7 @@ impl Client {
                     list.remove(idx);
                 }
                 if ops.is_empty() {
-                    return Err("carpeta no encontrada".into());
+                    return Err(t("carpeta no encontrada").into());
                 }
                 self.rootlist_changes(rev, ops)?;
                 Ok(Resp::RootlistChanged)
@@ -4193,7 +4197,7 @@ impl Client {
                 let (rev, list) = self.rootlist_raw()?;
                 let start_p = format!("spotify:start-group:{id}:");
                 let Some(idx) = list.iter().position(|u| u.starts_with(&start_p)) else {
-                    return Err("carpeta no encontrada".into());
+                    return Err(t("carpeta no encontrada").into());
                 };
                 // UPDATE_ITEM_URIS no está admitido en el rootlist: se quita la marca de inicio y se
                 // vuelve a añadir con el nombre nuevo en el mismo sitio (mismo id → misma carpeta).
@@ -4220,12 +4224,12 @@ impl Client {
                 let (rev, list) = self.rootlist_raw()?;
                 let uri = format!("spotify:playlist:{playlist}");
                 let Some(from) = list.iter().position(|u| u == &uri) else {
-                    return Err("la playlist no está en tu biblioteca".into());
+                    return Err(t("la playlist no está en tu biblioteca").into());
                 };
                 let to = match folder {
                     Some(fid) => {
                         let end = format!("spotify:end-group:{fid}");
-                        list.iter().position(|u| u == &end).ok_or("carpeta no encontrada")?
+                        list.iter().position(|u| u == &end).ok_or(t("carpeta no encontrada"))?
                     }
                     None => 0,
                 };
@@ -4257,7 +4261,7 @@ impl Client {
                 use librespot_protocol::playlist_permission::{GetMemberPermissionsResponse, PermissionLevel};
                 use protobuf::Message;
                 let out = self.spclient_pb(http::Method::GET, &format!("/playlist-permission/v1/playlist/{pid}/permission/members"), None)?;
-                let resp = GetMemberPermissionsResponse::parse_from_bytes(&out).map_err(|e| format!("miembros: {e}"))?;
+                let resp = GetMemberPermissionsResponse::parse_from_bytes(&out).map_err(|e| tr!("miembros: {}", e))?;
                 let mut members: Vec<(String, bool)> = resp
                     .member_permissions
                     .iter()
@@ -4431,7 +4435,7 @@ audio {:?}",
                     .map(|c| c.file_path(librespot_core::FileId::from_raw(&[0u8; 20])).is_some())
                     .unwrap_or(false);
                 if !cache_ok {
-                    return Err("la caché de audio está desactivada (Ajustes → Caché de audio)".into());
+                    return Err(t("la caché de audio está desactivada (Ajustes → Caché de audio)").into());
                 }
                 // Hilo propio: una descarga tarda segundos y no debe bloquear las peticiones de la interfaz.
                 let handle = self.handle.clone();
@@ -4469,7 +4473,7 @@ audio {:?}",
                     })),
                 )?;
                 let p: Playlist =
-                    serde_json::from_str(&text).map_err(|e| format!("respuesta inesperada: {e}"))?;
+                    serde_json::from_str(&text).map_err(|e| tr!("respuesta inesperada: {}", e))?;
                 Ok(Resp::PlaylistCreated(p))
             }
             Req::UpdatePlaylist {
@@ -4561,9 +4565,9 @@ audio {:?}",
                 let session = self.session()?;
                 let bytes = self
                     .block(TIMEOUT_ITEM, session.spclient().get_user_profile(id, Some(50), Some(0)))
-                    .map_err(|e| format!("perfil: {e}"))?;
+                    .map_err(|e| tr!("perfil: {}", e))?;
                 let v: Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| format!("perfil: respuesta inesperada: {e}"))?;
+                    .map_err(|e| tr!("perfil: respuesta inesperada: {}", e))?;
                 let img = |v: &Value| -> Option<Vec<Image>> {
                     v.as_str().filter(|s| !s.is_empty()).map(|u| {
                         vec![Image {
@@ -4666,7 +4670,7 @@ audio {:?}",
                 })
             }
             // Van por el carril de enriquecimiento (`run_lyrics`), que las pide en paralelo.
-            Req::Lyrics { .. } | Req::LyricsPrefetch { .. } => Err("las letras van por su carril".into()),
+            Req::Lyrics { .. } | Req::LyricsPrefetch { .. } => Err(t("las letras van por su carril").into()),
             Req::JamCurrent => {
                 let session = self.session()?;
                 let endpoint = format!(
@@ -4719,7 +4723,7 @@ audio {:?}",
                         }
                     }
                 }
-                Err(format!("Jam: no se pudo salir ({last})"))
+                Err(tr!("Jam: no se pudo salir ({})", last))
             }
             Req::JamEnd(session_id) => {
                 let _ = self.spclient(
@@ -4744,9 +4748,9 @@ audio {:?}",
                     let (meta, first) = std::thread::scope(|s| {
                         let f = s.spawn(|| page(0));
                         let meta = self.pf.query(pf::SHOW_META, serde_json::json!({"uri": uri, "includeContentCapabilityTrait": true, "includeEpisodeContentRatingsV2": false}));
-                        (meta, f.join().unwrap_or_else(|_| Err("el hilo falló".into())))
+                        (meta, f.join().unwrap_or_else(|_| Err(t("el hilo falló").into())))
                     });
-                    let show = pf::map_show_meta(&meta?).ok_or("podcast sin datos")?;
+                    let show = pf::map_show_meta(&meta?).ok_or(t("podcast sin datos"))?;
                     let (mut episodes, mut next, _) = pf::map_show_episodes(&first?);
                     ui.send(Msg::Api(ApiResult { req: req.clone(), result: Ok(Resp::Show { show: show.clone(), episodes: episodes.clone() }) }));
                     for _ in 0..3 {
@@ -4773,19 +4777,19 @@ audio {:?}",
             Req::VideoManifest(id) => {
                 let session = self.session()?;
                 let uri = SpotifyUri::from_uri(&format!("spotify:episode:{id}")).map_err(|e| e.to_string())?;
-                let ep = self.block(TIMEOUT_ITEM, librespot_metadata::Episode::get(&session, &uri)).map_err(|e| format!("episodio: {e}"))?;
-                let file = ep.videos.first().ok_or("el episodio no tiene vídeo")?;
+                let ep = self.block(TIMEOUT_ITEM, librespot_metadata::Episode::get(&session, &uri)).map_err(|e| tr!("episodio: {}", e))?;
+                let file = ep.videos.first().ok_or(t("el episodio no tiene vídeo"))?;
                 // El id del vídeo son los 16 primeros bytes del archivo (el resto, relleno).
                 let hex = file.to_base16().map_err(|e| e.to_string())?;
                 let source = hex.get(..32).unwrap_or(&hex);
                 let text = self.spclient(http::Method::GET, &format!("/manifests/v9/json/sources/{source}/options/supports_drm"))?;
-                let v: Value = serde_json::from_str(&text).map_err(|e| format!("manifiesto: {e}"))?;
+                let v: Value = serde_json::from_str(&text).map_err(|e| tr!("manifiesto: {}", e))?;
                 let manifest = crate::video::parse_manifest(&v)?;
                 Ok(Resp::VideoManifest { episode: id.clone(), manifest })
             }
             Req::Episode(id) => {
                 let v = self.pf.query(crate::pathfinder::EPISODE, serde_json::json!({"uri": format!("spotify:episode:{id}"), "includeEpisodeContentRatingsV2": false}))?;
-                Ok(Resp::Episode(crate::pathfinder::map_episode(&v).ok_or("episodio sin datos")?))
+                Ok(Resp::Episode(crate::pathfinder::map_episode(&v).ok_or(t("episodio sin datos"))?))
             }
             Req::Show(id) | Req::ShowPlain(id) => {
                 // Web API si está disponible; si no, metadatos internos.
@@ -4843,7 +4847,7 @@ audio {:?}",
 /// Lectura de la Web API sin la biblioteca conectada (el token de login5 recibió un 429). No es
 /// pasajero: hasta conectar la biblioteca seguirá igual, así que no promete reintentar. Se compara
 /// por valor (`Req::PlaylistMeta`) y la barra lateral le añade «Conectar con Spotify».
-pub const NO_APP_HINT: &str = "Conecta tu biblioteca con Spotify (no hace falta crear ninguna app).";
+pub const NO_APP_HINT: &str = tk!("Conecta tu biblioteca con Spotify (no hace falta crear ninguna app).");
 
 /// Metadatos de una playlist a partir de su playlist4 (la misma descarga que trae las pistas).
 /// Sin nombre visible del propietario, privacidad ni seguidores (solo los da la Web API); el
@@ -4931,7 +4935,7 @@ fn library_from_rootlist(contents: &librespot_protocol::playlist4_external::List
     } else if metas.len() == items.len() - groups {
         items.iter().filter(|i| !rootlist_group(i.uri())).zip(metas.iter()).collect()
     } else {
-        return Err(format!("rootlist: {} metadatos para {} entradas ({groups} de carpetas)", metas.len(), items.len()));
+        return Err(tr!("rootlist: {} metadatos para {} entradas ({} de carpetas)", metas.len(), items.len(), groups));
     };
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(pairs.len());
@@ -4974,7 +4978,7 @@ fn library_from_rootlist(contents: &librespot_protocol::playlist4_external::List
         });
     }
     if !out.is_empty() && out.iter().all(|p| p.name.is_empty()) {
-        return Err(format!("rootlist: {} playlists sin atributos", out.len()));
+        return Err(tr!("rootlist: {} playlists sin atributos", out.len()));
     }
     Ok(out)
 }
@@ -5058,7 +5062,7 @@ fn block_timeout<T, E: std::fmt::Display>(
 }
 
 fn timeout_message(d: Duration) -> String {
-    format!("Spotify no respondió en {} s", d.as_secs())
+    tr!("Spotify no respondió en {} s", d.as_secs())
 }
 
 /// Plazo de una petición a spclient según su método: las escrituras con más margen (ver
@@ -5233,9 +5237,9 @@ async fn batch_retry<M: librespot_metadata::Metadata + Clone>(
             let wait = wait.clamp(Duration::from_millis(400), Duration::from_secs(10));
             log::warn!("metadatos por lotes: {e}; se reintenta en {} ms", wait.as_millis());
             tokio::time::sleep(wait).await;
-            batch_chunk(session, keys, kind, singles, seed).await.map_err(|(e, _)| format!("metadatos por lotes: {e}"))
+            batch_chunk(session, keys, kind, singles, seed).await.map_err(|(e, _)| tr!("metadatos por lotes: {}", e))
         }
-        Err((e, None)) => Err(format!("metadatos por lotes: {e}")),
+        Err((e, None)) => Err(tr!("metadatos por lotes: {}", e)),
     }
 }
 
@@ -5304,7 +5308,7 @@ fn slim_track(mut t: Track) -> Track {
 
 /// Lee una imagen, la reduce y la codifica como JPEG de menos de 256 KB (límite de Spotify).
 fn encode_cover(path: &PathBuf) -> Result<Vec<u8>, String> {
-    let img = image::open(path).map_err(|e| format!("no se pudo abrir la imagen: {e}"))?;
+    let img = image::open(path).map_err(|e| tr!("no se pudo abrir la imagen: {}", e))?;
     let mut side = 640u32;
     let mut quality = 88u8;
     for _ in 0..6 {
@@ -5312,14 +5316,14 @@ fn encode_cover(path: &PathBuf) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
         enc.encode_image(&small)
-            .map_err(|e| format!("no se pudo codificar la imagen: {e}"))?;
+            .map_err(|e| tr!("no se pudo codificar la imagen: {}", e))?;
         if out.len() < 190 * 1024 {
             return Ok(out);
         }
         side = (side * 3 / 4).max(160);
         quality = quality.saturating_sub(10).max(50);
     }
-    Err("la imagen es demasiado grande incluso reducida".to_string())
+    Err(t("la imagen es demasiado grande incluso reducida").to_string())
 }
 
 /// Retry-After del 429 simulado: el que da Spotify cuando la cuota compartida está saturada.
@@ -5342,6 +5346,15 @@ fn fake_429_web() -> bool {
 /// Lista separada por comas; de momento solo se entiende `web`.
 fn fake_429_parse(v: Option<&str>) -> bool {
     v.is_some_and(|v| v.split(',').any(|p| p.trim().eq_ignore_ascii_case("web")))
+}
+
+/// Clave de los géneros de una canción: salen de Wikidata con la etiqueta en el idioma de la
+/// interfaz, así que la caché los guarda aparte por idioma (en español, la clave de siempre).
+pub fn song_genres_key(id: &str) -> String {
+    match crate::i18n::current() {
+        "es" => format!("song:{id}"),
+        lang => format!("song:{id}@{lang}"),
+    }
 }
 
 fn cooldown_message(secs: u64) -> String {
@@ -5381,9 +5394,9 @@ fn http_error(status: u16, text: &str) -> String {
         .and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| text.chars().take(120).collect());
     match status {
-        401 => "Spotify rechazó la sesión (401). Cierra sesión y vuelve a entrar.".to_string(),
-        403 => format!("Spotify no lo permite (403): {msg}"),
-        404 => format!("No encontrado (404): {msg}"),
+        401 => t("Spotify rechazó la sesión (401). Cierra sesión y vuelve a entrar.").to_string(),
+        403 => tr!("Spotify no lo permite (403): {}", msg),
+        404 => tr!("No encontrado (404): {}", msg),
         _ => format!("HTTP {status}: {msg}"),
     }
 }
@@ -5418,17 +5431,17 @@ fn download_track(
     let files: librespot_metadata::audio::AudioFiles = if episode {
         let uri = SpotifyUri::from_uri(&format!("spotify:episode:{id}")).map_err(|e| e.to_string())?;
         let ep = block_timeout(handle, TIMEOUT_DOWNLOAD_META, librespot_metadata::Episode::get(session, &uri))
-            .map_err(|e| format!("episodio: {e}"))?;
+            .map_err(|e| tr!("episodio: {}", e))?;
         ep.audio.clone()
     } else {
         let uri = SpotifyUri::from_uri(&format!("spotify:track:{id}")).map_err(|e| e.to_string())?;
         let mut track = block_timeout(handle, TIMEOUT_DOWNLOAD_META, librespot_metadata::Track::get(session, &uri))
-            .map_err(|e| format!("pista: {e}"))?;
+            .map_err(|e| tr!("pista: {}", e))?;
         if track.files.0.is_empty() {
             // Sin archivo en esta región: se prueba la primera alternativa.
-            let alt = track.alternatives.first().cloned().ok_or("sin archivo de audio disponible")?;
+            let alt = track.alternatives.first().cloned().ok_or(t("sin archivo de audio disponible"))?;
             track = block_timeout(handle, TIMEOUT_DOWNLOAD_META, librespot_metadata::Track::get(session, &alt))
-                .map_err(|e| format!("pista: {e}"))?;
+                .map_err(|e| tr!("pista: {}", e))?;
         }
         track.files.clone()
     };
@@ -5438,7 +5451,7 @@ fn download_track(
     // la quiere, y el reproductor elige ese fichero porque va primero en su orden.
     let order = librespot_playback::player::format_order(quality.bitrate());
     let (_, file_id) = librespot_playback::player::pick_audio_file(order, &track.files, |_| false)
-        .ok_or("sin formato de audio compatible")?;
+        .ok_or(t("sin formato de audio compatible"))?;
     // Ritmo estimado (bytes/s) para el primer tramo; la descarga sigue entera de todos modos.
     let mut file = handle
         .block_on(librespot_audio::AudioFile::open(session, file_id, 40_000))
@@ -5447,7 +5460,7 @@ fn download_track(
         return Ok(());
     }
     // Leer hasta el final fuerza la descarga completa; librespot la guarda en la caché al terminar.
-    std::io::copy(&mut file, &mut std::io::sink()).map_err(|e| format!("descarga: {e}"))?;
+    std::io::copy(&mut file, &mut std::io::sink()).map_err(|e| tr!("descarga: {}", e))?;
     Ok(())
 }
 
@@ -5494,7 +5507,7 @@ fn parse_home(v: &Value) -> Vec<HomeSection> {
                         if let Some(sec) = out.iter_mut().find(|s| s.id == section_id) {
                             sec.items.push(item);
                         } else {
-                            out.push(HomeSection { id: section_id, title: "Escuchado recientemente".into(), items: vec![item] });
+                            out.push(HomeSection { id: section_id, title: t("Escuchado recientemente").into(), items: vec![item] });
                         }
                     }
                 }
@@ -5539,7 +5552,7 @@ fn urldecode(s: &str) -> String {
 /// la app de desarrollo). El corazón y guardar necesitan que la cuenta esté en «User Management».
 fn like_error(e: String) -> String {
     if e.contains("403") || e.contains("Forbidden") || e.contains("404") {
-        "Spotify no permite modificar «Me gusta» desde apps de terceros en modo desarrollo.          Alternativa: añade la canción a una playlist (eso sí funciona)."
+        t("Spotify no permite modificar «Me gusta» desde apps de terceros en modo desarrollo.          Alternativa: añade la canción a una playlist (eso sí funciona).")
             .to_string()
     } else {
         e

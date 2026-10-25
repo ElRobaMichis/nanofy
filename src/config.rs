@@ -1,6 +1,8 @@
 //! Rutas de la aplicación y ajustes persistentes (un único `settings.json`).
 
 use directories::ProjectDirs;
+
+use crate::i18n::t;
 use serde::{Deserialize, Serialize};
 use std::hash::{BuildHasher, Hasher, RandomState};
 use std::path::PathBuf;
@@ -76,9 +78,9 @@ impl Quality {
     /// nombres de antes, comparar «Alta» con «Alta» era comparar 320 con 160 kbps.
     pub fn label(self) -> &'static str {
         match self {
-            Quality::Low => "Normal · 96 kbps",
-            Quality::Normal => "Alta · 160 kbps",
-            Quality::High => "Muy alta · 320 kbps",
+            Quality::Low => t("Normal · 96 kbps"),
+            Quality::Normal => t("Alta · 160 kbps"),
+            Quality::High => t("Muy alta · 320 kbps"),
         }
     }
 
@@ -119,17 +121,17 @@ pub enum Loudness {
 impl Loudness {
     pub fn label(self) -> &'static str {
         match self {
-            Loudness::Loud => "Alto",
-            Loudness::Normal => "Normal",
-            Loudness::Quiet => "Bajo",
+            Loudness::Loud => t("Alto"),
+            Loudness::Normal => t("Normal"),
+            Loudness::Quiet => t("Bajo"),
         }
     }
 
     pub fn hint(self) -> &'static str {
         match self {
-            Loudness::Loud => "−11 LUFS, con limitador · para ambientes ruidosos",
-            Loudness::Normal => "−14 LUFS · el predeterminado de Spotify",
-            Loudness::Quiet => "−19 LUFS · para ambientes tranquilos",
+            Loudness::Loud => t("−11 LUFS, con limitador · para ambientes ruidosos"),
+            Loudness::Normal => t("−14 LUFS · el predeterminado de Spotify"),
+            Loudness::Quiet => t("−19 LUFS · para ambientes tranquilos"),
         }
     }
 }
@@ -218,6 +220,8 @@ pub struct Settings {
     /// Su valor (id del artista o número del género) y su nombre para el botón.
     pub liked_filter_value: String,
     pub liked_filter_label: String,
+    /// Idioma de la interfaz: «auto» (el del sistema) o un código («es», «en»…; ver i18n.rs).
+    pub language: String,
     /// Biblioteca de lo más antiguo a lo más reciente (el botón «Recientes»).
     pub library_oldest: bool,
     /// Biblioteca agrupada por tipo (playlists, carpetas, álbumes, artistas…).
@@ -283,6 +287,7 @@ impl Default for Settings {
             liked_filter: 0,
             liked_filter_value: String::new(),
             liked_filter_label: String::new(),
+            language: "auto".into(),
             library_oldest: false,
             library_grouped: false,
             library_kind: 0,

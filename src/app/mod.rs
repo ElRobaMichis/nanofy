@@ -48,6 +48,7 @@ use crate::model::*;
 use crate::shell::{NativeHandles, FPS_CAP_KEY, FRAME_MS_KEY, FRAME_PHASES_KEY};
 use crate::update::{FailKind, MoveReason, Stage, UpdateInfo, UpdateResult};
 use crate::webauth::WebAuth;
+use crate::i18n::t;
 
 pub use theme::GREEN;
 pub const ERROR_RED: egui::Color32 = theme::RED;
@@ -1981,9 +1982,9 @@ impl App {
     pub fn toggle_hidden(&mut self, id: &str) {
         if !self.hidden_tracks.remove(id) {
             self.hidden_tracks.insert(id.to_string());
-            self.status("Canción oculta: se atenúa en las listas y se salta al reproducir");
+            self.status(t("Canción oculta: se atenúa en las listas y se salta al reproducir"));
         } else {
-            self.status("Canción visible de nuevo");
+            self.status(t("Canción visible de nuevo"));
         }
         if let Ok(t) = serde_json::to_string(&self.hidden_tracks) {
             let _ = std::fs::write(&self.hidden_path, t);
@@ -2006,17 +2007,17 @@ impl App {
                             .get(&id)
                             .map(|p| p.name.clone())
                             .or_else(|| self.playlists.iter().find(|p| p.id == id).map(|p| p.name.clone()))
-                            .unwrap_or_else(|| "Playlist".into());
+                            .unwrap_or_else(|| t("Playlist").into());
                         (name, Some(Page::Playlist(id)))
                     }
-                    "album" => (self.albums.get(&id).map(|a| a.name.clone()).unwrap_or_else(|| "Álbum".into()), Some(Page::Album(id))),
+                    "album" => (self.albums.get(&id).map(|a| a.name.clone()).unwrap_or_else(|| t("Álbum").into()), Some(Page::Album(id))),
                     "artist" => (
-                        self.artists.get(&id).and_then(|a| a.artist.as_ref()).map(|a| a.name.clone()).unwrap_or_else(|| "Artista".into()),
+                        self.artists.get(&id).and_then(|a| a.artist.as_ref()).map(|a| a.name.clone()).unwrap_or_else(|| t("Artista").into()),
                         Some(Page::Artist(id)),
                     ),
-                    "show" => (self.shows.get(&id).map(|s| s.0.name.clone()).unwrap_or_else(|| "Podcast".into()), Some(Page::Show(id))),
-                    "station" => ("Radio de la canción".into(), None),
-                    _ => ("Contexto".into(), None),
+                    "show" => (self.shows.get(&id).map(|s| s.0.name.clone()).unwrap_or_else(|| t("Podcast").into()), Some(Page::Show(id))),
+                    "station" => (t("Radio de la canción").into(), None),
+                    _ => (t("Contexto").into(), None),
                 })
             }
             Some(PlayTarget::Tracks { .. }) => self.last_play_page.clone().map(|p| (self.page_label(&p).1, Some(p))),
@@ -2089,8 +2090,8 @@ impl App {
         self.request_once("rootlist", Req::Rootlist);
         let current = self.folders.iter().find(|f| f.playlists.iter().any(|p| p == pid)).map(|f| f.id.clone());
         let label = match current.as_ref().and_then(|c| self.folders.iter().find(|f| &f.id == c)) {
-            Some(f) => format!("Carpeta: {}", f.name),
-            None => "Añadir a carpeta".to_string(),
+            Some(f) => tr!("Carpeta: {}", f.name),
+            None => t("Añadir a carpeta").to_string(),
         };
         let r = Self::menu_item(ui, Some(icons::Icon::Folder), &label, true);
         let folders: Vec<(String, String)> = self.folders.iter().map(|f| (f.id.clone(), f.name.clone())).collect();
@@ -2105,11 +2106,11 @@ impl App {
                     ui.close();
                 }
             }
-            if current.is_some() && Self::menu_item(ui, Some(icons::Icon::Minus), "Quitar de la carpeta", false).clicked() {
+            if current.is_some() && Self::menu_item(ui, Some(icons::Icon::Minus), t("Quitar de la carpeta"), false).clicked() {
                 self.api.send(Req::FolderMove { playlist: pid.clone(), folder: None });
                 ui.close();
             }
-            if Self::menu_item(ui, Some(icons::Icon::Plus), "Nueva carpeta…", false).clicked() {
+            if Self::menu_item(ui, Some(icons::Icon::Plus), t("Nueva carpeta…"), false).clicked() {
                 self.folder_dialog = Some(FolderDialog { id: None, name: String::new(), playlist: Some(pid.clone()), busy: false });
                 ui.close();
             }
@@ -2118,7 +2119,7 @@ impl App {
 
     /// «Invitar colaboradores»: genera (o reutiliza) el enlace de invitación y lo copia.
     pub fn invite_menu_item(&mut self, ui: &mut egui::Ui, pid: &str) {
-        if Self::menu_item(ui, Some(icons::Icon::People), "Invitar colaboradores", false).clicked() {
+        if Self::menu_item(ui, Some(icons::Icon::People), t("Invitar colaboradores"), false).clicked() {
             self.request_invite(pid);
             ui.close();
         }
@@ -2126,7 +2127,7 @@ impl App {
 
     pub fn request_invite(&mut self, pid: &str) {
         match self.invite_links.get(pid).cloned() {
-            Some(link) => self.actions.push(Action::CopyText(link, "Enlace de invitación")),
+            Some(link) => self.actions.push(Action::CopyText(link, tk!("Enlace de invitación"))),
             None => self.api.send(Req::InviteLink(pid.to_string())),
         }
     }
@@ -2314,7 +2315,7 @@ impl App {
             return;
         }
         if self.settings.audio_cache_mb == 0 {
-            self.status_err("Activa la caché de audio en Ajustes para descargar");
+            self.status_err(t("Activa la caché de audio en Ajustes para descargar"));
             return;
         }
         let ids: Vec<String> = ids
@@ -2322,7 +2323,7 @@ impl App {
             .filter(|i| !self.downloaded.contains(i) && !self.downloading.contains(i))
             .collect();
         if ids.is_empty() {
-            self.status("Ya estaban descargadas");
+            self.status(t("Ya estaban descargadas"));
             return;
         }
         for i in &ids {
@@ -2330,7 +2331,7 @@ impl App {
         }
         let n = ids.len();
         self.api.send(Req::Download { ids, episodes, quality: self.settings.quality });
-        self.status(if n == 1 { "Descargando 1 canción…".to_string() } else { format!("Descargando {n} canciones…") });
+        self.status(if n == 1 { t("Descargando 1 canción…").to_string() } else { tr!("Descargando {} canciones…", n) });
     }
 
     pub fn status(&mut self, text: impl Into<String>) {
@@ -2383,7 +2384,7 @@ impl App {
             log::info!("[update] consulta ignorada: hay una instalación en marcha");
             // La consulta manual borró la nota y Ajustes enseña el progreso debajo de ella.
             if let (true, Some(u)) = (manual, &self.update) {
-                self.update_note = Some((format!("Hay una versión nueva: {}", u.version), false));
+                self.update_note = Some((tr!("Hay una versión nueva: {}", u.version), false));
             }
             return;
         }
@@ -2399,7 +2400,7 @@ impl App {
         if let Stage::Ready { version, .. } = &self.update_stage {
             if !replaces_ready {
                 if manual {
-                    self.update_note = Some((format!("Nanofy {version} está lista"), false));
+                    self.update_note = Some((tr!("Nanofy {} está lista", version), false));
                     self.update_banner = true;
                 }
                 return;
@@ -2438,7 +2439,7 @@ impl App {
                 self.update = None;
                 self.update_banner = false;
                 self.update_stage = Stage::Idle;
-                self.update_note = Some((format!("Estás al día ({})", crate::update::current_version()), false));
+                self.update_note = Some((tr!("Estás al día ({})", crate::update::current_version()), false));
             }
             UpdateResult::Failed(e) => {
                 // La comprobación automática falla en silencio (sin red, límite de GitHub…).
@@ -2470,7 +2471,7 @@ impl App {
     /// usuario la busca a mano, y aun así instalarla es cosa suya. Devuelve si empezó a prepararla.
     fn offer_update(&mut self, info: UpdateInfo, manual: bool, location: Option<(PathBuf, MoveReason)>, staged: Option<PathBuf>) -> bool {
         let skipped = self.update_is_skipped(&info.version);
-        self.update_note = Some((format!("Hay una versión nueva: {}", info.version), false));
+        self.update_note = Some((tr!("Hay una versión nueva: {}", info.version), false));
         self.update = Some(info);
         self.update_stage = Stage::Available;
         if skipped && !manual {
@@ -2490,7 +2491,7 @@ impl App {
         if let Some(staged) = staged {
             let version = self.update.as_ref().map(|u| u.version.clone()).unwrap_or_default();
             log::info!("[update] la {version} ya estaba preparada");
-            self.update_note = Some((format!("Nanofy {version} está lista"), false));
+            self.update_note = Some((tr!("Nanofy {} está lista", version), false));
             self.update_silent = false;
             self.update_fake = false;
             self.update_confirm_jam = false;
@@ -2513,7 +2514,7 @@ impl App {
     /// instaló aquí y no llegaba a arrancar (se volvió a esta): solo si la pide el usuario.
     fn show_update(&mut self, info: UpdateInfo, manual: bool) {
         let skipped = !manual && self.update_is_skipped(&info.version);
-        self.update_note = Some((format!("Hay una versión nueva: {}", info.version), false));
+        self.update_note = Some((tr!("Hay una versión nueva: {}", info.version), false));
         self.update_banner = !skipped;
         self.update = Some(info);
     }
@@ -2530,11 +2531,11 @@ impl App {
                 self.update_check_at = Some(Instant::now() + crate::update::PENDING_RECHECK);
             }
             if manual {
-                self.update_note = Some((format!("Hay una versión nueva ({}), pero aún se está publicando; vuelve a mirar en unos minutos", info.version), false));
+                self.update_note = Some((tr!("Hay una versión nueva ({}), pero aún se está publicando; vuelve a mirar en unos minutos", info.version), false));
             }
             return;
         }
-        self.update_stage = Stage::Failed { kind: FailKind::NoAsset, detail: crate::update::NO_ASSET_TEXT.to_string() };
+        self.update_stage = Stage::Failed { kind: FailKind::NoAsset, detail: crate::i18n::t(crate::update::NO_ASSET_TEXT).to_string() };
         self.show_update(info, manual);
     }
 
@@ -2695,11 +2696,11 @@ impl App {
             return;
         }
         if u.asset.is_none() {
-            self.update_stage = Stage::Failed { kind: FailKind::NoAsset, detail: crate::update::NO_ASSET_TEXT.to_string() };
+            self.update_stage = Stage::Failed { kind: FailKind::NoAsset, detail: crate::i18n::t(crate::update::NO_ASSET_TEXT).to_string() };
             return;
         }
         if !crate::update::can_self_install() {
-            self.update_stage = Stage::Failed { kind: FailKind::NoAsset, detail: "En este sistema la actualización se instala a mano: descarga el zip".to_string() };
+            self.update_stage = Stage::Failed { kind: FailKind::NoAsset, detail: t("En este sistema la actualización se instala a mano: descarga el zip").to_string() };
             return;
         }
         self.update_retry = 0;
@@ -2768,7 +2769,7 @@ impl App {
             Stage::Ready { version, .. } => {
                 self.update_cancel = None;
                 self.update_retry = 0;
-                self.update_note = Some((format!("Nanofy {version} está lista"), false));
+                self.update_note = Some((tr!("Nanofy {} está lista", version), false));
                 // Lista y probada, pero no se instala sin que el usuario lo diga («Reiniciar»), o
                 // sola al abrir Nanofy la próxima vez. El aviso sale también si se preparó sola:
                 // es lo único que queda por hacer.
@@ -2829,11 +2830,11 @@ impl App {
         if self.update_fake {
             // Un «lista» de mentira para capturas: lo que hubiera preparado de verdad junto al
             // ejecutable (la compilación con la que se trabaja) no debe instalarse por él.
-            self.update_stage = Stage::Failed { kind: FailKind::Swap, detail: "Estado de prueba: no hay ninguna versión preparada".to_string() };
+            self.update_stage = Stage::Failed { kind: FailKind::Swap, detail: t("Estado de prueba: no hay ninguna versión preparada").to_string() };
             return;
         }
         let Some(target) = crate::update::target_exe() else {
-            self.update_stage = Stage::Failed { kind: FailKind::Swap, detail: "No se encuentra el ejecutable actual".to_string() };
+            self.update_stage = Stage::Failed { kind: FailKind::Swap, detail: t("No se encuentra el ejecutable actual").to_string() };
             self.update_banner = true;
             return;
         };
@@ -2848,7 +2849,7 @@ impl App {
         });
         if let Err(e) = spawn {
             self.update_applying = false;
-            self.update_stage = Stage::Failed { kind: FailKind::Swap, detail: format!("No se pudo instalar la versión nueva ({e})") };
+            self.update_stage = Stage::Failed { kind: FailKind::Swap, detail: tr!("No se pudo instalar la versión nueva ({})", e) };
             self.update_banner = true;
         }
     }
@@ -2904,7 +2905,7 @@ impl App {
         };
         if crate::update::note_lines(&info.notes).is_empty() {
             ctx.open_url(egui::OpenUrl::new_tab(info.page_url.clone()));
-            self.status("Se han abierto las novedades en el navegador");
+            self.status(t("Se han abierto las novedades en el navegador"));
         } else {
             self.notes_dialog = Some(info);
         }
@@ -2974,7 +2975,7 @@ impl App {
             _ => u.page_url.clone(),
         };
         ctx.open_url(egui::OpenUrl::new_tab(url));
-        self.status(if download { "Se ha abierto el navegador para descargar la versión nueva" } else { "Se han abierto las novedades en el navegador" });
+        self.status(if download { t("Se ha abierto el navegador para descargar la versión nueva") } else { t("Se han abierto las novedades en el navegador") });
     }
 
     pub fn status_err(&mut self, text: impl Into<String>) {
@@ -3529,7 +3530,7 @@ impl App {
                 // con credenciales guardadas, o algo la retiene): la interfaz sale igualmente de
                 // «iniciando sesión». Si la sesión llega después, `LoggedIn` manda.
                 if !crate::backend::cancel_login_listener() {
-                    ui.send(Msg::Backend(Event::LoginAborted { reason: "Inicio de sesión cancelado".to_string(), by_user: true }));
+                    ui.send(Msg::Backend(Event::LoginAborted { reason: t("Inicio de sesión cancelado").to_string(), by_user: true }));
                 }
             });
         if let Err(e) = spawned {
@@ -3554,9 +3555,9 @@ impl App {
                 self.web_chain = Some(c);
                 self.web_chain_login = false;
                 self.web_busy = true;
-                self.status("Se ha abierto el navegador: permite que Nanofy lea tu biblioteca…");
+                self.status(t("Se ha abierto el navegador: permite que Nanofy lea tu biblioteca…"));
             }
-            Err(e) => self.status_err(format!("No se pudo abrir la autorización de la biblioteca: {e}")),
+            Err(e) => self.status_err(tr!("No se pudo abrir la autorización de la biblioteca: {}", e)),
         }
     }
 
@@ -3601,13 +3602,13 @@ impl App {
             // (`LoggedIn` sin `fresh`) no debe soltarla mientras se acepta en el navegador.
             self.web_chain_login = false;
             self.mark_library_consent_asked();
-            self.status("Un último paso en el navegador: permite que Nanofy lea tu biblioteca (no tienes que crear nada).");
+            self.status(t("Un último paso en el navegador: permite que Nanofy lea tu biblioteca (no tienes que crear nada)."));
         } else if !self.settings.library_consent_asked && !self.web_busy {
             // No se pudo encadenar: una segunda pestaña, una sola vez, diciendo por qué se abre.
             self.mark_library_consent_asked();
             self.connect_library();
             if self.web_busy {
-                self.status("Un último paso en otra pestaña del navegador: permite que Nanofy lea tu biblioteca (no tienes que crear nada).");
+                self.status(t("Un último paso en otra pestaña del navegador: permite que Nanofy lea tu biblioteca (no tienes que crear nada)."));
             }
         }
     }
@@ -3759,14 +3760,14 @@ impl App {
             Event::Status(s) if s == crate::backend::RECONNECTING => match self.reconnect.as_mut() {
                 // Una orden no se pudo ejecutar: el aviso de la reconexión sale ya, sin esperar.
                 Some(r) => r.ask(Instant::now(), &mut self.status),
-                None => self.status(s),
+                None => self.status(crate::i18n::t_owned(&s)),
             },
             // Ya hubo sesión: es una reconexión o un reinicio, que no necesitan aviso (si la
             // reconexión tarda, lo dice `reconnect`).
             Event::Status(s) if s == crate::backend::CONNECTING && (self.reconnect.is_some() || self.conn_generation.is_some()) => {
                 log::debug!("[reconexión] aviso «{s}» callado");
             }
-            Event::Status(s) => self.status(s),
+            Event::Status(s) => self.status(crate::i18n::t_owned(&s)),
             Event::Error(s) => {
                 if matches!(self.auth, Auth::LoggingIn | Auth::Connecting { .. }) {
                     self.auth = Auth::LoggedOut;
@@ -3812,7 +3813,7 @@ impl App {
                     self.backend.send(Cmd::Preload(saved.now.uri.clone()));
                 }
                 // El aviso «Conectando…» duraba sus 8 s aunque la sesión llegase en 1 s.
-                if self.status.as_ref().is_some_and(|(t, _, err)| !err && t.starts_with("Conectando")) {
+                if self.status.as_ref().is_some_and(|(t, _, err)| !err && (t.starts_with("Conectando") || t.as_str() == crate::i18n::t(crate::backend::CONNECTING))) {
                     self.status = None;
                 }
                 // Recién reiniciada para actualizar: la copia local la guardó la ventana anterior al
@@ -3866,7 +3867,7 @@ impl App {
                     );
                     r.finish(Instant::now(), true, &mut self.status);
                 } else if !had_session {
-                    self.status("Conectado a Spotify");
+                    self.status(t("Conectado a Spotify"));
                 }
                 self.after_login_library(fresh);
             }
@@ -3968,7 +3969,7 @@ impl App {
                 self.output_lost = None;
                 self.not_premium = false;
                 self.media_dirty = true;
-                self.status("Sesión cerrada");
+                self.status(t("Sesión cerrada"));
             }
             Event::TrackChanged(np) => {
                 self.ws_trim_at = Some(Instant::now() + Duration::from_secs(6));
@@ -4009,7 +4010,7 @@ impl App {
                 self.player.position_ms = position_ms;
                 self.playback_recovered();
                 self.play_pause();
-                self.status("Temporizador: reproducción pausada al terminar la canción");
+                self.status(t("Temporizador: reproducción pausada al terminar la canción"));
             }
             Event::Playing { position_ms } => {
                 self.player.remote = None;
@@ -4061,7 +4062,7 @@ impl App {
                 self.output_lost = Some((uri, resume));
                 self.playback_error = Some(player_bar::PlaybackError::new(
                     player_bar::PlaybackErrorKind::NoOutput,
-                    player_bar::NO_OUTPUT_TEXT.to_string(),
+                    crate::i18n::t(player_bar::NO_OUTPUT_TEXT).to_string(),
                 ));
             }
             Event::AudioOutputBack => {
@@ -4106,7 +4107,7 @@ impl App {
                 }
                 self.playback_error = Some(player_bar::PlaybackError::new(
                     player_bar::PlaybackErrorKind::NotPremium,
-                    player_bar::NOT_PREMIUM_TEXT.to_string(),
+                    crate::i18n::t(player_bar::NOT_PREMIUM_TEXT).to_string(),
                 ));
             }
             Event::Unavailable => {
@@ -4126,7 +4127,7 @@ impl App {
                 self.load_retry = None;
                 self.playback_error = Some(player_bar::PlaybackError::new(
                     player_bar::PlaybackErrorKind::Cascade,
-                    player_bar::CASCADE_TEXT.to_string(),
+                    crate::i18n::t(player_bar::CASCADE_TEXT).to_string(),
                 ));
             }
             Event::Volume(v) => {
@@ -4163,7 +4164,7 @@ impl App {
                     self.pause_after_restore = true;
                     self.restore_mark = true;
                     self.restore_fallback_at = Some(Instant::now() + Duration::from_millis(3500));
-                    self.status("Sesión restaurada desde Spotify");
+                    self.status(t("Sesión restaurada desde Spotify"));
                 } else {
                     self.cluster_restored = true;
                     self.restore_deadline = None;
@@ -4528,7 +4529,7 @@ impl App {
                     Req::TrackInfo(ref id) if self.album_of_pending.as_deref() == Some(id.as_str()) => {
                         self.album_of_pending = None;
                         log::warn!("álbum de {id}: {e}");
-                        self.status_err("No se pudo encontrar el álbum de esta canción");
+                        self.status_err(t("No se pudo encontrar el álbum de esta canción"));
                     }
                     // Se ve la copia del disco (o una carga a medias) y la fresca no llegó (sin
                     // red, límite de ritmo): se mantiene y se reintenta con espera creciente. Antes
@@ -4603,7 +4604,7 @@ impl App {
                             // primera vez: la página vacía no dice por qué. Los reintentos, callados.
                             let nothing = self.lists.get(id).is_none_or(|l| l.tracks.is_empty());
                             if nothing && !self.list_retry.contains_key(id.as_str()) {
-                                self.status_err(format!("No se pudo cargar la playlist ({e}); se reintentará sola"));
+                                self.status_err(tr!("No se pudo cargar la playlist ({}); se reintentará sola", e));
                             }
                             self.schedule_list_retry(id, &e);
                             // Sin reintento programado (es el contexto en restauración, que la
@@ -4673,7 +4674,7 @@ impl App {
                             Some(n) if n <= 30 && self.search_retries < 2 => {
                                 log::info!("búsqueda «{q}» limitada por Spotify; se reintenta en {n} s");
                                 self.search_retry = Some((Instant::now() + Duration::from_secs(n), q.clone()));
-                                self.status(format!("Spotify limita; reintentando en {n} s"));
+                                self.status(tr!("Spotify limita; reintentando en {} s", n));
                             }
                             _ => {
                                 self.search_loading = false;
@@ -4751,7 +4752,7 @@ impl App {
                         for id in ids {
                             self.downloading.remove(id);
                         }
-                        self.status_err(format!("Descarga: {e}"));
+                        self.status_err(tr!("Descarga: {}", e));
                     }
                     Req::Save(ref ids) | Req::Unsave(ref ids) => {
                         let was_save = matches!(r.req, Req::Save(_));
@@ -4767,7 +4768,7 @@ impl App {
                         if e == crate::webauth::CONNECT_EXPIRED {
                             log::info!("autorización de la biblioteca: {e}");
                         } else {
-                            self.status_err(format!("No se pudo conectar la biblioteca: {e}"));
+                            self.status_err(tr!("No se pudo conectar la biblioteca: {}", e));
                         }
                     }
                     Req::Lyrics { .. } => {
@@ -5208,7 +5209,7 @@ impl App {
                 // También en las páginas de canción de ese álbum (o de ese artista, sin los del álbum).
                 // Los de la propia canción mandan; los de su álbum o artista, solo si no tiene.
                 for tp in self.track_pages.values_mut() {
-                    let own = key == format!("song:{}", tp.id);
+                    let own = key == crate::api::song_genres_key(&tp.id);
                     let album = tp.album.as_ref().and_then(|a| a.id.as_deref()).is_some_and(|a| key == format!("album:{a}"));
                     let artist = tp.artists.first().is_some_and(|a| key == format!("artist:{}", a.id));
                     if own || (tp.genres.is_empty() && (album || artist)) {
@@ -5278,7 +5279,7 @@ impl App {
                     self.album_of_pending = None;
                     match album_id {
                         Some(a) => self.go(Page::Album(a)),
-                        None => self.status_err("No se encontró el álbum de esta canción"),
+                        None => self.status_err(crate::i18n::t("No se encontró el álbum de esta canción")),
                     }
                 }
             }
@@ -5372,9 +5373,9 @@ impl App {
                     self.set_liked(&id, saved);
                 }
                 self.status(if saved {
-                    "Guardada en Canciones que te gustan"
+                    t("Guardada en Canciones que te gustan")
                 } else {
-                    "Quitada de Canciones que te gustan"
+                    t("Quitada de Canciones que te gustan")
                 });
             }
             Resp::AlbumSaved { id, saved } => {
@@ -5390,7 +5391,7 @@ impl App {
                     self.saved_albums.retain(|x| x.id != id);
                 }
                 self.snapshot_dirty = true;
-                self.status(if saved { "Álbum guardado en tu biblioteca" } else { "Álbum quitado de tu biblioteca" });
+                self.status(if saved { t("Álbum guardado en tu biblioteca") } else { t("Álbum quitado de tu biblioteca") });
             }
             Resp::HomeFeed(sections) => {
                 if let Ok(t) = serde_json::to_string(&sections) {
@@ -5432,9 +5433,9 @@ impl App {
                 }
                 if !matches!(r.req, Req::FolderMove { .. }) {
                     self.status(match r.req {
-                        Req::FolderCreate { .. } => "Carpeta creada",
-                        Req::FolderDelete(_) => "Carpeta eliminada",
-                        _ => "Carpeta renombrada",
+                        Req::FolderCreate { .. } => t("Carpeta creada"),
+                        Req::FolderDelete(_) => t("Carpeta eliminada"),
+                        _ => t("Carpeta renombrada"),
                     });
                 }
             }
@@ -5442,7 +5443,7 @@ impl App {
                 self.invite_links.insert(playlist, link.clone());
                 if matches!(r.req, Req::InviteLink(_)) {
                     log::info!("[invite] {link}");
-                    self.actions.push(Action::CopyText(link, "Enlace de invitación"));
+                    self.actions.push(Action::CopyText(link, tk!("Enlace de invitación")));
                 }
             }
             Resp::Members { playlist, members } => {
@@ -5463,7 +5464,7 @@ impl App {
                     self.followed_shows_list.retain(|x| x.id != id);
                     self.followed_shows.remove(&id);
                 }
-                self.status(if on { "Siguiendo el podcast" } else { "Has dejado de seguir el podcast" });
+                self.status(if on { t("Siguiendo el podcast") } else { t("Has dejado de seguir el podcast") });
             }
             Resp::EpisodeSaved { id, on } => {
                 if on {
@@ -5473,7 +5474,7 @@ impl App {
                     self.saved_episode_list.retain(|e| e.episode.id != id);
                     self.saved_episodes.remove(&id);
                 }
-                self.status(if on { "Episodio guardado" } else { "Episodio quitado de guardados" });
+                self.status(if on { t("Episodio guardado") } else { t("Episodio quitado de guardados") });
             }
             Resp::Downloaded(id) => {
                 self.downloading.remove(&id);
@@ -5482,7 +5483,7 @@ impl App {
                     let _ = std::fs::write(&self.downloads_path, t);
                 }
                 if self.downloading.is_empty() {
-                    self.status("Descarga completada");
+                    self.status(t("Descarga completada"));
                 }
             }
             Resp::Browse(d) => {
@@ -5560,9 +5561,9 @@ impl App {
                         self.save_dynamic();
                         self.dynamic_sync_key = None;
                     }
-                    self.status("Playlist dinámica creada: se pondrá al día sola");
+                    self.status(t("Playlist dinámica creada: se pondrá al día sola"));
                 } else {
-                    self.status("Playlist creada");
+                    self.status(t("Playlist creada"));
                     self.go(Page::Playlist(id));
                 }
             }
@@ -5617,18 +5618,18 @@ impl App {
                             return;
                         }
                     }
-                    self.status("Playlist actualizada");
+                    self.status(t("Playlist actualizada"));
                 } else if matches!(r.req, Req::SetPlaylistImage { .. }) {
                     self.images.clear();
-                    self.status("Imagen de la playlist actualizada");
+                    self.status(t("Imagen de la playlist actualizada"));
                 } else if matches!(r.req, Req::AddToPlaylist { .. }) {
-                    self.status("Añadida a la playlist");
+                    self.status(t("Añadida a la playlist"));
                 } else if matches!(r.req, Req::RemoveFromPlaylist { .. }) {
-                    self.status("Quitada de la playlist");
+                    self.status(t("Quitada de la playlist"));
                 } else if matches!(r.req, Req::FollowPlaylist(_)) {
-                    self.status("Playlist añadida a tu biblioteca");
+                    self.status(t("Playlist añadida a tu biblioteca"));
                 } else if matches!(r.req, Req::UnfollowPlaylist(_)) {
-                    self.status("Playlist quitada de tu biblioteca");
+                    self.status(t("Playlist quitada de tu biblioteca"));
                 }
             }
             Resp::User(u) => {
@@ -5673,9 +5674,9 @@ impl App {
                     self.followed_artists.clear();
                 }
                 self.status(if following {
-                    "Ahora sigues este perfil"
+                    t("Ahora sigues este perfil")
                 } else {
-                    "Has dejado de seguir este perfil"
+                    t("Has dejado de seguir este perfil")
                 });
             }
             // Mientras falta por responder una fuente mejor: se va enseñando (no se guarda).
@@ -5716,9 +5717,9 @@ impl App {
                 self.jam_busy = false;
                 self.jam_error = None;
                 match (&r.req, &j) {
-                    (Req::JamJoin(_), Some(_)) => self.status("Te has unido al Jam"),
-                    (Req::JamLeave(_), _) => self.status("Has salido del Jam"),
-                    (Req::JamEnd(_), _) => self.status("Jam finalizado"),
+                    (Req::JamJoin(_), Some(_)) => self.status(t("Te has unido al Jam")),
+                    (Req::JamLeave(_), _) => self.status(t("Has salido del Jam")),
+                    (Req::JamEnd(_), _) => self.status(t("Jam finalizado")),
                     _ => {}
                 }
                 // Al salir/terminar la Jam se deja de mostrar la cola compartida y se vuelve a la
@@ -5745,9 +5746,9 @@ impl App {
                     self.web_chain_done();
                 }
                 self.status(if personal {
-                    "Tu app propia está conectada. Recargando la biblioteca…"
+                    t("Tu app propia está conectada. Recargando la biblioteca…")
                 } else {
-                    "Biblioteca conectada con Spotify. Cargándola…"
+                    t("Biblioteca conectada con Spotify. Cargándola…")
                 });
                 // Si la autorización llegó antes que la sesión (encadenada al iniciar sesión), la
                 // carga la hará `LoggedIn`, ya con el token nuevo.
@@ -5758,14 +5759,14 @@ impl App {
             Resp::WebDisconnected => {
                 self.web_busy = false;
                 self.status(if matches!(r.req, Req::WebDisconnectPersonal) {
-                    "Tu app propia está desconectada"
+                    t("Tu app propia está desconectada")
                 } else {
-                    "Biblioteca desconectada de Spotify"
+                    t("Biblioteca desconectada de Spotify")
                 });
             }
             Resp::Done => {
                 if matches!(r.req, Req::AddToQueue(_)) {
-                    self.status("Añadida a la cola");
+                    self.status(t("Añadida a la cola"));
                     self.queue_at = Instant::now() - Duration::from_secs(60);
                 }
             }
@@ -6400,7 +6401,7 @@ impl App {
                     self.api.send(Req::AddToQueue(u));
                 }
                 self.api.send(Req::Queue);
-                self.status("Cola actualizada");
+                self.status(t("Cola actualizada"));
             }
         }
         if let Some(t) = self.sleep_at {
@@ -6409,7 +6410,7 @@ impl App {
                 if self.player.state == PlayState::Playing {
                     self.play_pause();
                 }
-                self.status("Temporizador: reproducción pausada");
+                self.status(crate::i18n::t("Temporizador: reproducción pausada"));
             }
         }
         if self.logged_in() {
@@ -6523,9 +6524,9 @@ impl App {
                 .unwrap_or(false);
             if mine {
                 self.api.send(Req::SetPlaylistImage { id, path });
-                self.status("Subiendo la imagen de la playlist…");
+                self.status(t("Subiendo la imagen de la playlist…"));
             } else {
-                self.status_err("Solo puedes cambiar la imagen de tus propias playlists");
+                self.status_err(t("Solo puedes cambiar la imagen de tus propias playlists"));
             }
         }
     }
@@ -6576,7 +6577,7 @@ impl App {
                             // Radio ya conocida: se abre al instante (con su copia en disco).
                             Some(pid) => self.open_radio_tab(pid),
                             None => {
-                                self.status("Abriendo la radio…");
+                                self.status(t("Abriendo la radio…"));
                                 self.api.send(Req::RadioPlaylist(id));
                             }
                         }
@@ -6596,7 +6597,7 @@ impl App {
                 }
                 Action::CopyText(text, what) => {
                     ctx.copy_text(text);
-                    self.status(format!("{what} copiado"));
+                    self.status(tr!("{} copiado", t(what)));
                 }
                 Action::AddToQueue(uri) => {
                     if self.logged_in() {
@@ -6661,7 +6662,7 @@ impl App {
                         }
                         None => PlaylistEditor {
                             id: None,
-                            name: "Nueva playlist".to_string(),
+                            name: t("Nueva playlist").to_string(),
                             description: String::new(),
                             public: true,
                             public_known: true,
@@ -6675,7 +6676,7 @@ impl App {
                 Action::PickPlaylistImage(id) => {
                     if let Some(path) = pick_image_file() {
                         self.api.send(Req::SetPlaylistImage { id, path });
-                        self.status("Subiendo la imagen de la playlist…");
+                        self.status(t("Subiendo la imagen de la playlist…"));
                     }
                 }
                 Action::OpenLink(link) => self.open_link(&link),
@@ -6730,13 +6731,13 @@ impl App {
                 self.jam_link = link.to_string();
                 self.jam_join(&id);
             }
-            _ => self.status_err(format!("Tipo de enlace no soportado: {kind}")),
+            _ => self.status_err(tr!("Tipo de enlace no soportado: {}", kind)),
         }
     }
 
     pub fn jam_join(&mut self, token: &str) {
         if !self.logged_in() {
-            self.status_err("Inicia sesión para unirte a un Jam");
+            self.status_err(t("Inicia sesión para unirte a un Jam"));
             return;
         }
         self.jam_busy = true;
@@ -6749,12 +6750,12 @@ impl App {
     /// externas, así que solo se conocen las canciones añadidas desde Nanofy.
     pub(super) fn queue_rebuild(&mut self, keep: Vec<String>) {
         if self.player.remote.is_some() {
-            self.status_err("La cola solo se puede editar cuando la música suena en Nanofy");
+            self.status_err(t("La cola solo se puede editar cuando la música suena en Nanofy"));
             return;
         }
         let Some(now) = self.player.now.clone() else { return };
         let Some(mut target) = self.last_play.clone() else {
-            self.status_err("No se puede reconstruir la cola: la reproducción no empezó desde Nanofy");
+            self.status_err(t("No se puede reconstruir la cola: la reproducción no empezó desde Nanofy"));
             return;
         };
         match &mut target {
@@ -6802,7 +6803,7 @@ impl App {
 
     pub fn queue_remove(&mut self, uri: &str) {
         let Some(i) = self.queued_local.iter().position(|u| u == uri) else {
-            self.status_err("Solo se pueden quitar las canciones añadidas a la cola desde Nanofy");
+            self.status_err(t("Solo se pueden quitar las canciones añadidas a la cola desde Nanofy"));
             return;
         };
         let mut keep = self.queued_local.clone();
@@ -6814,7 +6815,7 @@ impl App {
     /// a sonar): se piden los datos de la canción y, al llegar, se abre su álbum.
     pub fn open_album_of(&mut self, track_id: String) {
         self.album_of_pending = Some(track_id.clone());
-        self.status("Buscando el álbum…");
+        self.status(t("Buscando el álbum…"));
         self.api.send(Req::TrackInfo(track_id));
     }
 
@@ -6826,7 +6827,7 @@ impl App {
     /// lo añadido a la cola (y, con la reproducción automática, canciones parecidas).
     pub fn queue_drop_context(&mut self) {
         if self.player.remote.is_some() {
-            self.status_err("La cola solo se puede editar cuando la música suena en Nanofy");
+            self.status_err(t("La cola solo se puede editar cuando la música suena en Nanofy"));
             return;
         }
         let Some(now) = self.player.now.clone() else { return };
@@ -8051,7 +8052,7 @@ impl App {
     pub fn play(&mut self, t: PlayTarget) {
         self.play_after_restore = false;
         if !self.signed_in() {
-            self.status_err("Inicia sesión para reproducir música");
+            self.status_err(crate::i18n::t("Inicia sesión para reproducir música"));
             return;
         }
         if self.not_premium && self.player.remote.is_none() {
@@ -8203,7 +8204,7 @@ impl App {
     fn show_not_premium(&mut self) {
         self.playback_error = Some(player_bar::PlaybackError::new(
             player_bar::PlaybackErrorKind::NotPremium,
-            player_bar::NOT_PREMIUM_TEXT.to_string(),
+            crate::i18n::t(player_bar::NOT_PREMIUM_TEXT).to_string(),
         ));
     }
 
@@ -8494,7 +8495,7 @@ impl App {
     /// la cola). Se ve al instante; Spotify la confirma en la siguiente consulta.
     pub fn queue_move(&mut self, uri: String, before: Option<String>, after: Option<String>) {
         if self.player.remote.is_some() {
-            self.status_err("Para reordenar la cola, la música tiene que sonar en Nanofy");
+            self.status_err(t("Para reordenar la cola, la música tiene que sonar en Nanofy"));
             return;
         }
         let place = |list: &mut Vec<String>| {
@@ -8551,10 +8552,10 @@ impl App {
         if is_self {
             self.backend.send(Cmd::TransferHere);
             self.player.remote = None;
-            self.status("Trayendo la reproducción a este equipo…");
+            self.status(t("Trayendo la reproducción a este equipo…"));
         } else if let Some(id) = d.id.clone() {
             self.api.send(Req::Transfer { device_id: id });
-            self.status(format!("Reproduciendo en {}", d.name));
+            self.status(tr!("Reproduciendo en {}", d.name));
             // `local_audio` ya oculta la etiqueta; si el traspaso falla y sigue sonando aquí, vuelve.
             self.player.remote = Some(d);
             self.last_remote_poll = Instant::now() - Duration::from_millis(1500);
@@ -8586,7 +8587,7 @@ impl App {
             return;
         }
         if !self.logged_in() {
-            self.status_err("Inicia sesión para buscar");
+            self.status_err(t("Inicia sesión para buscar"));
             return;
         }
         if q.contains("open.spotify.com/") || q.starts_with("spotify:") {
@@ -8720,6 +8721,7 @@ impl App {
             || self.settings.loudness != self.draft.loudness;
         let media_changed = self.settings.media_keys != self.draft.media_keys;
         let autoplay_changed = self.settings.autoplay != self.draft.autoplay;
+        let language_changed = self.settings.language != self.draft.language;
         self.draft.zoom = self.draft.zoom.clamp(0.7, 2.0);
         self.draft.fps_cap = self.draft.fps_cap.clamp(30, 480);
         self.draft.crossfade_secs = self.draft.crossfade_secs.clamp(crate::config::CROSSFADE_SECS_MIN, crate::config::CROSSFADE_SECS_MAX);
@@ -8742,6 +8744,18 @@ impl App {
         self.settings = self.draft.clone();
         self.settings.save(&self.paths);
         self.apply_theme(ctx);
+        if language_changed {
+            crate::i18n::set(&self.settings.language);
+            // Lo que Spotify da en el idioma de la interfaz (categorías, secciones de Inicio)
+            // se vuelve a pedir en el nuevo.
+            self.browse = None;
+            self.browse_asked = false;
+            self.browse_pages.clear();
+            let _ = std::fs::remove_dir_all(self.browse_path.with_file_name("browse_pages"));
+            if self.logged_in() {
+                self.api.send(Req::HomeFeed);
+            }
+        }
         if media_changed {
             self.media = if self.settings.media_keys {
                 Media::new(self.hwnd, self.ui_tx.clone())
@@ -8753,19 +8767,19 @@ impl App {
         if restart && self.logged_in() {
             // El reinicio arranca con todos los ajustes nuevos, también los de audio.
             self.backend.send(Cmd::Restart(self.settings.clone()));
-            self.status("Ajustes guardados");
+            self.status(t("Ajustes guardados"));
         } else if audio || restart {
             // Calidad, gapless y volumen se aplican sin cortar la música. Sin sesión (o
             // reconectando) el backend solo guarda la copia, y la conexión siguiente ya la usa.
             self.backend.send(Cmd::AudioTuning(self.settings.clone()));
             self.status(match (quality_changed, volume_changed) {
-                (true, true) => "Calidad aplicada desde la próxima canción que se cargue; el volumen, al instante",
-                (true, false) => "Calidad aplicada desde la próxima canción que se cargue",
-                (false, true) => "Volumen aplicado al instante",
-                (false, false) => "Ajustes guardados",
+                (true, true) => t("Calidad aplicada desde la próxima canción que se cargue; el volumen, al instante"),
+                (true, false) => t("Calidad aplicada desde la próxima canción que se cargue"),
+                (false, true) => t("Volumen aplicado al instante"),
+                (false, false) => t("Ajustes guardados"),
             });
         } else {
-            self.status("Ajustes guardados");
+            self.status(t("Ajustes guardados"));
         }
         // Tras un `Restart` también: el backend ya crea el reproductor nuevo con el fundido en
         // vigor, pero así queda garantizado por el orden de las órdenes aunque eso cambie (con el
@@ -9183,17 +9197,18 @@ fn is_image_path(p: &std::path::Path) -> bool {
 /// Diálogo nativo para elegir una imagen (bloquea la interfaz mientras está abierto).
 pub fn pick_image_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("Imagen de la playlist")
-        .add_filter("Imágenes", &["jpg", "jpeg", "png", "webp", "bmp"])
+        .set_title(t("Imagen de la playlist"))
+        .add_filter(t("Imágenes"), &["jpg", "jpeg", "png", "webp", "bmp"])
         .pick_file()
 }
 
 pub fn fmt_thousands(n: u64) -> String {
     let s = n.to_string();
+    let sep = crate::i18n::thousands_sep();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
         if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push('.');
+            out.push(sep);
         }
         out.push(c);
     }

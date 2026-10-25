@@ -11,6 +11,7 @@ use super::widgets::{child_in, galley_truncated, text_on_baseline};
 use super::{Action, App, Auth, Page, PlayState, PlayTarget, Repeat, SideTab, SEARCH_ID, SIDEBAR_W};
 use crate::api::Req;
 use crate::config::{vol_pct_to_raw, vol_raw_db, vol_raw_to_pct};
+use crate::i18n::t;
 use crate::model::*;
 
 impl App {
@@ -33,7 +34,7 @@ impl App {
             let resp = ui.interact(rect, ui.id().with("top_library"), Sense::click());
             let color = st.color(page == Page::Library, resp.hovered());
             icons::paint_side(ui.painter(), pos2(x0 + 41.5, cy), 27.0, st.icon_of(color), Icon::Library);
-            let g = ui.painter().layout_no_wrap("Tu biblioteca".into(), theme::regular(TOP_FONT), color);
+            let g = ui.painter().layout_no_wrap(t("Tu biblioteca").into(), theme::regular(TOP_FONT), color);
             text_on_baseline(ui.painter(), pos2(x0 + 72.0, cy + 6.0), g, color);
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -51,7 +52,7 @@ impl App {
         let avatar = Rect::from_center_size(pos2(xr - 25.0, cy), vec2(34.0, 34.0));
         self.top_avatar(ui, avatar, &p);
         let gear = Rect::from_center_size(pos2(xr - 74.0, cy), vec2(30.0, 30.0));
-        let gr = ui.interact(gear.expand(4.0), ui.id().with("top_gear"), Sense::click()).on_hover_text("Ajustes (Ctrl+,)");
+        let gr = ui.interact(gear.expand(4.0), ui.id().with("top_gear"), Sense::click()).on_hover_text(t("Ajustes (Ctrl+,)"));
         let gear_color = st.color(page == Page::Settings, gr.hovered());
         icons::paint(ui.painter(), gear, st.icon_of(gear_color), Icon::Settings);
         if gr.hovered() {
@@ -67,7 +68,7 @@ impl App {
             _ => None,
         };
         if let Some(version) = ready {
-            let text_w = ui.painter().layout_no_wrap(UPDATE_PILL_TEXT.to_string(), theme::bold(13.0), Color32::BLACK).size().x;
+            let text_w = ui.painter().layout_no_wrap(t(UPDATE_PILL_TEXT).to_string(), theme::bold(13.0), Color32::BLACK).size().x;
             let (_, pill) = top_right_layout(full.width(), Some(text_w));
             if let Some(pill) = pill {
                 let w = match pill {
@@ -88,7 +89,7 @@ impl App {
         // «B» donde empieza la «D» (con la ventana estrecha, se acerca a Inicio). Buscar se vuelve
         // un campo de texto en su página.
         let home_c = pos2(x0 + 303.0, cy);
-        if self.top_item(ui, home_c, Icon::Home, 28.0, "Inicio", self.active == super::ActiveTab::Home, &st).clicked() {
+        if self.top_item(ui, home_c, Icon::Home, 28.0, t("Inicio"), self.active == super::ActiveTab::Home, &st).clicked() {
             self.go(Page::Home);
         }
         let search_c = pos2((x0 + 511.5).min(tabs_end - 90.0).max(home_c.x + 130.0), cy);
@@ -96,7 +97,7 @@ impl App {
         let search_right = if page == Page::Search {
             self.search_field(ui, search_c, (tabs_end - 8.0).max(search_c.x + 140.0), &st, &p)
         } else {
-            let r = self.top_item(ui, search_c, Icon::Search, 29.0, "Buscar", false, &st);
+            let r = self.top_item(ui, search_c, Icon::Search, 29.0, t("Buscar"), false, &st);
             if r.clicked() {
                 self.focus_search = true;
                 self.go(Page::Search);
@@ -134,7 +135,7 @@ impl App {
                 self.actions.push(Action::ActivateTab(i));
             }
             r.context_menu(|ui| {
-                if Self::menu_item(ui, Some(Icon::Close), "Cerrar pestaña", false).clicked() {
+                if Self::menu_item(ui, Some(Icon::Close), t("Cerrar pestaña"), false).clicked() {
                     self.actions.push(Action::CloseTab(i));
                     ui.close();
                 }
@@ -183,7 +184,7 @@ impl App {
                 self.login();
             }
         }
-        resp.on_hover_text(if logged { "Tu perfil" } else { "Iniciar sesión" });
+        resp.on_hover_text(if logged { t("Tu perfil") } else { t("Iniciar sesión") });
     }
 
     /// Inicio o Buscar: icono centrado en `c` (de lado `size`) y el texto 31 px a su derecha.
@@ -248,7 +249,7 @@ impl App {
         if show_close {
             let c = if narrow { icon_c } else { close_c };
             let area = Rect::from_center_size(c, vec2(26.0, 26.0));
-            let cr = ui.interact(area, ui.id().with(("close_tab", i)), Sense::click()).on_hover_text("Cerrar pestaña");
+            let cr = ui.interact(area, ui.id().with(("close_tab", i)), Sense::click()).on_hover_text(t("Cerrar pestaña"));
             if cr.hovered() {
                 ui.painter().circle_filled(c, 13.0, st.close_hover);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -284,7 +285,7 @@ impl App {
         // Texto de ayuda pintado aquí, en la línea base de la etiqueta del campo cerrado (el de
         // egui quedaba 1 px más alto y el texto saltaba al abrir Buscar).
         if self.search_query.is_empty() {
-            let g = ui.painter().layout_no_wrap("Buscar…".into(), theme::regular(TOP_FONT), st.text);
+            let g = ui.painter().layout_no_wrap(t("Buscar…").into(), theme::regular(TOP_FONT), st.text);
             text_on_baseline(ui.painter(), pos2(c.x + 31.0, c.y + 6.0), g, st.text);
         }
         if self.focus_search {
@@ -320,7 +321,7 @@ impl App {
             UpdatePill::Full(_) => {
                 let icon = Rect::from_center_size(pos2(rect.min.x + PILL_PAD + 9.0, rect.center().y), vec2(18.0, 18.0));
                 icons::paint(ui.painter(), icon, Color32::BLACK, Icon::Download);
-                ui.painter().text(pos2(icon.max.x + 6.0, rect.center().y), egui::Align2::LEFT_CENTER, UPDATE_PILL_TEXT, theme::bold(13.0), Color32::BLACK);
+                ui.painter().text(pos2(icon.max.x + 6.0, rect.center().y), egui::Align2::LEFT_CENTER, t(UPDATE_PILL_TEXT), theme::bold(13.0), Color32::BLACK);
             }
             UpdatePill::Icon => icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), Color32::BLACK, Icon::Download),
         }
@@ -328,11 +329,11 @@ impl App {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         let tip = if applying {
-            "Instalando la versión nueva…".to_string()
+            t("Instalando la versión nueva…").to_string()
         } else {
-            let tip = format!("Nanofy {version} está lista. La música seguirá donde estaba.");
+            let tip = tr!("Nanofy {} está lista. La música seguirá donde estaba.", version);
             // Solo el icono: el texto de la píldora pasa al globo.
-            if pill == UpdatePill::Icon { format!("{UPDATE_PILL_TEXT}. {tip}") } else { tip }
+            if pill == UpdatePill::Icon { format!("{}. {tip}", t(UPDATE_PILL_TEXT)) } else { tip }
         };
         resp.on_hover_text(tip)
     }
@@ -340,28 +341,28 @@ impl App {
     /// Icono y título de una página, para las pestañas de la barra superior.
     pub fn page_label(&self, page: &Page) -> (Icon, String) {
         match page {
-            Page::Home => (Icon::Home, "Inicio".into()),
-            Page::Search => (Icon::Search, "Buscar".into()),
-            Page::Library => (Icon::Library, "Tu biblioteca".into()),
-            Page::History => (Icon::History, "Historial".into()),
-            Page::Liked => (Icon::Heart, "Canciones que te gustan".into()),
-            Page::Albums => (Icon::Album, "Álbumes".into()),
-            Page::Saves => (Icon::Bookmark, "Guardados".into()),
-            Page::Shows => (Icon::Podcast, "Podcasts".into()),
-            Page::Audiobooks => (Icon::Book, "Audiolibros".into()),
-            Page::Folders => (Icon::Folder, "Carpetas".into()),
-            Page::Artists => (Icon::Artist, "Artistas".into()),
-            Page::Settings => (Icon::Settings, "Ajustes".into()),
-            Page::Episode(id) => (Icon::Podcast, self.episodes.get(id).map(|e| e.name.clone()).unwrap_or_else(|| "Episodio".into())),
+            Page::Home => (Icon::Home, t("Inicio").into()),
+            Page::Search => (Icon::Search, t("Buscar").into()),
+            Page::Library => (Icon::Library, t("Tu biblioteca").into()),
+            Page::History => (Icon::History, t("Historial").into()),
+            Page::Liked => (Icon::Heart, t("Canciones que te gustan").into()),
+            Page::Albums => (Icon::Album, t("Álbumes").into()),
+            Page::Saves => (Icon::Bookmark, t("Guardados").into()),
+            Page::Shows => (Icon::Podcast, t("Podcasts").into()),
+            Page::Audiobooks => (Icon::Book, t("Audiolibros").into()),
+            Page::Folders => (Icon::Folder, t("Carpetas").into()),
+            Page::Artists => (Icon::Artist, t("Artistas").into()),
+            Page::Settings => (Icon::Settings, t("Ajustes").into()),
+            Page::Episode(id) => (Icon::Podcast, self.episodes.get(id).map(|e| e.name.clone()).unwrap_or_else(|| t("Episodio").into())),
             Page::Browse(uri) => (
                 Icon::Search,
                 self.browse_pages
                     .get(uri)
                     .map(|p| p.title.clone())
                     .or_else(|| self.browse.iter().flat_map(|b| b.cards.iter().chain(&b.podcasts).chain(&b.audiobooks)).find(|c| &c.uri == uri).map(|c| c.title.clone()))
-                    .unwrap_or_else(|| "Explorar".into()),
+                    .unwrap_or_else(|| t("Explorar").into()),
             ),
-            Page::Show(id) => (Icon::Podcast, self.shows.get(id).map(|s| s.0.name.clone()).unwrap_or_else(|| "Podcast".into())),
+            Page::Show(id) => (Icon::Podcast, self.shows.get(id).map(|s| s.0.name.clone()).unwrap_or_else(|| t("Podcast").into())),
             Page::Playlist(id) => (
                 Icon::Playlist,
                 self.playlists
@@ -369,11 +370,11 @@ impl App {
                     .find(|pl| &pl.id == id)
                     .map(|pl| pl.name.clone())
                     .or_else(|| self.playlist_meta.get(id).map(|pl| pl.name.clone()))
-                    .unwrap_or_else(|| "Playlist".into()),
+                    .unwrap_or_else(|| t("Playlist").into()),
             ),
             Page::Album(id) => (
                 Icon::Album,
-                self.albums.get(id).map(|a| a.name.clone()).unwrap_or_else(|| "Álbum".into()),
+                self.albums.get(id).map(|a| a.name.clone()).unwrap_or_else(|| t("Álbum").into()),
             ),
             Page::Artist(id) => (
                 Icon::Artist,
@@ -381,12 +382,12 @@ impl App {
                     .get(id)
                     .and_then(|pg| pg.artist.as_ref().map(|a| a.name.clone()))
                     .or_else(|| self.artist_views.get(id).map(|v| v.name.clone()).filter(|n| !n.is_empty()))
-                    .unwrap_or_else(|| "Artista".into()),
+                    .unwrap_or_else(|| t("Artista").into()),
             ),
-            Page::Track(id) => (Icon::Album, self.track_pages.get(id).map(|p| p.name.clone()).unwrap_or_else(|| "Canción".into())),
+            Page::Track(id) => (Icon::Album, self.track_pages.get(id).map(|p| p.name.clone()).unwrap_or_else(|| t("Canción").into())),
             Page::User(id) => (
                 Icon::Person,
-                self.users.get(id).map(|u| u.name().to_string()).unwrap_or_else(|| "Perfil".into()),
+                self.users.get(id).map(|u| u.name().to_string()).unwrap_or_else(|| t("Perfil").into()),
             ),
         }
     }
@@ -408,7 +409,7 @@ impl App {
             let set: std::collections::HashSet<&str> = self.settings.pinned.iter().map(String::as_str).collect();
             (0..self.playlists.len()).filter(|&i| set.contains(self.playlists[i].id.as_str())).collect()
         };
-        let r = Self::side_row(ui, Icon::Pin, "Fijados", false, self.sidebar_pins_open, &st);
+        let r = Self::side_row(ui, Icon::Pin, t("Fijados"), false, self.sidebar_pins_open, &st);
         Self::side_chevron(ui, r.rect, self.sidebar_pins_open, if r.hovered() { st.hover } else { st.icon });
         if r.clicked() {
             self.sidebar_pins_open = !self.sidebar_pins_open;
@@ -417,7 +418,7 @@ impl App {
             ui.add_space(SIDE_CHILD_BEFORE);
             if pinned.is_empty() {
                 let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), SIDE_CHILD_H), Sense::hover());
-                let g = ui.painter().layout_no_wrap("Fija playlists con el clic derecho".into(), theme::regular(12.5), p.faint);
+                let g = ui.painter().layout_no_wrap(t("Fija playlists con el clic derecho").into(), theme::regular(12.5), p.faint);
                 text_on_baseline(ui.painter(), pos2(rect.min.x + SIDE_CHILD_TEXT_X, rect.center().y + 5.0), g, p.faint);
             }
             for i in pinned {
@@ -434,7 +435,7 @@ impl App {
         }
 
         // Playlists, con «+» (nueva playlist) al pasar el ratón.
-        let r = Self::side_row(ui, Icon::Playlist, "Playlists", false, self.sidebar_playlists_open, &st);
+        let r = Self::side_row(ui, Icon::Playlist, t("Playlists"), false, self.sidebar_playlists_open, &st);
         Self::side_chevron(ui, r.rect, self.sidebar_playlists_open, if r.hovered() { st.hover } else { st.icon });
         {
             let plus = Rect::from_center_size(pos2(r.rect.min.x + 214.0, r.rect.center().y), vec2(26.0, 26.0));
@@ -447,7 +448,7 @@ impl App {
             } else if r.clicked() {
                 self.sidebar_playlists_open = !self.sidebar_playlists_open;
             }
-            pr.on_hover_text("Nueva playlist (Ctrl+N)");
+            pr.on_hover_text(t("Nueva playlist (Ctrl+N)"));
         }
         if self.sidebar_playlists_open {
             ui.add_space(SIDE_CHILD_BEFORE);
@@ -484,32 +485,35 @@ impl App {
         }
 
         let items = [
-            (Icon::Heart, "Canciones que te gustan", Page::Liked),
-            (Icon::Bookmark, "Guardados", Page::Saves),
-            (Icon::Album, "Álbumes", Page::Albums),
-            (Icon::Folder, "Carpetas", Page::Folders),
-            (Icon::Podcast, "Podcasts", Page::Shows),
-            (Icon::Book, "Audiolibros", Page::Audiobooks),
-            (Icon::Artist, "Artistas", Page::Artists),
-            (Icon::History, "Historial", Page::History),
+            (Icon::Heart, tk!("Canciones que te gustan"), Page::Liked),
+            (Icon::Bookmark, tk!("Guardados"), Page::Saves),
+            (Icon::Album, tk!("Álbumes"), Page::Albums),
+            (Icon::Folder, tk!("Carpetas"), Page::Folders),
+            (Icon::Podcast, tk!("Podcasts"), Page::Shows),
+            (Icon::Book, tk!("Audiolibros"), Page::Audiobooks),
+            (Icon::Artist, tk!("Artistas"), Page::Artists),
+            (Icon::History, tk!("Historial"), Page::History),
         ];
         for (icon, label, pg) in items {
-            if Self::side_row(ui, icon, label, page == pg, false, &st).clicked() {
+            if Self::side_row(ui, icon, t(label), page == pg, false, &st).clicked() {
                 self.go_main(pg);
             }
         }
 
         // Último aviso de estado, abajo.
         if let Some((text, _, err)) = self.status.clone() {
+            // Los avisos que llegan en español (errores de Spotify que el código reconoce por
+            // su texto), traducidos al mostrarlos.
+            let text = crate::i18n::t_message(&text);
             ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                 let color = if err { theme::RED } else { p.weak };
                 ui.add_space(12.0);
                 // «Conecta tu biblioteca…» llega desde cualquier página que lea la Web API: la
                 // acción va con el aviso. (De abajo arriba: queda debajo del texto.)
-                if text == crate::api::NO_APP_HINT && !self.api.web_configured() && !self.web_busy {
+                if (text == crate::api::NO_APP_HINT || text == t(crate::api::NO_APP_HINT)) && !self.api.web_configured() && !self.web_busy {
                     ui.horizontal(|ui| {
                         ui.add_space(24.0);
-                        if ui.link(RichText::new("Conectar con Spotify").small()).clicked() {
+                        if ui.link(RichText::new(t("Conectar con Spotify")).small()).clicked() {
                             self.connect_library();
                         }
                     });
@@ -562,7 +566,7 @@ impl App {
         }
         let g = galley_truncated(ui.painter(), text, theme::regular(SIDE_FONT), color, (w - SIDE_CHILD_TEXT_X - 24.0).max(20.0));
         if dynamic {
-            resp.clone().on_hover_text("Playlist dinámica: se pone al día sola con tus canciones que te gustan");
+            resp.clone().on_hover_text(t("Playlist dinámica: se pone al día sola con tus canciones que te gustan"));
         }
         text_on_baseline(ui.painter(), pos2(rect.min.x + SIDE_CHILD_TEXT_X, c + 5.0), g, color);
         if resp.hovered() {
@@ -582,11 +586,11 @@ impl App {
         let mine = self.is_mine(pl);
         let pinned = self.settings.pinned.contains(&pl.id);
         r.context_menu(|ui| {
-            if Self::menu_item(ui, Some(Icon::NewTab), "Abrir en una nueva pestaña", false).clicked() {
+            if Self::menu_item(ui, Some(Icon::NewTab), t("Abrir en una nueva pestaña"), false).clicked() {
                 self.actions.push(Action::OpenInTab(Page::Playlist(pl.id.clone())));
                 ui.close();
             }
-            if Self::menu_item(ui, Some(Icon::Play), "Reproducir", false).clicked() {
+            if Self::menu_item(ui, Some(Icon::Play), t("Reproducir"), false).clicked() {
                 let shuffle = self.player.shuffle;
                 self.actions.push(Action::Play(PlayTarget::Context {
                     uri: pl.uri.clone(),
@@ -596,15 +600,15 @@ impl App {
                 }));
                 ui.close();
             }
-            if Self::menu_item(ui, Some(Icon::Pin), if pinned { "Desfijar" } else { "Fijar" }, false).clicked() {
+            if Self::menu_item(ui, Some(Icon::Pin), if pinned { t("Desfijar") } else { t("Fijar") }, false).clicked() {
                 self.actions.push(Action::Pin(pl.id.clone(), !pinned));
                 ui.close();
             }
-            if mine && Self::menu_item(ui, Some(Icon::Edit), "Editar…", false).clicked() {
+            if mine && Self::menu_item(ui, Some(Icon::Edit), t("Editar…"), false).clicked() {
                 self.actions.push(Action::OpenEditor(Some(pl.clone())));
                 ui.close();
             }
-            let label = if mine { "Eliminar" } else { "Quitar de la biblioteca" };
+            let label = if mine { t("Eliminar") } else { t("Quitar de la biblioteca") };
             if Self::menu_item(ui, Some(Icon::Trash), label, false).clicked() {
                 self.actions.push(Action::FollowPlaylist(pl.id.clone(), false));
                 ui.close();
@@ -650,23 +654,23 @@ impl App {
         self.play_button(ui, pos2(x0 + 40.0, cy), &st);
         if lay.shuffle_repeat {
             let episode = self.player.now.as_ref().is_some_and(|n| n.uri.starts_with("spotify:episode:"));
-            if self.bar_icon(ui, boxed(x0 + 69.0, 0.0), Icon::Prev, st.icon, "Anterior (Ctrl+←)").clicked() {
+            if self.bar_icon(ui, boxed(x0 + 69.0, 0.0), Icon::Prev, st.icon, t("Anterior (Ctrl+←)")).clicked() {
                 self.prev();
             }
-            if self.bar_icon(ui, boxed(x0 + 111.0, 0.0), Icon::Next, st.icon, "Siguiente (Ctrl+→)").clicked() {
+            if self.bar_icon(ui, boxed(x0 + 111.0, 0.0), Icon::Next, st.icon, t("Siguiente (Ctrl+→)")).clicked() {
                 self.next();
             }
             if episode {
                 // En un episodio, como en Spotify: 15 s atrás y adelante en lugar de aleatorio y repetir.
-                if self.bar_icon(ui, boxed(x0 + 154.0, 0.0), Icon::Replay15, st.icon, "Retroceder 15 s").clicked() {
+                if self.bar_icon(ui, boxed(x0 + 154.0, 0.0), Icon::Replay15, st.icon, t("Retroceder 15 s")).clicked() {
                     self.seek_by(-15_000);
                 }
-                if self.bar_icon(ui, boxed(x0 + 197.0, 0.0), Icon::Forward15, st.icon, "Avanzar 15 s").clicked() {
+                if self.bar_icon(ui, boxed(x0 + 197.0, 0.0), Icon::Forward15, st.icon, t("Avanzar 15 s")).clicked() {
                     self.seek_by(15_000);
                 }
             } else {
                 let shuffle = if self.player.shuffle { GREEN } else { st.icon };
-                if self.bar_icon(ui, boxed(x0 + 154.0, 0.0), Icon::Shuffle, shuffle, "Aleatorio (S)").clicked() {
+                if self.bar_icon(ui, boxed(x0 + 154.0, 0.0), Icon::Shuffle, shuffle, t("Aleatorio (S)")).clicked() {
                     self.toggle_shuffle();
                 }
                 let (rep_icon, rep_color) = match self.player.repeat {
@@ -674,15 +678,15 @@ impl App {
                     Repeat::Context => (Icon::Repeat, GREEN),
                     Repeat::Track => (Icon::RepeatOne, GREEN),
                 };
-                if self.bar_icon(ui, boxed(x0 + 197.0, 1.0), rep_icon, rep_color, "Repetir (R)").clicked() {
+                if self.bar_icon(ui, boxed(x0 + 197.0, 1.0), rep_icon, rep_color, t("Repetir (R)")).clicked() {
                     self.cycle_repeat();
                 }
             }
         } else {
-            if self.bar_icon(ui, boxed(x0 + 69.0, 0.0), Icon::Prev, st.icon, "Anterior (Ctrl+←)").clicked() {
+            if self.bar_icon(ui, boxed(x0 + 69.0, 0.0), Icon::Prev, st.icon, t("Anterior (Ctrl+←)")).clicked() {
                 self.prev();
             }
-            if self.bar_icon(ui, boxed(x0 + 111.0, 0.0), Icon::Next, st.icon, "Siguiente (Ctrl+→)").clicked() {
+            if self.bar_icon(ui, boxed(x0 + 111.0, 0.0), Icon::Next, st.icon, t("Siguiente (Ctrl+→)")).clicked() {
                 self.next();
             }
         }
@@ -724,7 +728,7 @@ impl App {
     /// Botón verde de reproducir / pausar (círculo de 39 px con un aro oscuro).
     fn play_button(&mut self, ui: &mut egui::Ui, c: egui::Pos2, st: &BarStyle) {
         let rect = Rect::from_center_size(c, vec2(42.0, 42.0));
-        let resp = ui.interact(rect, ui.id().with("bar_play"), Sense::click()).on_hover_text("Reproducir / pausar (Espacio)");
+        let resp = ui.interact(rect, ui.id().with("bar_play"), Sense::click()).on_hover_text(t("Reproducir / pausar (Espacio)"));
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
@@ -812,7 +816,7 @@ impl App {
     /// la línea de volumen, que se queda mientras el ratón esté en ella.
     fn volume_button(&mut self, ui: &mut egui::Ui, rect: Rect, st: &BarStyle) {
         let icon = if self.player.volume == 0 { Icon::Mute } else { Icon::Volume };
-        let resp = self.bar_icon(ui, rect, icon, st.icon, "Volumen · clic para silenciar (M)");
+        let resp = self.bar_icon(ui, rect, icon, st.icon, t("Volumen · clic para silenciar (M)"));
         if resp.clicked() {
             self.toggle_mute();
         }
@@ -852,7 +856,7 @@ impl App {
         painter.rect_filled(Rect::from_min_max(pos2(x0, y - h), pos2(xp.max(x0 + PROGRESS_H), y + h)), CornerRadius::same(2), st.fill);
         painter.circle_filled(pos2(xp, y), 6.0, st.fill);
         let db = vol_raw_db(raw_now);
-        let tip = if db.is_finite() { format!("{pct:.0} %  ({db:+.1} dB)") } else { "Silencio".to_string() };
+        let tip = if db.is_finite() { tr!("{} %  ({} dB)", format!("{pct:.0}"), format!("{db:+.1}")) } else { t("Silencio").to_string() };
         if resp.hovered() {
             resp.clone().on_hover_text(tip);
             self.volume_wheel_from(ui);
@@ -900,7 +904,7 @@ impl App {
     fn now_playing_block(&mut self, ui: &mut egui::Ui, cover: Rect, text_x: f32, text_w: f32, cy: f32, st: &BarStyle) {
         let painter = ui.painter().clone();
         let Some(np) = self.player.now.clone() else {
-            let g = painter.layout_no_wrap("Nada en reproducción".into(), theme::regular(ARTIST_FONT), st.dim);
+            let g = painter.layout_no_wrap(t("Nada en reproducción").into(), theme::regular(ARTIST_FONT), st.dim);
             text_on_baseline(&painter, pos2(cover.min.x, cy + 5.0), g, st.dim);
             return;
         };
@@ -909,7 +913,7 @@ impl App {
         if let Some(dj) = self.player.dj.clone() {
             self.cover_in(ui, Some(dj.image.as_str()).filter(|u| !u.is_empty()), cover, COVER_RADIUS);
             let what = match dj.title.as_str() {
-                "Up next" => "A continuación".to_string(),
+                "Up next" => t("A continuación").to_string(),
                 "" => "DJ".to_string(),
                 other => other.to_string(),
             };
@@ -965,7 +969,7 @@ impl App {
             (names, ARTIST_FONT, st.dim, cy + 5.0),
         ];
         if slow {
-            lines.push((SLOW_TEXT.to_string(), ARTIST_FONT, theme::palette(ui.ctx()).warn, cy + 24.0));
+            lines.push((t(SLOW_TEXT).to_string(), ARTIST_FONT, theme::palette(ui.ctx()).warn, cy + 24.0));
         } else if !np.album.is_empty() {
             lines.push((np.album.clone(), ARTIST_FONT, st.dim, cy + 24.0));
         }
@@ -1016,7 +1020,7 @@ impl App {
             if let (Some(id), Some(x)) = (&np.id, lay.heart) {
                 let liked = self.player.liked.unwrap_or(false);
                 let (icon, color) = if liked { (Icon::HeartFilled, GREEN) } else { (Icon::Heart, st.icon) };
-                let tip = if liked { "Quitar de Me gusta" } else { "Guardar en Me gusta" };
+                let tip = if liked { t("Quitar de Me gusta") } else { t("Guardar en Me gusta") };
                 if self.bar_icon(ui, boxed(x, 1.0), icon, color, tip).clicked() {
                     self.actions.push(Action::Like(id.clone(), !liked));
                 }
@@ -1026,7 +1030,7 @@ impl App {
                 // mientras está abierto, como en la referencia.
                 let open_here = self.add_dialog.as_ref().is_some_and(|d| d.bar_x.is_some());
                 let color = if open_here { Color32::WHITE } else { st.icon };
-                let r = self.bar_icon(ui, boxed(x, 0.0), Icon::PlusSquare, color, "Añadir a playlist");
+                let r = self.bar_icon(ui, boxed(x, 0.0), Icon::PlusSquare, color, t("Añadir a playlist"));
                 // Abierto aquí, sigue al botón aunque cambie el tamaño de la ventana.
                 if let Some(d) = self.add_dialog.as_mut().filter(|d| d.bar_x.is_some()) {
                     d.bar_x = Some(r.rect.center().x);
@@ -1049,7 +1053,7 @@ impl App {
         self.lyrics_button = None;
         if let Some(x) = lay.lyrics {
             let color = if self.side == Some(SideTab::Lyrics) { Color32::WHITE } else { st.icon };
-            let r = self.bar_icon(ui, boxed(x, 0.0), Icon::Lyrics, color, "Letra (L)");
+            let r = self.bar_icon(ui, boxed(x, 0.0), Icon::Lyrics, color, t("Letra (L)"));
             // El panel de la letra se coloca encima de este botón (`lyrics_panel.rs`).
             self.lyrics_button = Some(r.rect);
             if r.clicked() {
@@ -1067,8 +1071,8 @@ impl App {
             st.icon
         };
         let dev_tip = match &self.player.remote {
-            Some(d) => format!("Sonando en {}", d.name),
-            None => "Dispositivos".to_string(),
+            Some(d) => tr!("Sonando en {}", d.name),
+            None => t("Dispositivos").to_string(),
         };
         if lay.devices != lay.more {
             let r = self.bar_icon(ui, dev_rect, Icon::Devices, dev_color, &dev_tip);
@@ -1080,7 +1084,7 @@ impl App {
         // Los tres puntos: el panel de cristal de `player_menu.rs`.
         // Abierto desde la portada (clic derecho) no es este botón el que lo abrió.
         let more_color = if self.player_more_open && self.player_more_at.is_none() { Color32::WHITE } else { st.icon };
-        let more = self.bar_icon(ui, boxed(lay.more, 0.0), Icon::More, more_color, "Más");
+        let more = self.bar_icon(ui, boxed(lay.more, 0.0), Icon::More, more_color, t("Más"));
         if more.clicked() {
             self.player_more_open = !self.player_more_open || self.player_more_at.is_some();
             self.player_more_sub = None;
@@ -1098,7 +1102,7 @@ impl App {
             self.dj_orb(ui, pos2(xr - x, cy - 1.5));
         }
         let q_color = if self.side == Some(SideTab::Queue) { Color32::WHITE } else { st.icon };
-        if self.bar_icon(ui, boxed(lay.queue, 0.0), Icon::Queue, q_color, "Cola (Q)").clicked() {
+        if self.bar_icon(ui, boxed(lay.queue, 0.0), Icon::Queue, q_color, t("Cola (Q)")).clicked() {
             self.toggle_side(SideTab::Queue);
         }
     }
@@ -1106,7 +1110,7 @@ impl App {
     /// Botón de Jam: un orbe azul con un aro cian irregular. Abre la ventana de Jam.
     fn dj_orb(&mut self, ui: &mut egui::Ui, c: egui::Pos2) {
         let rect = Rect::from_center_size(c, vec2(36.0, 36.0));
-        let tip = if self.dj_active() { "DJ: cambiar de estilo" } else { "DJ" };
+        let tip = if self.dj_active() { t("DJ: cambiar de estilo") } else { "DJ" };
         let resp = ui.interact(rect, ui.id().with("dj_orb"), Sense::click()).on_hover_text(tip);
         let hover = resp.hovered();
         if hover {
@@ -1141,14 +1145,14 @@ impl App {
     }
 
     fn devices_menu(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Reproducir en").strong());
+        ui.label(RichText::new(t("Reproducir en")).strong());
         ui.separator();
         if !self.logged_in() {
-            ui.label("Inicia sesión para ver tus dispositivos.");
+            ui.label(t("Inicia sesión para ver tus dispositivos."));
             return;
         }
         if self.devices.is_empty() {
-            Self::loading(ui, "Buscando dispositivos");
+            Self::loading(ui, t("Buscando dispositivos"));
         }
         let devices = self.devices.clone();
         let mut listed_self = false;
@@ -1156,12 +1160,12 @@ impl App {
             let is_self = d.id.as_deref() == Some(self.device_id.as_str());
             listed_self |= is_self;
             let name = if is_self {
-                format!("{} (este equipo)", d.name)
+                tr!("{} (este equipo)", d.name)
             } else {
                 d.name.clone()
             };
             let icon = if is_self { Icon::Headphones } else { Icon::Devices };
-            let label = if d.is_active { format!("{name} · sonando") } else { name };
+            let label = if d.is_active { tr!("{} · sonando", name) } else { name };
             if Self::menu_item(ui, Some(icon), &label, false).clicked() {
                 self.select_device(d, is_self);
                 ui.close();
@@ -1175,14 +1179,14 @@ impl App {
                 kind: "computer".into(),
                 volume_percent: None,
             };
-            let text = format!("{} (este equipo)", me.name);
+            let text = tr!("{} (este equipo)", me.name);
             if Self::menu_item(ui, Some(Icon::Headphones), &text, false).clicked() {
                 self.select_device(me, true);
                 ui.close();
             }
         }
         ui.separator();
-        if Self::menu_item(ui, Some(Icon::Refresh), "Actualizar lista", false).clicked() {
+        if Self::menu_item(ui, Some(Icon::Refresh), t("Actualizar lista"), false).clicked() {
             self.api.send(Req::Devices);
         }
     }
@@ -1232,7 +1236,7 @@ impl App {
                                 ui.add_space(1.0);
                                 ui.add(Label::new(RichText::new(&err.text).color(p.text)).wrap());
                             });
-                            if icons::button(ui, Icon::Close, 24.0, p.weak).on_hover_text("Cerrar").clicked() {
+                            if icons::button(ui, Icon::Close, 24.0, p.weak).on_hover_text(t("Cerrar")).clicked() {
                                 action = Some(BannerAction::Dismiss);
                             }
                         });
@@ -1241,10 +1245,10 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.add_space(28.0);
                                 ui.spacing_mut().item_spacing.x = 8.0;
-                                if Self::primary_button(ui, "Reintentar", true).clicked() {
+                                if Self::primary_button(ui, t("Reintentar"), true).clicked() {
                                     action = Some(BannerAction::Retry);
                                 }
-                                if Self::secondary_button(ui, "Saltar", true).on_hover_text("Pasar a la siguiente canción").clicked() {
+                                if Self::secondary_button(ui, t("Saltar"), true).on_hover_text(t("Pasar a la siguiente canción")).clicked() {
                                     action = Some(BannerAction::Skip);
                                 }
                             });
@@ -1355,7 +1359,7 @@ pub fn load_retry_delay(failures: u8) -> Option<Duration> {
 fn quoted(name: Option<&str>) -> String {
     match name.map(str::trim).filter(|n| !n.is_empty()) {
         Some(n) => format!("«{n}»"),
-        None => "la canción".to_string(),
+        None => t("la canción").to_string(),
     }
 }
 
@@ -1372,15 +1376,15 @@ fn capitalized(s: &str) -> String {
 pub fn retrying_text(reason: &LoadFailure, name: Option<&str>) -> String {
     let t = quoted(name);
     match reason {
-        LoadFailure::Network(_) => format!("Se cortó la conexión al cargar {t}; reintentando…"),
+        LoadFailure::Network(_) => tr!("Se cortó la conexión al cargar {}; reintentando…", t),
         // Claves negadas o sin respuesta y el límite de peticiones: Spotify está frenando.
-        _ => format!("Spotify está frenando las peticiones de reproducción; reintentando {t}…"),
+        _ => tr!("Spotify está frenando las peticiones de reproducción; reintentando {}…", t),
     }
 }
 
 /// Aviso cuando ya no quedan reintentos automáticos.
 pub fn failed_text(name: Option<&str>) -> String {
-    format!("No se pudo reproducir {}.", quoted(name))
+    tr!("No se pudo reproducir {}.", quoted(name))
 }
 
 /// Aviso de un fallo definitivo: la canción se marca y se pasa a la siguiente.
@@ -1388,33 +1392,33 @@ pub fn skipped_text(reason: &LoadFailure, name: Option<&str>) -> String {
     let t = quoted(name);
     match reason {
         LoadFailure::NotAvailable(_) | LoadFailure::NoFormat => {
-            capitalized(&format!("{t} no está disponible en tu país o se retiró. Pasamos a la siguiente."))
+            capitalized(&tr!("{} no está disponible en tu país o se retiró. Pasamos a la siguiente.", t))
         }
-        _ => format!("No se pudo reproducir {t}. Pasamos a la siguiente."),
+        _ => tr!("No se pudo reproducir {}. Pasamos a la siguiente.", t),
     }
 }
 
 /// Aviso cuando se detuvo una cascada de canciones que no se pueden reproducir.
-pub const CASCADE_TEXT: &str = "Varias canciones seguidas no se pudieron reproducir; se detuvo la reproducción.";
+pub const CASCADE_TEXT: &str = tk!("Varias canciones seguidas no se pudieron reproducir; se detuvo la reproducción.");
 
 /// Aviso de una canción cortada por la red a media reproducción (en pausa en `position_ms`).
 pub fn stalled_text(position_ms: u32) -> String {
-    format!("Se cortó la conexión. Seguirá desde {} en cuanto vuelva.", super::watchdog::mmss(position_ms))
+    tr!("Se cortó la conexión. Seguirá desde {} en cuanto vuelva.", super::watchdog::mmss(position_ms))
 }
 
 /// Aviso cuando se deja de esperar una carga (30 s en «cargando»).
 pub fn stuck_text(name: Option<&str>) -> String {
-    format!("Spotify no responde y {} no termina de cargar.", quoted(name))
+    tr!("Spotify no responde y {} no termina de cargar.", quoted(name))
 }
 
 /// Aviso sin ningún dispositivo de salida de audio.
-pub const NO_OUTPUT_TEXT: &str = "No hay ninguna salida de audio. Conecta unos auriculares o altavoces.";
+pub const NO_OUTPUT_TEXT: &str = tk!("No hay ninguna salida de audio. Conecta unos auriculares o altavoces.");
 
 /// Aviso con una cuenta que no es Premium.
-pub const NOT_PREMIUM_TEXT: &str = "Spotify solo permite reproducir en apps externas con Premium. Puedes seguir explorando tu biblioteca, buscar y gestionar playlists.";
+pub const NOT_PREMIUM_TEXT: &str = tk!("Spotify solo permite reproducir en apps externas con Premium. Puedes seguir explorando tu biblioteca, buscar y gestionar playlists.");
 
 /// Lo que dice la barra mientras una canción tarda en cargar (`watchdog::SLOW_AFTER`).
-pub const SLOW_TEXT: &str = "Cargando… la conexión va lenta";
+pub const SLOW_TEXT: &str = tk!("Cargando… la conexión va lenta");
 
 // ------------------------------------------------------------ medidas del reproductor
 
@@ -1596,7 +1600,7 @@ fn bar_layout(w: f32) -> BarLayout {
 // ------------------------------------------------------------ píldora de actualización
 
 /// Texto de la píldora de la barra superior cuando hay una versión nueva lista.
-const UPDATE_PILL_TEXT: &str = "Reiniciar para actualizar";
+const UPDATE_PILL_TEXT: &str = tk!("Reiniciar para actualizar");
 /// Alto de la píldora (el ancho de solo el icono) y margen a cada lado del contenido.
 const PILL_H: f32 = 32.0;
 const PILL_PAD: f32 = 14.0;

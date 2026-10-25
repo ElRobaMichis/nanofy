@@ -19,6 +19,7 @@ use super::{ink_left, ink_right, lm, paint_mask, px, style, FolderDialog};
 use super::{BAR_BASE, BAR_FONT, CARD, COVER_W, GAP_GROUP_SEARCH, GAP_GROUP_TEXT, GAP_SORT_GROUP, GRID_C, GRID_LEFT, GRID_RIGHT, LIST_C};
 use super::{PITCH_X, PITCH_Y, SORT_TEXT_X, SUB_FONT, SUB_GAP, SUB_LINE, TITLE_FONT, VIEW_BG_DY, VIEW_BG_H, VIEW_BG_W};
 use crate::api::Req;
+use crate::i18n::t;
 use crate::model::Track;
 
 /// Arriba de la cabecera de la tabla (su «#», «Título»…), desde el borde del panel: la línea
@@ -42,9 +43,9 @@ const GRID_TITLE_BASE: f32 = 199.55;
 const SORT_ICON_X: f32 = 159.0;
 
 /// Órdenes del botón «Recientes» (`Settings::liked_sort`).
-const SORTS: [&str; 6] = ["Recientes", "Antiguas", "Título", "Artista", "Álbum", "Duración"];
+const SORTS: [&str; 6] = [tk!("Recientes"), tk!("Antiguas"), tk!("Título"), tk!("Artista"), tk!("Álbum"), tk!("Duración")];
 /// Filas del menú de filtro (`Settings::liked_filter`: 0 todo, 1 un artista, 2 un género).
-const FILTERS: [&str; 3] = ["Todo", "Artistas", "Géneros"];
+const FILTERS: [&str; 3] = [tk!("Todo"), tk!("Artistas"), tk!("Géneros")];
 
 /// Menú de filtro (2.png, misma escala que la página, medido por el antialias de sus bordes):
 /// 18,84 px a la izquierda de la tinta de su icono y 57,1 bajo el borde del panel; 191,5 de ancho
@@ -209,11 +210,11 @@ impl App {
             } else if shown.is_empty() {
                 let st = style(ui.ctx());
                 let text = if !self.album_search.trim().is_empty() {
-                    "Nada coincide con tu búsqueda"
+                    t("Nada coincide con tu búsqueda")
                 } else if filtered {
-                    "Ninguna canción que te gusta tiene este filtro"
+                    t("Ninguna canción que te gusta tiene este filtro")
                 } else {
-                    "Las canciones que te gusten aparecerán aquí"
+                    t("Las canciones que te gusten aparecerán aquí")
                 };
                 ui.add_space(20.0);
                 let g = ui.painter().layout_no_wrap(text.into(), theme::regular(14.0), st.sub);
@@ -323,16 +324,16 @@ impl App {
         let tone = |sel: bool, hov: bool| if sel { st.icon_on } else if hov { st.hover } else { st.icon };
         paint_mask(&painter, "list", &lm::LIST, px(&painter, o), tone(!grid, list_r.hovered()));
         paint_mask(&painter, "grid", &lm::GRID, px(&painter, o), tone(grid, grid_r.hovered()));
-        if list_r.on_hover_text("Lista").clicked() && grid {
+        if list_r.on_hover_text(t("Lista")).clicked() && grid {
             self.set_liked_grid(false);
         }
-        if grid_r.on_hover_text("Cuadrícula").clicked() && !grid {
+        if grid_r.on_hover_text(t("Cuadrícula")).clicked() && !grid {
             self.set_liked_grid(true);
         }
 
         // Orden: el nombre del elegido; al pulsar, la lista de órdenes.
         let sort = (self.settings.liked_sort as usize).min(SORTS.len() - 1);
-        let g = painter.layout_no_wrap(SORTS[sort].into(), theme::semibold(BAR_FONT), st.bar_text);
+        let g = painter.layout_no_wrap(t(SORTS[sort]).into(), theme::semibold(BAR_FONT), st.bar_text);
         let ink = ink_left(&g);
         let text_w = g.size().x - ink - ink_right(&g);
         let sort_hit = Rect::from_min_max(at(157.0, 9.0), at(SORT_TEXT_X + text_w + 8.0, 50.0));
@@ -356,9 +357,9 @@ impl App {
         let filter_x = SORT_TEXT_X + text_w + GAP_SORT_GROUP;
         let dx = filter_x - (lm::GROUP.ox as f32 + 2.0);
         let label = match &filter {
-            Some((1, _)) => format!("Filtro: Artista ({})", self.settings.liked_filter_label),
-            Some(_) => format!("Filtro: Género ({})", self.settings.liked_filter_label),
-            None => "Filtro: Todo".to_string(),
+            Some((1, _)) => tr!("Filtro: Artista ({})", self.settings.liked_filter_label),
+            Some(_) => tr!("Filtro: Género ({})", self.settings.liked_filter_label),
+            None => t("Filtro: Todo").to_string(),
         };
         let fa = painter.layout_no_wrap(label, theme::semibold(BAR_FONT), st.bar_text);
         let fa_ink = ink_left(&fa);
@@ -397,7 +398,7 @@ impl App {
         hand(ui, &s_r);
         let c = if open { st.icon_on } else if s_r.hovered() { st.hover } else { st.icon };
         paint_mask(&painter, "search", &lm::SEARCH, px(&painter, at(sdx, 0.0)), c);
-        if s_r.on_hover_text("Buscar en Canciones que te gustan").clicked() {
+        if s_r.on_hover_text(t("Buscar en Canciones que te gustan")).clicked() {
             self.album_search_open = !open;
             self.album_search_focus = self.album_search_open;
             if !self.album_search_open {
@@ -413,7 +414,7 @@ impl App {
                 .text_color(st.field_text)
                 .desired_width(field.width())
                 .vertical_align(egui::Align::Center)
-                .hint_text(egui::RichText::new("Buscar en Canciones que te gustan").color(st.field_hint));
+                .hint_text(egui::RichText::new(t("Buscar en Canciones que te gustan")).color(st.field_hint));
             let r = child.add_sized(field.size(), edit);
             if self.album_search_focus {
                 self.album_search_focus = false;
@@ -430,7 +431,7 @@ impl App {
 
         let po = pos2(panel.max.x.round() + PLUS_DX, o.y);
         if filter.is_some() {
-            let g = painter.layout_no_wrap("Playlist dinámica".into(), theme::semibold(BAR_FONT), DYN_TEXT);
+            let g = painter.layout_no_wrap(t("Playlist dinámica").into(), theme::semibold(BAR_FONT), DYN_TEXT);
             let lead = ink_left(&g);
             let w = g.size().x - lead - ink_right(&g);
             let right = po.x + DYN_TEXT_RIGHT;
@@ -443,7 +444,7 @@ impl App {
             paint_mask(&painter, "bolt", &km::BOLT, px(&painter, pos2(left, o.y)), bolt);
             text_on_baseline(&painter, pos2(left - lead, o.y + BAR_BASE), g, if hov { DYN_TEXT_HOVER } else { DYN_TEXT });
             let exists = self.liked_dynamic_rule().is_some();
-            let tip = if exists { "Abrir su playlist dinámica" } else { "Guardar como playlist dinámica: se pone al día sola cuando cambian tus canciones que te gustan" };
+            let tip = if exists { t("Abrir su playlist dinámica") } else { t("Guardar como playlist dinámica: se pone al día sola cuando cambian tus canciones que te gustan") };
             if r.on_hover_text(tip).clicked() {
                 self.liked_dynamic_click();
             }
@@ -454,14 +455,14 @@ impl App {
         let plus_r = ui.interact(plus_hit, ui.id().with("liked_plus"), Sense::click());
         hand(ui, &plus_r);
         paint_mask(&painter, "plus", &lm::PLUS, px(&painter, po), if plus_r.hovered() { st.hover } else { st.icon });
-        let plus_r = plus_r.on_hover_text("Crear");
+        let plus_r = plus_r.on_hover_text(t("Crear"));
         egui::Popup::menu(&plus_r).show(|ui| {
             ui.set_min_width(220.0);
-            if Self::menu_item(ui, Some(Icon::Playlist), "Playlist", false).clicked() {
+            if Self::menu_item(ui, Some(Icon::Playlist), t("Playlist"), false).clicked() {
                 self.actions.push(Action::OpenEditor(None));
                 ui.close();
             }
-            if Self::menu_item(ui, Some(Icon::Folder), "Carpeta", false).clicked() {
+            if Self::menu_item(ui, Some(Icon::Folder), t("Carpeta"), false).clicked() {
                 self.folder_dialog = Some(FolderDialog { id: None, name: String::new(), playlist: None, busy: false });
                 ui.close();
             }
@@ -512,9 +513,9 @@ impl App {
         let mut v: Vec<(String, String, usize)> = count.into_iter().map(|(k, (name, n))| (k, name, n)).collect();
         v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
         let note = match (kind, self.liked_genres_pending) {
-            (2, Some(n)) if n > 0 && n != usize::MAX => Some(format!("Buscando géneros… ({n})")),
-            (2, Some(n)) if n > 0 => Some("Buscando géneros…".to_string()),
-            (2, None) => Some("Buscando géneros…".to_string()),
+            (2, Some(n)) if n > 0 && n != usize::MAX => Some(tr!("Buscando géneros… ({})", n)),
+            (2, Some(n)) if n > 0 => Some(t("Buscando géneros…").to_string()),
+            (2, None) => Some(t("Buscando géneros…").to_string()),
             _ => None,
         };
         (v.into_iter().map(|(k, name, _)| (k, name)).collect(), note)
@@ -529,7 +530,7 @@ impl App {
             ui.allocate_rect(rect, Sense::click());
             fm_glass(ui.painter(), rect, dark);
             for (k, name) in SORTS.iter().enumerate() {
-                let item = FmItem { green: k == sort, ..FmItem::new(*name) };
+                let item = FmItem { green: k == sort, ..FmItem::new(t(*name)) };
                 if fm_row(ui, egui::Id::new(("liked_sort_row", k)), rect, rect.min.y + FM_PAD + FM_ROW * k as f32, &item, 0).clicked() {
                     pick = Some(k);
                 }
@@ -556,7 +557,7 @@ impl App {
             ui.allocate_rect(rect, Sense::click());
             fm_glass(ui.painter(), rect, dark);
             for (k, name) in FILTERS.iter().enumerate() {
-                let item = FmItem { chevron: k > 0, ..FmItem::new(*name) };
+                let item = FmItem { chevron: k > 0, ..FmItem::new(t(*name)) };
                 let r = fm_row(ui, egui::Id::new(("liked_filter_row", k)), rect, rect.min.y + FM_PAD + FM_ROW * k as f32, &item, k);
                 if k > 0 && (r.hovered() || r.clicked()) {
                     sub = Some(k as u8);
@@ -577,7 +578,7 @@ impl App {
                 items.push((None, FmItem { dim: true, ..FmItem::new(n) }));
             }
             if items.is_empty() {
-                items.push((None, FmItem { dim: true, ..FmItem::new("Nada aún") }));
+                items.push((None, FmItem { dim: true, ..FmItem::new(t("Nada aún")) }));
             }
             let smin = pos2(rect.min.x + FM_SUB_DX, rect.min.y + FM_ROW * kind as f32 + FM_SUB_DY);
             let room = ((panel.max.y - FM_SUB_BOTTOM - smin.y - 2.0 * FM_EDGE) / FM_ROW).floor().max(0.0) as usize + 1;
@@ -641,12 +642,12 @@ impl App {
     /// Marca de la cabecera de una playlist dinámica: texto y explicación.
     pub(in crate::app) fn dynamic_badge(&self, id: &str) -> Option<(String, String)> {
         let d = self.dynamic_playlists.iter().find(|d| d.id == id)?;
-        let what = if d.kind == 1 { format!("de {}", d.label) } else { format!("del género {}", d.label) };
+        let what = if d.kind == 1 { tr!("de {}", d.label) } else { tr!("del género {}", d.label) };
         Some((
-            format!("Dinámica · {}", d.label),
-            format!(
-                "Playlist dinámica: Nanofy le añade y le quita tus canciones que te gustan {what} en cuanto cambian, también si les das «Me gusta» desde el móvil u otra app (mientras Nanofy está abierta; si no, al abrirla). Lo que añadas tú a mano no se toca.\n\nAñadidas por Nanofy: {}.",
-                d.synced.len()
+            tr!("Dinámica · {}", d.label),
+            tr!(
+                "Playlist dinámica: Nanofy le añade y le quita tus canciones que te gustan {} en cuanto cambian, también si les das «Me gusta» desde el móvil u otra app (mientras Nanofy está abierta; si no, al abrirla). Lo que añadas tú a mano no se toca.\n\nAñadidas por Nanofy: {}.",
+                what, d.synced.len()
             ),
         ))
     }
@@ -669,16 +670,16 @@ impl App {
             return;
         }
         let Some(user_id) = self.my_id().map(str::to_string) else {
-            self.status_err("Inicia sesión para crear playlists");
+            self.status_err(t("Inicia sesión para crear playlists"));
             return;
         };
         let label = self.settings.liked_filter_label.clone();
-        let name = format!("{label} · Canciones que te gustan");
-        let what = if kind == 1 { "de" } else { "del género" };
-        let description = format!("Playlist dinámica de Nanofy: tus canciones que te gustan {what} {label}. Se pone al día sola cuando añades o quitas canciones.");
+        let name = tr!("{} · Canciones que te gustan", label);
+        let what = if kind == 1 { tr!("de {}", label) } else { tr!("del género {}", label) };
+        let description = tr!("Playlist dinámica de Nanofy: tus canciones que te gustan {}. Se pone al día sola cuando añades o quitas canciones.", what);
         self.pending_dynamic = Some(DynamicPlaylist { id: String::new(), name: name.clone(), kind, value, label, synced: Vec::new() });
         self.api.send(Req::CreatePlaylist { user_id, name, description, public: false, collaborative: false });
-        self.status("Creando la playlist dinámica…");
+        self.status(t("Creando la playlist dinámica…"));
     }
 
     pub(in crate::app) fn save_dynamic(&self) {

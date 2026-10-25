@@ -1,6 +1,6 @@
 [package]
 name = "nanofy"
-version = "1.32.1"
+version = "1.33.0"
 edition = "2021"
 description = "Cliente nativo y ligero de Spotify (Rust + egui + librespot)"
 license = "MIT"
@@ -26,6 +26,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 # Vídeo de los podcasts (H.264 sin DRM): el decodificador de Cisco, compilado desde su fuente.
 openh264 = "0.9"
+# Idioma del sistema (para el idioma de la interfaz en «Automático»).
+sys-locale = "0.3"
 directories = "6"
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }

@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::i18n::t;
+
 /// Un número que debería ser positivo y Spotify a veces manda negativo o con decimales (el
 /// `progress_ms` de `/me/player` justo al empezar una canción llega como `-86`): se ajusta a
 /// 0..=u32::MAX en vez de perder toda la respuesta.
@@ -776,12 +778,13 @@ impl AudioInfo {
     /// «Normalización: Normal · −5,3 dB (por canción)». `level` es el nombre del nivel elegido.
     pub fn normalisation_line(&self, level: &str) -> String {
         match self.gain_db {
-            None => "Normalización desactivada".to_string(),
-            Some(_) if !self.gain_data => format!("Normalización: {level} · sin datos de volumen (0 dB)"),
-            Some(db) => format!(
-                "Normalización: {level} · {} ({})",
+            None => t("Normalización desactivada").to_string(),
+            Some(_) if !self.gain_data => tr!("Normalización: {} · sin datos de volumen (0 dB)", level),
+            Some(db) => tr!(
+                "Normalización: {} · {} ({})",
+                level,
                 fmt_db(db),
-                if self.album_gain { "por álbum" } else { "por canción" }
+                if self.album_gain { t("por álbum") } else { t("por canción") }
             ),
         }
     }
@@ -791,20 +794,20 @@ impl AudioInfo {
     pub fn tooltip(&self, output: AudioOutput, level: &str, chosen_kbps: u16) -> Vec<String> {
         let mut lines = vec![self.source_line()];
         if let Some(o) = output.summary(false) {
-            lines.push(format!("Salida: {o}"));
+            lines.push(tr!("Salida: {}", o));
         }
         lines.push(self.normalisation_line(level));
         if self.below_requested() {
             if let (Some(k), Some(r)) = (self.kbps, self.requested_kbps) {
                 lines.push(if self.from_cache {
-                    format!("Suena la copia ya guardada a {k} kbps (de antes de cambiar la calidad).")
+                    tr!("Suena la copia ya guardada a {} kbps (de antes de cambiar la calidad).", k)
                 } else {
-                    format!("Esta canción no está disponible en {r} kbps; suena a {k} kbps.")
+                    tr!("Esta canción no está disponible en {} kbps; suena a {} kbps.", r, k)
                 });
             }
         }
         if self.requested_kbps.is_some_and(|r| r != chosen_kbps) {
-            lines.push(format!("La calidad nueva ({chosen_kbps} kbps) se aplica desde la próxima canción."));
+            lines.push(tr!("La calidad nueva ({} kbps) se aplica desde la próxima canción.", chosen_kbps));
         }
         lines
     }
@@ -859,9 +862,9 @@ impl AudioOutput {
         let resampling = self.resampling()?;
         let mut s = format!("{} kHz · ", fmt_khz(self.rate));
         s.push_str(match resampling {
-            Resampling::None => "sin remuestreo",
-            Resampling::Sinc => "remuestreo de alta calidad",
-            Resampling::Rodio => "remuestreo básico de rodio",
+            Resampling::None => t("sin remuestreo"),
+            Resampling::Sinc => t("remuestreo de alta calidad"),
+            Resampling::Rodio => t("remuestreo básico de rodio"),
         });
         if with_ratio && resampling != Resampling::None {
             s.push_str(&format!(" ({} → {} kHz)", fmt_khz(SOURCE_RATE), fmt_khz(self.rate)));
@@ -876,7 +879,7 @@ impl AudioOutput {
 /// 44100 → «44,1»; 48000 → «48»; 22050 → «22,05» (coma decimal, sin ceros de sobra).
 pub fn fmt_khz(hz: u32) -> String {
     let s = format!("{:.2}", hz as f64 / 1000.0);
-    s.trim_end_matches('0').trim_end_matches('.').replace('.', ",")
+    crate::i18n::decimal(s.trim_end_matches('0').trim_end_matches('.').to_string())
 }
 
 /// Ganancia con una cifra decimal, coma y signo tipográfico: «−5,3 dB», «+2,0 dB», «0 dB».
@@ -886,7 +889,7 @@ pub fn fmt_db(db: f32) -> String {
         return "0 dB".to_string();
     }
     let sign = if r < 0.0 { '−' } else { '+' };
-    format!("{sign}{:.1} dB", r.abs()).replace('.', ",")
+    crate::i18n::decimal(format!("{sign}{:.1} dB", r.abs()))
 }
 
 pub fn fmt_ms(ms: u32) -> String {
@@ -915,9 +918,9 @@ pub fn fmt_date(date: &str) -> String {
 pub fn fmt_total(ms: u64) -> String {
     let mins = ms / 60_000;
     if mins >= 60 {
-        format!("{} h {} min", mins / 60, mins % 60)
+        tr!("{} h {} min", mins / 60, mins % 60)
     } else {
-        format!("{mins} min")
+        tr!("{} min", mins)
     }
 }
 
@@ -1317,10 +1320,27 @@ impl HomeSection {
     /// Filas de recomendaciones (frente a las basadas en tu biblioteca).
     pub fn is_recommendation(&self) -> bool {
         let t = self.title.to_lowercase();
-        ["más como", "para fans de", "descubre más de", "recomendad", "emisoras recomendadas", "deja que", "álbumes con canciones"]
-            .iter()
-            .any(|p| t.starts_with(p))
+        // Los títulos llegan en el idioma de la interfaz (se piden así a Spotify).
+        [
+            "más como",
+            "para fans de",
+            "descubre más de",
+            "recomendad",
+            "emisoras recomendadas",
+            "deja que",
+            "álbumes con canciones",
+            "more like",
+            "for fans of",
+            "discover more from",
+            "more from",
+            "recommended",
+            "because you",
+            "albums featuring songs",
+        ]
+        .iter()
+        .any(|p| t.starts_with(p))
             || t.contains("recomend")
+            || t.contains("recommend")
     }
 
     /// 0 música, 1 podcasts, 2 audiolibros (por el título y el tipo de los ítems).
@@ -1447,32 +1467,32 @@ pub fn credits_from_json(v: &serde_json::Value) -> Vec<CreditGroup> {
 /// conocen, tal cual con la primera en mayúscula.
 pub fn role_es(role: &str) -> String {
     let es = match role.trim().to_lowercase().as_str() {
-        "main artist" => "Artista principal",
-        "featured artist" => "Artista invitado",
-        "composer" => "Compositor",
-        "lyricist" => "Letrista",
-        "writer" | "songwriter" => "Autor",
-        "producer" => "Productor",
-        "co-producer" => "Coproductor",
-        "executive producer" => "Productor ejecutivo",
-        "additional production" | "additional producer" => "Producción adicional",
-        "remixer" => "Remezclador",
-        "arranger" => "Arreglista",
-        "engineer" => "Ingeniero",
-        "mixing engineer" | "mixer" => "Ingeniero de mezcla",
-        "mastering engineer" => "Ingeniero de masterización",
-        "recording engineer" => "Ingeniero de grabación",
-        "programmer" | "programming" => "Programación",
-        "vocals" | "vocalist" | "lead vocals" => "Voz",
-        "background vocals" | "backing vocals" => "Coros",
-        "guitar" => "Guitarra",
-        "bass" | "bass guitar" => "Bajo",
-        "drums" => "Batería",
-        "keyboards" => "Teclados",
-        "piano" => "Piano",
-        "synthesizer" => "Sintetizador",
-        "percussion" => "Percusión",
-        "performer" => "Intérprete",
+        "main artist" => t("Artista principal"),
+        "featured artist" => t("Artista invitado"),
+        "composer" => t("Compositor"),
+        "lyricist" => t("Letrista"),
+        "writer" | "songwriter" => t("Autor"),
+        "producer" => t("Productor"),
+        "co-producer" => t("Coproductor"),
+        "executive producer" => t("Productor ejecutivo"),
+        "additional production" | "additional producer" => t("Producción adicional"),
+        "remixer" => t("Remezclador"),
+        "arranger" => t("Arreglista"),
+        "engineer" => t("Ingeniero"),
+        "mixing engineer" | "mixer" => t("Ingeniero de mezcla"),
+        "mastering engineer" => t("Ingeniero de masterización"),
+        "recording engineer" => t("Ingeniero de grabación"),
+        "programmer" | "programming" => t("Programación"),
+        "vocals" | "vocalist" | "lead vocals" => t("Voz"),
+        "background vocals" | "backing vocals" => t("Coros"),
+        "guitar" => t("Guitarra"),
+        "bass" | "bass guitar" => t("Bajo"),
+        "drums" => t("Batería"),
+        "keyboards" => t("Teclados"),
+        "piano" => t("Piano"),
+        "synthesizer" => t("Sintetizador"),
+        "percussion" => t("Percusión"),
+        "performer" => t("Intérprete"),
         other => return capitalize(other),
     };
     es.to_string()
@@ -1481,9 +1501,9 @@ pub fn role_es(role: &str) -> String {
 /// Título de un grupo de créditos en español.
 pub fn credit_group_es(title: &str) -> String {
     match title.trim().to_lowercase().as_str() {
-        "performers" => "Interpretada por".to_string(),
-        "writers" => "Escrita por".to_string(),
-        "producers" => "Producida por".to_string(),
+        "performers" => t("Interpretada por").to_string(),
+        "writers" => t("Escrita por").to_string(),
+        "producers" => t("Producida por").to_string(),
         other => capitalize(other),
     }
 }

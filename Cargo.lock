@@ -2700,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "nanofy"
-version = "1.32.1"
+version = "1.33.0"
 dependencies = [
  "base64 0.22.1",
  "directories",
@@ -2730,6 +2730,7 @@ dependencies = [
  "sha2",
  "softbuffer",
  "souvlaki",
+ "sys-locale",
  "sysinfo 0.37.2",
  "tokio",
  "ureq",
@@ -4746,6 +4747,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

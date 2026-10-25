@@ -81,7 +81,7 @@ una. Funciona en Windows, Linux y macOS, y la interfaz está en español. Para r
 - Teclas multimedia y controles de reproducción del sistema, con título y portada, en Windows, Linux y macOS.
 - Miniplayer siempre visible y, en Windows, botones de reproducción en la miniatura de la barra de tareas.
 - Los cortes de la conexión se reparan en segundo plano sin parar la música. Si se va la red, se pausa en ese segundo y continúa cuando vuelve; si algo falla o tarda, avisa y ofrece reintentar.
-- Tema claro, oscuro o del sistema.
+- En español o en inglés (o en el idioma del sistema), y fácil de traducir: cada idioma es un CSV ([cómo traducir](lang/README.md)).
 - <kbd>Ctrl</kbd>+<kbd>/</kbd> (<kbd>Cmd</kbd>+<kbd>/</kbd> en macOS) muestra los atajos de teclado.
 
 ## Rendimiento
@@ -212,6 +212,11 @@ Nanofy), el sistema y los pasos para reproducirlo, y adjunta `nanofy.log` y `nan
 carpeta aparece en [Privacidad y datos](#privacidad-y-datos)). Revísalos antes de publicarlos:
 incluyen tu nombre de usuario de Spotify y pueden incluir títulos de canciones. Los problemas de
 seguridad se avisan [en privado](SECURITY.md).
+
+## Traducir
+
+Para traducir Nanofy a tu idioma basta una hoja de cálculo: cada idioma es un CSV con el texto en
+español y su traducción. Los pasos están en [lang/README.md](lang/README.md).
 
 ## Créditos y licencia
 

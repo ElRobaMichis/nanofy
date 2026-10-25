@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::backend::Shared;
+use crate::i18n::t;
 use crate::model::*;
 
 const URL: &str = "https://api-partner.spotify.com/pathfinder/v2/query";
@@ -196,14 +197,14 @@ impl Pathfinder {
     pub fn usable(&self, web_cooled: bool) -> Result<String, (String, Option<u64>)> {
         let st = self.state.lock().unwrap();
         if st.blocked {
-            let why = if st.discovering { "buscando el hash nuevo de searchDesktop" } else { "hash de searchDesktop rechazado" };
+            let why = if st.discovering { t("buscando el hash nuevo de searchDesktop") } else { t("hash de searchDesktop rechazado") };
             return Err((why.to_string(), None));
         }
         if let Some(until) = st.down_until {
             let left = until.saturating_duration_since(Instant::now());
             if !left.is_zero() && (st.limited || !web_cooled) {
                 let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
-                let why = format!("pathfinder apartado {secs} s más");
+                let why = tr!("pathfinder apartado {} s más", secs);
                 return Err((why, st.limited.then_some(secs)));
             }
         }
@@ -325,7 +326,7 @@ impl Pathfinder {
             _ => return Err(PfErr::Failed(format!("HTTP {status}: {}", snippet(&text)))),
         }
         let Some(v) = v else {
-            return Err(PfErr::Down("respuesta que no es JSON".to_string()));
+            return Err(PfErr::Down(t("respuesta que no es JSON").to_string()));
         };
         let errors = v["errors"].as_array().filter(|e| !e.is_empty()).map(|e| snippet(&Value::Array(e.clone()).to_string()));
         let Some((result, raw, mapped)) = map_search(&v) else {
@@ -333,11 +334,11 @@ impl Pathfinder {
             // va por la Web API. Antes apartaba pathfinder 10 min y, con la Web API limitada, las
             // búsquedas siguientes fallaban todas.
             if query_failed(&v) {
-                return Err(PfErr::Failed(format!("errores: {}", errors.unwrap_or_default())));
+                return Err(PfErr::Failed(tr!("errores: {}", errors.unwrap_or_default())));
             }
             return Err(PfErr::Down(match errors {
-                Some(e) => format!("errores: {e}"),
-                None => "respuesta sin data.searchV2".to_string(),
+                Some(e) => tr!("errores: {}", e),
+                None => t("respuesta sin data.searchV2").to_string(),
             }));
         };
         // Errores parciales (un campo que no resolvió) con datos: se usa lo que llegó.
@@ -347,7 +348,7 @@ impl Pathfinder {
         if mapped == 0 {
             // Elementos que no se entienden: el formato cambió, no es una búsqueda vacía.
             return Err(if raw > 0 {
-                PfErr::Down(format!("{raw} resultados en un formato desconocido"))
+                PfErr::Down(tr!("{} resultados en un formato desconocido", raw))
             } else {
                 PfErr::Empty(result)
             });
@@ -370,13 +371,13 @@ impl Pathfinder {
             .to_string();
             let (status, _, text) = self.post(&body).map_err(|e| match e {
                 PfErr::Down(e) | PfErr::Failed(e) => e,
-                _ => "sin respuesta".to_string(),
+                _ => t("sin respuesta").to_string(),
             })?;
             let v: Option<Value> = serde_json::from_str(&text).ok();
             if unknown_hash(v.as_ref(), &text) {
                 let tried = self.ops.lock().unwrap().contains_key(op.name);
                 if tried {
-                    return Err(format!("Spotify ya no conoce el hash de {}", op.name));
+                    return Err(tr!("Spotify ya no conoce el hash de {}", op.name));
                 }
                 self.ops.lock().unwrap().insert(op.name, None);
                 log::warn!("pathfinder: Spotify ya no conoce el hash de {}; se busca el nuevo en el reproductor web", op.name);
@@ -386,19 +387,19 @@ impl Pathfinder {
                         hash = h;
                         continue;
                     }
-                    Ok(_) => return Err(format!("el reproductor web usa el mismo hash de {}", op.name)),
-                    Err(e) => return Err(format!("sin hash nuevo de {}: {e}", op.name)),
+                    Ok(_) => return Err(tr!("el reproductor web usa el mismo hash de {}", op.name)),
+                    Err(e) => return Err(tr!("sin hash nuevo de {}: {}", op.name, e)),
                 }
             }
             if !(200..=299).contains(&status) {
                 return Err(format!("HTTP {status}: {}", snippet(&text)));
             }
-            let v = v.ok_or_else(|| "respuesta que no es JSON".to_string())?;
+            let v = v.ok_or_else(|| t("respuesta que no es JSON").to_string())?;
             if let Some(e) = v["errors"].as_array().filter(|e| !e.is_empty()) {
                 log::info!("pathfinder {}: errores: {}", op.name, snippet(&Value::Array(e.clone()).to_string()));
             }
             return match &v["data"] {
-                Value::Null => Err(format!("{} sin data", op.name)),
+                Value::Null => Err(tr!("{} sin data", op.name)),
                 d => Ok(d.clone()),
             };
         }
@@ -421,13 +422,13 @@ impl Pathfinder {
         let token = self
             .handle
             .block_on(async { tokio::time::timeout(TIMEOUT, session.login5().auth_token()).await })
-            .map_err(|_| PfErr::Failed("token: sin respuesta".to_string()))?
+            .map_err(|_| PfErr::Failed(t("token: sin respuesta").to_string()))?
             .map_err(|e| PfErr::Failed(format!("token: {e}")))?
             .access_token;
         let client_token = self
             .handle
             .block_on(async { tokio::time::timeout(TIMEOUT, session.spclient().client_token()).await })
-            .map_err(|_| PfErr::Failed("client-token: sin respuesta".to_string()))?
+            .map_err(|_| PfErr::Failed(t("client-token: sin respuesta").to_string()))?
             .map_err(|e| PfErr::Failed(format!("client-token: {e}")))?;
         // El agente propio (y no el http_client de librespot): ese comparte el límite de
         // *.spotify.com con los metadatos y descarta el cuerpo de los errores, donde viene
@@ -444,7 +445,7 @@ impl Pathfinder {
             .header("spotify-app-version", APP_VERSION)
             .header("Content-Type", "application/json;charset=UTF-8")
             .header("Accept", "application/json")
-            .header("Accept-Language", "es")
+            .header("Accept-Language", crate::i18n::current())
             .header("User-Agent", USER_AGENT)
             .send(body.as_bytes());
         let mut resp = resp.map_err(net_err)?;
@@ -558,7 +559,7 @@ impl Pathfinder {
         let html = self.fetch(WEB_PLAYER, 4 << 20)?;
         let scripts = script_urls(&html);
         if scripts.is_empty() {
-            return Err("la página del reproductor web no enlaza su paquete".to_string());
+            return Err(t("la página del reproductor web no enlaza su paquete").to_string());
         }
         let mut last_err = String::new();
         for url in scripts.iter().take(4) {
@@ -584,7 +585,7 @@ impl Pathfinder {
                 }
             }
         }
-        Err(if last_err.is_empty() { format!("{name} no aparece en el paquete") } else { last_err })
+        Err(if last_err.is_empty() { tr!("{} no aparece en el paquete", name) } else { last_err })
     }
 
     fn fetch(&self, url: &str, limit: u64) -> Result<String, String> {
@@ -595,19 +596,19 @@ impl Pathfinder {
             .timeout_global(Some(Duration::from_secs(30)))
             .build()
             .header("User-Agent", USER_AGENT)
-            .header("Accept-Language", "es")
+            .header("Accept-Language", crate::i18n::current())
             .call()
-            .map_err(|e| format!("red: {e}"))?;
+            .map_err(|e| tr!("red: {}", e))?;
         let status = resp.status().as_u16();
         if status != 200 {
-            return Err(format!("HTTP {status} en {url}"));
+            return Err(tr!("HTTP {} en {}", status, url));
         }
         resp.body_mut()
             .with_config()
             .limit(limit)
             .lossy_utf8(true)
             .read_to_string()
-            .map_err(|e| format!("red: {e}"))
+            .map_err(|e| tr!("red: {}", e))
     }
 }
 
@@ -641,8 +642,8 @@ fn query_failed(v: &Value) -> bool {
 /// ser un corte momentáneo, que afectaría igual a la Web API: solo cuenta para esta búsqueda.
 fn net_err(e: ureq::Error) -> PfErr {
     match e {
-        ureq::Error::Timeout(_) => PfErr::Down(format!("no responde en {} s", TIMEOUT.as_secs())),
-        e => PfErr::Failed(format!("red: {e}")),
+        ureq::Error::Timeout(_) => PfErr::Down(tr!("no responde en {} s", TIMEOUT.as_secs())),
+        e => PfErr::Failed(tr!("red: {}", e)),
     }
 }
 
@@ -1171,7 +1172,7 @@ fn entry_of(d: &Value) -> Option<BrowseEntry> {
         }
         "Artist" => {
             let img = first_image(&d["visuals"]["avatarImage"]);
-            e("artist", text(&d["profile"]["name"]), "Artista".into(), img)
+            e("artist", text(&d["profile"]["name"]), t("Artista").into(), img)
         }
         "Playlist" => {
             let p = playlist(d)?;
@@ -1191,7 +1192,7 @@ fn entry_of(d: &Value) -> Option<BrowseEntry> {
             let authors = b.authors.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ");
             e("audiobook", b.name, authors, b.images.into_iter().max_by_key(|i| i.width.unwrap_or(0)).map(|i| i.url))
         }
-        "User" => e("user", text(&d["name"]), "Perfil".into(), first_image(&d["avatar"])),
+        "User" => e("user", text(&d["name"]), t("Perfil").into(), first_image(&d["avatar"])),
         _ => return None,
     })
 }

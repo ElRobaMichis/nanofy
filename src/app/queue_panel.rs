@@ -17,6 +17,7 @@ use super::theme::{self, GREEN};
 use super::widgets::{galley_truncated, text_on_baseline};
 use super::{Action, App, Page, PlayState, PlayTarget, Repeat};
 use crate::api::Req;
+use crate::i18n::t;
 use crate::model::Track;
 
 /// Ancho del panel; va 2 px por debajo del borde de arriba del contenido y 1 px dentro de los de
@@ -303,7 +304,7 @@ impl App {
     fn queue_tabs(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect, ink: &Ink) {
         let y = rect.min.y + RULE_Y;
         painter.rect_filled(Rect::from_min_max(pos2(rect.min.x, y - 0.5), pos2(rect.max.x, y + 0.5)), CornerRadius::ZERO, ink.rule);
-        for (k, label) in ["Cola", "Recientes"].into_iter().enumerate() {
+        for (k, label) in [t("Cola"), t("Recientes")].into_iter().enumerate() {
             let on = self.queue_recent == (k == 1);
             let x = rect.min.x + TAB_X[k];
             let r = text_at(painter, label, theme::regular(TAB_FONT), if on { ink.tab_on } else { ink.tab_off }, x, rect.min.y + TAB_BASE, 200.0);
@@ -328,11 +329,11 @@ impl App {
     fn queue_list(&mut self, ui: &mut egui::Ui, o: Pos2, ink: &Ink) -> f32 {
         let painter = ui.painter().clone();
         if !self.signed_in() {
-            text_at(&painter, "Inicia sesión para ver la cola.", theme::regular(ARTIST_FONT + 1.0), ink.artist, o.x + TAB_X[0], o.y + NOW_Y, W - 50.0);
+            text_at(&painter, t("Inicia sesión para ver la cola."), theme::regular(ARTIST_FONT + 1.0), ink.artist, o.x + TAB_X[0], o.y + NOW_Y, W - 50.0);
             return NOW_Y + 20.0;
         }
         let Some(q) = self.queue.clone() else {
-            text_at(&painter, "Cargando la cola…", theme::regular(ARTIST_FONT + 1.0), ink.artist, o.x + TAB_X[0], o.y + NOW_Y, W - 50.0);
+            text_at(&painter, t("Cargando la cola…"), theme::regular(ARTIST_FONT + 1.0), ink.artist, o.x + TAB_X[0], o.y + NOW_Y, W - 50.0);
             return NOW_Y + 20.0;
         };
         // Lo añadido a la cola desde Nanofy va primero; el resto es la continuación de la lista
@@ -356,7 +357,7 @@ impl App {
         }
         let mut groups: Vec<Group> = Vec::new();
         if !queued.is_empty() {
-            groups.push(Group { icon: Icon::QueueList, name: "Siguiente en la cola".into(), page: None, context: false, tracks: queued });
+            groups.push(Group { icon: Icon::QueueList, name: t("Siguiente en la cola").into(), page: None, context: false, tracks: queued });
         }
         if !rest.is_empty() {
             // El nombre de la lista en curso, si aún no se tiene, se pide como al abrir su página.
@@ -367,7 +368,7 @@ impl App {
                 Some((_, Some(Page::Album(id)))) if !self.albums.contains_key(&id) => self.request_once(&format!("album:{id}"), Req::Album(id.clone())),
                 _ => {}
             }
-            let (name, page) = self.now_context().unwrap_or_else(|| ("Siguientes canciones".into(), None));
+            let (name, page) = self.now_context().unwrap_or_else(|| (t("Siguientes canciones").into(), None));
             let icon = page.as_ref().map(|p| self.page_label(p).0).unwrap_or(Icon::Playlist);
             groups.push(Group { icon, name, page, context: true, tracks: rest });
         }
@@ -382,10 +383,10 @@ impl App {
             y = LIST_TOP + 32.0;
         }
         if groups.is_empty() {
-            text_at(&painter, "La cola está vacía.", theme::regular(ARTIST_FONT + 1.0), ink.artist, o.x + TAB_X[0], o.y + y, W - 50.0);
+            text_at(&painter, t("La cola está vacía."), theme::regular(ARTIST_FONT + 1.0), ink.artist, o.x + TAB_X[0], o.y + y, W - 50.0);
             return y + 24.0;
         }
-        text_at(&painter, "A continuación:", theme::bold(NEXT_FONT), ink.head, o.x + TAB_X[0], o.y + y, W - 50.0);
+        text_at(&painter, t("A continuación:"), theme::bold(NEXT_FONT), ink.head, o.x + TAB_X[0], o.y + y, W - 50.0);
         let mut head = y + HEAD_DY;
         let mut end = head;
         // Primera fila y canciones de cada grupo (para reordenar dentro de él).
@@ -441,7 +442,7 @@ impl App {
         }
         let recent = self.history_list();
         if recent.is_empty() {
-            text_at(&painter, "Cargando…", theme::regular(ARTIST_FONT + 1.0), ink.artist, o.x + TAB_X[0], o.y + NOW_Y, W - 50.0);
+            text_at(&painter, t("Cargando…"), theme::regular(ARTIST_FONT + 1.0), ink.artist, o.x + TAB_X[0], o.y + NOW_Y, W - 50.0);
             return NOW_Y + 20.0;
         }
         for (i, t) in recent.iter().enumerate() {
@@ -468,7 +469,7 @@ impl App {
         }
         if g.context {
             let shuffle = if self.player.shuffle { GREEN } else { ink.icon };
-            if icon_button(ui, egui::Id::new(("queue_shuffle", gi)), pos2(o.x + SHUFFLE_X, y + SHUFFLE_DY), BAR_ICON, Icon::Shuffle, shuffle, "Aleatorio").clicked() {
+            if icon_button(ui, egui::Id::new(("queue_shuffle", gi)), pos2(o.x + SHUFFLE_X, y + SHUFFLE_DY), BAR_ICON, Icon::Shuffle, shuffle, t("Aleatorio")).clicked() {
                 self.toggle_shuffle();
             }
             let (icon, color) = match self.player.repeat {
@@ -476,14 +477,14 @@ impl App {
                 Repeat::Context => (Icon::Repeat, GREEN),
                 Repeat::Track => (Icon::RepeatOne, GREEN),
             };
-            if icon_button(ui, egui::Id::new(("queue_repeat", gi)), pos2(o.x + REPEAT_X, y + REPEAT_DY), BAR_ICON, icon, color, "Repetir").clicked() {
+            if icon_button(ui, egui::Id::new(("queue_repeat", gi)), pos2(o.x + REPEAT_X, y + REPEAT_DY), BAR_ICON, icon, color, t("Repetir")).clicked() {
                 self.cycle_repeat();
             }
-            let tip = format!("Quitar lo que queda de {}", g.name);
+            let tip = tr!("Quitar lo que queda de {}", g.name);
             if icon_button(ui, egui::Id::new(("queue_drop", gi)), pos2(o.x + CLOSE_X, y + HEAD_CLOSE_DY), CLOSE, Icon::Close, ink.icon, &tip).clicked() {
                 self.queue_drop_context();
             }
-        } else if icon_button(ui, egui::Id::new(("queue_clear", gi)), pos2(o.x + CLOSE_X, y + HEAD_CLOSE_DY), CLOSE, Icon::Close, ink.icon, "Vaciar la cola").clicked() {
+        } else if icon_button(ui, egui::Id::new(("queue_clear", gi)), pos2(o.x + CLOSE_X, y + HEAD_CLOSE_DY), CLOSE, Icon::Close, ink.icon, t("Vaciar la cola")).clicked() {
             self.queue_clear();
         }
     }
@@ -546,8 +547,8 @@ impl App {
                 }
             }
             let tip = match kind {
-                Kind::Now => "Saltar",
-                _ => "Quitar de la cola",
+                Kind::Now => crate::i18n::t("Saltar"),
+                _ => crate::i18n::t("Quitar de la cola"),
             };
             if icon_button(ui, egui::Id::new(("queue_x", list_id, i)), pos2(o.x + CLOSE_X, y + CLOSE_DY), CLOSE, Icon::Close, ink.icon, tip).clicked() {
                 match kind {
@@ -588,14 +589,14 @@ impl App {
         let b = rect.max.y;
         let ry = b - FOOT_RULE;
         painter.rect_filled(Rect::from_min_max(pos2(rect.min.x, ry - 0.5), pos2(rect.max.x, ry + 0.5)), CornerRadius::ZERO, ink.rule);
-        text_at(painter, "Reproducir canciones similares", theme::semilight(FOOT_FONT), ink.foot, rect.min.x + FOOT_TEXT_X, b - FOOT_BASE, SWITCH_X - FOOT_TEXT_X - 12.0);
+        text_at(painter, t("Reproducir canciones similares"), theme::semilight(FOOT_FONT), ink.foot, rect.min.x + FOOT_TEXT_X, b - FOOT_BASE, SWITCH_X - FOOT_TEXT_X - 12.0);
         let cy = b - SWITCH_DY;
         let track = Rect::from_min_size(pos2(rect.min.x + SWITCH_X, cy - SWITCH.1 / 2.0), vec2(SWITCH.0, SWITCH.1));
         let on = self.settings.autoplay;
         let hit = Rect::from_min_max(pos2(rect.min.x + 8.0, ry + 4.0), pos2(rect.max.x - 8.0, b - 4.0));
         let resp = ui
             .interact(hit, egui::Id::new("queue_autoplay"), Sense::click())
-            .on_hover_text("Al acabarse lo que suena, sigue con canciones parecidas");
+            .on_hover_text(t("Al acabarse lo que suena, sigue con canciones parecidas"));
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }

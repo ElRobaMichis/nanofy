@@ -7,6 +7,7 @@ use super::icons::{self, Icon};
 use super::theme;
 use super::{pick_image_file, Action, App, ERROR_RED, GREEN};
 use crate::api::Req;
+use crate::i18n::t;
 use crate::model::*;
 use crate::update::{FailKind, MoveReason, NoteLine, Stage, UpdateInfo};
 
@@ -59,7 +60,7 @@ impl App {
                         ui.add_space(4.0);
                         ui.label(RichText::new(&view.title).font(theme::bold(15.0)));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if icons::button(ui, Icon::Close, 24.0, p.weak).on_hover_text("Recordar más tarde").clicked() {
+                            if icons::button(ui, Icon::Close, 24.0, p.weak).on_hover_text(t("Recordar más tarde")).clicked() {
                                 action = Some(UpdAction::Later);
                             }
                         });
@@ -120,7 +121,7 @@ impl App {
                             }
                             if view.skip {
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if Self::small_link(ui, "Omitir esta versión").on_hover_text("No volver a avisar de esta versión").clicked() {
+                                    if Self::small_link(ui, t("Omitir esta versión")).on_hover_text(t("No volver a avisar de esta versión")).clicked() {
                                         action = Some(UpdAction::Skip);
                                     }
                                 });
@@ -157,9 +158,9 @@ impl App {
                         let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
                         icons::paint(ui.painter(), r, theme::RED, Icon::Download);
                         ui.add_space(4.0);
-                        ui.label(RichText::new("No se pudo actualizar").font(theme::bold(15.0)));
+                        ui.label(RichText::new(t("No se pudo actualizar")).font(theme::bold(15.0)));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if icons::button(ui, Icon::Close, 24.0, p.weak).on_hover_text("Cerrar").clicked() {
+                            if icons::button(ui, Icon::Close, 24.0, p.weak).on_hover_text(t("Cerrar")).clicked() {
                                 action = Some(UpdAction::Later);
                             }
                         });
@@ -167,7 +168,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.add(Label::new(RichText::new(&msg).small().color(theme::RED)).wrap());
                     ui.add_space(12.0);
-                    if Self::primary_button(ui, "Reintentar", !self.update_busy).clicked() {
+                    if Self::primary_button(ui, t("Reintentar"), !self.update_busy).clicked() {
                         action = Some(UpdAction::Recheck);
                     }
                 });
@@ -227,11 +228,11 @@ impl App {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
                         icons::paint(ui.painter(), r, GREEN, Icon::Check);
-                        ui.label(RichText::new(format!("Nanofy se actualizó a la {version}")).font(theme::bold(14.0)));
-                        if Self::secondary_button(ui, "Ver novedades", true).clicked() {
+                        ui.label(RichText::new(tr!("Nanofy se actualizó a la {}", version)).font(theme::bold(14.0)));
+                        if Self::secondary_button(ui, t("Ver novedades"), true).clicked() {
                             action = Some(1);
                         }
-                        if icons::button(ui, Icon::Close, 24.0, p.weak).on_hover_text("Cerrar").clicked() {
+                        if icons::button(ui, Icon::Close, 24.0, p.weak).on_hover_text(t("Cerrar")).clicked() {
                             action = Some(2);
                         }
                     });
@@ -276,7 +277,7 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .frame(Self::dialog_frame(ctx))
             .show(ctx, |ui| {
-                if Self::dialog_title(ui, &format!("Novedades de Nanofy {}", info.version)) {
+                if Self::dialog_title(ui, &tr!("Novedades de Nanofy {}", info.version)) {
                     open = false;
                 }
                 egui::ScrollArea::vertical().id_salt("notes_dialog_text").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
@@ -298,11 +299,11 @@ impl App {
                 });
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    if Self::small_link(ui, "Ver en GitHub").on_hover_text(&info.page_url).clicked() {
+                    if Self::small_link(ui, t("Ver en GitHub")).on_hover_text(&info.page_url).clicked() {
                         github = true;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if Self::secondary_button(ui, "Cerrar", true).clicked() {
+                        if Self::secondary_button(ui, t("Cerrar"), true).clicked() {
                             open = false;
                         }
                     });
@@ -326,7 +327,7 @@ impl App {
         };
         let mut open = true;
         let mut submit = false;
-        let title = if d.id.is_some() { "Renombrar carpeta" } else { "Nueva carpeta" };
+        let title = if d.id.is_some() { t("Renombrar carpeta") } else { t("Nueva carpeta") };
         let p = theme::palette(ctx);
         egui::Window::new("folder_dialog")
             .title_bar(false)
@@ -339,9 +340,9 @@ impl App {
                 if Self::dialog_title(ui, title) {
                     open = false;
                 }
-                Self::field_label(ui, "NOMBRE");
+                Self::field_label(ui, t("NOMBRE"));
                 let r = Self::field_box(ui, |ui| {
-                    let r = ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("Mi carpeta").frame(egui::Frame::NONE).desired_width(f32::INFINITY));
+                    let r = ui.add(egui::TextEdit::singleline(&mut d.name).hint_text(t("Mi carpeta")).frame(egui::Frame::NONE).desired_width(f32::INFINITY));
                     if !d.busy {
                         r.request_focus();
                     }
@@ -352,17 +353,17 @@ impl App {
                 }
                 if d.playlist.is_some() {
                     ui.add_space(6.0);
-                    ui.label(RichText::new("La playlist se moverá dentro de la carpeta nueva.").small().color(p.faint));
+                    ui.label(RichText::new(t("La playlist se moverá dentro de la carpeta nueva.")).small().color(p.faint));
                 }
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        let label = if d.id.is_some() { "Guardar" } else { "Crear" };
+                        let label = if d.id.is_some() { t("Guardar") } else { t("Crear") };
                         if Self::primary_button(ui, label, !d.busy && !d.name.trim().is_empty()).clicked() {
                             submit = true;
                         }
-                        if Self::secondary_button(ui, "Cancelar", true).clicked() {
+                        if Self::secondary_button(ui, t("Cancelar"), true).clicked() {
                             open = false;
                         }
                         if d.busy {
@@ -393,29 +394,30 @@ impl App {
             return;
         }
         let mut open = self.show_shortcuts;
-        egui::Window::new("Atajos de teclado")
+        egui::Window::new(t("Atajos de teclado"))
+            .id(egui::Id::new("Atajos de teclado"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 let rows = [
-                    ("Espacio", "Reproducir o pausar"),
-                    ("Ctrl+← / Ctrl+→", "Anterior / siguiente"),
-                    ("Shift+← / Shift+→", "Retroceder / avanzar 10 s"),
-                    ("Ctrl+↑ / Ctrl+↓", "Volumen"),
-                    ("M", "Silenciar"),
-                    ("S / R", "Aleatorio / repetir"),
-                    ("Q / L", "Cola / letra"),
-                    ("Ctrl+J", "Jam (escuchar en grupo)"),
-                    ("Ctrl+N", "Nueva playlist"),
-                    ("Ctrl+F o /", "Buscar (o pegar un enlace)"),
-                    ("Ctrl+B", "Mostrar u ocultar la barra lateral"),
-                    ("Alt+← / Alt+→", "Atrás / adelante"),
-                    ("Ctrl+H / Ctrl+L", "Inicio / Canciones que te gustan"),
-                    ("Ctrl+,", "Ajustes"),
-                    ("Ctrl+/ o ?", "Esta ventana"),
-                    ("Ctrl+Q", "Salir"),
+                    (t("Espacio"), t("Reproducir o pausar")),
+                    ("Ctrl+← / Ctrl+→", t("Anterior / siguiente")),
+                    ("Shift+← / Shift+→", t("Retroceder / avanzar 10 s")),
+                    ("Ctrl+↑ / Ctrl+↓", t("Volumen")),
+                    ("M", t("Silenciar")),
+                    ("S / R", t("Aleatorio / repetir")),
+                    ("Q / L", t("Cola / letra")),
+                    ("Ctrl+J", t("Jam (escuchar en grupo)")),
+                    ("Ctrl+N", t("Nueva playlist")),
+                    (t("Ctrl+F o /"), t("Buscar (o pegar un enlace)")),
+                    ("Ctrl+B", t("Mostrar u ocultar la barra lateral")),
+                    ("Alt+← / Alt+→", t("Atrás / adelante")),
+                    ("Ctrl+H / Ctrl+L", t("Inicio / Canciones que te gustan")),
+                    ("Ctrl+,", t("Ajustes")),
+                    (t("Ctrl+/ o ?"), t("Esta ventana")),
+                    ("Ctrl+Q", t("Salir")),
                 ];
                 egui::Grid::new("shortcuts").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
                     for (k, d) in rows {
@@ -426,7 +428,7 @@ impl App {
                 });
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("En macOS, Cmd sustituye a Ctrl. Las teclas multimedia del teclado también funcionan.")
+                    RichText::new(t("En macOS, Cmd sustituye a Ctrl. Las teclas multimedia del teclado también funcionan."))
                         .small()
                         .color(ui.visuals().weak_text_color()),
                 );
@@ -453,7 +455,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new(text).font(theme::bold(16.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if icons::button(ui, Icon::Close, 26.0, p.weak).on_hover_text("Cerrar (Esc)").clicked() {
+                if icons::button(ui, Icon::Close, 26.0, p.weak).on_hover_text(t("Cerrar (Esc)")).clicked() {
                     close = true;
                 }
             });
@@ -542,11 +544,11 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .frame(Self::dialog_frame(ctx))
             .show(ctx, |ui| {
-                if Self::dialog_title(ui, "Jam · escuchar en grupo") {
+                if Self::dialog_title(ui, t("Jam · escuchar en grupo")) {
                     open = false;
                 }
                 if !self.logged_in() {
-                    ui.label(RichText::new("Inicia sesión para usar Jam.").color(p.weak));
+                    ui.label(RichText::new(t("Inicia sesión para usar Jam.")).color(p.weak));
                     return;
                 }
                 let busy = self.jam_busy;
@@ -555,10 +557,10 @@ impl App {
                         ui.horizontal(|ui| {
                             let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
                             icons::paint(ui.painter(), r, GREEN, Icon::People);
-                            ui.label(RichText::new(if jam.is_owner { "Estás en un Jam que has creado tú" } else { "Estás en un Jam" }).strong());
+                            ui.label(RichText::new(if jam.is_owner { t("Estás en un Jam que has creado tú") } else { t("Estás en un Jam") }).strong());
                         });
                         ui.add_space(12.0);
-                        Self::field_label(ui, "ENLACE PARA INVITAR");
+                        Self::field_label(ui, t("ENLACE PARA INVITAR"));
                         let link = jam.join_url.clone();
                         ui.horizontal(|ui| {
                             let w = ui.available_width() - 110.0;
@@ -568,15 +570,15 @@ impl App {
                                     ui.add(egui::TextEdit::singleline(&mut link.clone()).frame(egui::Frame::NONE).interactive(false).desired_width(w - 20.0))
                                 });
                             });
-                            if Self::secondary_button(ui, "Copiar", true).clicked() {
-                                self.actions.push(Action::CopyText(link.clone(), "Enlace del Jam"));
+                            if Self::secondary_button(ui, t("Copiar"), true).clicked() {
+                                self.actions.push(Action::CopyText(link.clone(), t("Enlace del Jam")));
                             }
                         });
                         ui.add_space(12.0);
                         let members = if jam.max_members > 0 {
-                            format!("PARTICIPANTES ({} DE {})", jam.members.len(), jam.max_members)
+                            tr!("PARTICIPANTES ({} DE {})", jam.members.len(), jam.max_members)
                         } else {
-                            format!("PARTICIPANTES ({})", jam.members.len())
+                            tr!("PARTICIPANTES ({})", jam.members.len())
                         };
                         Self::field_label(ui, &members);
                         for m in &jam.members {
@@ -585,7 +587,7 @@ impl App {
                                 self.cover(ui, m.image_url.as_deref(), 28.0, true);
                                 ui.label(RichText::new(&m.name).color(p.text));
                                 if m.is_owner {
-                                    let _ = Self::pill(ui, "Anfitrión", false);
+                                    let _ = Self::pill(ui, t("Anfitrión"), false);
                                 }
                             });
                         }
@@ -594,15 +596,15 @@ impl App {
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
-                            if Self::secondary_button(ui, "Salir del Jam", !busy).clicked() {
+                            if Self::secondary_button(ui, t("Salir del Jam"), !busy).clicked() {
                                 self.jam_busy = true;
                                 self.api.send(Req::JamLeave(jam.session_id.clone()));
                             }
-                            if jam.is_owner && Self::secondary_button(ui, "Finalizar para todos", !busy).clicked() {
+                            if jam.is_owner && Self::secondary_button(ui, t("Finalizar para todos"), !busy).clicked() {
                                 self.jam_busy = true;
                                 self.api.send(Req::JamEnd(jam.session_id.clone()));
                             }
-                            if Self::secondary_button(ui, "Actualizar", !busy).clicked() {
+                            if Self::secondary_button(ui, t("Actualizar"), !busy).clicked() {
                                 self.jam_busy = true;
                                 self.api.send(Req::JamCurrent);
                             }
@@ -612,10 +614,10 @@ impl App {
                         });
                     }
                     None => {
-                        ui.label(RichText::new("Varias personas escuchan y controlan la misma música desde sus propios dispositivos.").color(p.weak));
+                        ui.label(RichText::new(t("Varias personas escuchan y controlan la misma música desde sus propios dispositivos.")).color(p.weak));
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            if Self::primary_button(ui, "Crear un Jam", !busy).clicked() {
+                            if Self::primary_button(ui, t("Crear un Jam"), !busy).clicked() {
                                 self.jam_busy = true;
                                 self.jam_error = None;
                                 self.api.send(Req::JamCurrent);
@@ -625,7 +627,7 @@ impl App {
                             }
                         });
                         ui.add_space(14.0);
-                        Self::field_label(ui, "O ÚNETE CON UN ENLACE O CÓDIGO");
+                        Self::field_label(ui, t("O ÚNETE CON UN ENLACE O CÓDIGO"));
                         let mut join = false;
                         ui.horizontal(|ui| {
                             let w = ui.available_width() - 110.0;
@@ -643,14 +645,14 @@ impl App {
                                     join = true;
                                 }
                             });
-                            if Self::secondary_button(ui, "Unirme", !busy).clicked() {
+                            if Self::secondary_button(ui, t("Unirme"), !busy).clicked() {
                                 join = true;
                             }
                         });
                         if join && !busy {
                             match jam_token_from_link(&self.jam_link) {
                                 Some(token) => self.jam_join(&token),
-                                None => self.jam_error = Some("Enlace no válido".into()),
+                                None => self.jam_error = Some(t("Enlace no válido").into()),
                             }
                         }
                     }
@@ -661,7 +663,7 @@ impl App {
                 }
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new("Jam usa una API interna de Spotify a través de librespot; requiere Premium y puede dejar de funcionar si Spotify la cambia.")
+                    RichText::new(t("Jam usa una API interna de Spotify a través de librespot; requiere Premium y puede dejar de funcionar si Spotify la cambia."))
                         .small()
                         .color(p.faint),
                 );
@@ -680,7 +682,7 @@ impl App {
         };
         let mut open = true;
         let mut submit = false;
-        let title = if ed.id.is_some() { "Editar playlist" } else { "Nueva playlist" };
+        let title = if ed.id.is_some() { t("Editar playlist") } else { t("Nueva playlist") };
         let p = theme::palette(ctx);
         egui::Window::new("playlist_editor")
             .title_bar(false)
@@ -693,19 +695,19 @@ impl App {
                 if Self::dialog_title(ui, title) {
                     open = false;
                 }
-                Self::field_label(ui, "NOMBRE");
+                Self::field_label(ui, t("NOMBRE"));
                 let r = Self::field_box(ui, |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut ed.name).hint_text("Mi playlist").frame(egui::Frame::NONE).desired_width(f32::INFINITY))
+                    ui.add(egui::TextEdit::singleline(&mut ed.name).hint_text(t("Mi playlist")).frame(egui::Frame::NONE).desired_width(f32::INFINITY))
                 });
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     submit = true;
                 }
                 ui.add_space(10.0);
-                Self::field_label(ui, "DESCRIPCIÓN");
+                Self::field_label(ui, t("DESCRIPCIÓN"));
                 Self::field_box(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(&mut ed.description)
-                            .hint_text("Opcional")
+                            .hint_text(t("Opcional"))
                             .frame(egui::Frame::NONE)
                             .desired_width(f32::INFINITY)
                             .desired_rows(3),
@@ -713,7 +715,7 @@ impl App {
                 });
                 ui.add_space(10.0);
                 let mut public = ed.public;
-                if Self::toggle(ui, &mut public, "Playlist pública") {
+                if Self::toggle(ui, &mut public, t("Playlist pública")) {
                     ed.public = public;
                     ed.public_known = true;
                     if public {
@@ -723,14 +725,14 @@ impl App {
                 if ed.public {
                     // Pública: se colabora por invitación (como en Spotify), no con la bandera.
                     ui.add_space(4.0);
-                    Self::field_label(ui, "COLABORADORES");
+                    Self::field_label(ui, t("COLABORADORES"));
                     match &ed.id {
                         Some(id) => {
                             let me = self.my_id().map(|s| s.to_string());
                             let members = self.members.get(id).cloned().unwrap_or_default();
                             let others: Vec<String> = members.iter().filter(|(u, c)| *c && Some(u) != me.as_ref()).map(|(u, _)| u.clone()).collect();
                             if others.is_empty() {
-                                ui.label(RichText::new("Todavía nadie más colabora en esta playlist.").small().color(p.faint));
+                                ui.label(RichText::new(t("Todavía nadie más colabora en esta playlist.")).small().color(p.faint));
                             } else {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -743,18 +745,18 @@ impl App {
                                 });
                             }
                             ui.add_space(6.0);
-                            if Self::secondary_button(ui, "Copiar enlace de invitación", true).clicked() {
+                            if Self::secondary_button(ui, t("Copiar enlace de invitación"), true).clicked() {
                                 self.request_invite(id);
                             }
-                            ui.label(RichText::new("Quien abra el enlace en Spotify podrá añadir y quitar canciones.").small().color(p.faint));
+                            ui.label(RichText::new(t("Quien abra el enlace en Spotify podrá añadir y quitar canciones.")).small().color(p.faint));
                         }
                         None => {
-                            ui.label(RichText::new("Podrás invitar colaboradores en cuanto la crees.").small().color(p.faint));
+                            ui.label(RichText::new(t("Podrás invitar colaboradores en cuanto la crees.")).small().color(p.faint));
                         }
                     }
                 } else {
                     let mut collab = ed.collaborative;
-                    if Self::toggle(ui, &mut collab, "Colaborativa (otras personas pueden añadir y quitar canciones)") {
+                    if Self::toggle(ui, &mut collab, t("Colaborativa (otras personas pueden añadir y quitar canciones)")) {
                         ed.collaborative = collab;
                         // Colaborativa exige privada: lo que se ve pasa a ser lo que se envía.
                         if collab {
@@ -763,24 +765,24 @@ impl App {
                     }
                 }
                 ui.add_space(10.0);
-                Self::field_label(ui, "IMAGEN");
+                Self::field_label(ui, t("IMAGEN"));
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    if Self::secondary_button(ui, "Elegir…", true).clicked() {
+                    if Self::secondary_button(ui, t("Elegir…"), true).clicked() {
                         if let Some(path) = pick_image_file() {
                             ed.image_path = Some(path);
                         }
                     }
                     match &ed.image_path {
                         Some(path) => {
-                            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("imagen").to_string();
+                            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(t("imagen")).to_string();
                             ui.label(RichText::new(name).small().color(p.text));
-                            if icons::button(ui, Icon::Close, 22.0, p.weak).on_hover_text("Quitar").clicked() {
+                            if icons::button(ui, Icon::Close, 22.0, p.weak).on_hover_text(t("Quitar")).clicked() {
                                 ed.image_path = None;
                             }
                         }
                         None => {
-                            ui.label(RichText::new("o arrastra un JPG/PNG aquí").small().color(p.faint));
+                            ui.label(RichText::new(t("o arrastra un JPG/PNG aquí")).small().color(p.faint));
                         }
                     }
                 });
@@ -790,13 +792,13 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        let label = if ed.id.is_some() { "Guardar" } else { "Crear" };
+                        let label = if ed.id.is_some() { t("Guardar") } else { t("Crear") };
                         let can = !ed.busy && !ed.name.trim().is_empty();
                         if Self::primary_button(ui, label, can).clicked() {
                             submit = true;
                         }
                         // Cancelar siempre disponible (si una petición sigue en curso, termina sola).
-                        if Self::secondary_button(ui, "Cancelar", true).clicked() {
+                        if Self::secondary_button(ui, t("Cancelar"), true).clicked() {
                             open = false;
                         }
                         if ed.busy {
@@ -824,7 +826,7 @@ impl App {
                 }),
                 None => {
                     let Some(user_id) = self.my_id().map(|s| s.to_string()) else {
-                        self.status_err("Todavía no se ha cargado tu perfil; inténtalo en un momento");
+                        self.status_err(t("Todavía no se ha cargado tu perfil; inténtalo en un momento"));
                         ed.busy = false;
                         self.editor = Some(ed);
                         return;
@@ -898,59 +900,59 @@ pub(super) struct BannerView {
 /// la Jam; `applying`: ya se está sustituyendo el ejecutable.
 pub(super) fn banner_view(stage: &Stage, info: &UpdateInfo, current: &str, self_install: bool, in_jam: bool, applying: bool) -> BannerView {
     let v = &info.version;
-    let mut view = BannerView { title: format!("Nanofy {v} disponible"), ..Default::default() };
+    let mut view = BannerView { title: tr!("Nanofy {} disponible", v), ..Default::default() };
     if applying {
         let version = match stage {
             Stage::Ready { version, .. } => version,
             _ => v,
         };
-        view.title = format!("Nanofy {version} está lista");
-        view.spinner = Some("Instalando la versión nueva…".to_string());
+        view.title = tr!("Nanofy {} está lista", version);
+        view.spinner = Some(t("Instalando la versión nueva…").to_string());
         return view;
     }
     if !self_install {
         // macOS: la app no puede sustituirse sola; el zip es lo único útil.
-        view.sub = Some(format!("Tienes la {current}. Descarga el zip nuevo y sustituye el ejecutable."));
+        view.sub = Some(tr!("Tienes la {}. Descarga el zip nuevo y sustituye el ejecutable.", current));
         view.notes = true;
-        view.primary = Some(("Descargar", UpdAction::Download));
-        view.secondary = Some(("Ver novedades", UpdAction::Notes));
+        view.primary = Some((t("Descargar"), UpdAction::Download));
+        view.secondary = Some((t("Ver novedades"), UpdAction::Notes));
         view.skip = true;
         return view;
     }
     match stage {
         Stage::Downloading { done, total } => {
-            view.title = format!("Descargando Nanofy {v}");
+            view.title = tr!("Descargando Nanofy {}", v);
             view.progress = Some(crate::update::download_progress(*done, *total));
-            view.sub = Some("Puedes seguir escuchando mientras tanto.".to_string());
-            view.secondary = Some(("Cancelar", UpdAction::Cancel));
+            view.sub = Some(t("Puedes seguir escuchando mientras tanto.").to_string());
+            view.secondary = Some((t("Cancelar"), UpdAction::Cancel));
         }
         Stage::Preparing => {
             view.title = format!("Nanofy {v}");
-            view.spinner = Some("Preparando la actualización…".to_string());
-            view.sub = Some("Puedes seguir escuchando mientras tanto.".to_string());
-            view.secondary = Some(("Cancelar", UpdAction::Cancel));
+            view.spinner = Some(t("Preparando la actualización…").to_string());
+            view.sub = Some(t("Puedes seguir escuchando mientras tanto.").to_string());
+            view.secondary = Some((t("Cancelar"), UpdAction::Cancel));
         }
         Stage::Ready { version, .. } => {
-            view.title = format!("Nanofy {version} está lista");
+            view.title = tr!("Nanofy {} está lista", version);
             if in_jam {
-                view.sub = Some("Estás en una Jam: al reiniciar saldrás de ella.".to_string());
-                view.primary = Some(("Reiniciar igualmente", UpdAction::RestartJam));
+                view.sub = Some(t("Estás en una Jam: al reiniciar saldrás de ella.").to_string());
+                view.primary = Some((t("Reiniciar igualmente"), UpdAction::RestartJam));
             } else {
-                view.sub = Some("Reinicia para usar la versión nueva. La música seguirá donde estaba.".to_string());
-                view.primary = Some(("Reiniciar", UpdAction::Restart));
+                view.sub = Some(t("Reinicia para usar la versión nueva. La música seguirá donde estaba.").to_string());
+                view.primary = Some((t("Reiniciar"), UpdAction::Restart));
             }
-            view.secondary = Some(("Más tarde", UpdAction::Later));
-            view.footnote = Some("Si no, se instalará sola la próxima vez que abras Nanofy.");
+            view.secondary = Some((t("Más tarde"), UpdAction::Later));
+            view.footnote = Some(t("Si no, se instalará sola la próxima vez que abras Nanofy."));
         }
         Stage::Failed { kind, detail } => {
             let (text, extra) = crate::update::fail_message(*kind, detail, current);
             // Sin descarga para este sistema no es un error de la app: solo se informa.
             view.message = Some((text, *kind != FailKind::NoAsset));
             view.detail = extra;
-            view.primary = Some(if *kind == FailKind::NoAsset { ("Ver en GitHub", UpdAction::Page) } else { ("Reintentar", UpdAction::Install) });
+            view.primary = Some(if *kind == FailKind::NoAsset { (t("Ver en GitHub"), UpdAction::Page) } else { (t("Reintentar"), UpdAction::Install) });
             // Si el antivirus no la deja arrancar, reintentar puede dar lo mismo: queda el zip.
             if *kind == FailKind::Blocked {
-                view.link = Some(("Descargar a mano", UpdAction::Download));
+                view.link = Some((t("Descargar a mano"), UpdAction::Download));
             }
             view.skip = true;
         }
@@ -959,20 +961,20 @@ pub(super) fn banner_view(stage: &Stage, info: &UpdateInfo, current: &str, self_
             // Reintentar daría lo mismo. Dentro del zip basta con descomprimirlo; en una carpeta
             // sin permisos, el zip a mano es lo único que sirve.
             if *reason == MoveReason::ReadOnly {
-                view.primary = Some(("Descargar a mano", UpdAction::Download));
+                view.primary = Some((t("Descargar a mano"), UpdAction::Download));
             }
             view.skip = true;
         }
         Stage::Idle | Stage::Available if info.asset.is_none() => {
-            view.sub = Some(format!("Tienes la {current}. {}", crate::update::NO_ASSET_TEXT));
-            view.primary = Some(("Ver en GitHub", UpdAction::Page));
+            view.sub = Some(tr!("Tienes la {}. {}", current, t(crate::update::NO_ASSET_TEXT)));
+            view.primary = Some((t("Ver en GitHub"), UpdAction::Page));
             view.skip = true;
         }
         Stage::Idle | Stage::Available => {
-            view.sub = Some(format!("Tienes la {current}. Se descarga en segundos y solo tendrás que reiniciar."));
+            view.sub = Some(tr!("Tienes la {}. Se descarga en segundos y solo tendrás que reiniciar.", current));
             view.notes = true;
-            view.primary = Some(("Instalar", UpdAction::Install));
-            view.secondary = Some(("Ver novedades", UpdAction::Notes));
+            view.primary = Some((t("Instalar"), UpdAction::Install));
+            view.secondary = Some((t("Ver novedades"), UpdAction::Notes));
             view.skip = true;
         }
     }
@@ -1012,20 +1014,20 @@ impl AboutView {
 /// ha consultado).
 pub(super) fn about_view(stage: &Stage, update: Option<&UpdateInfo>, note: Option<&(String, bool)>, checking: bool, applying: bool, self_install: bool, current: &str) -> Option<AboutView> {
     if applying {
-        return Some(AboutView { waiting: true, ..AboutView::new("Instalando la versión nueva", Tone::Weak) });
+        return Some(AboutView { waiting: true, ..AboutView::new(t("Instalando la versión nueva"), Tone::Weak) });
     }
     // Lista o preparándose: una consulta que llegue a la vez no lo cambia (ver `App::on_update`).
     match stage {
         Stage::Ready { version, .. } => {
-            return Some(AboutView { primary: Some(("Reiniciar", UpdAction::Restart)), ..AboutView::new(format!("Nanofy {version} lista"), Tone::Text) });
+            return Some(AboutView { primary: Some((t("Reiniciar"), UpdAction::Restart)), ..AboutView::new(tr!("Nanofy {} lista", version), Tone::Text) });
         }
         Stage::Downloading { .. } | Stage::Preparing => {
-            return Some(AboutView { secondary: Some(("Cancelar", UpdAction::Cancel)), ..AboutView::new(stage.label(), Tone::Weak) });
+            return Some(AboutView { secondary: Some((t("Cancelar"), UpdAction::Cancel)), ..AboutView::new(stage.label(), Tone::Weak) });
         }
         _ => {}
     }
     if checking {
-        return Some(AboutView { waiting: true, ..AboutView::new("Buscando", Tone::Weak) });
+        return Some(AboutView { waiting: true, ..AboutView::new(t("Buscando"), Tone::Weak) });
     }
     let Some(u) = update else {
         // Sin versión nueva: al día, aún publicándose o el error de la consulta (o de la
@@ -1033,13 +1035,13 @@ pub(super) fn about_view(stage: &Stage, update: Option<&UpdateInfo>, note: Optio
         let (text, err) = note?;
         let mut view = AboutView::new(text.clone(), if *err { Tone::Error } else { Tone::Weak });
         if *err {
-            view.primary = Some(("Reintentar", UpdAction::Recheck));
+            view.primary = Some((t("Reintentar"), UpdAction::Recheck));
         }
         return Some(view);
     };
-    let mut view = AboutView::new(format!("Nanofy {} disponible", u.version), Tone::Text);
+    let mut view = AboutView::new(tr!("Nanofy {} disponible", u.version), Tone::Text);
     if !self_install {
-        view.primary = Some(("Descargar", UpdAction::Download));
+        view.primary = Some((t("Descargar"), UpdAction::Download));
         return Some(view);
     }
     match stage {
@@ -1048,23 +1050,23 @@ pub(super) fn about_view(stage: &Stage, update: Option<&UpdateInfo>, note: Optio
             view.text = text;
             view.tone = if *kind == FailKind::NoAsset { Tone::Weak } else { Tone::Error };
             view.detail = extra;
-            view.primary = Some(if *kind == FailKind::NoAsset { ("Ver en GitHub", UpdAction::Page) } else { ("Reintentar", UpdAction::Install) });
+            view.primary = Some(if *kind == FailKind::NoAsset { (t("Ver en GitHub"), UpdAction::Page) } else { (t("Reintentar"), UpdAction::Install) });
             if *kind == FailKind::Blocked {
-                view.link = Some(("Descargar a mano", UpdAction::Download));
+                view.link = Some((t("Descargar a mano"), UpdAction::Download));
             }
         }
         Stage::NeedsMove { dir, reason } => {
             view.detail = Some(reason.text(dir));
             if *reason == MoveReason::ReadOnly {
-                view.primary = Some(("Descargar a mano", UpdAction::Download));
+                view.primary = Some((t("Descargar a mano"), UpdAction::Download));
             }
         }
         _ if u.asset.is_none() => {
-            view.detail = Some(crate::update::NO_ASSET_TEXT.to_string());
-            view.primary = Some(("Ver en GitHub", UpdAction::Page));
+            view.detail = Some(t(crate::update::NO_ASSET_TEXT).to_string());
+            view.primary = Some((t("Ver en GitHub"), UpdAction::Page));
         }
         _ => {
-            view.primary = Some(("Instalar", UpdAction::Install));
+            view.primary = Some((t("Instalar"), UpdAction::Install));
             // Una consulta a mano que falló después de encontrar esta versión: se dice debajo.
             if let Some((text, true)) = note {
                 view.detail = Some(text.clone());

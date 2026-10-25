@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::bus::{Msg, UiTx};
+use crate::i18n::t;
 
 /// Repositorio del que se leen las releases.
 pub const REPO: &str = "ElRobaMichis/nanofy";
@@ -143,9 +144,9 @@ impl std::fmt::Debug for Asset {
 }
 
 /// Texto del aviso cuando la release no trae zip para este sistema.
-pub const NO_ASSET_TEXT: &str = "Esta versión aún no tiene descarga para tu sistema.";
+pub const NO_ASSET_TEXT: &str = tk!("Esta versión aún no tiene descarga para tu sistema.");
 /// Motivo del fallo cuando el disco está lleno (`ErrorKind::StorageFull`).
-pub const DISK_FULL_TEXT: &str = "No hay espacio suficiente en el disco para la actualización.";
+pub const DISK_FULL_TEXT: &str = tk!("No hay espacio suficiente en el disco para la actualización.");
 
 /// Lo que dice el aviso de un fallo: una frase según el tipo (qué pasó y qué puede hacer el
 /// usuario) y, aparte y en pequeño, el motivo real si añade algo. `detail` es el de
@@ -153,18 +154,18 @@ pub const DISK_FULL_TEXT: &str = "No hay espacio suficiente en el disco para la 
 pub fn fail_message(kind: FailKind, detail: &str, current: &str) -> (String, Option<String>) {
     let detail = detail.trim();
     let headline = match kind {
-        FailKind::Network => "No se pudo descargar la actualización. Revisa tu conexión.".to_string(),
-        FailKind::Corrupt => "La descarga llegó dañada y se descartó.".to_string(),
+        FailKind::Network => t("No se pudo descargar la actualización. Revisa tu conexión.").to_string(),
+        FailKind::Corrupt => t("La descarga llegó dañada y se descartó.").to_string(),
         // «Disk» es también cualquier otro error al escribir (permisos, una carpeta que ya no
         // está): solo con el disco lleno se dice que falta espacio.
-        FailKind::Disk if detail == DISK_FULL_TEXT => return ("No hay espacio suficiente en el disco.".to_string(), None),
-        FailKind::Disk => "No se pudo guardar la actualización en el disco.".to_string(),
-        FailKind::Blocked if cfg!(target_os = "windows") => format!("Windows o tu antivirus bloqueó la versión nueva. Sigues usando la {current}."),
-        FailKind::Blocked => format!("El sistema no dejó arrancar la versión nueva. Sigues usando la {current}."),
+        FailKind::Disk if detail == DISK_FULL_TEXT || detail == t(DISK_FULL_TEXT) => return (t("No hay espacio suficiente en el disco.").to_string(), None),
+        FailKind::Disk => t("No se pudo guardar la actualización en el disco.").to_string(),
+        FailKind::Blocked if cfg!(target_os = "windows") => tr!("Windows o tu antivirus bloqueó la versión nueva. Sigues usando la {}.", current),
+        FailKind::Blocked => tr!("El sistema no dejó arrancar la versión nueva. Sigues usando la {}.", current),
         // `swap_failure_text` ya es la frase entera, con el motivo entre paréntesis.
         FailKind::Swap if !detail.is_empty() => return (detail.to_string(), None),
-        FailKind::Swap => "No se pudo sustituir el ejecutable.".to_string(),
-        FailKind::NoAsset => NO_ASSET_TEXT.to_string(),
+        FailKind::Swap => t("No se pudo sustituir el ejecutable.").to_string(),
+        FailKind::NoAsset => t(NO_ASSET_TEXT).to_string(),
     };
     let extra = match split_reason(detail) {
         // La misma frase con el motivo entre paréntesis (la autoprueba, el SHA-256): solo el motivo.
@@ -218,13 +219,13 @@ impl MoveReason {
     /// Texto del aviso; `dir` es la carpeta del ejecutable.
     pub fn text(self, dir: &Path) -> String {
         match self {
-            MoveReason::ReadOnly => format!(
+            MoveReason::ReadOnly => tr!(
                 "Nanofy está en una carpeta donde no puede actualizarse solo ({}). Muévelo, por ejemplo a {}, y a partir de ahí se actualizará solo.",
                 dir.display(),
                 if cfg!(target_os = "windows") { r"%LOCALAPPDATA%\Programs\Nanofy" } else { "~/.local/bin" }
             ),
             MoveReason::RunningFromZip => {
-                "Estás abriendo Nanofy desde dentro del zip. Descomprímelo en una carpeta y ábrelo desde ahí.".to_string()
+                t("Estás abriendo Nanofy desde dentro del zip. Descomprímelo en una carpeta y ábrelo desde ahí.").to_string()
             }
         }
     }
@@ -252,11 +253,11 @@ impl Stage {
     pub fn label(&self) -> String {
         match self {
             Stage::Idle | Stage::Available => String::new(),
-            Stage::Downloading { done, total: Some(t) } if *t > 0 => format!("Descargando… {} %", (done * 100 / t).min(100)),
-            Stage::Downloading { done, .. } => format!("Descargando… {:.1} MB", *done as f64 / 1e6),
-            Stage::Preparing => "Preparando la actualización…".to_string(),
+            Stage::Downloading { done, total: Some(total) } if *total > 0 => tr!("Descargando… {} %", (done * 100 / total).min(100)),
+            Stage::Downloading { done, .. } => tr!("Descargando… {} MB", format!("{:.1}", *done as f64 / 1e6)),
+            Stage::Preparing => t("Preparando la actualización…").to_string(),
             // Lista no es instalada: se instala al pulsar «Reiniciar» o al abrir Nanofy otra vez.
-            Stage::Ready { version, .. } => format!("Nanofy {version} está lista"),
+            Stage::Ready { version, .. } => tr!("Nanofy {} está lista", version),
             Stage::NeedsMove { dir, reason } => reason.text(dir),
             Stage::Failed { detail, .. } => detail.clone(),
         }
@@ -480,7 +481,7 @@ pub fn stage(ui: UiTx, info: UpdateInfo, work_dir: PathBuf, cancel: Arc<AtomicBo
                 }
             };
             let Some(exe) = target_exe() else {
-                report(Stage::Failed { kind: FailKind::Disk, detail: "No se encuentra el ejecutable actual".to_string() });
+                report(Stage::Failed { kind: FailKind::Disk, detail: t("No se encuentra el ejecutable actual").to_string() });
                 return;
             };
             let test = |staged: &Path, version: &str| self_test(staged, version, SELF_TEST_LIMIT);
@@ -523,7 +524,7 @@ pub fn stage(ui: UiTx, info: UpdateInfo, work_dir: PathBuf, cancel: Arc<AtomicBo
     if let Err(e) = spawn {
         log::warn!("[update] no se pudo lanzar la instalación: {e}");
         // Sin esto el aviso se quedaría en «Descargando…» esperando a un hilo que no existe.
-        ui_err.send(Msg::UpdateStage { turn, stage: Stage::Failed { kind: FailKind::Disk, detail: format!("No se pudo empezar la descarga ({e})") } });
+        ui_err.send(Msg::UpdateStage { turn, stage: Stage::Failed { kind: FailKind::Disk, detail: tr!("No se pudo empezar la descarga ({})", e) } });
     }
     turn
 }
@@ -647,7 +648,7 @@ fn fail(kind: FailKind, detail: impl Into<String>) -> StageError {
 /// puede arreglar.
 fn disk(what: &str, e: std::io::Error) -> StageError {
     if e.kind() == std::io::ErrorKind::StorageFull {
-        fail(FailKind::Disk, DISK_FULL_TEXT)
+        fail(FailKind::Disk, t(DISK_FULL_TEXT))
     } else {
         fail(FailKind::Disk, format!("{what}: {e}"))
     }
@@ -665,7 +666,7 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), StageError> {
 /// bien (también si se cancela) no deja nada: ni la descarga ni el ejecutable a medias.
 fn stage_blocking(env: &StageEnv, info: &UpdateInfo, cancel: &AtomicBool, report: &mut dyn FnMut(Stage)) -> Result<PathBuf, StageError> {
     let Some(asset) = info.asset.as_ref() else {
-        return Err(fail(FailKind::NoAsset, NO_ASSET_TEXT));
+        return Err(fail(FailKind::NoAsset, t(NO_ASSET_TEXT)));
     };
     if let Some(reason) = location_problem(&env.exe) {
         let dir = env.exe.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -710,7 +711,7 @@ fn stage_steps(
     staged: &Path,
     meta: &Path,
 ) -> Result<(), StageError> {
-    std::fs::create_dir_all(&env.work_dir).map_err(|e| disk("No se pudo crear la carpeta de la descarga", e))?;
+    std::fs::create_dir_all(&env.work_dir).map_err(|e| disk(t("No se pudo crear la carpeta de la descarga"), e))?;
     download(asset, zip_part, cancel, report)?;
     report(Stage::Preparing);
     let (exe_size, exe_sha256) = extract(zip_part, exe_part)?;
@@ -726,8 +727,12 @@ fn stage_steps(
     let _ = std::fs::remove_file(exe_part);
     check_cancel(cancel)?;
     (env.self_test)(staged, &info.version).map_err(|why| {
-        let who = if cfg!(target_os = "windows") { "Windows o tu antivirus bloqueó" } else { "El sistema no dejó arrancar" };
-        fail(FailKind::Blocked, format!("{who} la versión nueva ({why}). Sigues usando la {}.", current_version()))
+        let text = if cfg!(target_os = "windows") {
+            tr!("Windows o tu antivirus bloqueó la versión nueva ({}). Sigues usando la {}.", why, current_version())
+        } else {
+            tr!("El sistema no dejó arrancar la versión nueva ({}). Sigues usando la {}.", why, current_version())
+        };
+        fail(FailKind::Blocked, text)
     })?;
     check_cancel(cancel)?;
     write_meta(meta, &StagedMeta { version: info.version.clone(), target: env.exe.clone(), exe_size, exe_sha256: hex(&exe_sha256), swap_failures: 0 })
@@ -767,9 +772,9 @@ fn download(asset: &Asset, zip_part: &Path, cancel: &AtomicBool, report: &mut dy
         .get(&asset.url)
         .header("User-Agent", &format!("Nanofy/{} (+https://github.com/{REPO})", current_version()))
         .call()
-        .map_err(|e| fail(FailKind::Network, format!("Sin conexión con GitHub ({e})")))?;
+        .map_err(|e| fail(FailKind::Network, tr!("Sin conexión con GitHub ({})", e)))?;
     if !resp.status().is_success() {
-        return Err(fail(FailKind::Network, format!("GitHub respondió HTTP {}", resp.status().as_u16())));
+        return Err(fail(FailKind::Network, tr!("GitHub respondió HTTP {}", resp.status().as_u16())));
     }
     // El tamaño que publica GitHub manda: es el del archivo, mientras que Content-Length puede
     // faltar o contar los bytes comprimidos en tránsito.
@@ -781,7 +786,7 @@ fn download(asset: &Asset, zip_part: &Path, cancel: &AtomicBool, report: &mut dy
     });
     let limit = if asset.size > 0 { asset.size } else { MAX_DOWNLOAD };
     let mut reader = resp.body_mut().as_reader();
-    let mut file = std::fs::File::create(zip_part).map_err(|e| disk("No se pudo crear la descarga", e))?;
+    let mut file = std::fs::File::create(zip_part).map_err(|e| disk(t("No se pudo crear la descarga"), e))?;
     let mut hasher = sha2::Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let (mut done, mut reported) = (0u64, 0u64);
@@ -789,17 +794,17 @@ fn download(asset: &Asset, zip_part: &Path, cancel: &AtomicBool, report: &mut dy
     report(Stage::Downloading { done: 0, total });
     loop {
         check_cancel(cancel)?;
-        let n = reader.read(&mut buf).map_err(|e| fail(FailKind::Network, format!("Descarga interrumpida: {e}")))?;
+        let n = reader.read(&mut buf).map_err(|e| fail(FailKind::Network, tr!("Descarga interrumpida: {}", e)))?;
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n]).map_err(|e| disk("No se pudo guardar la descarga", e))?;
+        file.write_all(&buf[..n]).map_err(|e| disk(t("No se pudo guardar la descarga"), e))?;
         hasher.update(&buf[..n]);
         done += n as u64;
         // Si ya pasa del tamaño que publica GitHub no es ese archivo: se corta aquí en vez de
         // seguir llenando el disco hasta que el servidor deje de mandar.
         if done > limit {
-            return Err(fail(FailKind::Corrupt, format!("La descarga no coincide con la release (más de {limit} bytes)")));
+            return Err(fail(FailKind::Corrupt, tr!("La descarga no coincide con la release (más de {} bytes)", limit)));
         }
         if done - reported >= 256 * 1024 || reported_at.elapsed() >= Duration::from_millis(100) {
             reported = done;
@@ -809,11 +814,11 @@ fn download(asset: &Asset, zip_part: &Path, cancel: &AtomicBool, report: &mut dy
     }
     drop(file);
     if let Some(t) = total.filter(|t| done < *t) {
-        return Err(fail(FailKind::Network, format!("Descarga incompleta ({done} de {t} bytes)")));
+        return Err(fail(FailKind::Network, tr!("Descarga incompleta ({} de {} bytes)", done, t)));
     }
     if let Some(want) = asset.sha256 {
         if hasher.finalize().as_slice() != want {
-            return Err(fail(FailKind::Corrupt, "La descarga llegó dañada (su SHA-256 no es el que publica la release) y se descartó."));
+            return Err(fail(FailKind::Corrupt, t("La descarga llegó dañada (su SHA-256 no es el que publica la release) y se descartó.")));
         }
     }
     Ok(())
@@ -830,14 +835,14 @@ fn is_binary_entry(name: &str, want: &str) -> bool {
 fn extract(zip_part: &Path, out_path: &Path) -> Result<(u64, [u8; 32]), StageError> {
     use sha2::Digest;
     use std::io::{Read, Write};
-    let f = std::fs::File::open(zip_part).map_err(|e| disk("No se pudo abrir la descarga", e))?;
-    let mut archive = zip::ZipArchive::new(f).map_err(|e| fail(FailKind::Corrupt, format!("Zip no válido: {e}")))?;
+    let f = std::fs::File::open(zip_part).map_err(|e| disk(t("No se pudo abrir la descarga"), e))?;
+    let mut archive = zip::ZipArchive::new(f).map_err(|e| fail(FailKind::Corrupt, tr!("Zip no válido: {}", e)))?;
     let want = binary_name_in_zip();
     let idx = (0..archive.len())
         .find(|&i| archive.name_for_index(i).is_some_and(|n| is_binary_entry(n, want)))
-        .ok_or_else(|| fail(FailKind::Corrupt, format!("El zip no contiene {want}")))?;
-    let mut entry = archive.by_index(idx).map_err(|e| fail(FailKind::Corrupt, format!("Zip no válido: {e}")))?;
-    let mut out = std::fs::File::create(out_path).map_err(|e| disk("No se pudo extraer el ejecutable", e))?;
+        .ok_or_else(|| fail(FailKind::Corrupt, tr!("El zip no contiene {}", want)))?;
+    let mut entry = archive.by_index(idx).map_err(|e| fail(FailKind::Corrupt, tr!("Zip no válido: {}", e)))?;
+    let mut out = std::fs::File::create(out_path).map_err(|e| disk(t("No se pudo extraer el ejecutable"), e))?;
     let mut hasher = sha2::Sha256::new();
     let mut head: Vec<u8> = Vec::with_capacity(4);
     let mut size = 0u64;
@@ -847,9 +852,9 @@ fn extract(zip_part: &Path, out_path: &Path) -> Result<(u64, [u8; 32]), StageErr
         // demás es el disco.
         let n = entry.read(&mut buf).map_err(|e| {
             if e.kind() == std::io::ErrorKind::InvalidData {
-                fail(FailKind::Corrupt, format!("No se pudo extraer el ejecutable: {e}"))
+                fail(FailKind::Corrupt, tr!("No se pudo extraer el ejecutable: {}", e))
             } else {
-                disk("No se pudo extraer el ejecutable", e)
+                disk(t("No se pudo extraer el ejecutable"), e)
             }
         })?;
         if n == 0 {
@@ -859,13 +864,13 @@ fn extract(zip_part: &Path, out_path: &Path) -> Result<(u64, [u8; 32]), StageErr
             let take = (4 - head.len()).min(n);
             head.extend_from_slice(&buf[..take]);
         }
-        out.write_all(&buf[..n]).map_err(|e| disk("No se pudo extraer el ejecutable", e))?;
+        out.write_all(&buf[..n]).map_err(|e| disk(t("No se pudo extraer el ejecutable"), e))?;
         hasher.update(&buf[..n]);
         size += n as u64;
     }
     drop(out);
     if size < MIN_EXE_SIZE || !head.starts_with(exe_magic()) {
-        return Err(fail(FailKind::Corrupt, "El ejecutable descargado no parece válido"));
+        return Err(fail(FailKind::Corrupt, t("El ejecutable descargado no parece válido")));
     }
     #[cfg(unix)]
     {
@@ -881,13 +886,13 @@ fn extract(zip_part: &Path, out_path: &Path) -> Result<(u64, [u8; 32]), StageErr
 /// de luz o está entero o no vale (sin el json no cuenta).
 fn place(from: &Path, staged: &Path, size: u64) -> Result<(), StageError> {
     remove_retrying(staged);
-    let what = format!("No se pudo dejar la versión nueva en {}", staged.parent().unwrap_or(staged).display());
+    let what = tr!("No se pudo dejar la versión nueva en {}", staged.parent().unwrap_or(staged).display());
     std::fs::copy(from, staged).map_err(|e| disk(&what, e))?;
     let f = std::fs::OpenOptions::new().write(true).open(staged).map_err(|e| disk(&what, e))?;
     f.sync_all().map_err(|e| disk(&what, e))?;
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     if len != size {
-        return Err(fail(FailKind::Disk, format!("{what}: la copia quedó incompleta ({len} de {size} bytes)")));
+        return Err(fail(FailKind::Disk, tr!("{}: la copia quedó incompleta ({} de {} bytes)", what, len, size)));
     }
     Ok(())
 }
@@ -897,7 +902,7 @@ fn write_meta(path: &Path, meta: &StagedMeta) -> Result<(), StageError> {
     if write_json(path, meta) {
         Ok(())
     } else {
-        Err(fail(FailKind::Disk, format!("No se pudo guardar {}", path.display())))
+        Err(fail(FailKind::Disk, tr!("No se pudo guardar {}", path.display())))
     }
 }
 
@@ -962,7 +967,7 @@ fn self_test(exe: &Path, version: &str, limit: Duration) -> Result<(), String> {
     use std::process::{Command, Stdio};
     if !exe.exists() {
         // Un antivirus que lo pone en cuarentena lo hace desaparecer sin más.
-        return Err("el archivo nuevo desapareció".to_string());
+        return Err(t("el archivo nuevo desapareció").to_string());
     }
     let mut cmd = Command::new(exe);
     cmd.arg("--self-test")
@@ -997,8 +1002,8 @@ fn self_test(exe: &Path, version: &str, limit: Duration) -> Result<(), String> {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(match other {
-                    Err(e) => format!("no se pudo esperar a la autoprueba: {e}"),
-                    _ => format!("la autoprueba no respondió en {} s", limit.as_secs()),
+                    Err(e) => tr!("no se pudo esperar a la autoprueba: {}", e),
+                    _ => tr!("la autoprueba no respondió en {} s", limit.as_secs()),
                 });
             }
         }
@@ -1006,11 +1011,11 @@ fn self_test(exe: &Path, version: &str, limit: Duration) -> Result<(), String> {
     let out = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
     let out = String::from_utf8_lossy(&out);
     if !status.success() {
-        return Err(format!("la autoprueba terminó con error ({status})"));
+        return Err(tr!("la autoprueba terminó con error ({})", status));
     }
     let want = format!("nanofy {version}");
     if out.trim() != want {
-        return Err(format!("la autoprueba respondió «{}» en vez de «{want}»", out.trim()));
+        return Err(tr!("la autoprueba respondió «{}» en vez de «{}»", out.trim(), want));
     }
     Ok(())
 }
@@ -1035,11 +1040,11 @@ fn spawn_retrying(cmd: &mut std::process::Command) -> std::io::Result<std::proce
 fn spawn_error(e: &std::io::Error) -> String {
     log::warn!("[update] la versión nueva no arrancó: {e}");
     match e.raw_os_error() {
-        Some(225) if cfg!(windows) => "el antivirus la tomó por una amenaza, código 225".to_string(),
-        Some(1260) if cfg!(windows) => "una directiva del sistema impide abrirla, código 1260".to_string(),
-        Some(4551) if cfg!(windows) => "Control inteligente de aplicaciones no deja abrirla, código 4551".to_string(),
-        Some(code) => format!("no arrancó, código {code}"),
-        None => format!("no arrancó: {e}"),
+        Some(225) if cfg!(windows) => t("el antivirus la tomó por una amenaza, código 225").to_string(),
+        Some(1260) if cfg!(windows) => t("una directiva del sistema impide abrirla, código 1260").to_string(),
+        Some(4551) if cfg!(windows) => t("Control inteligente de aplicaciones no deja abrirla, código 4551").to_string(),
+        Some(code) => tr!("no arrancó, código {}", code),
+        None => tr!("no arrancó: {}", e),
     }
 }
 
@@ -1158,7 +1163,7 @@ struct SwapLock(PathBuf);
 impl SwapLock {
     fn acquire(target: &Path) -> Result<Self, String> {
         let path = lock_path(target);
-        let busy = || "otra ventana de Nanofy está instalando la actualización".to_string();
+        let busy = || t("otra ventana de Nanofy está instalando la actualización").to_string();
         for first in [true, false] {
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut f) => {
@@ -1171,7 +1176,7 @@ impl SwapLock {
                     let _ = std::fs::remove_file(&path);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(busy()),
-                Err(e) => return Err(format!("no se pudo crear {}: {e}", path.display())),
+                Err(e) => return Err(tr!("no se pudo crear {}: {}", path.display(), e)),
             }
         }
         Err(busy())
@@ -1206,12 +1211,12 @@ fn swap_in(target: &Path, incoming: &Path, aside: &Path, gate: &Mutex<bool>, on_
         let busy = {
             let closed = gate.lock().unwrap_or_else(|e| e.into_inner());
             if *closed {
-                return Err("Nanofy se está cerrando".to_string());
+                return Err(t("Nanofy se está cerrando").to_string());
             }
             match std::fs::rename(target, aside) {
                 // Aún no se ha movido nada: se puede esperar sin prisa.
                 Err(e) if round < SWAP_ROUNDS && is_transient_lock(&e) => e,
-                Err(e) => return Err(format!("no se pudo apartar el ejecutable actual: {e}")),
+                Err(e) => return Err(tr!("no se pudo apartar el ejecutable actual: {}", e)),
                 Ok(()) => match std::fs::rename(incoming, target) {
                     Ok(()) => {
                         on_swapped();
@@ -1220,7 +1225,7 @@ fn swap_in(target: &Path, incoming: &Path, aside: &Path, gate: &Mutex<bool>, on_
                     Err(e) => {
                         put_back(aside, target)?;
                         if !(round < SWAP_ROUNDS && is_transient_lock(&e)) {
-                            return Err(format!("no se pudo colocar el ejecutable nuevo: {e}"));
+                            return Err(tr!("no se pudo colocar el ejecutable nuevo: {}", e));
                         }
                         e
                     }
@@ -1244,7 +1249,7 @@ fn put_back(aside: &Path, target: &Path) -> Result<(), String> {
         Ok(_) => Ok(()),
         Err(c) => {
             log::error!("[update] tampoco copiándolo: {c}");
-            Err(format!("no se pudo devolver el ejecutable actual a su sitio ({c}); está en {}", aside.display()))
+            Err(tr!("no se pudo devolver el ejecutable actual a su sitio ({}); está en {}", c, aside.display()))
         }
     }
 }
@@ -1260,7 +1265,7 @@ fn pick_aside(preferred: &Path) -> Result<PathBuf, String> {
             Err(e) => log::info!("[update] {} sigue en uso ({e})", p.display()),
         }
     }
-    Err(format!("{} está en uso", preferred.display()))
+    Err(tr!("{} está en uso", preferred.display()))
 }
 
 /// `nanofy.old.exe` → `nanofy.old-<pid>.exe` (en Linux, `nanofy.old` → `nanofy.old-<pid>`).
@@ -1322,26 +1327,26 @@ fn discard_staged(target: &Path) {
 /// intento (no se pudo leer: un antivirus la tiene abierta, por ejemplo).
 fn check_staged(meta: &StagedMeta, target: &Path, staged: &Path, current: &str) -> Result<(), (String, bool)> {
     if !same_path(&meta.target, target) {
-        return Err((format!("la versión preparada es para {}", meta.target.display()), true));
+        return Err((tr!("la versión preparada es para {}", meta.target.display()), true));
     }
     match (parse_version(&meta.version), parse_version(current)) {
         (Some(new), Some(cur)) if new > cur => {}
-        _ => return Err((format!("la versión preparada ({}) no es más nueva que la {current}", meta.version), true)),
+        _ => return Err((tr!("la versión preparada ({}) no es más nueva que la {}", meta.version, current), true)),
     }
     let len = match std::fs::metadata(staged) {
         Ok(m) => m.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(("la versión preparada ya no está; quizá la retiró el antivirus".to_string(), true));
+            return Err((t("la versión preparada ya no está; quizá la retiró el antivirus").to_string(), true));
         }
-        Err(e) => return Err((format!("no se pudo leer la versión preparada: {e}"), false)),
+        Err(e) => return Err((tr!("no se pudo leer la versión preparada: {}", e), false)),
     };
     if len != meta.exe_size {
-        return Err((format!("la versión preparada está incompleta ({len} de {} bytes)", meta.exe_size), true));
+        return Err((tr!("la versión preparada está incompleta ({} de {} bytes)", len, meta.exe_size), true));
     }
     match file_sha256(staged) {
         Ok(d) if hex(&d).eq_ignore_ascii_case(&meta.exe_sha256) => Ok(()),
-        Ok(_) => Err(("la versión preparada cambió después de probarla".to_string(), true)),
-        Err(e) => Err((format!("no se pudo leer la versión preparada: {e}"), false)),
+        Ok(_) => Err((t("la versión preparada cambió después de probarla").to_string(), true)),
+        Err(e) => Err((tr!("no se pudo leer la versión preparada: {}", e), false)),
     }
 }
 
@@ -1380,7 +1385,7 @@ fn apply_staged_in(meta: &StagedMeta, target: &Path, current: &str, gate: &Mutex
 /// «Reiniciar»: instala la versión preparada junto a `target`. Va en un hilo, con la ventana aún
 /// abierta; al terminar, la app se cierra y abre la nueva.
 pub fn apply_pending(target: &Path) -> Result<(), String> {
-    let meta: StagedMeta = read_json(&staged_meta_path(target)).ok_or_else(|| "no hay ninguna versión preparada".to_string())?;
+    let meta: StagedMeta = read_json(&staged_meta_path(target)).ok_or_else(|| t("no hay ninguna versión preparada").to_string())?;
     apply_staged(&meta, target)
 }
 
@@ -1403,9 +1408,9 @@ fn already_staged(exe: &Path, version: &str) -> Option<PathBuf> {
 pub fn swap_failure_text(target: &Path, why: &str) -> String {
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| binary_name_in_zip().to_string());
     if staged_meta_path(target).exists() {
-        format!("No se pudo sustituir {name} ({why}). Se intentará de nuevo al abrir Nanofy.")
+        tr!("No se pudo sustituir {} ({}). Se intentará de nuevo al abrir Nanofy.", name, why)
     } else {
-        format!("No se pudo instalar la versión nueva ({why}).")
+        tr!("No se pudo instalar la versión nueva ({}).", why)
     }
 }
 
@@ -1600,7 +1605,7 @@ pub fn on_launch() -> Launch {
         Health::Normal => {}
         Health::Probation => PROBATION.store(true, Ordering::Relaxed),
         Health::RolledBack { from, to } => {
-            let msg = format!("La versión {to} no arrancaba; se volvió a la {from}");
+            let msg = tr!("La versión {} no arrancaba; se volvió a la {}", to, from);
             if let Err(e) = spawn_target(&target, &args, &["--update-failed".to_string(), msg]) {
                 log::error!("[update] no se pudo abrir la {from}: {e}");
             }
@@ -1674,7 +1679,7 @@ fn apply_at_launch(target: &Path, args: &[String]) -> Launch {
                 }
                 None => log::error!("[update] sin {}: no se puede volver a la {from}", applied_path(target).display()),
             }
-            Launch::Continue { notice: Some(format!("La versión {} no arrancaba; sigues con la {from}", meta.version)) }
+            Launch::Continue { notice: Some(tr!("La versión {} no arrancaba; sigues con la {}", meta.version, from)) }
         }
     }
 }
@@ -1909,12 +1914,12 @@ fn fetch_latest_from(url: &str, current: &str) -> UpdateResult {
         Ok(r) if r.status().is_success() => r,
         // 404: todavía no hay ninguna release publicada.
         Ok(r) if r.status().as_u16() == 404 => return UpdateResult::UpToDate,
-        Ok(r) => return UpdateResult::Failed(format!("GitHub respondió HTTP {}", r.status().as_u16())),
-        Err(e) => return UpdateResult::Failed(format!("Sin conexión con GitHub ({e})")),
+        Ok(r) => return UpdateResult::Failed(tr!("GitHub respondió HTTP {}", r.status().as_u16())),
+        Err(e) => return UpdateResult::Failed(tr!("Sin conexión con GitHub ({})", e)),
     };
     let json: serde_json::Value = match resp.body_mut().read_json() {
         Ok(v) => v,
-        Err(e) => return UpdateResult::Failed(format!("Respuesta de GitHub no válida ({e})")),
+        Err(e) => return UpdateResult::Failed(tr!("Respuesta de GitHub no válida ({})", e)),
     };
     interpret(&json, current)
 }
@@ -1923,10 +1928,10 @@ fn fetch_latest_from(url: &str, current: &str) -> UpdateResult {
 /// `current_version()`, para que `NANOFY_VERSION` sirva de verdad en las pruebas).
 pub fn interpret(json: &serde_json::Value, current: &str) -> UpdateResult {
     let Some(tag) = json.get("tag_name").and_then(|v| v.as_str()) else {
-        return UpdateResult::Failed("La release no tiene etiqueta".to_string());
+        return UpdateResult::Failed(t("La release no tiene etiqueta").to_string());
     };
     let (Some(latest), Some(mine)) = (parse_version(tag), parse_version(current)) else {
-        return UpdateResult::Failed(format!("Versión no reconocida: {tag}"));
+        return UpdateResult::Failed(tr!("Versión no reconocida: {}", tag));
     };
     if latest <= mine {
         return UpdateResult::UpToDate;

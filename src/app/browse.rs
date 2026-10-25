@@ -15,6 +15,7 @@ use super::theme;
 use super::widgets::{galley_truncated, text_on_baseline};
 use super::{Action, App, Page};
 use crate::api::Req;
+use crate::i18n::t;
 use crate::model::{BrowseCard, BrowseData, BrowseEntry};
 
 // --- búsquedas recientes
@@ -90,7 +91,7 @@ const DIMMER: Color32 = Color32::from_gray(71);
 /// Secciones de «Explorar todo» y, por id de página, las categorías de cada una en orden (las de
 /// la referencia primero). Lo que Spotify dé y no esté aquí va a Géneros (casi todo lo nuevo lo
 /// es), salvo lo de dentro de Pódcasts y Audiolibros, que va a su sección.
-pub(super) const SECTIONS: [&str; 6] = ["Descubrir", "Géneros", "Estado de ánimo y actividad", "Entretenimiento", "Pódcasts", "Audiolibros"];
+pub(super) const SECTIONS: [&str; 6] = [tk!("Descubrir"), tk!("Géneros"), tk!("Estado de ánimo y actividad"), tk!("Entretenimiento"), tk!("Pódcasts"), tk!("Audiolibros")];
 const GROUPS: [&[&str]; 6] = [
     &[
         "0JQ5DAt0tbjZptfcdMSKl3", // Especialmente para ti (Made For You)
@@ -285,16 +286,16 @@ impl App {
         let p = theme::palette(ui.ctx());
         let painter = ui.painter().clone();
         let top = area.min.y + 60.0;
-        let g = painter.layout_no_wrap("No se pudo cargar".into(), theme::bold(20.0), p.text);
+        let g = painter.layout_no_wrap(t("No se pudo cargar").into(), theme::bold(20.0), p.text);
         let w = g.size().x;
         text_on_baseline(&painter, pos2(area.center().x - w / 2.0, top + 20.0), g, p.text);
-        let g = galley_truncated(&painter, err, theme::regular(13.0), p.weak, area.width() - 80.0);
+        let g = galley_truncated(&painter, &crate::i18n::t_message(err), theme::regular(13.0), p.weak, area.width() - 80.0);
         let w = g.size().x;
         text_on_baseline(&painter, pos2(area.center().x - w / 2.0, top + 46.0), g, p.weak);
         let b = Rect::from_center_size(pos2(area.center().x, top + 84.0), vec2(130.0, 38.0));
         let r = ui.interact(b, ui.id().with(("retry", key)), Sense::click());
         painter.rect_filled(b, CornerRadius::same(19), if r.hovered() { Color32::WHITE } else { Color32::from_gray(235) });
-        let g = painter.layout_no_wrap("Reintentar".into(), theme::bold(14.0), Color32::BLACK);
+        let g = painter.layout_no_wrap(t("Reintentar").into(), theme::bold(14.0), Color32::BLACK);
         let w = g.size().x;
         text_on_baseline(&painter, pos2(b.center().x - w / 2.0, b.center().y + 5.0), g, Color32::BLACK);
         if r.hovered() {
@@ -410,17 +411,17 @@ impl App {
             let strong = Color32::WHITE;
 
             if !recent.is_empty() {
-                let g = painter.layout_no_wrap("Búsquedas recientes".into(), theme::bold(TITLE_FONT), strong);
+                let g = painter.layout_no_wrap(t("Búsquedas recientes").into(), theme::bold(TITLE_FONT), strong);
                 text_on_baseline(&painter, pos2(o.x + RS_TITLE_X, o.y + RS_TITLE_BASE), g, strong);
                 self.recent_menu(ui, pos2(right - DOTS_DX, o.y + DOTS_Y));
                 self.recent_row(ui, o, right, &recent);
             }
 
-            let g = painter.layout_no_wrap("Explorar todo".into(), theme::bold(TITLE_FONT), strong);
+            let g = painter.layout_no_wrap(t("Explorar todo").into(), theme::bold(TITLE_FONT), strong);
             text_on_baseline(&painter, pos2(o.x + RS_TITLE_X, o.y + BROWSE_TITLE_BASE + shift), g, strong);
             if sections.is_empty() {
                 let p = theme::palette(ui.ctx());
-                let text = if self.browse_asked { "Cargando categorías…" } else { "Sin categorías" };
+                let text = if self.browse_asked { t("Cargando categorías…") } else { t("Sin categorías") };
                 let g = painter.layout_no_wrap(text.into(), theme::regular(14.0), p.weak);
                 text_on_baseline(&painter, pos2(o.x + RS_TITLE_X, o.y + BROWSE_TITLE_BASE + shift + 40.0), g, p.weak);
             }
@@ -445,7 +446,7 @@ impl App {
         let all: Vec<String> = self.recent_searches.iter().flatten().map(|e| e.uri.clone()).collect();
         let mut clear = false;
         egui::Popup::menu(&r).show(|ui| {
-            if Self::menu_item(ui, Some(super::icons::Icon::Trash), "Borrar búsquedas recientes", false).clicked() {
+            if Self::menu_item(ui, Some(super::icons::Icon::Trash), t("Borrar búsquedas recientes"), false).clicked() {
                 clear = true;
                 ui.close();
             }
@@ -509,7 +510,7 @@ impl App {
             if hit.hovered() || xr.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if xr.on_hover_text("Quitar de las búsquedas recientes").clicked() {
+            if xr.on_hover_text(t("Quitar de las búsquedas recientes")).clicked() {
                 remove = Some(e.uri.clone());
             } else if hit.clicked() {
                 open = Some(e.clone());
@@ -528,7 +529,7 @@ impl App {
     /// Una sección de «Explorar todo»: título, flechas y su fila de tarjetas.
     fn browse_row(&mut self, ui: &mut egui::Ui, g: usize, cards: &[BrowseCard], left: f32, right: f32, base: f32) {
         let painter = ui.painter().clone();
-        let g_title = painter.layout_no_wrap(SECTIONS[g].into(), theme::semibold(SEC_FONT), Color32::WHITE);
+        let g_title = painter.layout_no_wrap(t(SECTIONS[g]).into(), theme::semibold(SEC_FONT), Color32::WHITE);
         text_on_baseline(&painter, pos2(left + SEC_X, base), g_title, Color32::WHITE);
         let row = Rect::from_min_max(pos2(left + ROW_LEFT, base + SEC_CARDS_DY), pos2(right - ROW_RIGHT, base + SEC_CARDS_DY + CARD));
         let visible = (((row.width() + CARD_PITCH - CARD) / CARD_PITCH) + 0.01).floor().max(1.0) as usize;
@@ -594,7 +595,7 @@ impl App {
     pub(super) fn open_browse_card(&mut self, c: &BrowseCard) {
         match c.feature.as_deref() {
             // Especiales que Nanofy aún no tiene (listas de pódcasts, conciertos…).
-            Some(f) if !f.starts_with("spotify:page:") => self.status(&format!("«{}» aún no está en Nanofy", c.title)),
+            Some(f) if !f.starts_with("spotify:page:") => self.status(tr!("«{}» aún no está en Nanofy", c.title)),
             _ => self.actions.push(Action::Go(Page::Browse(c.uri.clone()))),
         }
     }
@@ -665,7 +666,7 @@ impl App {
             }
         }
         let Some(page) = self.browse_pages.get(&uri).cloned() else {
-            Self::loading(ui, "Cargando");
+            Self::loading(ui, t("Cargando"));
             return;
         };
         let p = theme::palette(ui.ctx());

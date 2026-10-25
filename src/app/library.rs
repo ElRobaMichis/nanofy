@@ -19,6 +19,7 @@ use super::theme;
 use super::widgets::{galley_truncated, keyed_child, text_on_baseline, CardKind};
 use super::{strip_html, Action, App, FolderDialog, Page, PlayTarget, LIKED};
 use crate::api::Req;
+use crate::i18n::t;
 
 mod liked;
 mod liked_masks;
@@ -213,10 +214,10 @@ impl Item {
     }
 }
 
-const GROUPS: [&str; 6] = ["Playlists", "Carpetas", "Álbumes", "Artistas", "Podcasts", "Audiolibros"];
+const GROUPS: [&str; 6] = [tk!("Playlists"), tk!("Carpetas"), tk!("Álbumes"), tk!("Artistas"), tk!("Podcasts"), tk!("Audiolibros")];
 
 /// Filtros del menú «Agrupar», en su orden (`settings.library_kind`).
-const KINDS: [&str; 8] = ["Todo", "Canciones", "Playlists", "Álbumes", "Artistas", "Carpetas", "Podcasts", "Audiolibros"];
+const KINDS: [&str; 8] = [tk!("Todo"), tk!("Canciones"), tk!("Playlists"), tk!("Álbumes"), tk!("Artistas"), tk!("Carpetas"), tk!("Podcasts"), tk!("Audiolibros")];
 
 // --- Menú «Agrupar» (referencias 15.png y 16.png: la ventana de 12.webp reducida a 0,853) ----
 
@@ -442,7 +443,7 @@ impl App {
                 }
             }
         } else {
-            if matches("canciones que te gustan") {
+            if matches(t("Canciones que te gustan")) {
                 items.push((Item::Liked, recent("liked"), 0));
             }
             let in_folder: HashSet<&str> = self.folders.iter().flat_map(|f| f.playlists.iter().map(String::as_str)).collect();
@@ -503,7 +504,7 @@ impl App {
         let and_more = |names: Vec<String>, more: bool| -> String {
             let list = names.join(", ");
             if more && !list.is_empty() {
-                format!("{list} y más")
+                tr!("{} y más", list)
             } else {
                 list
             }
@@ -513,8 +514,8 @@ impl App {
                 let list = self.lists.get(LIKED);
                 let total = list.map(|l| l.total).filter(|&t| t > 0).unwrap_or(self.liked_set.len() as u32);
                 let names: Vec<String> = list.map(|l| l.tracks.iter().take(3).map(|t| t.name.clone()).collect()).unwrap_or_default();
-                let subtitle = if names.is_empty() { format!("{total} canciones") } else { and_more(names, total > 3) };
-                CardData { item, key, title: "Canciones que te gustan".into(), subtitle, count: Some(total), count_color: LIKED_COUNT, cover: None, pinned }
+                let subtitle = if names.is_empty() { tr!("{} canciones", total) } else { and_more(names, total > 3) };
+                CardData { item, key, title: t("Canciones que te gustan").into(), subtitle, count: Some(total), count_color: LIKED_COUNT, cover: None, pinned }
             }
             Item::Playlist(i) => {
                 let pl = &self.playlists[i];
@@ -544,8 +545,8 @@ impl App {
                             d
                         } else {
                             match pl.owner_name() {
-                                "" => "Playlist".to_string(),
-                                owner => format!("De {owner}"),
+                                "" => t("Playlist").to_string(),
+                                owner => tr!("De {}", owner),
                             }
                         }
                     }
@@ -654,15 +655,15 @@ impl App {
         let tone = |sel: bool, hov: bool| if sel { st.icon_on } else if hov { st.hover } else { st.icon };
         paint_mask(&painter, "list", &lm::LIST, px(&painter, o), tone(!grid, list_r.hovered()));
         paint_mask(&painter, "grid", &lm::GRID, px(&painter, o), tone(grid, grid_r.hovered()));
-        if list_r.on_hover_text("Lista").clicked() && grid {
+        if list_r.on_hover_text(t("Lista")).clicked() && grid {
             self.set_library_grid(false);
         }
-        if grid_r.on_hover_text("Cuadrícula").clicked() && !grid {
+        if grid_r.on_hover_text(t("Cuadrícula")).clicked() && !grid {
             self.set_library_grid(true);
         }
 
         // Orden: «Recientes» o «Antiguos».
-        let label = if self.settings.library_oldest { "Antiguos" } else { "Recientes" };
+        let label = if self.settings.library_oldest { t("Antiguos") } else { t("Recientes") };
         let g = painter.layout_no_wrap(label.into(), theme::semibold(BAR_FONT), st.bar_text);
         let ink = ink_left(&g);
         let text_w = g.size().x - ink - ink_right(&g);
@@ -672,7 +673,7 @@ impl App {
         let hov = sort_r.hovered();
         paint_mask(&painter, "sort", &lm::SORT, px(&painter, o), if hov { st.hover } else { st.icon });
         text_on_baseline(&painter, at(SORT_TEXT_X - ink, BAR_BASE), g, if hov { st.hover } else { st.bar_text });
-        let tip = if self.settings.library_oldest { "De lo más antiguo a lo más reciente" } else { "De lo más reciente a lo más antiguo" };
+        let tip = if self.settings.library_oldest { t("De lo más antiguo a lo más reciente") } else { t("De lo más reciente a lo más antiguo") };
         if sort_r.on_hover_text(tip).clicked() {
             self.settings.library_oldest = !self.settings.library_oldest;
             self.settings.save(&self.paths);
@@ -683,7 +684,7 @@ impl App {
         let dx = group_x - (lm::GROUP.ox as f32 + 2.0);
         // Con un filtro elegido (y sin agrupar), el botón lleva su nombre.
         let kind = self.settings.library_kind as usize;
-        let glabel = if !self.settings.library_grouped && kind != 0 { KINDS[kind.min(KINDS.len() - 1)] } else { "Agrupar" };
+        let glabel = if !self.settings.library_grouped && kind != 0 { t(KINDS[kind.min(KINDS.len() - 1)]) } else { t("Agrupar") };
         let ga = painter.layout_no_wrap(glabel.into(), theme::semibold(BAR_FONT), st.icon);
         let ga_ink = ink_left(&ga);
         let ga_w = ga.size().x - ga_ink - ink_right(&ga);
@@ -719,7 +720,7 @@ impl App {
         hand(ui, &s_r);
         let c = if open { st.icon_on } else if s_r.hovered() { st.hover } else { st.icon };
         paint_mask(&painter, "search", &lm::SEARCH, px(&painter, at(sdx, 0.0)), c);
-        if s_r.on_hover_text("Buscar en Tu biblioteca").clicked() {
+        if s_r.on_hover_text(t("Buscar en Tu biblioteca")).clicked() {
             self.library_search_open = !open;
             if !self.library_search_open {
                 self.library_filter.clear();
@@ -734,7 +735,7 @@ impl App {
                 .text_color(st.field_text)
                 .desired_width(field.width())
                 .vertical_align(egui::Align::Center)
-                .hint_text(egui::RichText::new("Buscar en Tu biblioteca").color(st.field_hint));
+                .hint_text(egui::RichText::new(t("Buscar en Tu biblioteca")).color(st.field_hint));
             let r = child.add_sized(field.size(), edit);
             if self.library_search_open && self.library_filter.is_empty() && !r.has_focus() && !r.lost_focus() {
                 r.request_focus();
@@ -754,14 +755,14 @@ impl App {
         let plus_r = ui.interact(plus_hit, ui.id().with("lib_plus"), Sense::click());
         hand(ui, &plus_r);
         paint_mask(&painter, "plus", &lm::PLUS, px(&painter, po), if plus_r.hovered() { st.hover } else { st.icon });
-        let plus_r = plus_r.on_hover_text("Crear");
+        let plus_r = plus_r.on_hover_text(t("Crear"));
         egui::Popup::menu(&plus_r).show(|ui| {
             ui.set_min_width(220.0);
-            if Self::menu_item(ui, Some(Icon::Playlist), "Playlist", false).clicked() {
+            if Self::menu_item(ui, Some(Icon::Playlist), t("Playlist"), false).clicked() {
                 self.actions.push(Action::OpenEditor(None));
                 ui.close();
             }
-            if Self::menu_item(ui, Some(Icon::Folder), "Carpeta", false).clicked() {
+            if Self::menu_item(ui, Some(Icon::Folder), t("Carpeta"), false).clicked() {
                 self.folder_dialog = Some(FolderDialog { id: None, name: String::new(), playlist: None, busy: false });
                 ui.close();
             }
@@ -787,7 +788,7 @@ impl App {
             for (g, name) in GROUPS.iter().enumerate() {
                 let v: Vec<Item> = items.iter().copied().filter(|it| it.group() == g).collect();
                 if !v.is_empty() {
-                    sections.push((Some(name), v));
+                    sections.push((Some(t(*name)), v));
                 }
             }
         } else {
@@ -816,11 +817,11 @@ impl App {
         }
         if empty {
             let text = if !self.library_filter.trim().is_empty() {
-                "Nada coincide con tu búsqueda"
+                t("Nada coincide con tu búsqueda")
             } else if folder_head {
-                "Esta carpeta está vacía. Añade playlists desde su menú («Añadir a carpeta»)."
+                t("Esta carpeta está vacía. Añade playlists desde su menú («Añadir a carpeta»).")
             } else {
-                "Aquí aparecerá lo que guardes"
+                t("Aquí aparecerá lo que guardes")
             };
             let g = ui.painter().layout_no_wrap(text.into(), theme::regular(14.0), st.sub);
             let at = if folder_head { y - FIRST_ROW + SCROLL_TOP + 20.0 } else { y + 20.0 };
@@ -866,7 +867,7 @@ impl App {
         }
         super::icons::paint(ui.painter(), Rect::from_center_size(pos2(at.x + 10.0, at.y + 15.0), vec2(20.0, 20.0)), if r.hovered() { st.title } else { st.icon }, Icon::ArrowLeft);
         text_on_baseline(ui.painter(), pos2(at.x + 28.0, at.y + 22.0), g, st.title);
-        if r.on_hover_text("Volver a Tu biblioteca").clicked() {
+        if r.on_hover_text(t("Volver a Tu biblioteca")).clicked() {
             self.library_folder = None;
         }
     }
@@ -1009,32 +1010,32 @@ impl App {
         }
         let key = key.to_string();
         resp.context_menu(|ui| {
-            if Self::menu_item(ui, Some(Icon::Pin), if pinned { "Desfijar" } else { "Fijar" }, false).clicked() {
+            if Self::menu_item(ui, Some(Icon::Pin), if pinned { t("Desfijar") } else { t("Fijar") }, false).clicked() {
                 self.set_library_pin(&key, !pinned);
                 ui.close();
             }
             match item {
                 Item::Folder(i) => {
                     let f = self.folders[i].clone();
-                    if Self::menu_item(ui, Some(Icon::Edit), "Renombrar…", false).clicked() {
+                    if Self::menu_item(ui, Some(Icon::Edit), t("Renombrar…"), false).clicked() {
                         self.folder_dialog = Some(FolderDialog { id: Some(f.id.clone()), name: f.name.clone(), playlist: None, busy: false });
                         ui.close();
                     }
-                    if Self::menu_item(ui, Some(Icon::Trash), "Eliminar carpeta", false).clicked() {
+                    if Self::menu_item(ui, Some(Icon::Trash), t("Eliminar carpeta"), false).clicked() {
                         self.api.send(Req::FolderDelete(f.id.clone()));
                         ui.close();
                     }
                 }
                 Item::Album(i) => {
                     let id = self.saved_albums[i].id.clone();
-                    if Self::menu_item(ui, Some(Icon::NewTab), "Abrir en una nueva pestaña", false).clicked() {
+                    if Self::menu_item(ui, Some(Icon::NewTab), t("Abrir en una nueva pestaña"), false).clicked() {
                         self.actions.push(Action::OpenInTab(Page::Album(id)));
                         ui.close();
                     }
                 }
                 Item::Artist(i) => {
                     let id = self.followed_artists[i].id.clone();
-                    if Self::menu_item(ui, Some(Icon::NewTab), "Abrir en una nueva pestaña", false).clicked() {
+                    if Self::menu_item(ui, Some(Icon::NewTab), t("Abrir en una nueva pestaña"), false).clicked() {
                         self.actions.push(Action::OpenInTab(Page::Artist(id)));
                         ui.close();
                     }
@@ -1045,7 +1046,7 @@ impl App {
                         Item::Audiobook(i) => self.audiobooks[i].id.clone(),
                         _ => String::new(),
                     };
-                    if Self::menu_item(ui, Some(Icon::NewTab), "Abrir en una nueva pestaña", false).clicked() {
+                    if Self::menu_item(ui, Some(Icon::NewTab), t("Abrir en una nueva pestaña"), false).clicked() {
                         self.actions.push(Action::OpenInTab(Page::Show(id)));
                         ui.close();
                     }
@@ -1067,11 +1068,11 @@ impl App {
         let n = items.len();
         if n == 0 {
             let text = if !self.library_filter.trim().is_empty() {
-                "Nada coincide con tu búsqueda"
+                t("Nada coincide con tu búsqueda")
             } else if self.library_folder.is_some() {
-                "Esta carpeta está vacía. Añade playlists desde su menú («Añadir a carpeta»)."
+                t("Esta carpeta está vacía. Añade playlists desde su menú («Añadir a carpeta»).")
             } else {
-                "Aquí aparecerá lo que guardes"
+                t("Aquí aparecerá lo que guardes")
             };
             let g = ui.painter().layout_no_wrap(text.into(), theme::regular(14.0), style(ui.ctx()).sub);
             let at = pos2(ui.min_rect().min.x + GRID_LEFT, ui.cursor().min.y + 20.0);
@@ -1095,12 +1096,12 @@ impl App {
                 _ => CardKind::Playlist,
             };
             let what = match item {
-                Item::Liked | Item::Playlist(_) => "Playlist",
-                Item::Folder(_) => "Carpeta",
-                Item::Album(_) => "Álbum",
-                Item::Show(_) => "Podcast",
-                Item::Audiobook(_) => "Audiolibro",
-                Item::Artist(_) => "Artista",
+                Item::Liked | Item::Playlist(_) => t("Playlist"),
+                Item::Folder(_) => t("Carpeta"),
+                Item::Album(_) => t("Álbum"),
+                Item::Show(_) => t("Podcast"),
+                Item::Audiobook(_) => t("Audiolibro"),
+                Item::Artist(_) => t("Artista"),
             };
             let sub = if d.subtitle.is_empty() || matches!(item, Item::Liked) { what.to_string() } else { format!("{what} · {}", d.subtitle) };
             let mut c = keyed_child(ui, rect, ("lib_row", &d.key));
@@ -1154,7 +1155,7 @@ impl App {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                     let color = if on { text_on } else { text_off };
-                    let g = painter.layout_no_wrap(name.to_string(), theme::semilight(GM_FONT), color);
+                    let g = painter.layout_no_wrap(t(*name).to_string(), theme::semilight(GM_FONT), color);
                     let lead = ink_left(&g);
                     text_on_baseline(&painter, pos2(rect.min.x + GM_TEXT_X - lead, base), g, color);
                     if on && r.clicked() {
@@ -1169,7 +1170,7 @@ impl App {
                 if r.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                let g = painter.layout_no_wrap("Agrupar".into(), theme::semilight(GM_GROUP_FONT), text_on);
+                let g = painter.layout_no_wrap(t("Agrupar").into(), theme::semilight(GM_GROUP_FONT), text_on);
                 let lead = ink_left(&g);
                 text_on_baseline(&painter, pos2(rect.min.x + GM_TEXT_X - lead, rect.min.y + GM_GROUP_BASE), g, text_on);
                 let track = Rect::from_min_max(at(GM_TRACK[0], GM_TRACK[1]), at(GM_TRACK[2], GM_TRACK[3]));

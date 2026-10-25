@@ -10,13 +10,14 @@ use super::icons::{self, Icon};
 use super::player_menu::{Anchor, SongMenu};
 use super::theme::{self, GREEN};
 use super::{Action, App, Page, PlayTarget, ROW_H};
+use crate::i18n::t;
 use crate::model::*;
 
 pub const CARD_W: f32 = 168.0;
 pub const CARD_COVER: f32 = 152.0;
 pub const CARD_H: f32 = 226.0;
 /// Aviso de una fila que seguro no puede sonar (`Track::is_playable`); se puede pulsar igual.
-const UNPLAYABLE_HINT: &str = "Puede que no esté disponible en tu país o que se haya retirado de Spotify";
+const UNPLAYABLE_HINT: &str = tk!("Puede que no esté disponible en tu país o que se haya retirado de Spotify");
 
 #[derive(Clone, Copy)]
 pub enum Source<'a> {
@@ -444,7 +445,7 @@ impl App {
         });
         match state {
             Some(true) => {
-                if Self::pill(ui, "Siguiendo", true).on_hover_text("Dejar de seguir").clicked() {
+                if Self::pill(ui, t("Siguiendo"), true).on_hover_text(t("Dejar de seguir")).clicked() {
                     self.actions.push(Action::Follow {
                         kind,
                         id: id.to_string(),
@@ -453,7 +454,7 @@ impl App {
                 }
             }
             Some(false) => {
-                if Self::pill(ui, "Seguir", false).clicked() {
+                if Self::pill(ui, t("Seguir"), false).clicked() {
                     self.actions.push(Action::Follow {
                         kind,
                         id: id.to_string(),
@@ -462,7 +463,7 @@ impl App {
                 }
             }
             None => {
-                ui.add_enabled(false, egui::Button::new("Seguir"));
+                ui.add_enabled(false, egui::Button::new(t("Seguir")));
             }
         }
     }
@@ -479,13 +480,13 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             if icons::round_button(ui, Icon::Play, 44.0, GREEN, Color32::BLACK)
-                .on_hover_text("Reproducir")
+                .on_hover_text(t("Reproducir"))
                 .clicked()
             {
                 self.actions.push(Action::Play(play));
             }
             if icons::button(ui, Icon::Shuffle, 34.0, p.weak)
-                .on_hover_text("Aleatorio")
+                .on_hover_text(t("Aleatorio"))
                 .clicked()
             {
                 self.actions.push(Action::Play(shuffle));
@@ -581,12 +582,12 @@ impl App {
         let id = ui.id().with(("collection_bar", list_id));
         let play = Rect::from_center_size(pos2(bar.min.x + 21.0, cy), vec2(44.0, 44.0));
         let mut c = child_in(ui, play, Layout::left_to_right(Align::Center));
-        if icons::round_button(&mut c, Icon::Play, 44.0, GREEN, Color32::BLACK).on_hover_text("Reproducir").clicked() && !all.is_empty() {
+        if icons::round_button(&mut c, Icon::Play, 44.0, GREEN, Color32::BLACK).on_hover_text(t("Reproducir")).clicked() && !all.is_empty() {
             self.actions.push(Action::Play(target(false)));
         }
         // Huecos de los botones, de izquierda a derecha.
         let slot = |k: usize| pos2(bar.min.x + 75.5 + 54.5 * k as f32, cy);
-        if Self::slot_button(ui, id.with("shuffle"), slot(0) - vec2(0.5, 0.0), Icon::Shuffle, 30.0, ink.dim).on_hover_text("Aleatorio").clicked() && !all.is_empty() {
+        if Self::slot_button(ui, id.with("shuffle"), slot(0) - vec2(0.5, 0.0), Icon::Shuffle, 30.0, ink.dim).on_hover_text(t("Aleatorio")).clicked() && !all.is_empty() {
             self.actions.push(Action::Play(target(true)));
         }
         let mut k = if extra(self, ui, slot(1)) { 2 } else { 1 };
@@ -594,7 +595,7 @@ impl App {
             k += 1;
             slot(k - 1)
         };
-        if Self::slot_button(ui, id.with("queue"), next(), Icon::QueueList, 28.0, ink.dim).on_hover_text("Añadir a la cola").clicked() {
+        if Self::slot_button(ui, id.with("queue"), next(), Icon::QueueList, 28.0, ink.dim).on_hover_text(t("Añadir a la cola")).clicked() {
             for t in all {
                 self.actions.push(Action::AddToQueue(t.uri.clone()));
             }
@@ -603,11 +604,11 @@ impl App {
         let all_dl = ids().next().is_some() && ids().all(|i| self.downloaded.contains(i));
         let busy = !self.downloading.is_empty() && ids().any(|i| self.downloading.contains(i));
         let (icon, color, tip) = if all_dl {
-            (Icon::Download, GREEN, "Descargado (en la caché de audio)")
+            (Icon::Download, GREEN, t("Descargado (en la caché de audio)"))
         } else if busy {
-            (Icon::Hourglass, ink.dim, "Descargando…")
+            (Icon::Hourglass, ink.dim, t("Descargando…"))
         } else {
-            (Icon::Download, ink.dim, "Descargar")
+            (Icon::Download, ink.dim, t("Descargar"))
         };
         if Self::slot_button(ui, id.with("download"), next(), icon, 24.0, color).on_hover_text(tip).clicked() && !all_dl && !busy {
             let ids: Vec<String> = ids().cloned().collect();
@@ -618,12 +619,12 @@ impl App {
             }
         }
         if let Some(link) = link {
-            if Self::slot_button(ui, id.with("share"), next(), Icon::Share, 29.0, ink.dim).on_hover_text("Copiar enlace").clicked() {
-                self.actions.push(Action::CopyText(link.to_string(), "Enlace"));
+            if Self::slot_button(ui, id.with("share"), next(), Icon::Share, 29.0, ink.dim).on_hover_text(t("Copiar enlace")).clicked() {
+                self.actions.push(Action::CopyText(link.to_string(), t("Enlace")));
             }
         }
         if let Some(menu) = menu {
-            let more = Self::slot_button(ui, id.with("more"), next() - vec2(1.0, 0.0), Icon::More, 29.0, ink.dim).on_hover_text("Más");
+            let more = Self::slot_button(ui, id.with("more"), next() - vec2(1.0, 0.0), Icon::More, 29.0, ink.dim).on_hover_text(t("Más"));
             egui::Popup::menu(&more).show(|ui| {
                 ui.set_min_width(200.0);
                 menu(self, ui);
@@ -632,7 +633,7 @@ impl App {
         // Lupa a la derecha; el campo de búsqueda se abre a su izquierda.
         let lupa = pos2(bar.max.x - 23.0, cy - 2.0);
         let color = if self.album_search_open { GREEN } else { ink.dim };
-        if Self::slot_button(ui, id.with("search"), lupa, Icon::Search, 31.0, color).on_hover_text("Buscar en esta lista").clicked() {
+        if Self::slot_button(ui, id.with("search"), lupa, Icon::Search, 31.0, color).on_hover_text(t("Buscar en esta lista")).clicked() {
             self.album_search_open = !self.album_search_open;
             self.album_search_focus = self.album_search_open;
             if !self.album_search_open {
@@ -642,7 +643,7 @@ impl App {
         if self.album_search_open {
             let field = Rect::from_min_max(pos2((lupa.x - 250.0).max(bar.min.x + 360.0), cy - 15.0), pos2(lupa.x - 24.0, cy + 15.0));
             let mut f = child_in(ui, field, Layout::right_to_left(Align::Center));
-            let r = f.add(egui::TextEdit::singleline(&mut self.album_search).hint_text("Buscar en esta lista").desired_width(field.width()));
+            let r = f.add(egui::TextEdit::singleline(&mut self.album_search).hint_text(t("Buscar en esta lista")).desired_width(field.width()));
             if self.album_search_focus {
                 self.album_search_focus = false;
                 r.request_focus();
@@ -685,7 +686,7 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     let (icon, color) = if all_liked { (Icon::HeartFilled, GREEN) } else { (Icon::Heart, p.text) };
                     if icons::button(ui, icon, 34.0, color)
-                        .on_hover_text(if all_liked { "Quitar de Me gusta" } else { "Añadir a Me gusta" })
+                        .on_hover_text(if all_liked { t("Quitar de Me gusta") } else { t("Añadir a Me gusta") })
                         .clicked()
                     {
                         for i in &ids {
@@ -694,33 +695,33 @@ impl App {
                             }
                         }
                     }
-                    if icons::button(ui, Icon::PlusSquare, 34.0, p.text).on_hover_text("Añadir a una playlist").clicked() {
+                    if icons::button(ui, Icon::PlusSquare, 34.0, p.text).on_hover_text(t("Añadir a una playlist")).clicked() {
                         self.open_add_dialog(uris.clone());
                     }
-                    if icons::button(ui, Icon::Queue, 34.0, p.text).on_hover_text("Añadir a la cola").clicked() {
+                    if icons::button(ui, Icon::Queue, 34.0, p.text).on_hover_text(t("Añadir a la cola")).clicked() {
                         for u in &uris {
                             self.actions.push(Action::AddToQueue(u.clone()));
                         }
                     }
-                    if icons::button(ui, Icon::Download, 34.0, p.text).on_hover_text("Descargar").clicked() {
+                    if icons::button(ui, Icon::Download, 34.0, p.text).on_hover_text(t("Descargar")).clicked() {
                         if sel.first().and_then(|t| t.kind.as_deref()) == Some("episode") {
                             self.actions.push(Action::DownloadEpisodes(ids.clone()));
                         } else {
                             self.actions.push(Action::Download(ids.clone()));
                         }
                     }
-                    if icons::button(ui, Icon::Share, 34.0, p.text).on_hover_text("Copiar enlaces").clicked() {
+                    if icons::button(ui, Icon::Share, 34.0, p.text).on_hover_text(t("Copiar enlaces")).clicked() {
                         let links: Vec<String> = uris.iter().map(|u| uri_to_link(u)).collect();
-                        self.actions.push(Action::CopyText(links.join("\n"), "Enlaces"));
+                        self.actions.push(Action::CopyText(links.join("\n"), t("Enlaces")));
                     }
-                    let more = icons::button(ui, Icon::More, 34.0, p.text).on_hover_text("Más");
+                    let more = icons::button(ui, Icon::More, 34.0, p.text).on_hover_text(t("Más"));
                     egui::Popup::menu(&more).show(|ui| {
                         ui.set_min_width(200.0);
-                        if Self::menu_item(ui, Some(Icon::Play), "Reproducir la selección", false).clicked() {
+                        if Self::menu_item(ui, Some(Icon::Play), t("Reproducir la selección"), false).clicked() {
                             self.actions.push(Action::Play(PlayTarget::Tracks { uris: uris.clone(), index: Some(0), shuffle: false, context: None }));
                             ui.close();
                         }
-                        if Self::menu_item(ui, Some(Icon::Check), "Seleccionar todo", false).clicked() {
+                        if Self::menu_item(ui, Some(Icon::Check), t("Seleccionar todo"), false).clicked() {
                             self.sel_list = list_id.to_string();
                             self.sel = all.iter().map(|t| t.uri.clone()).collect();
                             ui.close();
@@ -728,10 +729,10 @@ impl App {
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
-                        if icons::round_button(ui, Icon::Minus, 26.0, GREEN, Color32::BLACK).on_hover_text("Deseleccionar todo").clicked() {
+                        if icons::round_button(ui, Icon::Minus, 26.0, GREEN, Color32::BLACK).on_hover_text(t("Deseleccionar todo")).clicked() {
                             self.sel.clear();
                         }
-                        ui.label(RichText::new(format!("{} seleccionadas", uris.len())).small().color(p.weak));
+                        ui.label(RichText::new(tr!("{} seleccionadas", uris.len())).small().color(p.weak));
                     });
                 });
             });
@@ -914,20 +915,20 @@ impl App {
                 let pos = pos2(num_x + num_w / 2.0 - galley.size().x / 2.0, y - galley.size().y / 2.0);
                 ui.painter().galley(pos, galley, p.weak);
             }
-            small(ui, title_x, "Título", false);
+            small(ui, title_x, t("Título"), false);
             if show_album {
-                small(ui, album_x, "Álbum", false);
+                small(ui, album_x, t("Álbum"), false);
             }
             if contrib {
-                small(ui, by_x, "Añadida por", false);
+                small(ui, by_x, t("Añadida por"), false);
             }
             if show_date {
-                small(ui, date_x, "Fecha", false);
+                small(ui, date_x, t("Fecha"), false);
             }
             if opts.selectable {
-                small(ui, right_x, "Duración", false);
+                small(ui, right_x, t("Duración"), false);
             } else {
-                small(ui, right_x + right_w, "Duración", true);
+                small(ui, right_x + right_w, t("Duración"), true);
             }
             ui.painter().line_segment(
                 [pos2(hrect.min.x + pad, hrect.max.y - 1.0), pos2(hrect.max.x - pad, hrect.max.y - 1.0)],
@@ -1121,17 +1122,17 @@ impl App {
                         self.actions.push(Action::Like(tid.clone(), !liked));
                     }
                     if hov {
-                        if icons::button(&mut c, Icon::PlusSquare, 28.0, p.weak).on_hover_text("Añadir a playlist").clicked() {
+                        if icons::button(&mut c, Icon::PlusSquare, 28.0, p.weak).on_hover_text(crate::i18n::t("Añadir a playlist")).clicked() {
                             self.open_add_dialog(vec![uri.clone()]);
                         }
                         let dl = self.downloaded.contains(tid);
                         let busy = self.downloading.contains(tid);
                         let (icon, color, tip) = if dl {
-                            (Icon::Download, GREEN, "Descargada (en la caché de audio)")
+                            (Icon::Download, GREEN, crate::i18n::t("Descargada (en la caché de audio)"))
                         } else if busy {
-                            (Icon::Hourglass, p.weak, "Descargando…")
+                            (Icon::Hourglass, p.weak, crate::i18n::t("Descargando…"))
                         } else {
-                            (Icon::Download, p.weak, "Descargar")
+                            (Icon::Download, p.weak, crate::i18n::t("Descargar"))
                         };
                         if icons::button(&mut c, icon, 28.0, color).on_hover_text(tip).clicked() && !dl && !busy {
                             if t.kind.as_deref() == Some("episode") {
@@ -1140,7 +1141,7 @@ impl App {
                                 self.actions.push(Action::Download(vec![tid.clone()]));
                             }
                         }
-                        let more = icons::button(&mut c, Icon::More, 28.0, p.weak).on_hover_text("Más");
+                        let more = icons::button(&mut c, Icon::More, 28.0, p.weak).on_hover_text(crate::i18n::t("Más"));
                         if more.clicked() {
                             self.toggle_song_menu(Self::song_menu_for(t, &opts, list_id, i, Anchor::Dots(more.rect)));
                         }
@@ -1168,11 +1169,11 @@ impl App {
                         self.actions.push(Action::Like(id.clone(), !liked));
                     }
                     if hov {
-                        if icons::button(&mut c, Icon::PlusSquare, 28.0, p.weak).on_hover_text("Añadir a playlist").clicked() {
+                        if icons::button(&mut c, Icon::PlusSquare, 28.0, p.weak).on_hover_text(crate::i18n::t("Añadir a playlist")).clicked() {
                             self.open_add_dialog(vec![t.uri.clone()]);
                         }
                         if opts.editable_playlist == Some("queue") {
-                            if icons::button(&mut c, Icon::Close, 28.0, p.weak).on_hover_text("Quitar de la cola").clicked() {
+                            if icons::button(&mut c, Icon::Close, 28.0, p.weak).on_hover_text(crate::i18n::t("Quitar de la cola")).clicked() {
                                 self.actions.push(Action::RemoveFromPlaylist { playlist_id: "queue".into(), uri: t.uri.clone() });
                             }
                         }
@@ -1184,7 +1185,7 @@ impl App {
                 self.report_row_hover(&t.uri, pressing);
             }
             let resp = if t.is_playable == Some(false) {
-                resp.on_hover_text(UNPLAYABLE_HINT)
+                resp.on_hover_text(crate::i18n::t(UNPLAYABLE_HINT))
             } else {
                 resp
             };
@@ -1233,17 +1234,17 @@ impl App {
                 let g = painter.layout_no_wrap(text.into(), small.clone(), ink.dim);
                 text_on_baseline(painter, pos2(left + x, base), g, ink.dim);
             };
-            put(TABLE_COVER_X, "Título");
+            put(TABLE_COVER_X, t("Título"));
             if let Some(x) = cols.album_x {
-                put(x, "Álbum");
+                put(x, t("Álbum"));
             }
             if let Some(x) = cols.by_x {
-                put(x, "Añadida por");
+                put(x, t("Añadida por"));
             }
             if let Some(x) = cols.date_x {
-                put(x, "Fecha");
+                put(x, t("Fecha"));
             }
-            put(cols.dur_x, "Duración");
+            put(cols.dur_x, t("Duración"));
             let y = head.min.y + 59.3;
             painter.line_segment([pos2(left - 1.0, y), pos2(left + w, y)], Stroke::new(2.2, ink.line));
         }
@@ -1352,7 +1353,7 @@ impl App {
                 // El corazón se ve siempre: verde relleno con Me gusta, solo contorno si no.
                 let liked = self.liked_set.contains(tid);
                 let (icon, color) = if liked { (Icon::HeartFilled, GREEN) } else { (Icon::Heart, ink.dim) };
-                let tip = if liked { "Quitar de Me gusta" } else { "Me gusta" };
+                let tip = if liked { crate::i18n::t("Quitar de Me gusta") } else { crate::i18n::t("Me gusta") };
                 // El dibujo del corazón queda algo alto en su cuadro: en la referencia va centrado.
                 if Self::slot_button(ui, id.with("like"), pos2(left + cols.heart_c - 1.0, cy + 1.5), icon, TABLE_HEART, color).on_hover_text(tip).clicked() {
                     self.actions.push(Action::Like(tid.clone(), !liked));
@@ -1367,7 +1368,7 @@ impl App {
                     if n_fit >= 1 {
                         // El mismo icono y tamaño que en el reproductor (al lado del corazón); el
                         // círculo con «+» es el de guardar en la biblioteca.
-                        if Self::slot_button(ui, id.with("add"), at(k), Icon::PlusSquare, TABLE_HEART, ink.dim).on_hover_text("Añadir a playlist").clicked() {
+                        if Self::slot_button(ui, id.with("add"), at(k), Icon::PlusSquare, TABLE_HEART, ink.dim).on_hover_text(crate::i18n::t("Añadir a playlist")).clicked() {
                             self.open_add_dialog(vec![uri.clone()]);
                         }
                         k += 1.0;
@@ -1376,11 +1377,11 @@ impl App {
                         let dl = self.downloaded.contains(tid);
                         let busy = self.downloading.contains(tid);
                         let (icon, color, tip) = if dl {
-                            (Icon::Download, GREEN, "Descargada (en la caché de audio)")
+                            (Icon::Download, GREEN, crate::i18n::t("Descargada (en la caché de audio)"))
                         } else if busy {
-                            (Icon::Hourglass, ink.dim, "Descargando…")
+                            (Icon::Hourglass, ink.dim, crate::i18n::t("Descargando…"))
                         } else {
-                            (Icon::Download, ink.dim, "Descargar")
+                            (Icon::Download, ink.dim, crate::i18n::t("Descargar"))
                         };
                         if Self::slot_button(ui, id.with("dl"), at(k), icon, 24.0, color).on_hover_text(tip).clicked() && !dl && !busy {
                             if t.kind.as_deref() == Some("episode") {
@@ -1392,7 +1393,7 @@ impl App {
                         k += 1.0;
                     }
                     if n_fit >= 2 {
-                        let more = Self::slot_button(ui, more_id.with("btn"), at(k), Icon::More, 30.0, ink.dim).on_hover_text("Más");
+                        let more = Self::slot_button(ui, more_id.with("btn"), at(k), Icon::More, 30.0, ink.dim).on_hover_text(crate::i18n::t("Más"));
                         if more.clicked() || want_menu {
                             let mut m = Self::song_menu_for(t, &opts, list_id, i, Anchor::Dots(more.rect));
                             if want_menu {
@@ -1437,7 +1438,7 @@ impl App {
             if hov {
                 self.report_row_hover(&t.uri, pressing);
             }
-            let resp = if t.is_playable == Some(false) { resp.on_hover_text(UNPLAYABLE_HINT) } else { resp };
+            let resp = if t.is_playable == Some(false) { resp.on_hover_text(crate::i18n::t(UNPLAYABLE_HINT)) } else { resp };
             if resp.double_clicked() {
                 self.actions.push(Action::Play(opts.target(i, tracks, shuffle)));
             } else if resp.clicked() {

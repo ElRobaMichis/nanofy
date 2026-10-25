@@ -23,6 +23,8 @@ use oauth2::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::t;
+
 /// Identidad de primera parte de Spotify (el mismo tipo de client id que usan clientes como
 /// fastpotify o librespot) con su redirección de loopback registrada. Una app de desarrollador
 /// propia queda limitada por Spotify en «modo desarrollo» (403 al dar Me gusta, seguir, etc.);
@@ -85,10 +87,10 @@ pub const CONNECT_CANCELLED: &str = "autorización cancelada";
 /// La autorización preparada caducó sin que el navegador volviera (`CONNECT_TIMEOUT`).
 pub const CONNECT_EXPIRED: &str = "la autorización caducó sin respuesta del navegador";
 
-const PAGE_DONE: &str = "Listo. Ya puedes cerrar esta pestaña y volver a Nanofy.";
-const PAGE_LOGIN_CANCELLED: &str = "Inicio de sesión cancelado. Ya puedes cerrar esta pestaña.";
-const PAGE_DENIED: &str = "No se ha conectado tu biblioteca. Puedes hacerlo cuando quieras desde Nanofy con «Conectar con Spotify».";
-const PAGE_STALE: &str = "Este enlace ya no vale. Vuelve a Nanofy y pulsa «Conectar con Spotify».";
+const PAGE_DONE: &str = tk!("Listo. Ya puedes cerrar esta pestaña y volver a Nanofy.");
+const PAGE_LOGIN_CANCELLED: &str = tk!("Inicio de sesión cancelado. Ya puedes cerrar esta pestaña.");
+const PAGE_DENIED: &str = tk!("No se ha conectado tu biblioteca. Puedes hacerlo cuando quieras desde Nanofy con «Conectar con Spotify».");
+const PAGE_STALE: &str = tk!("Este enlace ya no vale. Vuelve a Nanofy y pulsa «Conectar con Spotify».");
 
 type SpotifyClient = BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
@@ -200,8 +202,9 @@ a{color:#1ed760}";
 
 /// Página mínima con un solo mensaje (vuelta de la autorización de la biblioteca).
 fn simple_page(text: &str) -> String {
+    let lang = crate::i18n::current();
     format!(
-        "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\"><title>Nanofy</title>\
+        "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\"><title>Nanofy</title>\
          <style>{PAGE_STYLE}</style></head><body><p>{text}</p></body></html>"
     )
 }
@@ -218,21 +221,26 @@ fn simple_page(text: &str) -> String {
 /// incondicional llevaría a la segunda autorización tras cancelar la primera); el enlace queda
 /// por si el salto no ocurre.
 pub fn login_page(next: Option<&str>) -> String {
-    let script_cancel = format!("document.getElementById('m').textContent='{PAGE_LOGIN_CANCELLED}'");
+    // El aviso va entre comillas simples de JavaScript: un apóstrofo de la traducción las cerraría.
+    let cancelled = t(PAGE_LOGIN_CANCELLED).replace('\'', "\\'");
+    let script_cancel = format!("document.getElementById('m').textContent='{cancelled}'");
+    let lang = crate::i18n::current();
+    let done = t(PAGE_DONE);
+    let (wait, cont) = (t("Un momento…"), t("Continuar: permite que Nanofy lea tu biblioteca"));
     match next {
         Some(url) => {
             let href = html_attr(url);
             format!(
-                "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\"><title>Nanofy</title>\
-                 <style>{PAGE_STYLE}</style></head><body><div><p id=\"m\">Un momento…</p>\
-                 <p id=\"l\"><a id=\"a\" href=\"{href}\">Continuar: permite que Nanofy lea tu biblioteca</a></p></div>\
+                "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\"><title>Nanofy</title>\
+                 <style>{PAGE_STYLE}</style></head><body><div><p id=\"m\">{wait}</p>\
+                 <p id=\"l\"><a id=\"a\" href=\"{href}\">{cont}</a></p></div>\
                  <script>if(/[?&]code=/.test(location.search)){{location.replace(document.getElementById('a').href)}}\
                  else{{{script_cancel};document.getElementById('l').remove()}}</script></body></html>"
             )
         }
         None => format!(
-            "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\"><title>Nanofy</title>\
-             <style>{PAGE_STYLE}</style></head><body><p id=\"m\">{PAGE_DONE}</p>\
+            "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\"><title>Nanofy</title>\
+             <style>{PAGE_STYLE}</style></head><body><p id=\"m\">{done}</p>\
              <script>if(!/[?&]code=/.test(location.search)){{{script_cancel}}}</script></body></html>"
         ),
     }
@@ -264,9 +272,9 @@ fn serve_callback(stream: TcpStream, path: &str, state: &str) -> Callback {
     }
     let result = parse_callback(&line, path, state);
     let (status, body) = match &result {
-        Callback::Code(_) => ("200 OK", simple_page(PAGE_DONE)),
-        Callback::Denied(_) => ("200 OK", simple_page(PAGE_DENIED)),
-        Callback::Stale => ("400 Bad Request", simple_page(PAGE_STALE)),
+        Callback::Code(_) => ("200 OK", simple_page(t(PAGE_DONE))),
+        Callback::Denied(_) => ("200 OK", simple_page(t(PAGE_DENIED))),
+        Callback::Stale => ("400 Bad Request", simple_page(t(PAGE_STALE))),
         Callback::Ignore => ("404 Not Found", String::new()),
     };
     let response = format!(
@@ -291,8 +299,8 @@ fn wait_for_code(p: &PendingConnect) -> Result<String, String> {
         match p.listener.accept() {
             Ok((stream, _)) => match serve_callback(stream, &p.path, &p.state) {
                 Callback::Code(code) => return Ok(code),
-                Callback::Denied(e) if e == "access_denied" => return Err("la cancelaste en el navegador".to_string()),
-                Callback::Denied(e) => return Err(format!("Spotify respondió «{e}»")),
+                Callback::Denied(e) if e == "access_denied" => return Err(t("la cancelaste en el navegador").to_string()),
+                Callback::Denied(e) => return Err(tr!("Spotify respondió «{}»", e)),
                 Callback::Stale | Callback::Ignore => {}
             },
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(ACCEPT_POLL),
@@ -402,7 +410,7 @@ impl WebAuth {
             None => {
                 let c = client_id.trim();
                 if c.len() < 16 {
-                    return Err("Client ID no válido".to_string());
+                    return Err(t("Client ID no válido").to_string());
                 }
                 c.to_string()
             }
@@ -411,7 +419,7 @@ impl WebAuth {
         // tildes rotas en algunos navegadores.
         let client = librespot_oauth::OAuthClientBuilder::new(&client_id, &self.redirect, SCOPES.to_vec())
             .open_in_browser()
-            .with_custom_message(&simple_page(PAGE_DONE))
+            .with_custom_message(&simple_page(t(PAGE_DONE)))
             .build()
             .map_err(|e| e.to_string())?;
         let token = client.get_access_token().map_err(|e| e.to_string())?;
@@ -445,14 +453,14 @@ impl WebAuth {
         let client_id = self
             .fixed_client_id
             .clone()
-            .ok_or_else(|| "solo para la identidad de primera parte".to_string())?;
+            .ok_or_else(|| t("solo para la identidad de primera parte").to_string())?;
         let redirect = oauth2::url::Url::parse(&self.redirect).map_err(|e| e.to_string())?;
         let addr = redirect
             .socket_addrs(|| None)
             .ok()
             .and_then(|a| a.into_iter().next())
-            .ok_or_else(|| format!("redirección sin dirección: {}", self.redirect))?;
-        let listener = TcpListener::bind(addr).map_err(|e| format!("no se pudo escuchar en {addr}: {e}"))?;
+            .ok_or_else(|| tr!("redirección sin dirección: {}", self.redirect))?;
+        let listener = TcpListener::bind(addr).map_err(|e| tr!("no se pudo escuchar en {}: {}", addr, e))?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let client = BasicClient::new(ClientId::new(client_id.clone()))
             .set_auth_uri(AuthUrl::new(AUTH_URL.to_string()).map_err(|e| e.to_string())?)
@@ -495,7 +503,7 @@ impl WebAuth {
             .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(verifier)
             .request(&http)
-            .map_err(|e| format!("Spotify no aceptó la autorización ({e})"))?;
+            .map_err(|e| tr!("Spotify no aceptó la autorización ({})", e))?;
         let refresh = token.refresh_token().map(|t| t.secret().to_string()).unwrap_or_default();
         let valid = token.expires_in().unwrap_or(Duration::from_secs(3600));
         self.store_grant(&client_id, refresh, token.access_token().secret().to_string(), valid);
@@ -532,7 +540,7 @@ impl WebAuth {
         .map_err(|e| e.to_string())?;
         let token = client
             .refresh_token(&stored.refresh_token)
-            .map_err(|e| format!("no se pudo renovar el token de la Web API: {e}"))?;
+            .map_err(|e| tr!("no se pudo renovar el token de la Web API: {}", e))?;
         if !token.refresh_token.is_empty() && token.refresh_token != stored.refresh_token {
             let updated = Stored {
                 client_id: stored.client_id.clone(),

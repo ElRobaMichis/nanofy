@@ -17,6 +17,7 @@ use super::theme::{self, GREEN};
 use super::widgets::{galley_truncated, text_on_baseline};
 use super::{Action, App, Playlist};
 use crate::api::Req;
+use crate::i18n::t;
 
 /// Tamaño del panel.
 const W: f32 = 371.6;
@@ -193,7 +194,7 @@ impl App {
                 painter.rect_filled(rect, CornerRadius::same(RADIUS), ink.glass);
 
                 // Cabecera.
-                let g = painter.layout_no_wrap("Añadir a una playlist".into(), theme::semilight(HEAD_FONT), ink.text);
+                let g = painter.layout_no_wrap(t("Añadir a una playlist").into(), theme::semilight(HEAD_FONT), ink.text);
                 text_on_baseline(&painter, at(HEAD_X - lead(&g), HEAD_BASE), g, ink.text);
                 painter.line_segment([at(0.0, HEAD_LINE), at(W, HEAD_LINE)], Stroke::new(1.0, ink.line));
 
@@ -202,7 +203,7 @@ impl App {
                 painter.rect_filled(sb, CornerRadius::same(7), ink.field);
                 paint_mask(&painter, "add-search", &lm::SEARCH, px(&painter, at(SEARCH_ICON.x - (lm::SEARCH.ox as f32 + 2.0 + 11.0), SEARCH_ICON.y - (lm::SEARCH.oy as f32 + 2.0 + 11.0))), ink.icon);
                 if d.query.is_empty() {
-                    let g = painter.layout_no_wrap("Buscar una playlist o carpeta".into(), theme::semilight(SEARCH_FONT), ink.hint);
+                    let g = painter.layout_no_wrap(t("Buscar una playlist o carpeta").into(), theme::semilight(SEARCH_FONT), ink.hint);
                     text_on_baseline(&painter, at(SEARCH_TEXT_X - lead(&g), SEARCH_BASE), g, ink.hint);
                 }
                 let field = Rect::from_min_max(at(SEARCH_TEXT_X - 1.0, SEARCH_BOX[1] + 14.0), at(SEARCH_ICON.x - 18.0, SEARCH_BOX[3] - 14.0));
@@ -234,7 +235,7 @@ impl App {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
                             plus(ui.painter(), pos2(x0 + ICON_X, c), ink.icon);
-                            let g = ui.painter().layout_no_wrap("Nueva playlist".into(), theme::semilight(ROW_FONT), ink.text);
+                            let g = ui.painter().layout_no_wrap(t("Nueva playlist").into(), theme::semilight(ROW_FONT), ink.text);
                             text_on_baseline(ui.painter(), pos2(x0 + TEXT_X - lead(&g), c + 6.5), g, ink.text);
                             if r.clicked() {
                                 d.new_name = Some(String::new());
@@ -249,7 +250,7 @@ impl App {
                                 icons::paint(ui.painter(), Rect::from_center_size(pos2(x0 + ICON_X, c), vec2(16.0, 16.0)), GREEN, Icon::Check);
                             }
                             if name.is_empty() {
-                                let g = ui.painter().layout_no_wrap("Nombre de la playlist".into(), theme::semilight(ROW_FONT), ink.hint);
+                                let g = ui.painter().layout_no_wrap(t("Nombre de la playlist").into(), theme::semilight(ROW_FONT), ink.hint);
                                 text_on_baseline(ui.painter(), pos2(x0 + TEXT_X - lead(&g), c + 6.5), g, ink.hint);
                             }
                             let fr = Rect::from_min_max(pos2(x0 + TEXT_X - 1.0, c - 13.0), pos2(x0 + W - 24.0, c + 13.0));
@@ -282,7 +283,7 @@ impl App {
                     }
                     if entries.is_empty() {
                         let g = ui.painter().layout_no_wrap(
-                            if q.is_empty() { "Todavía no tienes playlists propias.".into() } else { "Nada coincide con tu búsqueda.".into() },
+                            if q.is_empty() { t("Todavía no tienes playlists propias.").into() } else { t("Nada coincide con tu búsqueda.").into() },
                             theme::semilight(FOOT_FONT),
                             ink.hint,
                         );
@@ -322,7 +323,7 @@ impl App {
                                 }
                             }
                             Entry::Empty => {
-                                let g = ui.painter().layout_no_wrap("Esta carpeta está vacía".into(), theme::semilight(ROW_FONT), ink.hint);
+                                let g = ui.painter().layout_no_wrap(t("Esta carpeta está vacía").into(), theme::semilight(ROW_FONT), ink.hint);
                                 text_on_baseline(ui.painter(), pos2(x0 + TEXT_X + INDENT - lead(&g), base), g, ink.hint);
                             }
                             Entry::Playlist { id, name, indent } => {
@@ -360,7 +361,7 @@ impl App {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
                 let cc = if cr.hovered() { ink.text } else { ink.cancel };
-                let g = painter.layout_no_wrap("Cancelar".into(), theme::semilight(FOOT_FONT), cc);
+                let g = painter.layout_no_wrap(t("Cancelar").into(), theme::semilight(FOOT_FONT), cc);
                 text_on_baseline(&painter, at(CANCEL_X - lead(&g), FOOT_BASE), g, cc);
                 if cr.clicked() {
                     keep = false;
@@ -373,7 +374,7 @@ impl App {
                 let green = if dr.hovered() { GREEN.lerp_to_gamma(Color32::WHITE, 0.12) } else { GREEN };
                 painter.rect_filled(db, CornerRadius::same(7), green);
                 let n = d.selected.len();
-                let label = if n > 1 { format!("Listo ({n})") } else { "Listo".to_string() };
+                let label = if n > 1 { tr!("Listo ({})", n) } else { t("Listo").to_string() };
                 let dark = Color32::from_gray(17);
                 let g = painter.layout_no_wrap(label, theme::semilight(DONE_FONT), dark);
                 let w = g.size().x;
@@ -389,7 +390,7 @@ impl App {
                     d.pending_new = Some(name.clone());
                     self.api.send(Req::CreatePlaylist { user_id, name, description: String::new(), public: false, collaborative: false });
                 }
-                None => self.status_err("Todavía no se ha cargado tu perfil; inténtalo en un momento"),
+                None => self.status_err(t("Todavía no se ha cargado tu perfil; inténtalo en un momento")),
             }
         }
         // Escape (sin estar escribiendo un nombre) o un clic fuera lo cierran, salvo en el botón
@@ -409,7 +410,7 @@ impl App {
                 }
             }
             if n > 0 {
-                self.status(if n == 1 { "Añadido a la playlist".to_string() } else { format!("Añadido a {n} playlists") });
+                self.status(if n == 1 { t("Añadido a la playlist").to_string() } else { tr!("Añadido a {} playlists", n) });
             }
             keep = false;
         }

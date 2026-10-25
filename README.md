@@ -92,6 +92,7 @@ Jam. It runs on Windows, Linux and macOS. **Playback requires Spotify Premium.**
 - An always-on-top miniplayer and, on Windows, playback buttons in the taskbar thumbnail.
 - Connection drops are repaired in the background without stopping the music. If the network goes away, it pauses at that second and resumes when it comes back.
 - Light, dark or system theme.
+- In English or Spanish (or the system's language), and easy to translate: each language is one CSV file ([how to translate](lang/README.md)).
 - <kbd>Ctrl</kbd>+<kbd>/</kbd> (<kbd>Cmd</kbd>+<kbd>/</kbd> on macOS) lists the keyboard shortcuts.
 
 ## Performance
@@ -220,7 +221,8 @@ your Spotify username and may include song titles. Security problems go
 ## Contributing
 
 Pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to build, test and send
-changes, and how the code is organized.
+changes, and how the code is organized. To translate Nanofy into your language you only need a
+spreadsheet: see [lang/README.md](lang/README.md).
 
 ## Credits and license
 

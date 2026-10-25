@@ -5,6 +5,7 @@ Spanish** (*también en español*).
 
 - **Found a bug?** Open an [issue](https://github.com/ElRobaMichis/nanofy/issues/new/choose) with the bug template.
 - **Have an idea?** Open a feature request first, so we can agree on it before you spend time coding.
+- **Want to translate?** Each language is one CSV file; see [lang/README.md](lang/README.md).
 - **Want to code?** Look for issues labeled
   [`good first issue`](https://github.com/ElRobaMichis/nanofy/labels/good%20first%20issue) or
   [`help wanted`](https://github.com/ElRobaMichis/nanofy/labels/help%20wanted), and say in the issue
@@ -15,7 +16,7 @@ Please read the [code of conduct](CODE_OF_CONDUCT.md). Security problems go
 
 ## Reporting a bug
 
-Include the version (Settings → «Acerca de Nanofy»), your system and the steps to reproduce it. Attach
+Include the version (Settings → About Nanofy), your system and the steps to reproduce it. Attach
 `nanofy.log` (current session) and `nanofy.log.1` (the previous one), taken right after the problem:
 they're in `%LOCALAPPDATA%\nanofy\data` (Windows), `~/.local/state/nanofy` (Linux) or
 `~/Library/Application Support/nanofy` (macOS). The logs include your Spotify username and may include

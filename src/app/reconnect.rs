@@ -9,13 +9,14 @@
 use std::time::{Duration, Instant};
 
 use crate::backend::ReconnectReason;
+use crate::i18n::t;
 
 /// Una reconexión que acaba antes de esto no se cuenta: el corte ya se oyó y la música vuelve sola.
 pub const NOTICE_AFTER: Duration = Duration::from_secs(4);
 /// El que sale si la reconexión tarda (y mientras se intenta).
 pub const RECONNECTING: &str = crate::backend::RECONNECTING;
 /// Al volver, solo si antes se dijo que se reconectaba.
-pub const RESTORED: &str = "Conexión con Spotify restablecida";
+pub const RESTORED: &str = tk!("Conexión con Spotify restablecida");
 
 /// El aviso de estado de la app: texto, cuándo se puso y si es de error.
 pub type Status = Option<(String, Instant, bool)>;
@@ -75,8 +76,8 @@ impl Reconnect {
             return None;
         }
         Some(match self.retry_in(now) {
-            Some(d) => format!("Sin conexión con Spotify; reintentando en {} s…", secs_up(d)),
-            None => RECONNECTING.to_string(),
+            Some(d) => tr!("Sin conexión con Spotify; reintentando en {} s…", secs_up(d)),
+            None => t(RECONNECTING).to_string(),
         })
     }
 
@@ -104,7 +105,7 @@ impl Reconnect {
     /// aviso propio que quede se quita.
     pub fn finish(self, now: Instant, restored: bool, status: &mut Status) {
         if restored && self.shown() {
-            *status = Some((RESTORED.to_string(), now, false));
+            *status = Some((t(RESTORED).to_string(), now, false));
         } else if self.owns(status) {
             *status = None;
         }

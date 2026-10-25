@@ -17,6 +17,7 @@ use super::icons::{self, Icon};
 use super::theme::{self, GREEN};
 use super::widgets::{galley_truncated, text_on_baseline, uri_to_link};
 use super::{Action, App, PlayState};
+use crate::i18n::t;
 use crate::model::LyricLine;
 
 /// Tamaño del panel; el borde derecho, a 27,5 px del centro del botón de la letra (como «Añadir
@@ -212,7 +213,7 @@ impl App {
 
     fn lyrics_header(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect, ink: &Ink) {
         let at = |x: f32, y: f32| pos2(rect.min.x + x, rect.min.y + y);
-        let g = galley_truncated(painter, "Letra", theme::regular(TITLE_FONT), ink.title, 100.0);
+        let g = galley_truncated(painter, t("Letra"), theme::regular(TITLE_FONT), ink.title, 100.0);
         let lead = ink_left(&g);
         text_on_baseline(painter, at(TITLE_X - lead, TITLE_BASE), g, ink.title);
         // ↗ (aún sin función).
@@ -226,7 +227,7 @@ impl App {
         let sc = at(SYNC_C.0, SYNC_C.1);
         let r = ui
             .interact(Rect::from_center_size(pos2(sc.x - 2.0, sc.y + 2.0), vec2(34.0, 38.0)), egui::Id::new("lyrics_sync"), Sense::click())
-            .on_hover_text(if on { "La letra sigue a la canción (pulsa para moverte libremente)" } else { "Seguir la canción" });
+            .on_hover_text(if on { t("La letra sigue a la canción (pulsa para moverte libremente)") } else { t("Seguir la canción") });
         let base = if on { GREEN } else { ink.icon };
         let color = if r.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -248,7 +249,7 @@ impl App {
 
         // Compartir: copia el renglón que suena (o el primero) con la canción y su enlace.
         let shc = at(SHARE_C.0, SHARE_C.1);
-        let r = ui.interact(Rect::from_center_size(shc, vec2(34.0, 34.0)), egui::Id::new("lyrics_share"), Sense::click()).on_hover_text("Compartir este fragmento");
+        let r = ui.interact(Rect::from_center_size(shc, vec2(34.0, 34.0)), egui::Id::new("lyrics_share"), Sense::click()).on_hover_text(t("Compartir este fragmento"));
         let color = if r.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             ink.icon.lerp_to_gamma(Color32::WHITE, 0.45)
@@ -259,7 +260,7 @@ impl App {
         icons::paint(painter, Rect::from_center_size(pos2(shc.x - 0.26, shc.y + 1.09), vec2(29.0, 29.0)), color, Icon::Share);
         if r.clicked() {
             if let Some(text) = self.lyrics_share_text() {
-                self.actions.push(Action::CopyText(text, "Fragmento de la letra"));
+                self.actions.push(Action::CopyText(text, t("Fragmento de la letra")));
             }
         }
     }
@@ -282,20 +283,20 @@ impl App {
             text_on_baseline(painter, pos2(list.min.x + LINE_X - lead, list.min.y + FIRST_BASE), g, ink.note);
         };
         if !self.signed_in() {
-            note(&painter, "Inicia sesión para ver la letra.");
+            note(&painter, t("Inicia sesión para ver la letra."));
             return;
         }
         self.ensure_lyrics();
         let Some(np) = self.player.now.clone() else {
-            note(&painter, "Nada en reproducción.");
+            note(&painter, t("Nada en reproducción."));
             return;
         };
         if self.lyrics_loading {
-            note(&painter, "Buscando la letra…");
+            note(&painter, t("Buscando la letra…"));
             return;
         }
         let Some(lyrics) = self.lyrics.clone() else {
-            note(&painter, "Esta canción no tiene letra disponible.");
+            note(&painter, t("Esta canción no tiene letra disponible."));
             return;
         };
         self.prefetch_next_lyrics();

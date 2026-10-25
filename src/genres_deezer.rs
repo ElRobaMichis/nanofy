@@ -186,7 +186,7 @@ impl Deezer {
                 .get(url)
                 .header("User-Agent", "Nanofy (https://github.com/ElRobaMichis/nanofy)")
                 .header("Accept", "application/json")
-                .header("Accept-Language", "es")
+                .header("Accept-Language", crate::i18n::current())
                 .call();
             let mut resp = match resp {
                 Ok(r) if r.status().is_success() => r,

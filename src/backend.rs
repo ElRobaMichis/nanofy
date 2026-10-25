@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 
 use crate::ap_keeper::{Action as LinkAction, Keeper, Outcome as LinkOutcome};
 use crate::bus::{Msg, UiTx};
+use crate::i18n::t;
 use crate::config::{vol_pct_to_raw, Loudness, Paths, Settings};
 use crate::model::{AudioInfo, NowPlaying};
 
@@ -76,7 +77,7 @@ const LOGIN_PORT: u16 = 8898;
 /// órdenes del reproductor quedaba parado hasta reiniciar Nanofy.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Motivo de un inicio de sesión cancelado (en Spotify, con «Cancelar» o por `LOGIN_TIMEOUT`).
-const LOGIN_CANCELLED: &str = "Inicio de sesión cancelado";
+const LOGIN_CANCELLED: &str = tk!("Inicio de sesión cancelado");
 
 const SCOPES: &[&str] = &[
     "app-remote-control",
@@ -338,13 +339,13 @@ impl ReconnectReason {
 
 /// Aviso de `start` al conectar. La interfaz lo calla si ya hubo sesión (es una reconexión o un
 /// reinicio): sin esto, cada corte de un segundo decía «Conectando…».
-pub const CONNECTING: &str = "Conectando con Spotify…";
+pub const CONNECTING: &str = tk!("Conectando con Spotify…");
 /// Aviso de una orden que no se pudo ejecutar porque se está reconectando. La interfaz lo une al
 /// de la reconexión en marcha, que sale ya (alguien pidió algo) en vez de esperar.
-pub const RECONNECTING: &str = "Reconectando con Spotify…";
+pub const RECONNECTING: &str = tk!("Reconectando con Spotify…");
 /// Spirc vive pero Spotify aún no ha aceptado este dispositivo (su servidor falla al registrarlo):
 /// reconectar no lo arregla, así que se espera a que salga (lo reintenta Spirc).
-pub const WAITING_REGISTRATION: &str = "Spotify no acepta este dispositivo ahora mismo (fallo de sus servidores); se sigue intentando…";
+pub const WAITING_REGISTRATION: &str = tk!("Spotify no acepta este dispositivo ahora mismo (fallo de sus servidores); se sigue intentando…");
 
 /// Lo que se enseña mientras habla el locutor del DJ, como en la app de Spotify: su nombre
 /// («DJ Livi»), qué presenta («Up next») y su imagen.
@@ -400,7 +401,7 @@ enum StartError {
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StartError::NotPremium => f.write_str("la cuenta no es Premium"),
+            StartError::NotPremium => f.write_str(t("la cuenta no es Premium")),
             StartError::Other(e) => f.write_str(e),
         }
     }
@@ -878,7 +879,7 @@ async fn run(
             }
             Err(e) => {
                 forget_cached_tokens(&paths);
-                report_start_error(&ui, "No se pudo conectar con Spotify", e)
+                report_start_error(&ui, t("No se pudo conectar con Spotify"), e)
             }
         }
     }
@@ -1152,7 +1153,7 @@ async fn run(
                 let (creds, fresh) = match cached_credentials(&paths) {
                     Some(c) => (Ok(c), false),
                     None => {
-                        ui.status("Se ha abierto el navegador para iniciar sesión en Spotify…");
+                        ui.status(t("Se ha abierto el navegador para iniciar sesión en Spotify…"));
                         (browser_login(chain).await, true)
                     }
                 };
@@ -1167,12 +1168,12 @@ async fn run(
                         }
                         Err(e) => {
                             forget_cached_tokens(&paths);
-                            report_start_error(&ui, "No se pudo conectar con Spotify", e)
+                            report_start_error(&ui, t("No se pudo conectar con Spotify"), e)
                         }
                     },
                     Err(e) => {
-                        let by_user = e.starts_with(LOGIN_CANCELLED);
-                        let reason = if by_user { e } else { format!("No se pudo iniciar sesión: {e}") };
+                        let by_user = e.starts_with(LOGIN_CANCELLED) || e.starts_with(t(LOGIN_CANCELLED));
+                        let reason = if by_user { e } else { tr!("No se pudo iniciar sesión: {}", e) };
                         log::warn!("{reason}");
                         ui.send(Msg::Backend(Event::LoginAborted { reason, by_user }));
                     }
@@ -1207,11 +1208,11 @@ async fn run(
                     generation += 1;
                     match start(&paths, &settings, crossfade, creds, &ui, &shared, generation, dead_tx.clone(), link_tx.clone(), false).await {
                         Ok(a) => {
-                            ui.status("Ajustes de reproducción aplicados");
+                            ui.status(t("Ajustes de reproducción aplicados"));
                             link.reset();
                             active = Some(a);
                         }
-                        Err(e) => report_start_error(&ui, "No se pudo reiniciar la reproducción", e),
+                        Err(e) => report_start_error(&ui, t("No se pudo reiniciar la reproducción"), e),
                     }
                 }
             }
@@ -1296,7 +1297,7 @@ async fn run(
                     if retry_at.is_some() {
                         ui.status(RECONNECTING);
                     } else {
-                        ui.status("Inicia sesión para reproducir música");
+                        ui.status(t("Inicia sesión para reproducir música"));
                     }
                     continue;
                 };
@@ -1474,7 +1475,7 @@ async fn run(
                     _ => Ok(()),
                 };
                 if let Err(e) = result {
-                    ui.error(format!("Error de reproducción: {e}"));
+                    ui.error(tr!("Error de reproducción: {}", e));
                 }
             }
         }
@@ -1520,7 +1521,7 @@ async fn browser_login(chain: Option<String>) -> Result<Credentials, String> {
                 // No se pudo cortar (el puerto no era suyo): se deja ese hilo y el bucle sigue.
                 Err(_) => log::warn!("la espera del inicio de sesión no se pudo cortar"),
             }
-            Err(format!("{LOGIN_CANCELLED}: pasaron {} minutos sin completarlo en el navegador", LOGIN_TIMEOUT.as_secs() / 60))
+            Err(tr!("{}: pasaron {} minutos sin completarlo en el navegador", t(LOGIN_CANCELLED), LOGIN_TIMEOUT.as_secs() / 60))
         }
     }
 }
@@ -1541,7 +1542,7 @@ fn oauth_login(chain: Option<&str>) -> Result<Credentials, String> {
 /// en Spotify o en Nanofy) es una cancelación, no un error; el resto se explica tal cual.
 fn login_error(e: librespot_oauth::OAuthError) -> String {
     match e {
-        librespot_oauth::OAuthError::AuthCodeNotFound { uri } if uri.contains("error=") => LOGIN_CANCELLED.to_string(),
+        librespot_oauth::OAuthError::AuthCodeNotFound { uri } if uri.contains("error=") => t(LOGIN_CANCELLED).to_string(),
         e => e.to_string(),
     }
 }
@@ -1625,14 +1626,14 @@ async fn start(
     (player_config.crossfade_ms, player_config.crossfade_albums) = crossfade;
 
     // Volumen lineal en el mezclador: la curva perceptual (dB) la aplica la interfaz.
-    let mixer = (mixer::find(None).ok_or("no hay mezclador de volumen disponible")?)(
+    let mixer = (mixer::find(None).ok_or(t("no hay mezclador de volumen disponible"))?)(
         MixerConfig {
             volume_ctrl: VolumeCtrl::Linear,
             ..MixerConfig::default()
         },
     )
     .map_err(|e| e.to_string())?;
-    let sink = audio_backend::find(None).ok_or("no hay salida de audio disponible")?;
+    let sink = audio_backend::find(None).ok_or(t("no hay salida de audio disponible"))?;
 
     // El dispositivo de audio se abre en la primera reproducción, no al arrancar: sin
     // hilos ni búferes de WASAPI/ALSA/CoreAudio hasta que hacen falta.
@@ -1772,7 +1773,7 @@ async fn start(
         Ok(r) => r.map_err(|e| e.to_string())?,
         Err(_) => {
             session.shutdown();
-            return Err("Spotify no respondió al conectar (25 s)".into());
+            return Err(t("Spotify no respondió al conectar (25 s)").into());
         }
     };
     tokio::spawn(async move {
@@ -2166,7 +2167,7 @@ fn format_info(f: librespot_metadata::audio::AudioFileFormat) -> (&'static str, 
         XHE_AAC_16 => ("xHE-AAC", Some(16)),
         XHE_AAC_24 => ("xHE-AAC", Some(24)),
         FLAC_FLAC | FLAC_FLAC_24BIT => ("FLAC", None),
-        OTHER5 => ("Desconocido", None),
+        OTHER5 => (t("Desconocido"), None),
     }
 }
 
@@ -2181,7 +2182,7 @@ fn audio_info(
     use librespot_playback::config::Bitrate;
     let (codec, kbps) = match source.format {
         Some(f) => format_info(f),
-        None => ("Archivo local", None),
+        None => (t("Archivo local"), None),
     };
     AudioInfo {
         // La misma uri que trae TrackChanged (`NowPlaying::uri`).

@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::t;
+
 /// Fotogramas decodificados por delante como mucho (a 854 × 480, ~1,6 MB cada uno).
 const QUEUE: usize = 12;
 /// Resolución que se pide: la mayor que no pase de esta altura (el marco de la página mide ~546).
@@ -31,9 +33,9 @@ pub struct VideoManifest {
 
 /// Manifiesto (`/manifests/v9/json/sources/…`) -> lo necesario, con la resolución elegida.
 pub fn parse_manifest(v: &serde_json::Value) -> Result<VideoManifest, String> {
-    let c = v["contents"].get(0).ok_or("manifiesto sin contenido")?;
+    let c = v["contents"].get(0).ok_or(t("manifiesto sin contenido"))?;
     if c["encryption_infos"].as_array().is_some_and(|a| !a.is_empty()) {
-        return Err("el vídeo va cifrado".into());
+        return Err(t("el vídeo va cifrado").into());
     }
     let profiles: Vec<&serde_json::Value> = c["profiles"]
         .as_array()
@@ -47,11 +49,11 @@ pub fn parse_manifest(v: &serde_json::Value) -> Result<VideoManifest, String> {
         .filter(|p| height(p) <= MAX_HEIGHT)
         .max_by_key(|p| height(p))
         .or_else(|| profiles.iter().min_by_key(|p| height(p)))
-        .ok_or("sin vídeo MP4 en el manifiesto")?;
+        .ok_or(t("sin vídeo MP4 en el manifiesto"))?;
     Ok(VideoManifest {
-        base: v["base_urls"].get(0).and_then(|b| b.as_str()).ok_or("manifiesto sin servidor")?.to_string(),
-        init: v["initialization_template"].as_str().ok_or("sin plantilla de inicio")?.to_string(),
-        segment: v["segment_template"].as_str().ok_or("sin plantilla de segmentos")?.to_string(),
+        base: v["base_urls"].get(0).and_then(|b| b.as_str()).ok_or(t("manifiesto sin servidor"))?.to_string(),
+        init: v["initialization_template"].as_str().ok_or(t("sin plantilla de inicio"))?.to_string(),
+        segment: v["segment_template"].as_str().ok_or(t("sin plantilla de segmentos"))?.to_string(),
         seg_len_ms: c["segment_length"].as_u64().unwrap_or(4) * 1000,
         end_ms: c["end_time_millis"].as_u64().or(v["end_time_millis"].as_u64()).unwrap_or(0),
         profile: pick["id"].as_u64().unwrap_or(0) as u32,
@@ -103,34 +105,34 @@ pub struct Init {
 }
 
 pub fn parse_init(data: &[u8]) -> Result<Init, String> {
-    let moov = child(data, b"moov").ok_or("inicio sin moov")?;
-    let trak = child(moov, b"trak").ok_or("inicio sin trak")?;
-    let mdia = child(trak, b"mdia").ok_or("inicio sin mdia")?;
-    let mdhd = child(mdia, b"mdhd").ok_or("inicio sin mdhd")?;
-    let timescale = if mdhd.first() == Some(&1) { be32(mdhd, 20) } else { be32(mdhd, 12) }.ok_or("mdhd corto")?;
-    let stsd = child(child(child(mdia, b"minf").ok_or("sin minf")?, b"stbl").ok_or("sin stbl")?, b"stsd").ok_or("sin stsd")?;
+    let moov = child(data, b"moov").ok_or(t("inicio sin moov"))?;
+    let trak = child(moov, b"trak").ok_or(t("inicio sin trak"))?;
+    let mdia = child(trak, b"mdia").ok_or(t("inicio sin mdia"))?;
+    let mdhd = child(mdia, b"mdhd").ok_or(t("inicio sin mdhd"))?;
+    let timescale = if mdhd.first() == Some(&1) { be32(mdhd, 20) } else { be32(mdhd, 12) }.ok_or(t("mdhd corto"))?;
+    let stsd = child(child(child(mdia, b"minf").ok_or(t("sin minf"))?, b"stbl").ok_or(t("sin stbl"))?, b"stsd").ok_or(t("sin stsd"))?;
     // stsd: versión/flags (4) y número de entradas (4); luego la entrada avc1: cabecera visual de 78
     // bytes y sus cajas (avcC entre ellas).
-    let entries = boxes(stsd.get(8..).ok_or("stsd corto")?);
-    let avc1 = entries.iter().find(|(k, _)| k == b"avc1" || k == b"avc3").ok_or("sin avc1")?.1;
-    let avcc = child(avc1.get(78..).ok_or("avc1 corto")?, b"avcC").ok_or("sin avcC")?;
-    let nal_len = (avcc.get(4).ok_or("avcC corto")? & 3) as usize + 1;
+    let entries = boxes(stsd.get(8..).ok_or(t("stsd corto"))?);
+    let avc1 = entries.iter().find(|(k, _)| k == b"avc1" || k == b"avc3").ok_or(t("sin avc1"))?.1;
+    let avcc = child(avc1.get(78..).ok_or(t("avc1 corto"))?, b"avcC").ok_or(t("sin avcC"))?;
+    let nal_len = (avcc.get(4).ok_or(t("avcC corto"))? & 3) as usize + 1;
     let mut headers = Vec::new();
     let mut i = 5;
-    let n_sps = (avcc.get(i).ok_or("avcC corto")? & 0x1f) as usize;
+    let n_sps = (avcc.get(i).ok_or(t("avcC corto"))? & 0x1f) as usize;
     i += 1;
     for _ in 0..n_sps {
-        let len = u16::from_be_bytes(avcc.get(i..i + 2).ok_or("sps corto")?.try_into().unwrap()) as usize;
+        let len = u16::from_be_bytes(avcc.get(i..i + 2).ok_or(t("sps corto"))?.try_into().unwrap()) as usize;
         headers.extend_from_slice(&[0, 0, 0, 1]);
-        headers.extend_from_slice(avcc.get(i + 2..i + 2 + len).ok_or("sps corto")?);
+        headers.extend_from_slice(avcc.get(i + 2..i + 2 + len).ok_or(t("sps corto"))?);
         i += 2 + len;
     }
-    let n_pps = *avcc.get(i).ok_or("avcC corto")? as usize;
+    let n_pps = *avcc.get(i).ok_or(t("avcC corto"))? as usize;
     i += 1;
     for _ in 0..n_pps {
-        let len = u16::from_be_bytes(avcc.get(i..i + 2).ok_or("pps corto")?.try_into().unwrap()) as usize;
+        let len = u16::from_be_bytes(avcc.get(i..i + 2).ok_or(t("pps corto"))?.try_into().unwrap()) as usize;
         headers.extend_from_slice(&[0, 0, 0, 1]);
-        headers.extend_from_slice(avcc.get(i + 2..i + 2 + len).ok_or("pps corto")?);
+        headers.extend_from_slice(avcc.get(i + 2..i + 2 + len).ok_or(t("pps corto"))?);
         i += 2 + len;
     }
     Ok(Init { headers, nal_len, timescale: timescale.max(1) })
@@ -154,13 +156,13 @@ pub fn parse_segment(data: &[u8], init: &Init) -> Result<Vec<Sample>, String> {
             offset = moof_start;
             continue;
         }
-        let traf = child(moof, b"traf").ok_or("moof sin traf")?;
-        let tfhd = child(traf, b"tfhd").ok_or("traf sin tfhd")?;
+        let traf = child(moof, b"traf").ok_or(t("moof sin traf"))?;
+        let tfhd = child(traf, b"tfhd").ok_or(t("traf sin tfhd"))?;
         let tf_flags = be32(tfhd, 0).unwrap_or(0) & 0xff_ffff;
         let mut p = 8;
         let mut base = moof_start;
         if tf_flags & 0x01 != 0 {
-            base = u64::from_be_bytes(tfhd.get(p..p + 8).ok_or("tfhd corto")?.try_into().unwrap()) as usize;
+            base = u64::from_be_bytes(tfhd.get(p..p + 8).ok_or(t("tfhd corto"))?.try_into().unwrap()) as usize;
             p += 8;
         }
         if tf_flags & 0x02 != 0 {
@@ -176,7 +178,7 @@ pub fn parse_segment(data: &[u8], init: &Init) -> Result<Vec<Sample>, String> {
         let def_size = if tf_flags & 0x10 != 0 { be32(tfhd, p).unwrap_or(0) } else { 0 };
         let tfdt = child(traf, b"tfdt");
         let mut dts: u64 = match tfdt {
-            Some(t) if t.first() == Some(&1) => u64::from_be_bytes(t.get(4..12).ok_or("tfdt corto")?.try_into().unwrap()),
+            Some(t) if t.first() == Some(&1) => u64::from_be_bytes(t.get(4..12).ok_or(crate::i18n::t("tfdt corto"))?.try_into().unwrap()),
             Some(t) => be32(t, 4).unwrap_or(0) as u64,
             None => 0,
         };
@@ -224,7 +226,7 @@ pub fn parse_segment(data: &[u8], init: &Init) -> Result<Vec<Sample>, String> {
                 } else {
                     0
                 };
-                let raw = data.get(pos..pos + size).ok_or("muestra fuera del segmento")?;
+                let raw = data.get(pos..pos + size).ok_or(t("muestra fuera del segmento"))?;
                 let pts = (dts as i64 + cto).max(0) as u64;
                 out.push(Sample { pts_ms: pts * 1000 / init.timescale as u64, data: annex_b(raw, init.nal_len) });
                 pos += size;

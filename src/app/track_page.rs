@@ -23,6 +23,7 @@ use super::theme::{self, GREEN};
 use super::widgets::{child_in, galley_truncated, text_on_baseline, uri_to_link, RowOpts, Source};
 use super::{fmt_thousands, Action, App, Page, PlayState, PlayTarget};
 use crate::api::Req;
+use crate::i18n::t;
 use crate::model::*;
 
 /// Portada: esquina a (37, 38), 500 de lado, esquinas de 10.
@@ -213,7 +214,7 @@ const INK: Ink = Ink {
 };
 
 /// Pestañas de debajo de la ficha.
-const TABS: [&str; 3] = ["Letra", "Créditos", "Más como esta"];
+const TABS: [&str; 3] = [tk!("Letra"), tk!("Créditos"), tk!("Más como esta")];
 
 /// Donde acaba la tinta del último carácter de la primera fila.
 fn ink_right(g: &egui::Galley) -> f32 {
@@ -364,7 +365,7 @@ impl App {
         let Some(page) = self.track_pages.remove(&id) else {
             let o = ui.max_rect().min;
             let failed = self.track_page_failed.contains(&id);
-            let text = if failed { "No se pudo cargar la canción. Pulsa para reintentar." } else { "Cargando…" };
+            let text = if failed { t("No se pudo cargar la canción. Pulsa para reintentar.") } else { t("Cargando…") };
             let g = ui.painter().layout_no_wrap(text.to_string(), theme::regular(17.0), INK.note);
             let rect = text_on_baseline(ui.painter(), pos2(o.x + COL_X, o.y + TITLE_BASE), g, INK.note);
             let r = ui.interact(rect, ui.id().with("track_retry"), Sense::click());
@@ -505,7 +506,7 @@ impl App {
         for (k, label) in TABS.iter().enumerate() {
             let on = self.track_tab == k as u8;
             let color = if on { INK.tab_on } else { INK.tab_off };
-            let g = painter.layout_no_wrap(label.to_string(), theme::regular(TAB_FONT), color);
+            let g = painter.layout_no_wrap(t(*label).to_string(), theme::regular(TAB_FONT), color);
             let (l, r) = (ink_left(&g), ink_right(&g));
             let rect = text_on_baseline(&painter, pos2(o.x + x - l, rule_y - TAB_BASE_UP), g, color);
             let hit = ui.interact(rect.expand2(vec2(10.0, 14.0)), ui.id().with(("track_tab", k)), Sense::click());
@@ -622,7 +623,7 @@ impl App {
         let playing = current && self.player.state == PlayState::Playing;
         // Play / pausa.
         let rect = Rect::from_center_size(play, vec2(2.0 * PLAY_R, 2.0 * PLAY_R));
-        let r = ui.interact(rect, ui.id().with("track_play"), Sense::click()).on_hover_text(if playing { "Pausar" } else { "Reproducir" });
+        let r = ui.interact(rect, ui.id().with("track_play"), Sense::click()).on_hover_text(if playing { t("Pausar") } else { t("Reproducir") });
         let green = if r.hovered() { GREEN.lerp_to_gamma(Color32::WHITE, 0.15) } else { GREEN };
         painter.circle_filled(play, PLAY_R, green);
         if playing {
@@ -650,12 +651,12 @@ impl App {
         let liked = self.liked_set.contains(&page.id);
         let downloaded = self.downloaded.contains(&page.id);
         let buttons: [(&'static str, &LibMask, &str); 6] = [
-            ("song-heart", &sm::HEART, if liked { "Quitar de Me gusta" } else { "Guardar en Me gusta" }),
-            ("song-add", &sm::ADD, "Añadir a una playlist"),
-            ("song-queue", &sm::QUEUE, "Añadir a la cola"),
-            ("song-save", &sm::SAVE, if downloaded { "Descargada" } else { "Descargar" }),
-            ("song-share", &sm::SHARE, "Copiar el enlace de la canción"),
-            ("song-more", &sm::MORE, "Más opciones"),
+            ("song-heart", &sm::HEART, if liked { t("Quitar de Me gusta") } else { t("Guardar en Me gusta") }),
+            ("song-add", &sm::ADD, t("Añadir a una playlist")),
+            ("song-queue", &sm::QUEUE, t("Añadir a la cola")),
+            ("song-save", &sm::SAVE, if downloaded { t("Descargada") } else { t("Descargar") }),
+            ("song-share", &sm::SHARE, t("Copiar el enlace de la canción")),
+            ("song-more", &sm::MORE, t("Más opciones")),
         ];
         for (k, (name, mask, tip)) in buttons.into_iter().enumerate() {
             let c = pos2(play.x + BTN_PITCH * (k + 1) as f32, play.y);
@@ -681,10 +682,10 @@ impl App {
                     1 => self.open_add_dialog(vec![page.uri.clone()]),
                     2 => {
                         self.actions.push(Action::AddToQueue(page.uri.clone()));
-                        self.status("Añadida a la cola");
+                        self.status(t("Añadida a la cola"));
                     }
                     3 if !downloaded => self.actions.push(Action::Download(vec![page.id.clone()])),
-                    4 => self.actions.push(Action::CopyText(uri_to_link(&page.uri), "Enlace")),
+                    4 => self.actions.push(Action::CopyText(uri_to_link(&page.uri), t("Enlace"))),
                     5 => self.toggle_song_menu(SongMenu {
                         track: track_of(page),
                         album_id: page.album.as_ref().and_then(|a| a.id.clone()),
@@ -703,9 +704,9 @@ impl App {
     fn track_lyric_icons(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, o: egui::Pos2, rule_y: f32, page: &TrackPage) {
         let icons: [(&'static str, &LibMask, &str); 4] = [
             ("song-lyr-sync", &sm::LYR_SYNC, ""),
-            ("song-lyr-translate", &sm::LYR_TRANSLATE, "Traducir (pronto)"),
+            ("song-lyr-translate", &sm::LYR_TRANSLATE, t("Traducir (pronto)")),
             ("song-lyr-comment", &sm::LYR_COMMENT, ""),
-            ("song-lyr-size", &sm::LYR_SIZE, "Tamaño del texto (pronto)"),
+            ("song-lyr-size", &sm::LYR_SIZE, t("Tamaño del texto (pronto)")),
         ];
         let on = self.settings.lyrics_sync;
         let current = self.player.now.as_ref().and_then(|n| n.id.as_deref()) == Some(page.id.as_str());
@@ -716,12 +717,12 @@ impl App {
             let c = pos2(o.x + LYR_ICON_X, rule_y + LYR_ICON_DY + k as f32 * LYR_ICON_PITCH);
             let tip = match k {
                 0 => match (on, following || !current) {
-                    (true, true) => "La letra sigue a la canción (pulsa para moverte libremente)",
-                    (true, false) => "Ir a lo que suena",
-                    (false, _) => "Seguir la canción",
+                    (true, true) => t("La letra sigue a la canción (pulsa para moverte libremente)"),
+                    (true, false) => t("Ir a lo que suena"),
+                    (false, _) => t("Seguir la canción"),
                 },
-                2 if self.track_notes => "Ocultar las explicaciones de Genius",
-                2 => "Explicaciones de Genius",
+                2 if self.track_notes => t("Ocultar las explicaciones de Genius"),
+                2 => t("Explicaciones de Genius"),
                 _ => tip,
             };
             let r = ui.interact(Rect::from_center_size(c, vec2(40.0, 40.0)), ui.id().with(("track_lyr_icon", k)), Sense::click()).on_hover_text(tip);
@@ -800,7 +801,7 @@ impl App {
             text_on_baseline(&painter, pos2(o.x + line_x - l, o.y + rule_nat + LINE_FIRST), g, INK.note);
         };
         let Some(lyrics) = lyrics else {
-            note(if loading { "Buscando la letra…" } else { "Esta canción no tiene letra disponible." });
+            note(if loading { t("Buscando la letra…") } else { t("Esta canción no tiene letra disponible.") });
             return rule_nat + LINE_FIRST + 60.0;
         };
         if current {
@@ -985,15 +986,15 @@ impl App {
         let card_top = o.y + rule_nat + rows.get(top_line).map_or(LINE_FIRST, |r| r.0) - HL_UP + CARD_TOP_DY;
         let card = match &notes {
             Notes::Off => None,
-            Notes::Loading => Some(("Buscando en Genius…".to_string(), None)),
-            Notes::Failed => Some(("No se pudo consultar Genius.".to_string(), None)),
-            Notes::Missing => Some(("Genius no tiene explicaciones de esta canción.".to_string(), None)),
+            Notes::Loading => Some((t("Buscando en Genius…").to_string(), None)),
+            Notes::Failed => Some((t("No se pudo consultar Genius.").to_string(), None)),
+            Notes::Missing => Some((t("Genius no tiene explicaciones de esta canción.").to_string(), None)),
             Notes::Ready(song, _) => match sel {
                 Some(k) => {
                     let n = &song.notes[spans[k].note];
                     Some((n.body.clone(), Some(n.url.clone())))
                 }
-                None => Some(("Genius no tiene explicaciones de los versos de esta letra.".to_string(), Some(song.url.clone()))),
+                None => Some((t("Genius no tiene explicaciones de los versos de esta letra.").to_string(), Some(song.url.clone()))),
             },
         };
         if let Some((body, link)) = card {
@@ -1049,7 +1050,7 @@ impl App {
         let painter = painter.with_clip_rect(clip);
         // Cabecera.
         let mut job = egui::text::LayoutJob::default();
-        job.append("De ", 0.0, egui::TextFormat::simple(theme::semilight(CARD_HEAD_FONT), INK.tab_off));
+        job.append(t("De "), 0.0, egui::TextFormat::simple(theme::semilight(CARD_HEAD_FONT), INK.tab_off));
         job.append("Genius", 0.0, egui::TextFormat::simple(theme::semilight(CARD_HEAD_FONT), INK.title));
         let g = painter.layout_job(job);
         let (l, r) = (ink_left(&g), ink_right(&g));
@@ -1070,7 +1071,7 @@ impl App {
         }
         let clicked = resp.clicked();
         if link.is_some() {
-            resp.on_hover_text("Abrir en Genius");
+            resp.on_hover_text(t("Abrir en Genius"));
         }
         if let (Some(url), true) = (link, clicked) {
             self.actions.push(Action::OpenLink(url));
@@ -1097,7 +1098,7 @@ impl App {
         let painter = ui.painter().clone();
         let mut y = rule_nat + 52.0;
         if page.credits.is_empty() {
-            let g = painter.layout_no_wrap("Spotify no tiene créditos de esta canción.".to_string(), theme::regular(17.0), INK.note);
+            let g = painter.layout_no_wrap(t("Spotify no tiene créditos de esta canción.").to_string(), theme::regular(17.0), INK.note);
             text_on_baseline(&painter, pos2(o.x + TAB_X, o.y + y), g, INK.note);
             return y + 60.0;
         }
@@ -1133,7 +1134,7 @@ impl App {
     fn track_related(&mut self, ui: &mut egui::Ui, page: &TrackPage, o: egui::Pos2, rule_nat: f32) -> f32 {
         let top = rule_nat + 24.0;
         if page.related.is_empty() {
-            let g = ui.painter().layout_no_wrap("Spotify no tiene recomendaciones para esta canción.".to_string(), theme::regular(17.0), INK.note);
+            let g = ui.painter().layout_no_wrap(t("Spotify no tiene recomendaciones para esta canción.").to_string(), theme::regular(17.0), INK.note);
             text_on_baseline(ui.painter(), pos2(o.x + TAB_X, o.y + top + 28.0), g, INK.note);
             return top + 80.0;
         }

@@ -1304,12 +1304,20 @@ pub struct HomeItem {
 }
 
 impl HomeItem {
-    /// "playlist", "album", "artist", "show", "collection" (Me gusta) u otro.
+    /// "playlist", "album", "artist", "show", "collection" (Me gusta) u otro. En «Escuchado
+    /// recientemente», «Canciones que te gustan» llega a veces como una playlist de Spotify
+    /// (`spotify:playlist:37i9dQZF1F…`) con la portada de Me gusta: es tu colección, no esa
+    /// playlist (abrirla llevaba a la página de playlist en vez de a la de Me gusta).
     pub fn kind(&self) -> &str {
-        if self.uri.ends_with(":collection") {
+        if self.uri.ends_with(":collection") || self.is_liked_songs() {
             return "collection";
         }
         self.uri.split(':').nth(1).unwrap_or("")
+    }
+
+    /// Lleva la portada de Spotify de «Canciones que te gustan».
+    pub fn is_liked_songs(&self) -> bool {
+        self.image.as_deref().is_some_and(|u| u.contains("/liked-songs/"))
     }
     pub fn id(&self) -> &str {
         self.uri.rsplit(':').next().unwrap_or("")
@@ -1607,6 +1615,17 @@ pub struct BrowsePage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// «Canciones que te gustan» del inicio es la colección también cuando llega como playlist
+    /// de Spotify con la portada de Me gusta (así viene en «Escuchado recientemente»).
+    #[test]
+    fn me_gusta_del_inicio_es_la_coleccion() {
+        let item = |uri: &str, image: Option<&str>| HomeItem { uri: uri.into(), image: image.map(str::to_string), ..Default::default() };
+        assert_eq!(item("spotify:playlist:37i9dQZF1F5p3rmiWPIYgZ", Some("https://misc.scdn.co/liked-songs/liked-songs-300.png")).kind(), "collection");
+        assert_eq!(item("spotify:user:abc:collection", None).kind(), "collection");
+        assert_eq!(item("spotify:playlist:53anr2MTr7D7ApOxSAnxvi", Some("https://mosaic.scdn.co/300/ab67")).kind(), "playlist");
+        assert_eq!(item("spotify:album:4m2880jivSbbyEGAKfITCa", None).kind(), "album");
+    }
 
     #[test]
     fn creditos_y_papeles_de_cada_artista() {

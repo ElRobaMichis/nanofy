@@ -1190,6 +1190,9 @@ pub struct App {
     pub search_filter: u8,
     /// Página de Ajustes: pestaña, búsqueda, desplegables (settings_page.rs).
     pub settings_ui: settings_page::SettingsUi,
+    /// Solo en el modo de control: dónde quedó cada tarjeta del inicio, para pulsarlas de verdad
+    /// en las pruebas.
+    pub qa_rects: HashMap<String, egui::Rect>,
 
     #[cfg(not(windows))]
     pub sys: sysinfo::System,
@@ -1613,6 +1616,7 @@ impl App {
             artist_grid: true,
             search_filter: 0,
             settings_ui: Default::default(),
+            qa_rects: HashMap::new(),
             #[cfg(not(windows))]
             sys: sysinfo::System::new(),
             mem_mb: None,

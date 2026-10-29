@@ -1833,6 +1833,7 @@ impl App {
             "library_folder": self.library_folder,
             "home_filter": self.home_filter,
             "artist_tab": self.artist_tab,
+            "qa_rects": self.qa_rects.iter().map(|(k, r)| (k.clone(), json!([r.min.x, r.min.y, r.max.x, r.max.y]))).collect::<serde_json::Map<String, Value>>(),
             "settings_ui": {
                 "tab": self.settings_ui.tab,
                 "search": self.settings_ui.search,

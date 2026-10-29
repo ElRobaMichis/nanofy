@@ -1068,6 +1068,9 @@ impl App {
         let card_kind = match kind {
             "playlist" => CardKind::Playlist,
             "artist" => CardKind::Artist,
+            // Con la portada de Spotify se ve como una playlist (como hasta ahora); sin ella, el
+            // corazón verde.
+            "collection" if item.image.is_some() => CardKind::Playlist,
             "collection" => CardKind::Liked,
             _ => CardKind::Album,
         };
@@ -1083,6 +1086,9 @@ impl App {
             item.subtitle.clone()
         };
         let r = self.home_tile(ui, card_kind, item.image.as_deref(), &item.title, &subtitle);
+        if self.control_mode {
+            self.qa_rects.insert(format!("home:{}", item.title), r.rect);
+        }
         // El DJ no es una playlist que se pueda abrir (la Web API no la da): como en Spotify,
         // pulsarlo lo pone a sonar.
         if item.uri == super::DJ_URI {

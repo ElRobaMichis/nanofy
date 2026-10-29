@@ -140,7 +140,7 @@ Nanofy busca versiones nuevas al arrancar y cada seis horas con una petición an
 Windows y Linux descarga la actualización en segundo plano, comprueba su tamaño y su SHA-256 y
 muestra «Reiniciar para actualizar»; si la versión nueva no arranca, Nanofy vuelve solo a la
 anterior. En macOS solo avisa. Tanto la búsqueda como la instalación automática se pueden
-desactivar en Ajustes → Acerca de Nanofy.
+desactivar en Ajustes → Acerca de.
 
 ## Compilar
 
@@ -186,7 +186,7 @@ piden a las direcciones que indica Spotify, normalmente las de su CDN.
 
 Las credenciales y los tokens se guardan en JSON sin cifrar, no en el llavero del sistema.
 «Cerrar sesión» (Ajustes → Cuenta) borra la sesión guardada, pero no el acceso a la biblioteca, que
-se quita con «Desconectar» en Ajustes → Biblioteca.
+se quita con «Desconectar» en la misma pestaña, en «Biblioteca de Spotify».
 
 ### Desinstalar
 
@@ -207,8 +207,8 @@ cuenta de Spotify.
 
 ## Informar de un fallo
 
-Abre un [issue](https://github.com/ElRobaMichis/nanofy/issues/new/choose) con la versión (Ajustes → Acerca de
-Nanofy), el sistema y los pasos para reproducirlo, y adjunta `nanofy.log` y `nanofy.log.1` (la
+Abre un [issue](https://github.com/ElRobaMichis/nanofy/issues/new/choose) con la versión (Ajustes → Acerca
+de), el sistema y los pasos para reproducirlo, y adjunta `nanofy.log` y `nanofy.log.1` (la
 carpeta aparece en [Privacidad y datos](#privacidad-y-datos)). Revísalos antes de publicarlos:
 incluyen tu nombre de usuario de Spotify y pueden incluir títulos de canciones. Los problemas de
 seguridad se avisan [en privado](SECURITY.md).

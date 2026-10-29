@@ -94,7 +94,6 @@ pub enum Icon {
     NewTab,
     Trash,
     Edit,
-    #[allow(dead_code)]
     Keyboard,
     /// «›» y «⌄» de las secciones plegables de la barra lateral.
     ChevronRight,
@@ -106,6 +105,41 @@ pub enum Icon {
     /// Flechas con asta de las estanterías del inicio.
     ArrowLeft,
     ArrowRight,
+    /// «⌃»: fila desplegada de Ajustes.
+    ChevronUp,
+    // Iconos de las filas de Ajustes.
+    /// Calidad de audio: barras de una onda.
+    Waveform,
+    /// Normalizar volumen: tres deslizadores verticales.
+    Equalizer,
+    /// Reproducción sin pausas.
+    Infinity,
+    /// Fundido entre canciones: dos curvas que se cruzan.
+    Crossfade,
+    /// Reproducir canciones similares: ondas de radio.
+    Radio,
+    /// Nombre en Spotify Connect: monitor y móvil.
+    Computer,
+    /// Precarga inteligente: rayo.
+    Bolt,
+    /// Límite de fotogramas: velocímetro.
+    Gauge,
+    /// Caché de audio: disco.
+    Drive,
+    /// Caché de imágenes: foto con montañas.
+    Image,
+    /// Idioma: globo.
+    Globe,
+    /// Tema: círculo mitad relleno.
+    Contrast,
+    /// Escala de la interfaz: «Aa».
+    TextSize,
+    /// Biblioteca de Spotify: nube.
+    Cloud,
+    /// App de desarrollador: «</>».
+    Code,
+    /// Información técnica: chip.
+    Chip,
 }
 
 /// Grosor del trazo en unidades de la rejilla de 24.
@@ -311,6 +345,22 @@ fn heart_path() -> Vec<Pos2> {
     pts.extend(arc_pts(right, r, 203.8, 404.2));
     pts.push(tip);
     pts
+}
+
+/// Punto de corte de arriba de dos circunferencias que se cortan.
+fn upper_meet(c1: Pos2, r1: f32, c2: Pos2, r2: f32) -> Pos2 {
+    let dv = c2 - c1;
+    let dist = dv.length();
+    let a = (r1 * r1 - r2 * r2 + dist * dist) / (2.0 * dist);
+    let h = (r1 * r1 - a * a).max(0.0).sqrt();
+    let mid = c1 + dv * (a / dist);
+    let perp = vec2(-dv.y, dv.x) / dist;
+    let (p, q) = (mid + perp * h, mid - perp * h);
+    if p.y < q.y {
+        p
+    } else {
+        q
+    }
 }
 
 /// Gira los puntos `deg` grados alrededor del centro de la rejilla.
@@ -758,6 +808,121 @@ fn build(icon: Icon, d: &mut Draw) {
         }
         Icon::ChevronRight => d.poly(&[(9.5, 5.5), (15.0, 12.0), (9.5, 18.5)]),
         Icon::ChevronDown => d.poly(&[(5.5, 9.5), (12.0, 15.0), (18.5, 9.5)]),
+        Icon::ChevronUp => d.poly(&[(5.5, 14.5), (12.0, 9.0), (18.5, 14.5)]),
+        Icon::Waveform => {
+            for (x, h) in [(4.0, 3.0), (8.0, 9.0), (12.0, 15.0), (16.0, 9.0), (20.0, 3.0)] {
+                d.line((x, 12.0 - h / 2.0), (x, 12.0 + h / 2.0));
+            }
+        }
+        Icon::Equalizer => {
+            for (x, k) in [(6.0, 15.0), (12.0, 8.6), (18.0, 13.0)] {
+                d.line((x, 3.6), (x, k - 2.3));
+                d.ring((x, k), 2.3);
+                d.line((x, k + 2.3), (x, 20.4));
+            }
+        }
+        Icon::Infinity => {
+            // Lemniscata de Bernoulli algo más alta que la de verdad.
+            let n = 96;
+            let pts: Vec<Pos2> = (0..=n)
+                .map(|i| {
+                    let t = PI * 2.0 * i as f32 / n as f32;
+                    let (sn, cs) = t.sin_cos();
+                    let k = 1.0 + sn * sn;
+                    pos2(12.0 + 8.8 * cs / k, 12.0 + 8.8 * 1.45 * sn * cs / k)
+                })
+                .collect();
+            d.stroke(pts);
+        }
+        Icon::Crossfade => {
+            d.cubic((3.0, 6.6), (11.0, 6.6), (13.0, 17.4), (21.0, 17.4));
+            d.cubic((3.0, 17.4), (11.0, 17.4), (13.0, 6.6), (21.0, 6.6));
+        }
+        Icon::Radio => {
+            d.dot((12.0, 12.0), 1.9);
+            d.arc((12.0, 12.0), 5.0, 140.0, 220.0);
+            d.arc((12.0, 12.0), 5.0, -40.0, 40.0);
+            d.arc((12.0, 12.0), 8.8, 145.0, 215.0);
+            d.arc((12.0, 12.0), 8.8, -35.0, 35.0);
+        }
+        Icon::Computer => {
+            d.rrect((2.6, 4.6), (16.0, 14.4), 1.8);
+            d.line((9.3, 14.4), (9.3, 18.6));
+            d.line((5.9, 18.8), (12.7, 18.8));
+            d.rrect((18.0, 8.4), (21.6, 18.8), 1.3);
+        }
+        Icon::Bolt => d.rpoly(&[(13.6, 2.8), (5.2, 13.6), (11.4, 13.6), (10.4, 21.2), (18.8, 10.2), (12.6, 10.2)], 0.9, true),
+        Icon::Gauge => {
+            d.arc((12.0, 13.4), 8.8, 150.0, 390.0);
+            d.line((12.0, 13.4), (16.2, 8.8));
+            d.dot((12.0, 13.4), 1.7);
+        }
+        Icon::Drive => {
+            d.rrect((3.0, 5.0), (21.0, 19.0), 2.6);
+            d.line((3.0, 13.0), (21.0, 13.0));
+            d.dot((16.8, 16.1), 1.2);
+        }
+        Icon::Image => {
+            d.rrect((3.0, 4.0), (21.0, 20.0), 2.6);
+            d.rpoly(&[(3.6, 17.2), (8.8, 11.6), (13.0, 15.8), (15.4, 13.4), (20.4, 18.4)], 1.0, false);
+            d.ring((15.6, 8.8), 1.7);
+        }
+        Icon::Globe => {
+            d.ring((12.0, 12.0), 9.0);
+            let meridian: Vec<Pos2> = (0..=64)
+                .map(|i| {
+                    let t = PI * 2.0 * i as f32 / 64.0;
+                    pos2(12.0 + 4.0 * t.cos(), 12.0 + 9.0 * t.sin())
+                })
+                .collect();
+            d.stroke(meridian);
+            d.line((3.4, 12.0), (20.6, 12.0));
+        }
+        Icon::Contrast => {
+            d.ring((12.0, 12.0), 8.8);
+            let mut half = arc_pts(pos2(12.0, 12.0), 8.8, -90.0, 90.0);
+            half.push(pos2(12.0, 3.2));
+            d.push(Prim::Fill(half));
+        }
+        Icon::TextSize => {
+            d.poly(&[(2.6, 19.0), (8.2, 5.0), (13.8, 19.0)]);
+            d.line((4.6, 14.2), (11.8, 14.2));
+            d.poly(&[(15.4, 19.0), (18.4, 11.4), (21.4, 19.0)]);
+            d.line((16.5, 16.4), (20.3, 16.4));
+        }
+        Icon::Cloud => {
+            // Tres círculos (izquierda, arriba, derecha) que se juntan y la base recta.
+            let (l, lr) = (pos2(7.2, 14.6), 3.9);
+            let (b, br) = (pos2(12.6, 10.9), 5.4);
+            let (r, rr) = (pos2(17.6, 14.2), 4.3);
+            let deg = |c: Pos2, p: Pos2| (p.y - c.y).atan2(p.x - c.x).to_degrees().rem_euclid(360.0);
+            let lb = upper_meet(l, lr, b, br);
+            let brp = upper_meet(b, br, r, rr);
+            let mut pts = arc_pts(l, lr, 90.0, deg(l, lb));
+            let (b0, mut b1) = (deg(b, lb), deg(b, brp));
+            if b1 < b0 {
+                b1 += 360.0;
+            }
+            pts.extend(arc_pts(b, br, b0, b1));
+            pts.extend(arc_pts(r, rr, deg(r, brp), 450.0));
+            pts.push(pts[0]);
+            d.stroke(pts);
+        }
+        Icon::Code => {
+            d.poly(&[(8.0, 6.8), (2.8, 12.0), (8.0, 17.2)]);
+            d.poly(&[(16.0, 6.8), (21.2, 12.0), (16.0, 17.2)]);
+            d.line((13.6, 4.6), (10.4, 19.4));
+        }
+        Icon::Chip => {
+            d.rrect((6.0, 6.0), (18.0, 18.0), 2.2);
+            d.rrect((9.6, 9.6), (14.4, 14.4), 0.8);
+            for k in [9.5, 14.5] {
+                d.line((k, 2.8), (k, 6.0));
+                d.line((k, 18.0), (k, 21.2));
+                d.line((2.8, k), (6.0, k));
+                d.line((18.0, k), (21.2, k));
+            }
+        }
         Icon::Hourglass => {
             d.line((6.0, 3.5), (18.0, 3.5));
             d.line((6.0, 20.5), (18.0, 20.5));
@@ -1039,6 +1204,9 @@ mod tests {
         Icon::EyeOff, Icon::DragHandle, Icon::Folder, Icon::Book,
         Icon::NewTab, Icon::Trash, Icon::Edit, Icon::Keyboard, Icon::ChevronRight,
         Icon::ChevronDown, Icon::HomeFilled, Icon::Customize, Icon::ArrowLeft, Icon::ArrowRight,
+        Icon::ChevronUp, Icon::Waveform, Icon::Equalizer, Icon::Infinity, Icon::Crossfade, Icon::Radio, Icon::Computer,
+        Icon::Bolt, Icon::Gauge, Icon::Drive, Icon::Image, Icon::Globe, Icon::Contrast, Icon::TextSize, Icon::Cloud,
+        Icon::Code, Icon::Chip,
     ];
 
     /// Todos se ven (tienen tinta) y caben en su cuadro: el marco exterior queda casi vacío, así

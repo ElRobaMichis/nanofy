@@ -21,6 +21,7 @@ mod player_menu;
 mod lyrics_panel;
 mod queue_panel;
 mod reconnect;
+mod settings_page;
 mod song_masks;
 mod theme;
 mod track_page;
@@ -1187,6 +1188,8 @@ pub struct App {
     pub artist_tab: u8,
     pub artist_grid: bool,
     pub search_filter: u8,
+    /// Página de Ajustes: pestaña, búsqueda, desplegables (settings_page.rs).
+    pub settings_ui: settings_page::SettingsUi,
 
     #[cfg(not(windows))]
     pub sys: sysinfo::System,
@@ -1609,6 +1612,7 @@ impl App {
             artist_tab: 0,
             artist_grid: true,
             search_filter: 0,
+            settings_ui: Default::default(),
             #[cfg(not(windows))]
             sys: sysinfo::System::new(),
             mem_mb: None,
@@ -8714,7 +8718,14 @@ impl App {
     }
 
     pub fn save_settings(&mut self, ctx: &egui::Context) {
+        self.commit_settings(ctx, false);
+    }
+
+    /// Aplica y guarda el borrador. `quiet`: desde la página de Ajustes, donde cada cambio se
+    /// aplica al tocarlo; sin el aviso de «Ajustes guardados» (sí los que dicen algo más).
+    pub fn commit_settings(&mut self, ctx: &egui::Context, quiet: bool) {
         let restart = self.settings.restart_differs(&self.draft);
+        let cache_limit = self.settings.cache_limit_differs(&self.draft);
         let audio = self.settings.audio_differs(&self.draft);
         let quality_changed = self.settings.quality != self.draft.quality;
         let volume_changed = self.settings.normalisation != self.draft.normalisation
@@ -8764,21 +8775,31 @@ impl App {
             };
             self.media_dirty = true;
         }
+        if cache_limit {
+            // Otro tamaño de la caché: en marcha, sin cortar la música.
+            self.backend.send(Cmd::AudioCacheLimit(self.settings.audio_cache_mb));
+        }
         if restart && self.logged_in() {
             // El reinicio arranca con todos los ajustes nuevos, también los de audio.
             self.backend.send(Cmd::Restart(self.settings.clone()));
-            self.status(t("Ajustes guardados"));
+            if !quiet {
+                self.status(t("Ajustes guardados"));
+            }
         } else if audio || restart {
             // Calidad, gapless y volumen se aplican sin cortar la música. Sin sesión (o
             // reconectando) el backend solo guarda la copia, y la conexión siguiente ya la usa.
             self.backend.send(Cmd::AudioTuning(self.settings.clone()));
-            self.status(match (quality_changed, volume_changed) {
-                (true, true) => t("Calidad aplicada desde la próxima canción que se cargue; el volumen, al instante"),
-                (true, false) => t("Calidad aplicada desde la próxima canción que se cargue"),
-                (false, true) => t("Volumen aplicado al instante"),
-                (false, false) => t("Ajustes guardados"),
-            });
-        } else {
+            let msg = match (quality_changed, volume_changed) {
+                (true, true) => Some(t("Calidad aplicada desde la próxima canción que se cargue; el volumen, al instante")),
+                (true, false) => Some(t("Calidad aplicada desde la próxima canción que se cargue")),
+                (false, true) if !quiet => Some(t("Volumen aplicado al instante")),
+                _ if !quiet => Some(t("Ajustes guardados")),
+                _ => None,
+            };
+            if let Some(m) = msg {
+                self.status(m);
+            }
+        } else if !quiet {
             self.status(t("Ajustes guardados"));
         }
         // Tras un `Restart` también: el backend ya crea el reproductor nuevo con el fundido en
@@ -9038,7 +9059,7 @@ impl crate::shell::UiApp for App {
                 let page_now = self.page().clone();
                 let library = page_now == Page::Library && self.signed_in();
                 let liked = page_now == Page::Liked && self.signed_in();
-                let black = library || liked || matches!(page_now, Page::Artist(_) | Page::Home | Page::Search);
+                let black = library || liked || matches!(page_now, Page::Artist(_) | Page::Home | Page::Search | Page::Settings);
                 if matches!(page_now, Page::Track(_)) {
                     // La de una canción, sobre su portada desenfocada (fija: no se desplaza).
                     self.track_panel = Some(panel);
@@ -9079,6 +9100,11 @@ impl crate::shell::UiApp for App {
                     // Buscar sin consulta (o escribiendo, hasta pulsar Intro): búsquedas recientes
                     // y «Explorar todo» (browse.rs).
                     self.search_start(ui, panel);
+                    return;
+                }
+                if page_now == Page::Settings {
+                    // Ajustes: título, pestañas que se quedan arriba al bajar y sus tarjetas.
+                    self.settings_panel(ui, panel);
                     return;
                 }
                 if liked {

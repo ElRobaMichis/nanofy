@@ -26,14 +26,15 @@ const HERO_FOLLOW: Color32 = Color32::from_gray(200);
 const HERO_ICON: Color32 = Color32::from_gray(232);
 /// Fila de pestañas: alto, tamaño de letra, separación entre nombres y colores.
 const TAB_ROW_H: f32 = 61.0;
-const TAB_FONT: f32 = 14.75;
-const TAB_GAP: f32 = 51.0;
-const TAB_TEXT: Color32 = Color32::from_gray(130);
-const TAB_HOVER: Color32 = Color32::from_gray(205);
-const TAB_SELECTED: Color32 = Color32::from_gray(214);
-const TAB_ICON: Color32 = Color32::from_gray(138);
+/// (También las de Ajustes, `settings_page.rs`.)
+pub(super) const TAB_FONT: f32 = 14.75;
+pub(super) const TAB_GAP: f32 = 51.0;
+pub(super) const TAB_TEXT: Color32 = Color32::from_gray(130);
+pub(super) const TAB_HOVER: Color32 = Color32::from_gray(205);
+pub(super) const TAB_SELECTED: Color32 = Color32::from_gray(214);
+pub(super) const TAB_ICON: Color32 = Color32::from_gray(138);
 const TOGGLE_BG: Color32 = Color32::from_gray(19);
-const SEPARATOR: Color32 = Color32::from_gray(26);
+pub(super) const SEPARATOR: Color32 = Color32::from_gray(26);
 /// Márgenes del contenido bajo las pestañas y hueco hasta la primera fila de tarjetas.
 const BODY_LEFT: i8 = 23;
 const BODY_RIGHT: i8 = 26;

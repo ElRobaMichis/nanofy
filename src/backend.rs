@@ -129,6 +129,9 @@ pub enum Cmd {
     /// Autoplay (seguir con canciones parecidas al acabarse lo que suena), al instante y sin
     /// reiniciar. También sin sesión: la conexión siguiente ya lo usa.
     Autoplay(bool),
+    /// Nuevo tamaño de la caché de audio (MB, mayor que 0) sin reiniciar: lo que sobre se borra
+    /// ya, empezando por lo usado hace más tiempo. Activarla o desactivarla sí reinicia.
+    AudioCacheLimit(u64),
     /// Ajustes nuevos sin reiniciar: el reproductor aplica la normalización al instante y la
     /// calidad desde la próxima canción. También sin sesión, para que conectar use los nuevos.
     AudioTuning(Settings),
@@ -1240,6 +1243,15 @@ async fn run(
                     a.player.set_audio_tuning(tuning(&settings));
                 }
             }
+            Cmd::AudioCacheLimit(mb) => {
+                settings.audio_cache_mb = mb;
+                if let Some(cache) = active.as_ref().and_then(|a| a.session.cache().cloned()) {
+                    match cache.set_size_limit(mb.max(1) * 1024 * 1024) {
+                        Ok(()) => log::info!("caché de audio: límite de {mb} MB"),
+                        Err(e) => log::warn!("caché de audio: no se pudo aplicar el límite de {mb} MB: {e}"),
+                    }
+                }
+            }
             Cmd::Crossfade { ms, albums } => {
                 // También sin sesión: la conexión siguiente crea el reproductor con este valor.
                 crossfade = (ms, albums);
@@ -2141,6 +2153,16 @@ fn map_event(ev: PlayerEvent) -> Option<Event> {
 
 /// Cómo sale el audio hacia el dispositivo (la última salida abierta). Se lee de unos atómicos
 /// del reproductor: se puede llamar en cada fotograma sin esperar a su hilo.
+/// Dispositivo de salida predeterminado y su frecuencia, sin abrirlo (unos milisegundos).
+pub fn default_audio_output() -> Option<(String, u32)> {
+    audio_backend::default_output()
+}
+
+/// Nombre del dispositivo por el que sale el audio, si ya se abrió alguno.
+pub fn audio_output_name() -> Option<String> {
+    audio_backend::output_device_name()
+}
+
 pub fn audio_output() -> crate::model::AudioOutput {
     let (rate, channels, sinc) = audio_backend::output_info();
     crate::model::AudioOutput { rate, channels, sinc }

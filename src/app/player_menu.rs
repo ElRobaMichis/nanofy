@@ -232,6 +232,11 @@ fn glass(painter: &egui::Painter, rect: Rect, ink: &Ink) {
     painter.rect_filled(rect, CornerRadius::same(RADIUS), ink.glass);
 }
 
+/// El mismo cristal para otros menús (los desplegables de Ajustes).
+pub(super) fn paint_glass(ctx: &egui::Context, painter: &egui::Painter, rect: Rect) {
+    glass(painter, rect, &ink(ctx));
+}
+
 /// Alto de un panel de `n` filas.
 fn natural_height(n: usize) -> f32 {
     FIRST_BASE + ROW * (n as f32 - 1.0) + LAST_PAD

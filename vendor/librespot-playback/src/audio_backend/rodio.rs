@@ -22,6 +22,28 @@ fn output_volume() -> f32 {
 static OUTPUT_RATE: AtomicU32 = AtomicU32::new(0);
 static OUTPUT_CH: AtomicU16 = AtomicU16::new(0);
 static RESAMPLED: AtomicBool = AtomicBool::new(false);
+/// Nombre del dispositivo de la última salida abierta (vacío: aún ninguna), para Ajustes.
+static OUTPUT_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Dispositivo de salida predeterminado del sistema y su frecuencia, sin abrirlo: la que usará
+/// la salida en Windows (en modo compartido no deja abrirlo a otra). Unos milisegundos: para
+/// llamarlo de vez en cuando, no en cada fotograma.
+pub fn default_output() -> Option<(String, u32)> {
+    if crate::core::fault::no_output() {
+        return None;
+    }
+    let device = cpal::default_host().default_output_device()?;
+    let name = device.name().ok()?;
+    let rate = device.default_output_config().ok()?.sample_rate().0;
+    Some((name, rate))
+}
+
+/// Nombre del dispositivo de la última salida abierta («Altavoces (Realtek(R) Audio)»), si ya
+/// se abrió alguna.
+pub fn output_device_name() -> Option<String> {
+    let name = OUTPUT_NAME.lock().ok()?.clone();
+    (!name.is_empty()).then_some(name)
+}
 
 /// Hay salida de audio: falso cuando el último intento de sonar (`start`, `write`) no encontró
 /// ningún dispositivo. Empieza en verdadero (aún no se sabe) y lo vuelve a poner `probe_output`
@@ -600,6 +622,9 @@ impl RodioSink {
                     let rate = stream.config().sample_rate();
                     let channels = stream.config().channel_count();
                     let resampler = output_resampler(rate, channels);
+                    if let Ok(mut n) = OUTPUT_NAME.lock() {
+                        n.clone_from(&device_name);
+                    }
                     let clock_rate = if resampler.is_some() { rate } else { SAMPLE_RATE };
                     self.out = Some(Output {
                         sink,

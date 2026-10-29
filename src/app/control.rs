@@ -1116,6 +1116,46 @@ impl App {
                 }
                 None => err("falta n"),
             },
+            // ------------------------------------------------------------ Ajustes
+            "settings_tab" => {
+                self.settings_ui.open_tab(n(cmd, "i").unwrap_or(0).clamp(0, 4) as u8);
+                if self.page() != &Page::Settings {
+                    self.draft = self.settings.clone();
+                    self.go(Page::Settings);
+                }
+                ok()
+            }
+            "settings_search" => {
+                let q = s(cmd, "q").unwrap_or("").to_string();
+                self.settings_ui.search_open = true;
+                self.settings_ui.search = q;
+                ok()
+            }
+            "settings_expand" => {
+                let row = match s(cmd, "what") {
+                    Some("dev") => super::settings_page::Row::DevApp,
+                    Some("tech") => super::settings_page::Row::TechInfo,
+                    _ => return err("what: dev | tech"),
+                };
+                let on = b(cmd, "on", true);
+                self.settings_ui.expanded.retain(|r| *r != row);
+                if on {
+                    self.settings_ui.expanded.push(row);
+                }
+                ok()
+            }
+            "settings_dropdown" => {
+                self.settings_ui.dropdown = match s(cmd, "what") {
+                    Some("quality") => Some(super::settings_page::Drop::Quality),
+                    Some("language") => Some(super::settings_page::Drop::Language),
+                    _ => None,
+                };
+                ok()
+            }
+            "settings_scroll" => {
+                self.settings_ui.scroll_to = Some(n(cmd, "y").unwrap_or(0).max(0) as f32);
+                ok()
+            }
             "artist_tab" => match n(cmd, "n") {
                 Some(t) => {
                     self.artist_tab = t as u8;
@@ -1793,6 +1833,15 @@ impl App {
             "library_folder": self.library_folder,
             "home_filter": self.home_filter,
             "artist_tab": self.artist_tab,
+            "settings_ui": {
+                "tab": self.settings_ui.tab,
+                "search": self.settings_ui.search,
+                "search_open": self.settings_ui.search_open,
+                "stuck": self.settings_ui.stuck(),
+                "offset": self.settings_ui.offset(),
+                "dropdown": self.settings_ui.dropdown.map(|d| format!("{d:?}")),
+                "rects": self.settings_ui.rects.iter().map(|(k, r)| (k.clone(), json!([r.min.x, r.min.y, r.max.x, r.max.y]))).collect::<serde_json::Map<String, Value>>(),
+            },
             "artist_grid": self.artist_grid,
             "hidden_tracks": self.hidden_tracks,
             "downloaded": self.downloaded,

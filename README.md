@@ -147,7 +147,7 @@ Nanofy checks for new versions on startup and every six hours with an anonymous 
 Windows and Linux it downloads the update in the background, verifies its size and SHA-256 and shows
 «Reiniciar para actualizar» (*Restart to update*); if the new version doesn't start, Nanofy rolls back
 by itself. On macOS it only lets you know. Both checking and installing can be turned off in Settings →
-«Acerca de Nanofy» (*About Nanofy*).
+About.
 
 ## Build from source
 
@@ -190,9 +190,9 @@ addresses Spotify gives, normally its CDN.
 | Session, credentials, library copy and `nanofy.log` | `%LOCALAPPDATA%\nanofy\data` | `~/.local/state/nanofy` | `~/Library/Application Support/nanofy` |
 | Audio, cover art and list cache | `%LOCALAPPDATA%\nanofy\cache` | `~/.cache/nanofy` | `~/Library/Caches/nanofy` |
 
-Credentials and tokens are stored as unencrypted JSON, not in the system keychain. «Cerrar sesión»
-(*Sign out*, in Settings → «Cuenta») deletes the saved session but not the library access, which is
-removed with «Desconectar» (*Disconnect*) in Settings → «Biblioteca».
+Credentials and tokens are stored as unencrypted JSON, not in the system keychain. *Log out*
+(Settings → Account) deletes the saved session but not the library access, which is removed with
+*Disconnect* in the same tab, under *Spotify library*.
 
 ### Uninstall
 
@@ -213,7 +213,7 @@ want, also revoke its access on your Spotify account's apps page.
 ## Reporting a bug
 
 Open an [issue](https://github.com/ElRobaMichis/nanofy/issues/new/choose) (English or Spanish) with
-the version (Settings → «Acerca de Nanofy»), your system and the steps to reproduce it, and attach
+the version (Settings → About), your system and the steps to reproduce it, and attach
 `nanofy.log` and `nanofy.log.1` from the data folder above. Review them before posting: they include
 your Spotify username and may include song titles. Security problems go
 [privately](SECURITY.md).

@@ -16,7 +16,7 @@ Please read the [code of conduct](CODE_OF_CONDUCT.md). Security problems go
 
 ## Reporting a bug
 
-Include the version (Settings → About Nanofy), your system and the steps to reproduce it. Attach
+Include the version (Settings → About), your system and the steps to reproduce it. Attach
 `nanofy.log` (current session) and `nanofy.log.1` (the previous one), taken right after the problem:
 they're in `%LOCALAPPDATA%\nanofy\data` (Windows), `~/.local/state/nanofy` (Linux) or
 `~/Library/Application Support/nanofy` (macOS). The logs include your Spotify username and may include

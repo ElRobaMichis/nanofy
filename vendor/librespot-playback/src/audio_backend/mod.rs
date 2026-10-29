@@ -135,7 +135,7 @@ mod rodio;
 #[cfg(feature = "rodio-backend")]
 use self::rodio::RodioSink;
 #[cfg(feature = "rodio-backend")]
-pub use self::rodio::{output_info, output_ok, probe_output, set_output_volume};
+pub use self::rodio::{default_output, output_device_name, output_info, output_ok, probe_output, set_output_volume};
 
 #[cfg(feature = "sdl-backend")]
 mod sdl;

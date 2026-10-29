@@ -245,6 +245,12 @@ impl FsSizeLimiter {
         Self::prune_internal(|| self.limiter.lock().expect(CACHE_LIMITER_POISON_MSG).pop())
     }
 
+    /// Cambia el límite en marcha y borra lo que sobre (lo usado hace más tiempo primero).
+    fn set_limit(&self, limit: u64) -> Result<(), Error> {
+        self.limiter.lock().expect(CACHE_LIMITER_POISON_MSG).size_limit = limit;
+        self.prune()
+    }
+
     fn new(path: &Path, limit: u64) -> Result<Self, Error> {
         let mut limiter = SizeLimiter::new(limit);
 
@@ -308,6 +314,15 @@ impl Cache {
         };
 
         Ok(cache)
+    }
+
+    /// Nuevo límite de la caché de audio, sin reiniciar la sesión (Nanofy: Ajustes → Caché de
+    /// audio). Sin caché de audio o sin límite no hace nada.
+    pub fn set_size_limit(&self, limit: u64) -> Result<(), Error> {
+        match self.size_limiter.as_deref() {
+            Some(limiter) => limiter.set_limit(limit),
+            None => Ok(()),
+        }
     }
 
     pub fn credentials(&self) -> Option<Credentials> {

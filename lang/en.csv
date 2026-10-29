@@ -385,91 +385,6 @@ Esperando,Waiting
 Conecta tu biblioteca,Connect your library
 Solo tienes que autorizar tu cuenta en la web de Spotify; no hace falta crear ninguna app.,You just need to authorize your account on Spotify's website; no need to create any app.
 Conectar con Spotify,Connect with Spotify
-Conectada con Spotify,Connected with Spotify
-Sin conectar,Not connected
-Desconectar,Disconnect
-Reconectar,Reconnect
-¿No se abrió o la cerraste?,"Didn't it open, or did you close it?"
-Abrir de nuevo,Open again
-"Autoriza tu cuenta en el navegador (una sola vez). Habilita la biblioteca, la búsqueda, las playlists, el corazón y seguir artistas. No necesitas crear ninguna app.","Authorize your account in the browser (just once). It enables the library, search, playlists, the heart and following artists. You don't need to create any app."
-"Avanzado (opcional, no hace falta)","Advanced (optional, not needed)"
-Tu propia app de desarrollador,Your own developer app
-Quitar,Remove
-Reconectar app,Reconnect app
-Conectar mi app,Connect my app
-Se ha abierto el navegador para autorizar tu app…,Your browser opened to authorize your app…
-"No hace falta: Nanofy funciona entero sin ella. Solo si ya tienes una app en developer.spotify.com y quieres que las lecturas usen su cuota, añádele esta Redirect URI y pega aquí su Client ID:","Not needed: Nanofy works fully without it. Only if you already have an app on developer.spotify.com and want reads to use its quota, add this Redirect URI to it and paste its Client ID here:"
-Copiar la URI,Copy URI
-CLIENT ID DE TU APP,YOUR APP'S CLIENT ID
-32 caracteres,32 characters
-Fundido entre canciones,Crossfade songs
-Fundido activado,Crossfade on
-Fundido desactivado,Crossfade off
-Duración del fundido,Crossfade duration
-"La siguiente canción entra mientras la anterior se apaga. No se aplica al cambiar de canción a mano, al repetir una canción ni en podcasts.","The next song comes in while the previous one fades out. Not applied when you change songs by hand, repeat a song or in podcasts."
-Fundir también canciones seguidas de un mismo álbum,Also crossfade consecutive songs from the same album
-Spotify no funde temas consecutivos de un álbum para respetar las transiciones del artista.,"Spotify doesn't crossfade consecutive tracks of an album, to respect the artist's transitions."
-Fundido suspendido mientras el temporizador «al terminar la canción» está puesto.,Crossfade paused while the “end of song” sleep timer is set.
-Ajustes,Settings
-"El fundido entre canciones se aplica al instante; los demás cambios de reproducción, al guardar; el resto, al instante.","Crossfade applies right away; other playback changes, when you save; everything else, right away."
-Reproducción,Playback
-Nombre en Spotify Connect,Spotify Connect name
-Así aparece Nanofy en la lista de dispositivos.,This is how Nanofy appears in the device list.
-Calidad de audio,Audio quality
-"Ogg Vorbis, el mismo formato que la app de escritorio de Spotify. «Muy alta» es la máxima calidad que Spotify entrega a apps que no son las suyas.","Ogg Vorbis, the same format as Spotify's desktop app. “Very high” is the highest quality Spotify delivers to apps other than its own."
-Sin pérdida (FLAC): Spotify solo la entrega a sus apps y dispositivos certificados.,Lossless (FLAC): Spotify only delivers it to its own apps and certified devices.
-"El dispositivo ya está a 44,1 kHz: el audio llega sin convertir.",The device is already at 44.1 kHz: audio arrives unconverted.
-"Para evitar el remuestreo, pon el dispositivo en 44100 Hz: Configuración → Sistema → Sonido → (dispositivo) → Formato.","To avoid resampling, set the device to 44100 Hz: Settings → System → Sound → (device) → Format."
-"Para evitar el remuestreo, pon el dispositivo de salida en 44100 Hz.","To avoid resampling, set the output device to 44100 Hz."
-Salida de audio,Audio output
-Se sabrá al reproducir la primera canción,Known once the first song plays
-Normalizar volumen,Normalize volume
-Como en Spotify: todas las canciones suenan a un volumen parecido.,Like Spotify: all songs play at a similar volume.
-Nivel de volumen,Volume level
-Reproducción sin pausas (gapless),Gapless playback
-Autoplay al terminar una lista,Autoplay when a list ends
-Precarga inteligente,Smart preload
-Prepara la canción sobre la que pasas el ratón para que suene al instante.,Prepares the song under your mouse so it plays instantly.
-Teclas multimedia del sistema,System media keys
-Caché de audio en disco,Audio cache on disk
-Las canciones descargadas y ya escuchadas se guardan aquí.,Downloaded and already played songs are stored here.
-Apariencia y rendimiento,Appearance and performance
-Idioma,Language
-Lo que falte en un idioma se ve en español.,Anything missing in a language is shown in Spanish.
-Automático,Automatic
-Tema,Theme
-Sistema,System
-Oscuro,Dark
-Claro,Light
-Escala de la interfaz,Interface scale
-Límite de fotogramas,Frame limit
-Solo durante animaciones; en reposo no se repinta.,Only during animations; nothing is redrawn when idle.
-Guardar,Save
-Descartar,Discard
-Al guardar se reinicia el reproductor.,Saving restarts the player.
-"Biblioteca · playlists, búsqueda, Me gusta y perfiles","Library · playlists, search, Liked Songs and profiles"
-Cuenta,Account
-Cerrar sesión,Log out
-Ver mi perfil,View my profile
-Con una cuenta gratuita Spotify no permite reproducir música en clientes externos.,With a free account Spotify doesn't allow playing music in external clients.
-Conectando con Spotify,Connecting to Spotify
-Acerca de Nanofy,About Nanofy
-Versión {},Version {}
-Buscar actualizaciones,Check for updates
-Buscar versiones nuevas automáticamente,Check for new versions automatically
-Actualizar automáticamente,Update automatically
-Descarga las versiones nuevas en segundo plano; solo tendrás que pulsar Reiniciar.,Downloads new versions in the background; you'll only have to click Restart.
-En esta copia (de desarrollo o de pruebas) no se aplica: las versiones nuevas se avisan con «Instalar».,Not applied in this copy (development or testing): new versions are offered with “Install”.
-Memoria en uso {} MB · {} portadas en memoria ({} MB) · último fotograma {} ms,Memory in use {} MB · {} covers in memory ({} MB) · last frame {} ms
-Teclas multimedia: {},Media keys: {}
-activas,active
-no disponibles,unavailable
-Ajustes: {},Settings: {}
-Caché: {},Cache: {}
-Borrar caché de imágenes,Clear image cache
-Caché de imágenes borrada,Image cache cleared
-Atajos de teclado,Keyboard shortcuts
-"Nanofy es un proyecto independiente y no está afiliado a Spotify. Usa librespot para la reproducción y egui para la interfaz, dibujada por CPU.","Nanofy is an independent project and isn't affiliated with Spotify. It uses librespot for playback and egui for the interface, drawn by the CPU."
 Recordar más tarde,Remind me later
 Omitir esta versión,Skip this version
 No volver a avisar de esta versión,Don't notify me about this version again
@@ -483,6 +398,8 @@ Renombrar carpeta,Rename folder
 NOMBRE,NAME
 Mi carpeta,My folder
 La playlist se moverá dentro de la carpeta nueva.,The playlist will be moved into the new folder.
+Guardar,Save
+Atajos de teclado,Keyboard shortcuts
 Espacio,Space
 Reproducir o pausar,Play or pause
 Anterior / siguiente,Previous / next
@@ -497,6 +414,7 @@ Buscar (o pegar un enlace),Search (or paste a link)
 Mostrar u ocultar la barra lateral,Show or hide the sidebar
 Atrás / adelante,Back / forward
 Inicio / Canciones que te gustan,Home / Liked Songs
+Ajustes,Settings
 Ctrl+/ o ?,Ctrl+/ or ?
 Esta ventana,This window
 Salir,Quit
@@ -535,6 +453,7 @@ Colaborativa (otras personas pueden añadir y quitar canciones),Collaborative (o
 IMAGEN,IMAGE
 Elegir…,Choose…
 imagen,image
+Quitar,Remove
 o arrastra un JPG/PNG aquí,or drag a JPG/PNG here
 Nanofy {} disponible,Nanofy {} available
 Instalando la versión nueva…,Installing the new version…
@@ -679,6 +598,113 @@ Reproducir canciones similares,Play similar songs
 "Al acabarse lo que suena, sigue con canciones parecidas","When what's playing runs out, keep going with similar songs"
 Conexión con Spotify restablecida,Connection to Spotify restored
 Sin conexión con Spotify; reintentando en {} s…,No connection to Spotify; retrying in {} s…
+Reproducción,Playback
+Dispositivo,Device
+Apariencia,Appearance
+Cuenta,Account
+Sonido,Sound
+Transiciones,Transitions
+Este equipo,This computer
+Almacenamiento,Storage
+Biblioteca de Spotify,Spotify library
+Actualizaciones,Updates
+Desactivada,Off
+Buscar en Ajustes,Search settings
+Ningún ajuste coincide con «{}».,No settings match “{}”.
+"Nanofy es un proyecto independiente y no está afiliado a Spotify. Usa librespot para la reproducción y egui para la interfaz, dibujada por CPU.","Nanofy is an independent project and isn't affiliated with Spotify. It uses librespot for playback and egui for the interface, drawn by the CPU."
+Calidad de audio,Audio quality
+"Ogg Vorbis, el mismo formato que la app de escritorio de Spotify.","Ogg Vorbis, the same format as Spotify's desktop app."
+Normalizar volumen,Normalize volume
+Todas las canciones suenan a un volumen parecido.,All songs play at a similar volume.
+Nivel de volumen,Volume level
+Se sabrá al reproducir la primera canción,Known once the first song plays
+"El dispositivo ya está a 44,1 kHz: el audio llega sin convertir.",The device is already at 44.1 kHz: audio arrives unconverted.
+"Para evitar el remuestreo, pon el dispositivo a 44,1 kHz en Configuración → Sistema → Sonido.","To avoid resampling, set the device to 44.1 kHz in Settings → System → Sound."
+"Para evitar el remuestreo, pon el dispositivo de salida a 44,1 kHz.","To avoid resampling, set the output device to 44.1 kHz."
+Salida de audio,Audio output
+Reproducción sin pausas,Gapless playback
+"Sin silencios entre canciones, como en los discos en vivo.","No silence between songs, like on live albums."
+Fundido suspendido mientras el temporizador «al terminar la canción» está puesto.,Crossfade paused while the “end of song” sleep timer is set.
+Fundido entre canciones,Crossfade songs
+La siguiente entra mientras la anterior se apaga.,The next song comes in while the previous one fades out.
+Duración del fundido,Crossfade duration
+También entre canciones de un mismo álbum,Also between songs from the same album
+"Spotify no lo hace, para respetar las transiciones del artista.","Spotify doesn't, to respect the artist's transitions."
+"Al acabarse lo que suena, sigue con canciones parecidas.","When what's playing runs out, keep going with similar songs."
+Nombre en Spotify Connect,Spotify Connect name
+Así aparece Nanofy en tus otros dispositivos y en las Jams.,This is how Nanofy appears on your other devices and in Jams.
+Controla la música con el teclado y desde el panel de Windows.,Control the music with the keyboard and from the Windows panel.
+Controla la música con el teclado y desde el Centro de control.,Control the music with the keyboard and from Control Center.
+Controla la música con el teclado y desde el sistema.,Control the music with the keyboard and from the system.
+Teclas multimedia,Media keys
+Precarga inteligente,Smart preload
+Prepara la canción sobre la que pasas el ratón para que suene al instante.,Prepares the song under your mouse so it plays instantly.
+Límite de fotogramas,Frame limit
+Solo durante animaciones; en reposo no se repinta.,Only during animations; nothing is redrawn when idle.
+Caché de audio,Audio cache
+Las canciones descargadas y ya escuchadas se guardan aquí.,Downloaded and already played songs are stored here.
+{} portadas · {},{} covers · {}
+Calculando…,Calculating…
+Caché de imágenes,Image cache
+Borrar,Clear
+Automático,Automatic
+Idioma,Language
+Lo que falte en un idioma se ve en español.,Anything missing in a language is shown in Spanish.
+«Sistema» sigue el modo claro u oscuro de Windows.,“System” follows Windows' light or dark mode.
+«Sistema» sigue el modo claro u oscuro del sistema.,“System” follows the system's light or dark mode.
+Tema,Theme
+Escala de la interfaz,Interface scale
+Agranda o achica el texto y los controles.,Makes text and controls bigger or smaller.
+Esperando al navegador…,Waiting for the browser…
+Permite que Nanofy lea tu biblioteca en la pestaña que se abrió.,Let Nanofy read your library in the tab that opened.
+Abrir de nuevo,Open again
+Conectada con Spotify,Connected with Spotify
+"Nanofy lee tus playlists, carpetas y Me gusta, y busca en todo el catálogo.","Nanofy reads your playlists, folders and Liked Songs, and searches the whole catalog."
+Desconectar,Disconnect
+Biblioteca sin conectar,Library not connected
+Autoriza tu cuenta en el navegador (una sola vez). No necesitas crear ninguna app.,Authorize your account in the browser (just once). You don't need to create any app.
+Conectada. Las lecturas usan la cuota de tu app.,Connected. Reads use your app's quota.
+Opcional. Nanofy funciona entero sin ella.,Optional. Nanofy works fully without it.
+Tu propia app de desarrollador,Your own developer app
+Buscar versiones nuevas,Check for new versions
+Al abrir Nanofy y cada pocas horas.,When Nanofy opens and every few hours.
+En esta copia (de desarrollo o de pruebas) no se aplica: las versiones nuevas se avisan con «Instalar».,Not applied in this copy (development or testing): new versions are offered with “Install”.
+Actualizar automáticamente,Update automatically
+Descarga las versiones nuevas en segundo plano; solo tendrás que pulsar Reiniciar.,Downloads new versions in the background; you'll only have to click Restart.
+"Espacio, Cmd+→, Cmd+J y los demás.","Space, Cmd+→, Cmd+J and the rest."
+"Espacio, Ctrl+→, Ctrl+J y los demás.","Space, Ctrl+→, Ctrl+J and the rest."
+Información técnica,Technical information
+"Memoria, rendimiento y dónde se guardan tus datos.","Memory, performance and where your data is stored."
+"No se aplica al cambiar de canción a mano, al repetir una canción ni en podcasts.","Not applied when you change songs by hand, repeat a song or in podcasts."
+Caché de imágenes borrada,Image cache cleared
+Reconectando con el nombre nuevo…,Reconnecting with the new name…
+Dispositivo predeterminado,Default device
+Aún no ha sonado nada,Nothing has played yet
+Sistema,System
+Oscuro,Dark
+Claro,Light
+Cerrar sesión,Log out
+Iniciando sesión,Logging in
+Conectando con Spotify…,Connecting to Spotify…
+Sin sesión,Not logged in
+Inicia sesión para escuchar y ver tu biblioteca.,Log in to listen and see your library.
+Ver mi perfil,View my profile
+Con una cuenta gratuita Spotify no permite reproducir música en clientes externos.,With a free account Spotify doesn't allow playing music in external clients.
+Versión {},Version {}
+Buscar actualizaciones,Check for updates
+Solo si ya tienes una app en developer.spotify.com y quieres que las lecturas usen su cuota: añádele esta Redirect URI y pega aquí su Client ID.,Only if you already have an app on developer.spotify.com and want reads to use its quota: add this Redirect URI to it and paste its Client ID here.
+Client ID (32 caracteres),Client ID (32 characters)
+Reconectar app,Reconnect app
+Conectar mi app,Connect my app
+Se ha abierto el navegador para autorizar tu app…,Your browser opened to authorize your app…
+Memoria en uso {} MB · {} portadas en memoria ({} MB) · último fotograma {} ms,Memory in use {} MB · {} covers in memory ({} MB) · last frame {} ms
+Teclas multimedia: {},Media keys: {}
+activas,active
+no disponibles,unavailable
+Ajustes: {},Settings: {}
+Caché: {},Cache: {}
+Sin pérdida (FLAC),Lossless (FLAC)
+Solo en las apps de Spotify,Only in Spotify's own apps
 Créditos,Credits
 Más como esta,More like this
 No se pudo cargar la canción. Pulsa para reintentar.,Couldn't load the song. Click to retry.
@@ -709,7 +735,6 @@ Añadida por,Added by
 Fecha,Date
 Descargada (en la caché de audio),Downloaded (in the audio cache)
 Me gusta,Like
-Conectando con Spotify…,Connecting to Spotify…
 Reconectando con Spotify…,Reconnecting to Spotify…
 Spotify no acepta este dispositivo ahora mismo (fallo de sus servidores); se sigue intentando…,Spotify isn't accepting this device right now (a server failure on their side); still trying…
 la cuenta no es Premium,the account isn't Premium

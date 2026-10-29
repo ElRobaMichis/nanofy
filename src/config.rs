@@ -439,9 +439,16 @@ impl Settings {
         changed
     }
 
-    /// Ajustes que obligan a reiniciar el reproductor de librespot (y con él la sesión).
+    /// Ajustes que obligan a reiniciar el reproductor de librespot (y con él la sesión): el
+    /// nombre del dispositivo y activar o desactivar la caché de audio. Su tamaño se cambia en
+    /// marcha (`cache_limit_differs`).
     pub fn restart_differs(&self, other: &Settings) -> bool {
-        self.device_name != other.device_name || self.audio_cache_mb != other.audio_cache_mb
+        self.device_name != other.device_name || (self.audio_cache_mb == 0) != (other.audio_cache_mb == 0)
+    }
+
+    /// Otro tamaño de la caché de audio, activa antes y después: va en vivo (`Cmd::AudioCacheLimit`).
+    pub fn cache_limit_differs(&self, other: &Settings) -> bool {
+        self.audio_cache_mb != other.audio_cache_mb && self.audio_cache_mb > 0 && other.audio_cache_mb > 0
     }
 
     /// Ajustes de audio que se aplican en vivo, sin reiniciar (`Cmd::AudioTuning`): la calidad y
@@ -757,9 +764,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Solo el nombre y la caché reinician el reproductor; calidad, gapless y volumen se aplican
-    /// en vivo; el fundido y el autoplay tienen su propia orden; lo demás (tema, zoom…) no toca
-    /// la reproducción.
+    /// Solo el nombre y activar o quitar la caché reinician el reproductor; su tamaño, la calidad,
+    /// gapless y el volumen se aplican en vivo; el fundido y el autoplay tienen su propia orden; lo
+    /// demás (tema, zoom…) no toca la reproducción.
     #[test]
     fn ajustes_que_reinician_y_ajustes_en_vivo() {
         let base = Settings::default();
@@ -770,7 +777,13 @@ mod tests {
         };
         assert_eq!(with(&|s| s.device_name = "Otro".into()), (true, false));
         assert_eq!(with(&|s| s.autoplay = !s.autoplay), (false, false));
-        assert_eq!(with(&|s| s.audio_cache_mb = 1024), (true, false));
+        assert_eq!(with(&|s| s.audio_cache_mb = 1024), (false, false));
+        assert_eq!(with(&|s| s.audio_cache_mb = 0), (true, false));
+        let mut bigger = base.clone();
+        bigger.audio_cache_mb = 2048;
+        assert!(base.cache_limit_differs(&bigger));
+        bigger.audio_cache_mb = 0;
+        assert!(!base.cache_limit_differs(&bigger), "quitarla reinicia, no va en vivo");
         assert_eq!(with(&|s| s.quality = Quality::Low), (false, true));
         assert_eq!(with(&|s| s.normalisation = false), (false, true));
         assert_eq!(with(&|s| s.loudness = Loudness::Quiet), (false, true));
